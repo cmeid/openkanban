@@ -2600,10 +2600,19 @@ func (m *Model) prepareSpawn(ticket *board.Ticket, proj *project.Project, agentC
 
 		switch agentType {
 		case "claude":
-			if isNewSession && promptTemplate != "" {
-				prompt := agent.BuildContextPrompt(promptTemplate, ticket)
-				if prompt != "" {
-					args = append(args, prompt)
+			if isNewSession {
+				// Title the Claude session so it's identifiable in the
+				// session picker and terminal title. Only on new sessions
+				// — resumes inherit the existing name. Skip if the user
+				// already set -n / --name via config args.
+				if !hasClaudeNameFlag(args) && strings.TrimSpace(ticket.Title) != "" {
+					args = append(args, "-n", ticket.Title)
+				}
+				if promptTemplate != "" {
+					prompt := agent.BuildContextPrompt(promptTemplate, ticket)
+					if prompt != "" {
+						args = append(args, prompt)
+					}
 				}
 			} else if !isNewSession {
 				hasFlag := false
@@ -2825,6 +2834,18 @@ func (m *Model) saveTicket(ticket *board.Ticket) {
 	if err := m.globalStore.Save(ticket); err != nil {
 		m.notify("Failed to save: " + err.Error())
 	}
+}
+
+// hasClaudeNameFlag returns true if the args slice already contains
+// a Claude Code session-name flag (-n or --name). Used to avoid
+// double-naming when the user pre-set it in their agent config.
+func hasClaudeNameFlag(args []string) bool {
+	for _, a := range args {
+		if a == "-n" || a == "--name" || strings.HasPrefix(a, "--name=") {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Model) resetSpawnState(ticketID board.TicketID) {

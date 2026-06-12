@@ -3,7 +3,9 @@ package project
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/techdufus/openkanban/internal/board"
 )
@@ -176,12 +178,9 @@ func TestTicketStore_CountByStatus(t *testing.T) {
 }
 
 func TestTicketStore_SaveAndLoad(t *testing.T) {
-	tmpDir := t.TempDir()
-	configDir := filepath.Join(tmpDir, "config")
-	repoDir := filepath.Join(tmpDir, "repo")
-	os.MkdirAll(configDir, 0755)
-	os.MkdirAll(repoDir, 0755)
-	t.Setenv("OPENKANBAN_CONFIG_DIR", configDir)
+	configDir := setupTmpConfigDir(t)
+	repoDir := filepath.Join(t.TempDir(), "repo")
+	os.MkdirAll(repoDir, 0o755)
 
 	store := NewTicketStore("project-1", repoDir)
 	ticket := board.NewTicket("Persistent Ticket", "project-1")
@@ -189,19 +188,24 @@ func TestTicketStore_SaveAndLoad(t *testing.T) {
 	ticket.Status = board.StatusInProgress
 	store.Add(ticket)
 
-	if err := store.Save(); err != nil {
-		t.Fatalf("Save() error: %v", err)
+	if err := store.SaveTicket(ticket); err != nil {
+		t.Fatalf("SaveTicket: %v", err)
 	}
 
-	ticketsPath := filepath.Join(configDir, "tickets", "project-1.json")
-	if _, err := os.Stat(ticketsPath); os.IsNotExist(err) {
-		t.Fatalf("tickets file should exist at %s", ticketsPath)
+	// Per-ticket file lives under tickets/{project}/{filename}.md
+	projectDir := filepath.Join(configDir, "tickets", "project-1")
+	entries, err := os.ReadDir(projectDir)
+	if err != nil {
+		t.Fatalf("read project dir: %v", err)
+	}
+	if len(entries) != 1 || !strings.HasSuffix(entries[0].Name(), ".md") {
+		t.Fatalf("expected one .md file under %s, got %v", projectDir, entries)
 	}
 
 	project := &Project{ID: "project-1", RepoPath: repoDir}
 	loaded, err := LoadTicketStore(project)
 	if err != nil {
-		t.Fatalf("LoadTicketStore() error: %v", err)
+		t.Fatalf("LoadTicketStore: %v", err)
 	}
 
 	if loaded.Count() != 1 {
@@ -226,124 +230,190 @@ func TestTicketStore_SaveAndLoad(t *testing.T) {
 	}
 }
 
-func TestLoadTicketStore_NonexistentFile(t *testing.T) {
-	tmpDir := t.TempDir()
-	project := &Project{ID: "project-1", RepoPath: tmpDir}
+func TestLoadTicketStore_EmptyProjectDir(t *testing.T) {
+	setupTmpConfigDir(t)
+	project := &Project{ID: "project-empty", RepoPath: t.TempDir()}
 
 	store, err := LoadTicketStore(project)
 	if err != nil {
-		t.Fatalf("LoadTicketStore() should not error for nonexistent file: %v", err)
+		t.Fatalf("LoadTicketStore should not error for empty project: %v", err)
 	}
-
 	if store.Count() != 0 {
 		t.Errorf("loaded store should be empty; got %d tickets", store.Count())
 	}
 }
 
-func TestTicketStore_AtomicSave(t *testing.T) {
-	tmpDir := t.TempDir()
-	configDir := filepath.Join(tmpDir, "config")
-	repoDir := filepath.Join(tmpDir, "repo")
-	os.MkdirAll(configDir, 0755)
-	os.MkdirAll(repoDir, 0755)
-	t.Setenv("OPENKANBAN_CONFIG_DIR", configDir)
+func TestTicketStore_AtomicSaveNoTmpLeftover(t *testing.T) {
+	configDir := setupTmpConfigDir(t)
+	store := NewTicketStore("project-1", t.TempDir())
+	ticket := board.NewTicket("AtomicTest", "project-1")
+	store.Add(ticket)
 
-	store := NewTicketStore("project-1", repoDir)
-	store.Add(board.NewTicket("Test", "project-1"))
-
-	if err := store.Save(); err != nil {
-		t.Fatalf("Save() error: %v", err)
+	if err := store.SaveTicket(ticket); err != nil {
+		t.Fatalf("SaveTicket: %v", err)
 	}
 
-	tmpPath := filepath.Join(configDir, "tickets", "project-1.json.tmp")
-	if _, err := os.Stat(tmpPath); !os.IsNotExist(err) {
-		t.Error("temp file should not exist after successful save")
-	}
-}
-
-func TestTicketStore_Migration(t *testing.T) {
-	tmpDir := t.TempDir()
-	configDir := filepath.Join(tmpDir, "config")
-	repoDir := filepath.Join(tmpDir, "repo")
-	os.MkdirAll(configDir, 0755)
-	os.MkdirAll(repoDir, 0755)
-	t.Setenv("OPENKANBAN_CONFIG_DIR", configDir)
-
-	// Create old-style ticket file
-	oldDir := filepath.Join(repoDir, ".openkanban")
-	os.MkdirAll(oldDir, 0755)
-	oldPath := filepath.Join(oldDir, "tickets.json")
-	oldData := `{"project_id":"project-1","tickets":{"T-001":{"id":"T-001","title":"Old Ticket","status":"backlog"}}}`
-	os.WriteFile(oldPath, []byte(oldData), 0644)
-
-	// Load should migrate
-	p := &Project{ID: "project-1", RepoPath: repoDir}
-	store, err := LoadTicketStore(p)
+	projectDir := filepath.Join(configDir, "tickets", "project-1")
+	entries, err := os.ReadDir(projectDir)
 	if err != nil {
-		t.Fatalf("LoadTicketStore failed: %v", err)
+		t.Fatalf("read project dir: %v", err)
 	}
-
-	// Verify ticket was migrated
-	if store.Count() != 1 {
-		t.Errorf("expected 1 ticket after migration, got %d", store.Count())
-	}
-
-	// Verify new file exists
-	newPath := filepath.Join(configDir, "tickets", "project-1.json")
-	if _, err := os.Stat(newPath); os.IsNotExist(err) {
-		t.Error("new ticket file should exist after migration")
-	}
-
-	// Verify old file still exists (not deleted)
-	if _, err := os.Stat(oldPath); os.IsNotExist(err) {
-		t.Error("old ticket file should still exist after migration")
+	for _, ent := range entries {
+		if strings.HasSuffix(ent.Name(), ".tmp") {
+			t.Errorf("leftover .tmp file: %s", ent.Name())
+		}
 	}
 }
 
-func TestGlobalTicketStore_RemoveProjectArchive(t *testing.T) {
-	tmpDir := t.TempDir()
-	configDir := filepath.Join(tmpDir, "config")
-	repoDir := filepath.Join(tmpDir, "repo")
-	os.MkdirAll(configDir, 0755)
-	os.MkdirAll(repoDir, 0755)
-	t.Setenv("OPENKANBAN_CONFIG_DIR", configDir)
+// TestSave_DoesNotTouchPeerFiles is the load-bearing regression test
+// for the original cross-session clobber bug. Per-ticket storage means
+// saving ticket A must not modify ticket B's file in any way.
+func TestSave_DoesNotTouchPeerFiles(t *testing.T) {
+	setupTmpConfigDir(t)
+	store := NewTicketStore("project-1", t.TempDir())
 
-	// Create a registry
+	tA := board.NewTicket("Ticket A", "project-1")
+	tB := board.NewTicket("Ticket B", "project-1")
+	store.Add(tA)
+	store.Add(tB)
+
+	if err := store.SaveTicket(tA); err != nil {
+		t.Fatalf("save A: %v", err)
+	}
+	if err := store.SaveTicket(tB); err != nil {
+		t.Fatalf("save B: %v", err)
+	}
+
+	pathB := store.paths[tB.ID]
+	statB1, err := os.Stat(pathB)
+	if err != nil {
+		t.Fatalf("stat B: %v", err)
+	}
+
+	// Give the filesystem enough resolution to detect any modification.
+	time.Sleep(20 * time.Millisecond)
+
+	// Mutate and save A. B's file MUST be untouched.
+	tA.Description = "Edit that should not affect B"
+	tA.UpdatedAt = time.Now()
+	if err := store.SaveTicket(tA); err != nil {
+		t.Fatalf("re-save A: %v", err)
+	}
+
+	statB2, err := os.Stat(pathB)
+	if err != nil {
+		t.Fatalf("re-stat B: %v", err)
+	}
+
+	if !statB1.ModTime().Equal(statB2.ModTime()) {
+		t.Errorf("saving A modified B's mtime (before=%v after=%v) — cross-ticket clobber regression!",
+			statB1.ModTime(), statB2.ModTime())
+	}
+	if statB1.Size() != statB2.Size() {
+		t.Errorf("saving A changed B's size (before=%d after=%d)", statB1.Size(), statB2.Size())
+	}
+}
+
+// TestSaveTicket_TitleEditRemovesOldFile guards against orphan files
+// when the slug part of the filename changes due to a title edit.
+func TestSaveTicket_TitleEditRemovesOldFile(t *testing.T) {
+	configDir := setupTmpConfigDir(t)
+	store := NewTicketStore("project-1", t.TempDir())
+
+	tk := board.NewTicket("Original Title", "project-1")
+	store.Add(tk)
+	if err := store.SaveTicket(tk); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	oldPath := store.paths[tk.ID]
+
+	// Edit the title; the filename slug will change.
+	tk.Title = "Brand New Title"
+	tk.Touch()
+	if err := store.SaveTicket(tk); err != nil {
+		t.Fatalf("re-save with new title: %v", err)
+	}
+	newPath := store.paths[tk.ID]
+
+	if oldPath == newPath {
+		t.Fatal("test bug: filename should change when title changes")
+	}
+	if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+		t.Errorf("old file at %s should be removed after rename", oldPath)
+	}
+	if _, err := os.Stat(newPath); err != nil {
+		t.Errorf("new file at %s should exist: %v", newPath, err)
+	}
+
+	// Project dir should have exactly one file.
+	projectDir := filepath.Join(configDir, "tickets", "project-1")
+	entries, err := os.ReadDir(projectDir)
+	if err != nil {
+		t.Fatalf("read project dir: %v", err)
+	}
+	if len(entries) != 1 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("expected exactly 1 file after rename, got %d: %v", len(entries), names)
+	}
+}
+
+func TestGlobalTicketStore_RemoveProjectArchivesWholeDir(t *testing.T) {
+	configDir := setupTmpConfigDir(t)
+	repoDir := filepath.Join(t.TempDir(), "repo")
+	os.MkdirAll(repoDir, 0o755)
+
 	registry := newRegistry()
-
-	// Add a project and save tickets
 	p := &Project{ID: "project-1", Name: "Test", RepoPath: repoDir}
-	registry.Add(p)
+	if err := registry.Add(p); err != nil {
+		t.Fatalf("registry.Add: %v", err)
+	}
 
 	store := NewTicketStore(p.ID, p.RepoPath)
-	store.Add(board.NewTicket("Test ticket", p.ID))
-	if err := store.Save(); err != nil {
-		t.Fatalf("Save failed: %v", err)
+	tk := board.NewTicket("Archived ticket", p.ID)
+	store.Add(tk)
+	if err := store.SaveTicket(tk); err != nil {
+		t.Fatalf("SaveTicket: %v", err)
 	}
 
-	// Create global store and add project
 	globalStore := NewGlobalTicketStore(registry)
-	globalStore.AddProject(p)
+	globalStore.projects[p.ID] = p
+	globalStore.ticketStores[p.ID] = store
 
-	// Verify ticket file exists
-	ticketPath := filepath.Join(configDir, "tickets", "project-1.json")
-	if _, err := os.Stat(ticketPath); os.IsNotExist(err) {
-		t.Fatal("ticket file should exist before removal")
+	projectDir := filepath.Join(configDir, "tickets", "project-1")
+	if _, err := os.Stat(projectDir); err != nil {
+		t.Fatalf("project dir should exist before removal: %v", err)
 	}
 
-	// Remove project
 	if err := globalStore.RemoveProject(p.ID); err != nil {
-		t.Fatalf("RemoveProject failed: %v", err)
+		t.Fatalf("RemoveProject: %v", err)
 	}
 
-	// Verify ticket file moved to archived
-	archivedPath := filepath.Join(configDir, "tickets", "archived", "project-1.json")
-	if _, err := os.Stat(archivedPath); os.IsNotExist(err) {
-		t.Error("ticket file should be archived after project removal")
+	// Project dir gone from its original location.
+	if _, err := os.Stat(projectDir); !os.IsNotExist(err) {
+		t.Error("project dir should be removed after archival")
 	}
 
-	// Verify original file no longer exists
-	if _, err := os.Stat(ticketPath); !os.IsNotExist(err) {
-		t.Error("original ticket file should not exist after archiving")
+	// Archived under tickets/archived/<id>_<ts>/
+	archivedRoot := filepath.Join(configDir, "tickets", "archived")
+	entries, err := os.ReadDir(archivedRoot)
+	if err != nil {
+		t.Fatalf("read archived root: %v", err)
+	}
+	found := false
+	for _, ent := range entries {
+		if strings.HasPrefix(ent.Name(), "project-1_") && ent.IsDir() {
+			found = true
+			// Confirm the per-ticket file lives inside.
+			inner, _ := os.ReadDir(filepath.Join(archivedRoot, ent.Name()))
+			if len(inner) != 1 {
+				t.Errorf("expected 1 ticket file inside archived dir, got %d", len(inner))
+			}
+		}
+	}
+	if !found {
+		t.Errorf("no archived directory found matching project-1_*; entries: %v", entries)
 	}
 }

@@ -1,12 +1,14 @@
 package project
 
 import (
-	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/techdufus/openkanban/internal/board"
@@ -22,12 +24,21 @@ func ticketsDir() string {
 	}
 	return filepath.Join(dir, "tickets")
 }
-const ticketsFile = "tickets.json"
 
+// TicketStore is the in-memory view of a single project's tickets.
+//
+// On disk: tickets/{ProjectID}/{slug}-{uuid8}.md, one file per ticket.
+// The store is not itself serialised; only individual tickets are.
 type TicketStore struct {
-	ProjectID string                           `json:"project_id"`
-	Tickets   map[board.TicketID]*board.Ticket `json:"tickets"`
-	UpdatedAt time.Time                        `json:"updated_at"`
+	ProjectID string
+	Tickets   map[board.TicketID]*board.Ticket
+	UpdatedAt time.Time
+
+	// paths caches the on-disk path each ticket was loaded from (or
+	// last written to). Used so SaveTicket knows where to atomically
+	// rename and DeleteTicketFile knows what to os.Remove without
+	// scanning the directory.
+	paths map[board.TicketID]string
 
 	repoPath string
 }
@@ -37,79 +48,147 @@ func NewTicketStore(projectID, repoPath string) *TicketStore {
 		ProjectID: projectID,
 		Tickets:   make(map[board.TicketID]*board.Ticket),
 		UpdatedAt: time.Now(),
+		paths:     make(map[board.TicketID]string),
 		repoPath:  repoPath,
 	}
 }
 
+// LoadTicketStore migrates from legacy single-file storage if needed,
+// then reads every .md in the project's per-ticket directory.
 func LoadTicketStore(project *Project) (*TicketStore, error) {
 	store := NewTicketStore(project.ID, project.RepoPath)
 
-	// Check for migration from old location
-	oldPath := filepath.Join(project.RepoPath, ".openkanban", "tickets.json")
-	newPath := store.filePath()
-
-	// Ensure tickets directory exists
-	if err := os.MkdirAll(ticketsDir(), 0755); err != nil {
-		return nil, err
+	if _, err := MigrateProjectToPerTicket(project.ID); err != nil {
+		// Migration failure is logged but non-fatal — the user can
+		// inspect the legacy .json file and the .migrating workspace
+		// to recover. Return an empty store so the TUI still boots.
+		log.Printf("openkanban: migration for project %s failed: %v", project.ID, err)
 	}
 
-	// Migration: if old exists and new doesn't, migrate
-	if _, err := os.Stat(oldPath); err == nil {
-		if _, err := os.Stat(newPath); os.IsNotExist(err) {
-			// Old exists, new doesn't - migrate
-			data, readErr := os.ReadFile(oldPath)
-			if readErr == nil {
-				if writeErr := os.WriteFile(newPath, data, 0644); writeErr == nil {
-					log.Printf("Migrated tickets from %s to %s. You can safely delete the old .openkanban directory.", oldPath, newPath)
-				}
+	dir := store.ticketDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("create project ticket dir: %w", err)
+	}
+
+	walkErr := filepath.WalkDir(dir, func(path string, d fs.DirEntry, werr error) error {
+		if werr != nil {
+			return werr
+		}
+		if d.IsDir() {
+			if path == dir {
+				return nil
 			}
+			return fs.SkipDir
 		}
-	}
-
-	// Load from new location
-	data, err := os.ReadFile(newPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return store, nil
+		if !strings.HasSuffix(d.Name(), ".md") {
+			return nil
 		}
-		return nil, err
+		data, rerr := os.ReadFile(path)
+		if rerr != nil {
+			log.Printf("openkanban: skip %s: read: %v", path, rerr)
+			return nil
+		}
+		ticket, perr := UnmarshalTicket(data)
+		if perr != nil {
+			log.Printf("openkanban: skip %s: parse: %v", path, perr)
+			return nil
+		}
+		// Frontmatter ID is canonical identity. Filename is cosmetic.
+		// If the file's project_id is empty, backfill from the project
+		// being loaded (defensive against hand-edited files).
+		if ticket.ProjectID == "" {
+			ticket.ProjectID = project.ID
+		}
+		store.Tickets[ticket.ID] = ticket
+		store.paths[ticket.ID] = path
+		return nil
+	})
+	if walkErr != nil {
+		return nil, fmt.Errorf("walk project ticket dir: %w", walkErr)
 	}
 
-	if err := json.Unmarshal(data, store); err != nil {
-		return nil, err
-	}
-
-	if store.Tickets == nil {
-		store.Tickets = make(map[board.TicketID]*board.Ticket)
-	}
-	store.repoPath = project.RepoPath
-
+	store.UpdatedAt = time.Now()
 	return store, nil
 }
 
-func (s *TicketStore) filePath() string {
-	return filepath.Join(ticketsDir(), s.ProjectID+".json")
+// ticketDir returns the absolute path to this project's ticket directory.
+func (s *TicketStore) ticketDir() string {
+	return filepath.Join(ticketsDir(), s.ProjectID)
 }
 
-func (s *TicketStore) Save() error {
-	dir := ticketsDir()
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
+// SaveTicket writes a single ticket as Markdown via tmp+rename. It
+// does not touch any other ticket's file — the load-bearing property
+// behind hot-reload safety.
+//
+// If the ticket's filename has changed since the cached path (e.g.
+// title was edited), the old file is removed after the new one is
+// committed. Identity is always the frontmatter id.
+func (s *TicketStore) SaveTicket(t *board.Ticket) error {
+	if t == nil {
+		return errors.New("SaveTicket: nil ticket")
+	}
+	if t.ProjectID == "" {
+		t.ProjectID = s.ProjectID
 	}
 
-	s.UpdatedAt = time.Now()
+	dir := s.ticketDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("ensure project dir: %w", err)
+	}
 
-	data, err := json.MarshalIndent(s, "", "  ")
+	data, err := MarshalTicket(t)
 	if err != nil {
-		return err
+		return fmt.Errorf("marshal ticket: %w", err)
 	}
 
-	path := s.filePath()
-	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
-		return err
+	newPath := filepath.Join(dir, TicketFilename(t))
+	tmpPath := newPath + ".tmp"
+
+	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
+		return fmt.Errorf("write tmp: %w", err)
 	}
-	return os.Rename(tmpPath, path)
+	if err := os.Rename(tmpPath, newPath); err != nil {
+		return fmt.Errorf("rename tmp to dest: %w", err)
+	}
+
+	// If the previous cached path was different (title-driven rename),
+	// remove the old file. The frontmatter id in both files would be
+	// identical, but only the new path should remain.
+	if oldPath, hadOld := s.paths[t.ID]; hadOld && oldPath != newPath {
+		if rmErr := os.Remove(oldPath); rmErr != nil && !os.IsNotExist(rmErr) {
+			log.Printf("openkanban: failed to remove stale path %s after rename: %v", oldPath, rmErr)
+		}
+	}
+	s.paths[t.ID] = newPath
+	s.Tickets[t.ID] = t
+	s.UpdatedAt = time.Now()
+	return nil
+}
+
+// DeleteTicketFile removes the on-disk file for a ticket without
+// touching peers. Returns nil if the ticket was never persisted.
+func (s *TicketStore) DeleteTicketFile(id board.TicketID) error {
+	path, ok := s.paths[id]
+	if !ok {
+		return nil
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove ticket file: %w", err)
+	}
+	delete(s.paths, id)
+	return nil
+}
+
+// SaveAll fans out across the in-memory ticket map, writing each via
+// SaveTicket. Returns the first error encountered (does not roll back
+// successful writes).
+func (s *TicketStore) SaveAll() error {
+	for _, ticket := range s.Tickets {
+		if err := s.SaveTicket(ticket); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *TicketStore) Add(ticket *board.Ticket) {
@@ -125,9 +204,16 @@ func (s *TicketStore) Get(id board.TicketID) (*board.Ticket, error) {
 	return t, nil
 }
 
+// Delete removes a ticket from the in-memory map AND from disk.
+// Today's callers (GlobalTicketStore.Delete) rely on the file being
+// removed without an explicit Save call, since per-ticket storage
+// has no "rewrite the whole file without this ticket" pathway.
 func (s *TicketStore) Delete(id board.TicketID) error {
 	if _, ok := s.Tickets[id]; !ok {
 		return board.ErrTicketNotFound
+	}
+	if err := s.DeleteTicketFile(id); err != nil {
+		return err
 	}
 	delete(s.Tickets, id)
 	return nil
@@ -249,7 +335,9 @@ func (g *GlobalTicketStore) Delete(id board.TicketID) error {
 
 	store := g.ticketStores[ticket.ProjectID]
 	if store != nil {
-		store.Delete(id)
+		if err := store.Delete(id); err != nil {
+			return err
+		}
 	}
 	delete(g.allTickets, id)
 	return nil
@@ -268,17 +356,18 @@ func (g *GlobalTicketStore) Move(id board.TicketID, newStatus board.TicketStatus
 	return nil
 }
 
+// Save persists a single ticket. Atomic; touches only that ticket's file.
 func (g *GlobalTicketStore) Save(ticket *board.Ticket) error {
 	store := g.ticketStores[ticket.ProjectID]
 	if store == nil {
 		return board.ErrTicketNotFound
 	}
-	return store.Save()
+	return store.SaveTicket(ticket)
 }
 
 func (g *GlobalTicketStore) SaveAll() error {
 	for _, store := range g.ticketStores {
-		if err := store.Save(); err != nil {
+		if err := store.SaveAll(); err != nil {
 			return err
 		}
 	}
@@ -327,29 +416,25 @@ func (g *GlobalTicketStore) AddProject(p *Project) {
 	g.ticketStores[p.ID] = NewTicketStore(p.ID, p.RepoPath)
 }
 
+// RemoveProject archives the project's whole ticket directory by
+// renaming tickets/{id}/ to tickets/archived/{id}_{ts}/, then drops
+// in-memory references.
 func (g *GlobalTicketStore) RemoveProject(id string) error {
 	if _, ok := g.projects[id]; !ok {
 		return ErrProjectNotFound
 	}
 
-	// Archive ticket file before removing
-	srcPath := filepath.Join(ticketsDir(), id+".json")
-	if _, err := os.Stat(srcPath); err == nil {
-		archivedDir := filepath.Join(ticketsDir(), "archived")
-		if err := os.MkdirAll(archivedDir, 0755); err != nil {
+	srcDir := filepath.Join(ticketsDir(), id)
+	if _, err := os.Stat(srcDir); err == nil {
+		archivedRoot := filepath.Join(ticketsDir(), "archived")
+		if err := os.MkdirAll(archivedRoot, 0o755); err != nil {
 			return err
 		}
-
-		dstPath := filepath.Join(archivedDir, id+".json")
-		// If archived file already exists, append timestamp
-		if _, err := os.Stat(dstPath); err == nil {
-			dstPath = filepath.Join(archivedDir, fmt.Sprintf("%s_%d.json", id, time.Now().Unix()))
-		}
-
-		if err := os.Rename(srcPath, dstPath); err != nil {
+		dstDir := filepath.Join(archivedRoot, fmt.Sprintf("%s_%d", id, time.Now().Unix()))
+		if err := os.Rename(srcDir, dstDir); err != nil {
 			return err
 		}
-		log.Printf("Archived tickets to %s", dstPath)
+		log.Printf("openkanban: archived project %s tickets to %s", id, dstDir)
 	}
 
 	delete(g.projects, id)
