@@ -1024,8 +1024,53 @@ func (m *Model) handleAgentViewMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	pane.HandleMouse(msg)
+	// BubbleTea reports mouse Y relative to the host terminal (row 0
+	// = top of TUI). The pane's content sits below the agent view's
+	// chrome (1-row header, plus optional 1-row deps line). Subtract
+	// the chrome height so the pane sees pane-relative coordinates;
+	// otherwise selection lands one (or two) rows below the cursor.
+	chrome := m.agentViewChromeHeight()
+	adjusted := msg
+	adjusted.Y = msg.Y - chrome
+	if adjusted.Y < 0 {
+		// Click landed on the chrome itself (header or deps line).
+		// Row 0 / close-button case is handled above; other chrome
+		// clicks are no-ops.
+		return m, nil
+	}
+
+	pane.HandleMouse(adjusted)
 	return m, nil
+}
+
+// agentViewChromeHeight returns the height in rows of the non-pane
+// content rendered above the agent terminal pane: 1 for the header,
+// plus 1 for the deps line when the focused ticket has any
+// BlockedBy / Blocks relationships. Used to translate host-terminal
+// mouse coords into pane-relative coords.
+func (m *Model) agentViewChromeHeight() int {
+	ticket, _ := m.globalStore.Get(m.focusedPane)
+	return agentChromeHeight(ticketHasDeps(m.globalStore, ticket))
+}
+
+// ticketHasDeps reports whether a ticket has any incoming or outgoing
+// dependency relationships (i.e. the agent view should render its
+// deps line for this ticket).
+func ticketHasDeps(g *project.GlobalTicketStore, t *board.Ticket) bool {
+	if g == nil || t == nil {
+		return false
+	}
+	return len(g.GetBlockedBy(t.ID)) > 0 || len(g.GetBlocks(t.ID)) > 0
+}
+
+// agentChromeHeight is the pure mapping from "does the deps line
+// render?" to chrome height. Kept separate from the Model so it can
+// be unit-tested without constructing a store.
+func agentChromeHeight(hasDeps bool) int {
+	if hasDeps {
+		return 2
+	}
+	return 1
 }
 
 func (m *Model) handleTicketFormMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {

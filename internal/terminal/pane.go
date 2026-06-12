@@ -547,8 +547,19 @@ func (p *Pane) HandleMouse(msg tea.MouseMsg) {
 		return
 	}
 
-	// When mouse tracking is disabled, handle scrolling and selection ourselves
-	if !p.mouseEnabled {
+	// Shift+drag (or shift-click) reclaims mouse from the child
+	// process for text selection, even when the child has enabled
+	// mouse tracking. Matches the convention used by ghostty / iTerm2
+	// for selecting text in mouse-mode applications. Mid-drag motion
+	// (MouseButtonNone) is also routed to selection when a selection
+	// is in progress, regardless of Shift state, so a user can release
+	// Shift partway through a drag without breaking the selection.
+	selectionInProgress := p.selection != nil && p.selection.Mode == SelectionSelecting
+	bypassForSelection := msg.Shift || (msg.Button == tea.MouseButtonNone && selectionInProgress)
+
+	// When mouse tracking is disabled OR the user is bypassing for
+	// selection, handle scrolling and selection ourselves.
+	if !p.mouseEnabled || bypassForSelection {
 		switch msg.Button {
 		case tea.MouseButtonWheelUp:
 			// Scrolling clears selection
