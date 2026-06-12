@@ -327,10 +327,18 @@ func (m *Model) renderColumn(col board.Column, tickets []*board.Ticket, isActive
 		borderColor = m.colors.overlay
 	}
 
+	// MaxHeight prevents the column from ever exceeding the board area: if the
+	// visibleTicketCount estimate is off by a row, lipgloss clips from the
+	// bottom instead of the terminal scrolling and clipping the top.
+	maxHeight := m.boardAreaHeight()
+	if maxHeight < 1 {
+		maxHeight = 1
+	}
 	style := lipgloss.NewStyle().
 		Border(border).
 		BorderForeground(borderColor).
 		Width(width).
+		MaxHeight(maxHeight).
 		Padding(0, 1)
 
 	if !isLast {

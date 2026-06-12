@@ -46,8 +46,15 @@ const (
 	minColumnWidth = 20
 	columnOverhead = 5
 
-	ticketHeight       = 6
+	// ticketHeight is the worst-case rendered height of a ticket card in rows
+	// (2 border + 5 content lines + 1 bottom margin). Used to estimate how many
+	// fit in a column; over-packing here pushes the column past the terminal
+	// height and the top is clipped off-screen.
+	ticketHeight       = 8
 	columnHeaderHeight = 3
+	// indicatorReserveRows reserves vertical space for the "▲ N more" and
+	// "▼ N more" overflow indicators rendered inside a column.
+	indicatorReserveRows = 2
 
 	formFieldTitle       = 0
 	formFieldDescription = 1
@@ -2096,7 +2103,7 @@ func (m *Model) moveTicket(delta int) {
 }
 
 func (m *Model) visibleTicketCount() int {
-	availableHeight := m.columnContentHeight()
+	availableHeight := m.columnContentHeight() - indicatorReserveRows
 	if availableHeight <= 0 {
 		return 1
 	}
@@ -2104,10 +2111,23 @@ func (m *Model) visibleTicketCount() int {
 	return max(count, 1)
 }
 
+// boardAreaHeight is the vertical space available for the column row, between
+// the header (with its trailing newline) and the status bar (with its
+// preceding newline). headerHeight() already includes its own padding/border.
+func (m *Model) boardAreaHeight() int {
+	const (
+		newlineAfterHeader      = 1
+		newlineBeforeStatusBar  = 1
+		statusBarHeight         = 1
+	)
+	return m.height - m.headerHeight() - newlineAfterHeader - newlineBeforeStatusBar - statusBarHeight
+}
+
 func (m *Model) columnContentHeight() int {
-	boardHeight := m.height - 4
-	contentHeight := boardHeight - columnHeaderHeight - 4
-	return contentHeight
+	const (
+		columnBottomBorder = 1
+	)
+	return m.boardAreaHeight() - columnHeaderHeight - columnBottomBorder
 }
 
 func (m *Model) ensureTicketVisible() {
