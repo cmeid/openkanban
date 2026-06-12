@@ -547,73 +547,67 @@ func (p *Pane) HandleMouse(msg tea.MouseMsg) {
 		return
 	}
 
-	// Shift+drag (or shift-click) reclaims mouse from the child
-	// process for text selection, even when the child has enabled
-	// mouse tracking. Matches the convention used by ghostty / iTerm2
-	// for selecting text in mouse-mode applications. Mid-drag motion
-	// (MouseButtonNone) is also routed to selection when a selection
-	// is in progress, regardless of Shift state, so a user can release
-	// Shift partway through a drag without breaking the selection.
-	selectionInProgress := p.selection != nil && p.selection.Mode == SelectionSelecting
-	bypassForSelection := msg.Shift || (msg.Button == tea.MouseButtonNone && selectionInProgress)
-
-	// When mouse tracking is disabled OR the user is bypassing for
-	// selection, handle scrolling and selection ourselves.
-	if !p.mouseEnabled || bypassForSelection {
+	// Selection processing runs regardless of whether the child has
+	// mouse tracking enabled, so the user can always drag-to-select
+	// and Cmd+C-to-copy text from any pane. When the child also has
+	// mouse tracking on, the event is ALSO forwarded to it below
+	// (unless Shift is held — see the Shift bypass at the end).
+	//
+	// A bare click without drag does not produce a persistent
+	// selection (SelectionState.Finish transitions to Idle when
+	// anchor==cursor), so menu clicks still work normally.
+	if p.selection != nil {
 		switch msg.Button {
-		case tea.MouseButtonWheelUp:
-			// Scrolling clears selection
-			if p.selection != nil && p.selection.IsActive() {
-				p.selection.Clear()
-			}
-			p.scrollUp(3)
-			return
-		case tea.MouseButtonWheelDown:
-			if p.selection != nil && p.selection.IsActive() {
-				p.selection.Clear()
-			}
-			p.scrollDown(3)
-			return
 		case tea.MouseButtonLeft:
-			if p.selection != nil {
-				// Convert viewport coordinates to logical position
-				pos := p.viewportToLogical(msg.X, msg.Y)
-				if msg.Action == tea.MouseActionPress {
-					p.selection.Start(pos)
-					p.dirty = true
-				} else if msg.Action == tea.MouseActionMotion {
-					p.selection.Update(pos)
-					p.dirty = true
-				} else if msg.Action == tea.MouseActionRelease {
-					p.selection.Finish()
-					p.dirty = true
-				}
-			}
-			return
-		case tea.MouseButtonRight, tea.MouseButtonMiddle:
-			// Other clicks clear selection
-			if p.selection != nil && p.selection.IsActive() {
-				p.selection.Clear()
+			pos := p.viewportToLogical(msg.X, msg.Y)
+			switch msg.Action {
+			case tea.MouseActionPress:
+				p.selection.Start(pos)
+				p.dirty = true
+			case tea.MouseActionMotion:
+				p.selection.Update(pos)
+				p.dirty = true
+			case tea.MouseActionRelease:
+				p.selection.Finish()
 				p.dirty = true
 			}
-			return
 		case tea.MouseButtonNone:
-			// Motion event during selection
-			if p.selection != nil && p.selection.Mode == SelectionSelecting {
+			if p.selection.Mode == SelectionSelecting {
 				pos := p.viewportToLogical(msg.X, msg.Y)
 				p.selection.Update(pos)
 				p.dirty = true
 			}
-			return
+		case tea.MouseButtonRight, tea.MouseButtonMiddle:
+			if p.selection.IsActive() {
+				p.selection.Clear()
+				p.dirty = true
+			}
+		case tea.MouseButtonWheelUp, tea.MouseButtonWheelDown:
+			// Scrolling invalidates the pinned selection coordinates.
+			if p.selection.IsActive() {
+				p.selection.Clear()
+				p.dirty = true
+			}
+		}
+	}
+
+	// When the child has not enabled mouse tracking, also handle wheel
+	// scrolling locally against our own scrollback buffer.
+	if !p.mouseEnabled {
+		switch msg.Button {
+		case tea.MouseButtonWheelUp:
+			p.scrollUp(3)
+		case tea.MouseButtonWheelDown:
+			p.scrollDown(3)
 		}
 		return
 	}
 
-	// Forward mouse events when app has enabled mouse tracking
-	// Clear any selection when mouse mode is enabled
-	if p.selection != nil && p.selection.IsActive() {
-		p.selection.Clear()
-		p.dirty = true
+	// Mouse tracking is enabled. Shift held = the user is claiming the
+	// event for openkanban (selection already handled above); don't
+	// also pass it to the child.
+	if msg.Shift {
+		return
 	}
 
 	var seq []byte
