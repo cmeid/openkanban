@@ -4,7 +4,7 @@ Terminal-based kanban board with integrated AI agent spawning for ticket work.
 
 ## Stack
 
-Go 1.21+, BubbleTea (TUI), creack/pty, vt10x (terminal emulation)
+Go 1.21+, BubbleTea (TUI), creack/pty, charmbracelet/x/vt (terminal emulation; see [Terminal Emulator](docs/AGENT_INTEGRATION.md#architecture-terminal-emulator))
 
 ## Development
 
@@ -34,7 +34,7 @@ cmd/           CLI entry (cobra)
 internal/
   ui/          BubbleTea Model - central orchestrator
   agent/       Agent config, status detection, spawning prep
-  terminal/    PTY management, vt10x rendering, scrollback
+  terminal/    PTY management, charm/x/vt emulator wrapper, scrollback
   board/       Ticket/column data structures
   project/     Multi-project registry, settings cascade
   config/      JSON config, validation, themes

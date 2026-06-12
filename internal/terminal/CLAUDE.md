@@ -7,21 +7,35 @@ PTY management and terminal emulation for agent processes.
 - **Pane** - manages single PTY + virtual terminal
 - **ScrollbackBuffer** - ring buffer for history (default 10k lines)
 - **SelectionState** - text selection state machine
+- **Glyph** - internal cell representation; emulator-agnostic
 
 ## PTY Handling
 
 Uses `creack/pty`:
 ```go
-pty.Start(cmd)      // spawn with PTY
-pty.Setsize(f, ws)  // resize
+pty.StartWithSize(cmd, &Winsize{...})  // fork with size, atomic
+pty.Setsize(f, ws)                     // resize (on host window change only)
 ```
+
+`StartWithSize` is preferred over `Start + Setsize` to avoid a TIOCSWINSZ race; see the commit fixing that race for context.
 
 ## Terminal Emulation
 
-Uses `vt10x` for escape sequence parsing:
+Uses `github.com/charmbracelet/x/vt` (`SafeEmulator`) for escape sequence parsing and screen state:
 - Cursor management
 - Cell-based rendering
 - Color/attribute handling
+- Scroll regions, alt-screen, scrollback (we use our own scrollback ring, not charm's)
+
+charm/x/vt emits *responses* (DA queries, cursor reports, etc.) through `Emulator.Read()`. We MUST spawn a goroutine that loops `Read()` → writes to the PTY, or the emulator deadlocks on the first query. See `Pane.startDrainUnlocked` and `stopDrainUnlocked`.
+
+See [docs/AGENT_INTEGRATION.md#architecture-terminal-emulator](../../docs/AGENT_INTEGRATION.md#architecture-terminal-emulator) for the rationale behind choosing charm/x/vt over the previous library (hinshun/vt10x).
+
+## Internal Glyph Type
+
+`glyph.go` defines openkanban's `Glyph` (a value-typed cell with Char/Bold/Italic/.../FG/BG/Width). The rest of the package — scrollback, selection, render — uses `Glyph` exclusively. Only `pane.go` touches the emulator's native `*uv.Cell`, and only at the boundary (`cellToGlyph`).
+
+This is intentional: it decouples scrollback/selection/render code from the emulator choice, so a future swap doesn't ripple through every file.
 
 ## Message Types
 
@@ -35,6 +49,7 @@ BubbleTea integration:
 - Throttled at 50ms intervals
 - `dirty` flag tracks when re-render needed
 - Cached view string until dirty
+- `glyphANSI(g)` emits SGR escape sequences from a Glyph
 
 ## Key Translation
 
@@ -52,9 +67,15 @@ BubbleTea integration:
 
 ## Escape Sequence Detection
 
-Byte scanning for mode switches:
+Byte scanning at the openkanban layer (independent of the emulator) for:
 - Mouse mode: `\x1b[?1000h`
 - Alt screen: `\x1b[?1049h`
+
+These flags drive openkanban's own mouse-forwarding and selection behavior. charm/x/vt also tracks them internally; we keep our own scanner for the few places we need the state synchronously during byte processing.
+
+## Cursor Visibility
+
+charm/x/vt does not expose a public `CursorVisible()` getter (the `Cursor` struct with `Hidden bool` lives on the private `Screen`). We track DECTCEM state via `Callbacks.CursorVisibility` into an `atomic.Bool` on the Pane (`cursorHidden`), which the renderer reads lock-free.
 
 ## Anti-Patterns
 
@@ -62,4 +83,5 @@ Byte scanning for mode switches:
 - Don't skip resize handling - causes display corruption
 - Don't render on every output - use throttling
 - Don't leak PTY file descriptors - always close
-- Don't assume vt10x handles all sequences - some need manual parsing
+- Don't `Read()` the emulator from anywhere other than the drain goroutine — its response pipe is a single consumer
+- Don't expose `*uv.Cell` outside of pane.go's boundary — translate to `Glyph`

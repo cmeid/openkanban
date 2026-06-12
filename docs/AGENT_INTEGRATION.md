@@ -214,16 +214,20 @@ case "claude":
 ### PTY Architecture
 
 ```go
-// internal/terminal/pane.go
+// internal/terminal/pane.go — illustrative
 
 type Pane struct {
-    id      string
-    vt      vt10x.Terminal   // Virtual terminal (handles escape sequences)
-    pty     *os.File         // PTY master file descriptor
-    cmd     *exec.Cmd        // Running process
-    workdir string           // Working directory
-    width   int
-    height  int
+    id           string
+    vt           *xvt.SafeEmulator   // charm/x/vt emulator, mutex-wrapped
+    pty          *os.File            // PTY master file descriptor
+    cmd          *exec.Cmd           // Running process
+    workdir      string
+    width        int
+    height       int
+
+    cursorHidden atomic.Bool         // tracks DECTCEM via charm callback
+    drainStop    chan struct{}       // shuts down the response-drain goroutine
+    drainWG      sync.WaitGroup
 }
 ```
 
@@ -232,29 +236,32 @@ type Pane struct {
 ```go
 func (p *Pane) Start(command string, args ...string) tea.Cmd {
     return func() tea.Msg {
-        // Create virtual terminal
-        p.vt = vt10x.New(vt10x.WithSize(p.width, p.height))
-
-        // Build command
         p.cmd = exec.Command(command, args...)
-        p.cmd.Env = buildCleanEnv()  // Filter OPENCODE_*, CLAUDE_* vars
+        p.cmd.Env = buildCleanEnv(p.sessionName)
         p.cmd.Dir = p.workdir
 
-        // Start PTY
-        ptmx, err := pty.Start(p.cmd)
+        // Fork with size atomically (avoids the TIOCSWINSZ race that
+        // used to leave bottom-anchored UI rendered at the top).
+        ptmx, err := pty.StartWithSize(p.cmd, &pty.Winsize{
+            Rows: uint16(p.height), Cols: uint16(p.width),
+        })
         if err != nil {
             return ExitMsg{PaneID: p.id, Err: err}
         }
         p.pty = ptmx
 
-        // Set terminal size
-        pty.Setsize(p.pty, &pty.Winsize{
-            Rows: uint16(p.height),
-            Cols: uint16(p.width),
+        // Spin up the emulator. charm/x/vt emits responses
+        // (DA queries, cursor reports, ...) via Read() — we MUST drain
+        // those bytes back to the PTY or the emulator deadlocks.
+        p.vt = xvt.NewSafeEmulator(p.width, p.height)
+        p.vt.SetCallbacks(xvt.Callbacks{
+            CursorVisibility: func(visible bool) {
+                p.cursorHidden.Store(!visible)
+            },
         })
+        p.startDrainUnlocked()  // goroutine: for { Read; pty.Write }
 
-        // Start reading output
-        return p.readOutput()()
+        return p.readOutputUnlocked()()
     }
 }
 ```
@@ -292,10 +299,49 @@ func (p *Pane) translateKey(msg tea.KeyMsg) []byte {
 
 ```go
 func (p *Pane) View() string {
-    // Render vt10x buffer with ANSI colors
-    // Handles cursor position, colors, attributes
+    // Iterate cells from the emulator, translate each to our internal
+    // Glyph type via cellToGlyph(p.vt.CellAt(x, y)), batch runs of
+    // identical SGR, emit ANSI for the host terminal.
 }
 ```
+
+## Architecture: Terminal Emulator
+
+OpenKanban currently uses `github.com/charmbracelet/x/vt` (specifically `SafeEmulator`) for in-pane terminal emulation. This section explains why, and what it cost to move there.
+
+### Previous: hinshun/vt10x
+
+The original implementation used `github.com/hinshun/vt10x`. It was small (~2k LOC), legible, and broadly correct for plain output. Two material problems surfaced over time:
+
+1. **Bottom-edge scroll counting drifts.** vt10x handles the cursor-down command (`CSI N B`) by clamping the cursor at the bottom row without scrolling. Line feed (`\n`) at the bottom scrolls separately. The two paths don't share state perfectly: over many cycles of "draw menu, scroll N lines, redraw," vt10x's cursor row diverged from what a correct terminal computes. The captured-PTY repro showed up to **46 rows of drift** in a 22-second session, with claude's "thinking" indicator landing at the wrong row in vt10x's grid. Rendered to the host terminal, the symptom is the input bar (or AskUserQuestion menu cursor) appearing at the top of the pane instead of the bottom, non-deterministically.
+
+2. **Unmaintained.** Last release in 2022. The bug above is unlikely to ever be upstream-fixed.
+
+### Chosen: charmbracelet/x/vt
+
+`charmbracelet/x/vt` is part of the same ecosystem as the rest of openkanban's TUI dependencies (Bubble Tea, lipgloss, ultraviolet). Verified against the same captured-PTY trace, charm/x/vt produces a cursor position consistent with a correct terminal, and content lands at the expected rows.
+
+Other candidates considered:
+- **Fork-and-fix vt10x.** Patching the bottom-edge clamp/scroll interaction is ~50 LOC. Cheap up-front but leaves us owning a fork of an unmaintained library; future bugs we haven't hit yet (and there will be some — escape-sequence surfaces are large) would all need patching.
+- **Build a screen buffer on top of `charmbracelet/x/ansi`.** Parser-only; we'd have written the screen state machine ourselves. Too much surface area for too little payoff.
+- **gdamore/tcell.** A UI rendering library — it generates ANSI, doesn't parse it. Wrong direction.
+
+### What the migration cost
+
+- **New internal `Glyph` type** (`internal/terminal/glyph.go`). The scrollback ring, selection state, and render path all use `Glyph` — they don't touch the emulator's native `*uv.Cell`. Only `pane.go` translates at the boundary (`cellToGlyph`). This makes the emulator a swap-out detail.
+- **Response-pipe drain goroutine.** charm/x/vt emits replies to terminal queries (DA, cursor position, etc.) through `Emulator.Read()`. Without a consumer, the emulator deadlocks on the first query. `Pane.startDrainUnlocked` runs the consumer for the lifetime of the pane; `stopDrainUnlocked` closes the emulator, unblocking `Read` with EOF.
+- **Cursor visibility hook.** charm/x/vt's public API does not expose a `CursorVisible()` getter (the `Cursor.Hidden` flag lives on a private `Screen`). We register a `Callbacks.CursorVisibility` callback that flips an `atomic.Bool` on the Pane; the renderer reads it lock-free.
+- **Dependency-tree shift.** Brought transitive bumps to Bubble Tea (1.3.4 → 1.3.10), bubbles (0.21.0 → 1.0.0), and a new direct dep on `charmbracelet/ultraviolet` and `charmbracelet/x/ansi`. All same-ecosystem upgrades.
+
+### Known limitations carried forward
+
+- **Single-rune cells.** `cellToGlyph` collapses a grapheme cluster (charm's `Cell.Content` is a UTF-8 string supporting ZWJ, combining marks, etc.) to its first rune. The rest of the renderer assumes 1 rune per cell. Double-wide CJK still renders narrowly; combining marks drop. Cell width is captured (`Glyph.Width`) but unused. This matches the prior vt10x behavior.
+- **Mouse-mode detection.** openkanban keeps its own byte scanner for `?1000h` / `?1049h` because we need the state synchronously during input handling. charm/x/vt tracks these internally too — we don't read from it for these specific flags.
+
+### When to revisit
+
+- If charm/x/vt's API surface stabilizes enough to expose `CursorVisible()` directly, we can drop the callback machinery.
+- If grapheme-width support becomes a felt issue (CJK users, emoji-heavy output), the rendering path needs to be reworked to iterate `Glyph.Width` for spacing — that's a larger change touching the column-major loops in pane.go.
 
 ## Status Detection
 

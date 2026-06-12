@@ -121,6 +121,12 @@ OpenKanban is highly configurable. Agents, keybindings, branch naming, cleanup b
 
 See [Configuration Guide](./docs/CONFIGURATION.md) for the full reference, or [Data Model](./docs/DATA_MODEL.md) for the on-disk layout.
 
+## Architecture notes
+
+Each agent pane is backed by a real PTY (`creack/pty`) wrapped with a virtual terminal emulator (`charmbracelet/x/vt`) that parses every escape sequence the agent emits, maintains the screen + scrollback state, and lets openkanban render it inside the TUI.
+
+The emulator choice and the rationale for moving off the previous one (`hinshun/vt10x`) live in [docs/AGENT_INTEGRATION.md#architecture-terminal-emulator](./docs/AGENT_INTEGRATION.md#architecture-terminal-emulator) — short version: vt10x miscounted scrolls over long sessions, the bug was unpatched upstream, and charm/x/vt is correct + actively maintained in the same ecosystem as the rest of the TUI stack.
+
 ## License
 
 [AGPL-3.0](LICENSE)
