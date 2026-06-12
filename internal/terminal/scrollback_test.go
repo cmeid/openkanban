@@ -2,19 +2,17 @@ package terminal
 
 import (
 	"testing"
-
-	"github.com/hinshun/vt10x"
 )
 
-func makeTestLine(s string) []vt10x.Glyph {
-	glyphs := make([]vt10x.Glyph, len(s))
+func makeTestLine(s string) []Glyph {
+	glyphs := make([]Glyph, len(s))
 	for i, ch := range s {
-		glyphs[i] = vt10x.Glyph{Char: ch}
+		glyphs[i] = Glyph{Char: ch, Width: 1}
 	}
 	return glyphs
 }
 
-func lineToString(line []vt10x.Glyph) string {
+func lineToString(line []Glyph) string {
 	if line == nil {
 		return ""
 	}

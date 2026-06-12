@@ -2,17 +2,15 @@ package terminal
 
 import (
 	"sync"
-
-	"github.com/hinshun/vt10x"
 )
 
 // ScrollbackBuffer is a ring buffer for storing terminal scrollback history.
 // It stores lines that have scrolled off the top of the terminal screen.
 type ScrollbackBuffer struct {
-	lines    [][]vt10x.Glyph // Circular buffer of lines
-	head     int             // Index where next line will be written
-	count    int             // Number of lines currently stored
-	capacity int             // Maximum number of lines
+	lines    [][]Glyph // Circular buffer of lines
+	head     int       // Index where next line will be written
+	count    int       // Number of lines currently stored
+	capacity int       // Maximum number of lines
 	mu       sync.RWMutex
 }
 
@@ -22,19 +20,19 @@ func NewScrollbackBuffer(capacity int) *ScrollbackBuffer {
 		capacity = 10000 // Default
 	}
 	return &ScrollbackBuffer{
-		lines:    make([][]vt10x.Glyph, capacity),
+		lines:    make([][]Glyph, capacity),
 		capacity: capacity,
 	}
 }
 
 // Push adds a line to the scrollback buffer.
 // If the buffer is full, the oldest line is overwritten.
-func (sb *ScrollbackBuffer) Push(line []vt10x.Glyph) {
+func (sb *ScrollbackBuffer) Push(line []Glyph) {
 	sb.mu.Lock()
 	defer sb.mu.Unlock()
 
 	// Copy the line to avoid holding references to the original
-	lineCopy := make([]vt10x.Glyph, len(line))
+	lineCopy := make([]Glyph, len(line))
 	copy(lineCopy, line)
 
 	sb.lines[sb.head] = lineCopy
@@ -54,7 +52,7 @@ func (sb *ScrollbackBuffer) Len() int {
 
 // Get returns the line at the given index (0 = oldest line in buffer).
 // Returns nil if index is out of bounds.
-func (sb *ScrollbackBuffer) Get(index int) []vt10x.Glyph {
+func (sb *ScrollbackBuffer) Get(index int) []Glyph {
 	sb.mu.RLock()
 	defer sb.mu.RUnlock()
 
@@ -77,7 +75,7 @@ func (sb *ScrollbackBuffer) Get(index int) []vt10x.Glyph {
 
 // GetRange returns lines from startIndex to endIndex (exclusive).
 // Useful for rendering a viewport of scrollback history.
-func (sb *ScrollbackBuffer) GetRange(startIndex, endIndex int) [][]vt10x.Glyph {
+func (sb *ScrollbackBuffer) GetRange(startIndex, endIndex int) [][]Glyph {
 	sb.mu.RLock()
 	defer sb.mu.RUnlock()
 
@@ -91,7 +89,7 @@ func (sb *ScrollbackBuffer) GetRange(startIndex, endIndex int) [][]vt10x.Glyph {
 		return nil
 	}
 
-	result := make([][]vt10x.Glyph, endIndex-startIndex)
+	result := make([][]Glyph, endIndex-startIndex)
 	for i := startIndex; i < endIndex; i++ {
 		var actualIndex int
 		if sb.count < sb.capacity {

@@ -3,16 +3,18 @@ package terminal
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/atotto/clipboard"
 	tea "github.com/charmbracelet/bubbletea"
+	xvt "github.com/charmbracelet/x/vt"
 	"github.com/creack/pty"
-	"github.com/hinshun/vt10x"
 )
 
 const (
@@ -21,12 +23,12 @@ const (
 )
 
 type Pane struct {
-	id      string
-	vt      vt10x.Terminal
-	pty     *os.File
-	cmd     *exec.Cmd
-	mu      sync.Mutex
-	running bool
+	id          string
+	vt          *xvt.SafeEmulator
+	pty         *os.File
+	cmd         *exec.Cmd
+	mu          sync.Mutex
+	running     bool
 	exitErr     error
 	workdir     string
 	sessionName string
@@ -42,11 +44,23 @@ type Pane struct {
 
 	// Scrollback and viewport state (Issue #95)
 	scrollback      *ScrollbackBuffer
-	altScreenActive bool     // tracks if child process is in alternate screen mode
-	viewportOffset  int      // lines scrolled back (0 = live view)
-	lastTopRow      []vt10x.Glyph // snapshot of row 0 before write for scroll detection
-	scrollbackSize  int      // configured scrollback buffer size
+	altScreenActive bool            // tracks if child process is in alternate screen mode
+	viewportOffset  int             // lines scrolled back (0 = live view)
+	lastTopRow      []Glyph         // snapshot of row 0 before write for scroll detection
+	scrollbackSize  int             // configured scrollback buffer size
 	selection       *SelectionState // mouse text selection state
+
+	// cursorHidden tracks DECTCEM state for the live emulator. charm/x/vt
+	// does not expose a getter on Emulator, so we maintain our own flag
+	// via the Callbacks.CursorVisibility hook. Atomic so the goroutine
+	// that drives the callback can safely write while renderers read.
+	cursorHidden atomic.Bool
+
+	// drainStop stops the goroutine that pipes emulator-emitted responses
+	// (DA queries, etc.) back to the PTY. Without that drain charm/x/vt
+	// deadlocks on its first device-attributes write.
+	drainStop chan struct{}
+	drainWG   sync.WaitGroup
 }
 
 func New(id string, width, height int, scrollbackSize int) *Pane {
@@ -208,7 +222,7 @@ func (p *Pane) Start(command string, args ...string) tea.Cmd {
 		// first frame at the OS-default 80x24 before SIGWINCH arrives,
 		// causing bottom-anchored UI (input bars, status lines) to
 		// pin to row 24 of the child's coordinate space — which lands
-		// at the wrong row in our actual-sized vt10x buffer.
+		// at the wrong row in our actual-sized emulator buffer.
 		// StartWithSize sets TIOCSWINSZ atomically with the fork.
 		ptmx, err := pty.StartWithSize(p.cmd, &pty.Winsize{
 			Rows: uint16(p.height),
@@ -222,15 +236,77 @@ func (p *Pane) Start(command string, args ...string) tea.Cmd {
 		p.running = true
 		p.exitErr = nil
 
-		// Create virtual terminal with PTY as writer for escape sequence responses
-		// This allows the terminal emulator to respond to queries like cursor position (DSR)
-		p.vt = vt10x.New(vt10x.WithSize(p.width, p.height), vt10x.WithWriter(p.pty))
+		// Create the virtual terminal. charm/x/vt emits responses
+		// (device attributes, cursor reports, etc.) via Read(); we
+		// MUST drain that pipe and forward to the PTY or the
+		// emulator deadlocks on the first DA query.
+		p.vt = xvt.NewSafeEmulator(p.width, p.height)
+		p.vt.SetCallbacks(xvt.Callbacks{
+			CursorVisibility: func(visible bool) {
+				p.cursorHidden.Store(!visible)
+			},
+		})
+		p.cursorHidden.Store(false)
+		p.startDrainUnlocked()
+
 		p.scrollback = NewScrollbackBuffer(p.scrollbackSize)
 		p.selection = NewSelectionState()
 
 		// Start read loop
 		return p.readOutputUnlocked()()
 	}
+}
+
+// startDrainUnlocked spawns the goroutine that forwards emulator
+// responses back to the PTY. Must be called with p.mu held.
+func (p *Pane) startDrainUnlocked() {
+	p.drainStop = make(chan struct{})
+	stop := p.drainStop
+	vt := p.vt
+	ptyFile := p.pty
+
+	p.drainWG.Add(1)
+	go func() {
+		defer p.drainWG.Done()
+		buf := make([]byte, 4096)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			n, err := vt.Read(buf)
+			if n > 0 && ptyFile != nil {
+				_, _ = ptyFile.Write(buf[:n])
+			}
+			if err != nil {
+				if err == io.EOF {
+					return
+				}
+				// Other errors: stop draining; the pane is being torn down.
+				return
+			}
+		}
+	}()
+}
+
+// stopDrainUnlocked terminates the response-drain goroutine. Must be
+// called with p.mu held. Closing the emulator unblocks any in-flight
+// Read so the goroutine actually exits.
+func (p *Pane) stopDrainUnlocked() {
+	if p.drainStop == nil {
+		return
+	}
+	close(p.drainStop)
+	if p.vt != nil {
+		// Close the emulator to unblock Read().
+		_ = p.vt.Emulator.Close()
+	}
+	p.drainStop = nil
+	// Don't Wait here while holding p.mu — the drain goroutine
+	// doesn't grab p.mu, but a future caller might want Stop() to
+	// return promptly. The wait is cheap regardless.
+	p.drainWG.Wait()
 }
 
 func (p *Pane) Stop() error {
@@ -243,6 +319,7 @@ func (p *Pane) Stop() error {
 	if p.pty != nil {
 		p.pty.Close()
 	}
+	p.stopDrainUnlocked()
 	p.running = false
 	return nil
 }
@@ -278,6 +355,7 @@ func (p *Pane) StopGraceful(timeout time.Duration) error {
 	if p.pty != nil {
 		p.pty.Close()
 	}
+	p.stopDrainUnlocked()
 	p.running = false
 	p.mu.Unlock()
 
@@ -353,6 +431,7 @@ func (p *Pane) Update(msg tea.Msg) tea.Cmd {
 		if p.pty != nil {
 			p.pty.Close()
 		}
+		p.stopDrainUnlocked()
 		p.mu.Unlock()
 		return nil
 	}
@@ -452,41 +531,37 @@ func (p *Pane) detectAltScreenChanges(data []byte) {
 	}
 }
 
-// captureScrollbackBeforeWrite takes a snapshot of row 0 before vt.Write
-// Called with mutex held.
+// captureScrollbackBeforeWrite takes a snapshot of row 0 before vt.Write.
+// Called with mutex held. SafeEmulator's own internal mutex serializes
+// emulator access; we additionally rely on p.mu to keep this pair
+// atomic with respect to other pane operations.
 func (p *Pane) captureScrollbackBeforeWrite() {
 	if p.vt == nil || p.altScreenActive {
 		p.lastTopRow = nil
 		return
 	}
 
-	p.vt.Lock()
-	cols, _ := p.vt.Size()
+	cols := p.vt.Width()
 	if cols <= 0 {
-		p.vt.Unlock()
 		p.lastTopRow = nil
 		return
 	}
 
 	// Snapshot row 0
-	p.lastTopRow = make([]vt10x.Glyph, cols)
+	p.lastTopRow = make([]Glyph, cols)
 	for col := 0; col < cols; col++ {
-		p.lastTopRow[col] = p.vt.Cell(col, 0)
+		p.lastTopRow[col] = cellToGlyph(p.vt.CellAt(col, 0))
 	}
-	p.vt.Unlock()
 }
 
-// captureScrollbackAfterWrite checks if row 0 changed and captures scrolled line
+// captureScrollbackAfterWrite checks if row 0 changed and captures scrolled line.
 // Called with mutex held.
 func (p *Pane) captureScrollbackAfterWrite() {
 	if p.vt == nil || p.altScreenActive || p.lastTopRow == nil {
 		return
 	}
 
-	p.vt.Lock()
-	defer p.vt.Unlock()
-
-	cols, _ := p.vt.Size()
+	cols := p.vt.Width()
 	if cols <= 0 || cols != len(p.lastTopRow) {
 		return
 	}
@@ -494,7 +569,7 @@ func (p *Pane) captureScrollbackAfterWrite() {
 	// Compare current row 0 with snapshot
 	changed := false
 	for col := 0; col < cols; col++ {
-		if p.vt.Cell(col, 0) != p.lastTopRow[col] {
+		if cellToGlyph(p.vt.CellAt(col, 0)) != p.lastTopRow[col] {
 			changed = true
 			break
 		}
@@ -509,10 +584,11 @@ func (p *Pane) captureScrollbackAfterWrite() {
 	p.lastTopRow = nil
 }
 
-// isLineVisible checks if a line is still visible on screen
-// Called with vt.Lock held.
-func (p *Pane) isLineVisible(line []vt10x.Glyph) bool {
-	cols, rows := p.vt.Size()
+// isLineVisible checks if a line is still visible on screen.
+// Called with mutex held.
+func (p *Pane) isLineVisible(line []Glyph) bool {
+	cols := p.vt.Width()
+	rows := p.vt.Height()
 	if len(line) != cols {
 		return false
 	}
@@ -520,7 +596,7 @@ func (p *Pane) isLineVisible(line []vt10x.Glyph) bool {
 	for row := 0; row < rows; row++ {
 		match := true
 		for col := 0; col < cols; col++ {
-			if p.vt.Cell(col, row) != line[col] {
+			if cellToGlyph(p.vt.CellAt(col, row)) != line[col] {
 				match = false
 				break
 			}
@@ -695,11 +771,11 @@ func (p *Pane) HandleKey(msg tea.KeyMsg) tea.Msg {
 	// Handle scroll navigation keys (work regardless of mouse mode)
 	switch key {
 	case "shift+pgup":
-		_, rows := p.vt.Size()
+		rows := p.vt.Height()
 		p.scrollUp(rows / 2)
 		return nil
 	case "shift+pgdown":
-		_, rows := p.vt.Size()
+		rows := p.vt.Height()
 		p.scrollDown(rows / 2)
 		return nil
 	case "shift+home":
@@ -758,23 +834,21 @@ func (p *Pane) copySelectionUnlocked() {
 	}
 
 	// Get scrollback lines for text extraction
-	var scrollbackLines [][]vt10x.Glyph
+	var scrollbackLines [][]Glyph
 	scrollbackLen := 0
 	if p.scrollback != nil {
 		scrollbackLen = p.scrollback.Len()
 		scrollbackLines = p.scrollback.GetRange(0, scrollbackLen)
 	}
 
-	// Get live screen accessor
-	var liveRows int
-	p.vt.Lock()
-	_, liveRows = p.vt.Size()
-	liveScreen := func(col, row int) vt10x.Glyph {
-		return p.vt.Cell(col, row)
+	// Get live screen accessor. SafeEmulator handles its own locking
+	// for CellAt, so the closure is safe to use directly.
+	liveRows := p.vt.Height()
+	liveScreen := func(col, row int) Glyph {
+		return cellToGlyph(p.vt.CellAt(col, row))
 	}
 
 	text := p.selection.ExtractText(scrollbackLines, liveScreen, liveRows, scrollbackLen)
-	p.vt.Unlock()
 
 	if text != "" {
 		clipboard.WriteAll(text)
@@ -873,10 +947,8 @@ func (p *Pane) GetContent() string {
 		return ""
 	}
 
-	p.vt.Lock()
-	defer p.vt.Unlock()
-
-	cols, rows := p.vt.Size()
+	cols := p.vt.Width()
+	rows := p.vt.Height()
 	if cols <= 0 || rows <= 0 {
 		return ""
 	}
@@ -887,7 +959,7 @@ func (p *Pane) GetContent() string {
 			result.WriteByte('\n')
 		}
 		for col := 0; col < cols; col++ {
-			ch := p.vt.Cell(col, row).Char
+			ch := cellToGlyph(p.vt.CellAt(col, row)).Char
 			if ch == 0 {
 				ch = ' '
 			}
@@ -921,10 +993,8 @@ func (p *Pane) renderVTUnlocked() string {
 		return "Terminal not initialized"
 	}
 
-	p.vt.Lock()
-	defer p.vt.Unlock()
-
-	cols, rows := p.vt.Size()
+	cols := p.vt.Width()
+	rows := p.vt.Height()
 	if cols <= 0 || rows <= 0 {
 		return ""
 	}
@@ -937,8 +1007,8 @@ func (p *Pane) renderVTUnlocked() string {
 	return p.renderLiveScreenUnlocked(cols, rows)
 }
 
-// renderScrolledViewUnlocked renders a viewport that includes scrollback history
-// Must hold mu and vt.Lock
+// renderScrolledViewUnlocked renders a viewport that includes scrollback history.
+// Must hold p.mu.
 func (p *Pane) renderScrolledViewUnlocked(cols, rows int) string {
 	scrollbackLen := p.scrollback.Len()
 	offset := p.viewportOffset
@@ -987,12 +1057,11 @@ func (p *Pane) renderScrolledViewUnlocked(cols, rows int) string {
 	return result.String()
 }
 
-// renderGlyphLine renders a line of glyphs with ANSI styling
-// logicalRow is used for selection highlighting
-func (p *Pane) renderGlyphLine(line []vt10x.Glyph, cols int, logicalRow int) string {
+// renderGlyphLine renders a line of glyphs with ANSI styling.
+// logicalRow is used for selection highlighting.
+func (p *Pane) renderGlyphLine(line []Glyph, cols int, logicalRow int) string {
 	var result strings.Builder
-	var currentFG, currentBG vt10x.Color
-	var currentMode int16
+	var currentStyle Glyph
 	var batch strings.Builder
 	firstCell := true
 	inSelection := false
@@ -1004,7 +1073,7 @@ func (p *Pane) renderGlyphLine(line []vt10x.Glyph, cols int, logicalRow int) str
 		if inSelection {
 			result.WriteString("\x1b[7m") // Reverse video for selection
 		} else {
-			result.WriteString(buildANSI(currentFG, currentBG, currentMode))
+			result.WriteString(glyphANSI(currentStyle))
 		}
 		result.WriteString(batch.String())
 		result.WriteString("\x1b[0m")
@@ -1012,7 +1081,7 @@ func (p *Pane) renderGlyphLine(line []vt10x.Glyph, cols int, logicalRow int) str
 	}
 
 	for col := 0; col < cols; col++ {
-		var glyph vt10x.Glyph
+		var glyph Glyph
 		if col < len(line) {
 			glyph = line[col]
 		}
@@ -1025,13 +1094,11 @@ func (p *Pane) renderGlyphLine(line []vt10x.Glyph, cols int, logicalRow int) str
 		cellSelected := p.selection != nil && p.selection.Contains(Position{Row: logicalRow, Col: col})
 
 		// Style changed or selection changed? Flush batch
-		if !firstCell && (glyph.FG != currentFG || glyph.BG != currentBG || glyph.Mode != currentMode || cellSelected != inSelection) {
+		if !firstCell && (!glyph.styleEqual(currentStyle) || cellSelected != inSelection) {
 			flushBatch()
 		}
 
-		currentFG = glyph.FG
-		currentBG = glyph.BG
-		currentMode = glyph.Mode
+		currentStyle = glyph
 		inSelection = cellSelected
 		firstCell = false
 
@@ -1042,13 +1109,12 @@ func (p *Pane) renderGlyphLine(line []vt10x.Glyph, cols int, logicalRow int) str
 	return result.String()
 }
 
-// renderLiveRow renders a single row from the live terminal screen
-// logicalRow is used for selection highlighting
-// Must hold vt.Lock
+// renderLiveRow renders a single row from the live terminal screen.
+// logicalRow is used for selection highlighting.
+// Must hold p.mu.
 func (p *Pane) renderLiveRow(cols, row int, logicalRow int) string {
 	var result strings.Builder
-	var currentFG, currentBG vt10x.Color
-	var currentMode int16
+	var currentStyle Glyph
 	var batch strings.Builder
 	firstCell := true
 	inSelection := false
@@ -1060,18 +1126,18 @@ func (p *Pane) renderLiveRow(cols, row int, logicalRow int) string {
 		if inSelection {
 			result.WriteString("\x1b[7m") // Reverse video for selection
 		} else {
-			result.WriteString(buildANSI(currentFG, currentBG, currentMode))
+			result.WriteString(glyphANSI(currentStyle))
 		}
 		result.WriteString(batch.String())
 		result.WriteString("\x1b[0m")
 		batch.Reset()
 	}
 
-	cursor := p.vt.Cursor()
-	cursorVisible := p.vt.CursorVisible()
+	cursor := p.vt.CursorPosition()
+	cursorVisible := !p.cursorHidden.Load()
 
 	for col := 0; col < cols; col++ {
-		glyph := p.vt.Cell(col, row)
+		glyph := cellToGlyph(p.vt.CellAt(col, row))
 		ch := glyph.Char
 		if ch == 0 {
 			ch = ' '
@@ -1081,8 +1147,7 @@ func (p *Pane) renderLiveRow(cols, row int, logicalRow int) string {
 		cellSelected := p.selection != nil && p.selection.Contains(Position{Row: logicalRow, Col: col})
 
 		// Style changed or selection changed? Flush batch
-		if !firstCell && (glyph.FG != currentFG || glyph.BG != currentBG ||
-			glyph.Mode != currentMode || isCursor || cellSelected != inSelection) {
+		if !firstCell && (!glyph.styleEqual(currentStyle) || isCursor || cellSelected != inSelection) {
 			flushBatch()
 		}
 
@@ -1096,9 +1161,7 @@ func (p *Pane) renderLiveRow(cols, row int, logicalRow int) string {
 			continue
 		}
 
-		currentFG = glyph.FG
-		currentBG = glyph.BG
-		currentMode = glyph.Mode
+		currentStyle = glyph
 		inSelection = cellSelected
 		firstCell = false
 
@@ -1109,10 +1172,10 @@ func (p *Pane) renderLiveRow(cols, row int, logicalRow int) string {
 	return result.String()
 }
 
-// renderLiveScreenUnlocked renders the live terminal screen (must hold mu and vt.Lock)
+// renderLiveScreenUnlocked renders the live terminal screen. Must hold p.mu.
 func (p *Pane) renderLiveScreenUnlocked(cols, rows int) string {
-	cursor := p.vt.Cursor()
-	cursorVisible := p.vt.CursorVisible()
+	cursor := p.vt.CursorPosition()
+	cursorVisible := !p.cursorHidden.Load()
 
 	var result strings.Builder
 	result.Grow(rows * cols * 2)
@@ -1123,8 +1186,7 @@ func (p *Pane) renderLiveScreenUnlocked(cols, rows int) string {
 		}
 
 		// Track current style for batching
-		var currentFG, currentBG vt10x.Color
-		var currentMode int16
+		var currentStyle Glyph
 		var batch strings.Builder
 		firstCell := true
 		inSelection := false
@@ -1136,7 +1198,7 @@ func (p *Pane) renderLiveScreenUnlocked(cols, rows int) string {
 			if inSelection {
 				result.WriteString("\x1b[7m") // Reverse video for selection
 			} else {
-				result.WriteString(buildANSI(currentFG, currentBG, currentMode))
+				result.WriteString(glyphANSI(currentStyle))
 			}
 			result.WriteString(batch.String())
 			result.WriteString("\x1b[0m")
@@ -1144,7 +1206,7 @@ func (p *Pane) renderLiveScreenUnlocked(cols, rows int) string {
 		}
 
 		for col := 0; col < cols; col++ {
-			glyph := p.vt.Cell(col, row)
+			glyph := cellToGlyph(p.vt.CellAt(col, row))
 			ch := glyph.Char
 			if ch == 0 {
 				ch = ' '
@@ -1155,8 +1217,7 @@ func (p *Pane) renderLiveScreenUnlocked(cols, rows int) string {
 			cellSelected := p.selection != nil && p.selection.Contains(Position{Row: logicalRow, Col: col})
 
 			// Style changed or selection changed? Flush batch
-			if !firstCell && (glyph.FG != currentFG || glyph.BG != currentBG ||
-				glyph.Mode != currentMode || isCursor || cellSelected != inSelection) {
+			if !firstCell && (!glyph.styleEqual(currentStyle) || isCursor || cellSelected != inSelection) {
 				flushBatch()
 			}
 
@@ -1170,9 +1231,7 @@ func (p *Pane) renderLiveScreenUnlocked(cols, rows int) string {
 				continue
 			}
 
-			currentFG = glyph.FG
-			currentBG = glyph.BG
-			currentMode = glyph.Mode
+			currentStyle = glyph
 			inSelection = cellSelected
 			firstCell = false
 
@@ -1182,65 +1241,6 @@ func (p *Pane) renderLiveScreenUnlocked(cols, rows int) string {
 	}
 
 	return result.String()
-}
-
-// buildANSI constructs ANSI escape sequence for given colors/mode
-func buildANSI(fg, bg vt10x.Color, mode int16) string {
-	var parts []string
-
-	// Foreground
-	if fgCode := colorToANSI(fg, true); fgCode != "" {
-		parts = append(parts, fgCode)
-	}
-
-	// Background
-	if bgCode := colorToANSI(bg, false); bgCode != "" {
-		parts = append(parts, bgCode)
-	}
-
-	// Attributes
-	if mode&0x04 != 0 { // Bold
-		parts = append(parts, "1")
-	}
-	if mode&0x10 != 0 { // Italic
-		parts = append(parts, "3")
-	}
-	if mode&0x02 != 0 { // Underline
-		parts = append(parts, "4")
-	}
-	if mode&0x01 != 0 { // Reverse
-		parts = append(parts, "7")
-	}
-
-	if len(parts) == 0 {
-		return ""
-	}
-
-	return fmt.Sprintf("\x1b[%sm", strings.Join(parts, ";"))
-}
-
-// colorToANSI converts vt10x.Color to ANSI escape sequence component
-func colorToANSI(c vt10x.Color, isFG bool) string {
-	// Default color (special value)
-	if c >= 0x01000000 {
-		return ""
-	}
-
-	base := 38 // Foreground
-	if !isFG {
-		base = 48 // Background
-	}
-
-	// ANSI 256-color palette (0-255)
-	if c < 256 {
-		return fmt.Sprintf("%d;5;%d", base, c)
-	}
-
-	// True color RGB (encoded as r<<16 | g<<8 | b)
-	r := (c >> 16) & 0xFF
-	g := (c >> 8) & 0xFF
-	b := c & 0xFF
-	return fmt.Sprintf("%d;2;%d;%d;%d", base, r, g, b)
 }
 
 func buildCleanEnv(sessionName string) []string {

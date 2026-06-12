@@ -2,8 +2,6 @@ package terminal
 
 import (
 	"strings"
-
-	"github.com/hinshun/vt10x"
 )
 
 // SelectionMode represents the current state of text selection.
@@ -111,8 +109,8 @@ func (s *SelectionState) Contains(pos Position) bool {
 // liveRows: number of rows in live screen
 // scrollbackLen: total lines in scrollback
 func (s *SelectionState) ExtractText(
-	scrollbackLines [][]vt10x.Glyph,
-	liveScreen func(col, row int) vt10x.Glyph,
+	scrollbackLines [][]Glyph,
+	liveScreen func(col, row int) Glyph,
 	liveRows int,
 	scrollbackLen int,
 ) string {
@@ -124,7 +122,7 @@ func (s *SelectionState) ExtractText(
 	var result strings.Builder
 
 	for row := start.Row; row <= end.Row; row++ {
-		var line []vt10x.Glyph
+		var line []Glyph
 
 		// Determine if this row is in scrollback or live screen
 		// Logical row: negative = scrollback (counted from end), 0+ = live screen

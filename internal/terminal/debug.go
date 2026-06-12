@@ -10,8 +10,8 @@ import (
 // ptyDebugLog appends every byte read from a PTY to a debug file when
 // the OPENKANBAN_PTY_DEBUG_LOG env var is set to a writable path.
 // Used for diagnosing terminal-emulation bugs by capturing the raw
-// byte stream a child agent emits and replaying it through vt10x in
-// isolation.
+// byte stream a child agent emits and replaying it through the
+// terminal emulator in isolation.
 //
 // Format: a header line of the form
 //
