@@ -384,6 +384,46 @@ func (g *GlobalTicketStore) Move(id board.TicketID, newStatus board.TicketStatus
 	return nil
 }
 
+// MoveProject reassigns a ticket from its current project to a new
+// one. Atomically removes the source .md file and writes a fresh .md
+// in the destination project's directory. Refuses if the ticket has
+// an active worktree -- the worktree is bound to the source repo;
+// moving would orphan it.
+func (g *GlobalTicketStore) MoveProject(id board.TicketID, newProjectID string) error {
+	ticket, ok := g.allTickets[id]
+	if !ok {
+		return board.ErrTicketNotFound
+	}
+	if ticket.ProjectID == newProjectID {
+		return nil
+	}
+
+	srcStore := g.ticketStores[ticket.ProjectID]
+	dstStore := g.ticketStores[newProjectID]
+	if dstStore == nil {
+		return ErrProjectNotFound
+	}
+	if ticket.WorktreePath != "" {
+		return ErrTicketHasWorktree
+	}
+
+	// Remove from the source store. Delete handles both
+	// `delete(srcStore.Tickets, id)` AND removing the on-disk .md
+	// file in the source project's directory.
+	if srcStore != nil {
+		if err := srcStore.Delete(id); err != nil {
+			return err
+		}
+	}
+
+	// Reassign and persist. SaveTicket writes the new .md in the
+	// destination project's directory and updates dstStore.Tickets
+	// and dstStore.paths.
+	ticket.ProjectID = newProjectID
+	ticket.Touch()
+	return dstStore.SaveTicket(ticket)
+}
+
 // Save persists a single ticket. Atomic; touches only that ticket's file.
 func (g *GlobalTicketStore) Save(ticket *board.Ticket) error {
 	store := g.ticketStores[ticket.ProjectID]

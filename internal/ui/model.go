@@ -1149,7 +1149,7 @@ func (m *Model) handleTicketForm(msg tea.KeyMsg, isEdit bool) (tea.Model, tea.Cm
 		if m.ticketFormField == formFieldTitle {
 			return m.saveTicketForm(isEdit)
 		}
-		if m.ticketFormField == formFieldProject && !isEdit {
+		if m.ticketFormField == formFieldProject {
 			return m.handleProjectSelection()
 		}
 
@@ -1481,13 +1481,8 @@ func (m *Model) nextFormField(isEdit bool) *Model {
 	m.blurAllFormFields()
 	m.ticketFormField++
 
-	maxField := formFieldBlockedBy
-	if !isEdit {
-		maxField = formFieldProject
-	}
-
 	for {
-		if m.ticketFormField > maxField {
+		if m.ticketFormField > formFieldProject {
 			m.ticketFormField = formFieldTitle
 		}
 		if m.ticketFormField == formFieldBranch && m.branchLocked {
@@ -1508,14 +1503,9 @@ func (m *Model) prevFormField(isEdit bool) *Model {
 	m.blurAllFormFields()
 	m.ticketFormField--
 
-	maxField := formFieldBlockedBy
-	if !isEdit {
-		maxField = formFieldProject
-	}
-
 	for {
 		if m.ticketFormField < formFieldTitle {
-			m.ticketFormField = maxField
+			m.ticketFormField = formFieldProject
 		}
 		if m.ticketFormField == formFieldBranch && m.branchLocked {
 			m.ticketFormField--
@@ -1586,6 +1576,17 @@ func (m *Model) saveTicketForm(isEdit bool) (tea.Model, tea.Cmd) {
 	if isEdit && m.editingTicketID != "" {
 		ticket, _ := m.globalStore.Get(m.editingTicketID)
 		if ticket != nil {
+			if ticket.ProjectID != m.selectedProject.ID {
+				if err := m.globalStore.MoveProject(ticket.ID, m.selectedProject.ID); err != nil {
+					switch err {
+					case project.ErrTicketHasWorktree:
+						m.notify("Cannot change project: ticket has an active worktree")
+					default:
+						m.notify("Failed to change project: " + err.Error())
+					}
+					return m, nil
+				}
+			}
 			ticket.Title = title
 			ticket.Description = desc
 			if !m.branchLocked {
@@ -2211,6 +2212,16 @@ func (m *Model) editTicket() (tea.Model, tea.Cmd) {
 	m.branchLocked = ticket.WorktreePath != ""
 	m.agentLocked = ticket.AgentSpawnedAt != nil
 	m.selectedProject = m.globalStore.GetProjectForTicket(ticket)
+	m.projectListIndex = 0
+	if m.selectedProject != nil {
+		for i, p := range m.globalStore.Projects() {
+			if p.ID == m.selectedProject.ID {
+				m.projectListIndex = i
+				break
+			}
+		}
+	}
+	m.showAddProjectForm = false
 	m.titleInput.SetValue(ticket.Title)
 	m.descInput.SetValue(ticket.Description)
 	if ticket.BranchName != "" {

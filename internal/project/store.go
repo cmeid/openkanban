@@ -11,8 +11,9 @@ import (
 )
 
 var (
-	ErrProjectNotFound = errors.New("project not found")
-	ErrDuplicatePath   = errors.New("project with this repository path already exists")
+	ErrProjectNotFound   = errors.New("project not found")
+	ErrDuplicatePath     = errors.New("project with this repository path already exists")
+	ErrTicketHasWorktree = errors.New("ticket has an active worktree and cannot change projects")
 )
 
 type ProjectRegistry struct {
