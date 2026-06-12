@@ -361,6 +361,21 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
+// ReloadFromDisk re-reads the config from disk and replaces the
+// contents of c in place. Existing pointers to c remain valid.
+// Existing agent processes are unaffected; only newly spawned agents
+// see updated AgentConfig values.
+//
+// Safe to call from a Bubble Tea Update goroutine.
+func (c *Config) ReloadFromDisk() error {
+	fresh, err := Load("")
+	if err != nil {
+		return err
+	}
+	*c = *fresh
+	return nil
+}
+
 func (c *Config) mergeAgentDefaults() {
 	defaults := DefaultConfig()
 

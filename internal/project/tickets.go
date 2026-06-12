@@ -471,6 +471,76 @@ func (g *GlobalTicketStore) GetBlocks(ticketID board.TicketID) []*board.Ticket {
 	return blocks
 }
 
+// PathOf returns the on-disk path of a ticket if known. Returns
+// false if the ticket has never been saved or was loaded into the
+// store from an unknown source.
+func (g *GlobalTicketStore) PathOf(id board.TicketID) (string, bool) {
+	ticket, ok := g.allTickets[id]
+	if !ok {
+		return "", false
+	}
+	store := g.ticketStores[ticket.ProjectID]
+	if store == nil {
+		return "", false
+	}
+	p, ok := store.paths[id]
+	return p, ok
+}
+
+// ReloadTicket reads (or, if the file is gone, drops) a single ticket
+// file. Identity is taken from the file's frontmatter id, not from
+// the path — so a renamed file (e.g. title edit while the TUI is open)
+// reloads as the same ticket and updates the in-memory paths cache.
+//
+// Safe to call from a Bubble Tea Update goroutine. Not safe to call
+// concurrently with itself or with Save methods.
+func (g *GlobalTicketStore) ReloadTicket(projectID, path string) error {
+	store := g.ticketStores[projectID]
+	if store == nil {
+		return nil
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// File was deleted externally. Find which ticket was at
+			// this path and drop it from in-memory state.
+			for id, p := range store.paths {
+				if p == path {
+					delete(store.Tickets, id)
+					delete(store.paths, id)
+					delete(g.allTickets, id)
+					return nil
+				}
+			}
+			return nil
+		}
+		return fmt.Errorf("read ticket %s: %w", path, err)
+	}
+
+	ticket, err := UnmarshalTicket(data)
+	if err != nil {
+		return fmt.Errorf("parse ticket %s: %w", path, err)
+	}
+	if ticket.ProjectID == "" {
+		ticket.ProjectID = projectID
+	}
+
+	// If a different filename previously held this id (title edit),
+	// clean up the stale paths-map entry so we don't leak the old key.
+	if oldPath, hadOld := store.paths[ticket.ID]; hadOld && oldPath != path {
+		// We don't os.Remove here — the old file may still exist on
+		// disk; the file-system event for its removal will come
+		// separately and trigger the drop branch above.
+		_ = oldPath
+	}
+
+	g.allTickets[ticket.ID] = ticket
+	store.Tickets[ticket.ID] = ticket
+	store.paths[ticket.ID] = path
+	return nil
+}
+
 func (g *GlobalTicketStore) RemoveBlockerReferences(ticketID board.TicketID) {
 	for _, ticket := range g.allTickets {
 		if len(ticket.BlockedBy) == 0 {

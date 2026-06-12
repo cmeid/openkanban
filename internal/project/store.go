@@ -59,6 +59,22 @@ func LoadRegistry() (*ProjectRegistry, error) {
 	return &reg, nil
 }
 
+// ReloadFromDisk re-reads projects.json and replaces the contents of
+// r in place. Existing pointers to r remain valid. Project pointers
+// inside r.Projects are replaced wholesale, so callers should re-fetch
+// any project pointer they previously cached if they care about
+// post-reload mutations.
+//
+// Safe to call from a Bubble Tea Update goroutine.
+func (r *ProjectRegistry) ReloadFromDisk() error {
+	fresh, err := LoadRegistry()
+	if err != nil {
+		return err
+	}
+	*r = *fresh
+	return nil
+}
+
 func (r *ProjectRegistry) Save() error {
 	path, err := registryPath()
 	if err != nil {

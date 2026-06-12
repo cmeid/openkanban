@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"github.com/techdufus/openkanban/internal/project"
 	"github.com/techdufus/openkanban/internal/ui"
 	"github.com/techdufus/openkanban/internal/update"
+	"github.com/techdufus/openkanban/internal/watch"
 )
 
 func Run(cfg *config.Config, filterPath, version string) error {
@@ -62,6 +64,12 @@ func Run(cfg *config.Config, filterPath, version string) error {
 
 	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseAllMotion())
 
+	// Start the file watcher; failure is non-fatal (TUI works without
+	// hot-reload, just no live updates for external edits).
+	if watcher := startFileWatcher(registry, program); watcher != nil {
+		defer watcher.Close()
+	}
+
 	go func() {
 		<-sigChan
 		model.Cleanup()
@@ -70,6 +78,43 @@ func Run(cfg *config.Config, filterPath, version string) error {
 
 	_, err = program.Run()
 	return err
+}
+
+// startFileWatcher constructs a watch.Watcher rooted at the config
+// dir, subscribes to each existing project's tickets subdir, and
+// pumps debounced events into the Bubble Tea program. Returns nil if
+// the watcher could not be created; the TUI continues without
+// hot-reload in that case.
+//
+// Note: projects added or removed mid-session are not retroactively
+// watched. Users adding a project externally need to quit + relaunch
+// to pick up its tickets.
+func startFileWatcher(registry *project.ProjectRegistry, program *tea.Program) *watch.Watcher {
+	configDir, err := config.ConfigDir()
+	if err != nil {
+		log.Printf("openkanban: file watcher disabled (config dir resolution failed: %v)", err)
+		return nil
+	}
+	w, err := watch.New(configDir)
+	if err != nil {
+		log.Printf("openkanban: file watcher disabled (%v)", err)
+		return nil
+	}
+	for _, p := range registry.List() {
+		if perr := w.AddProject(p.ID); perr != nil {
+			log.Printf("openkanban: watch project %s: %v", p.ID, perr)
+		}
+	}
+	go func() {
+		for ev := range w.Events() {
+			program.Send(ui.FsChangedMsg{
+				Domain:    ev.Domain,
+				Path:      ev.Path,
+				ProjectID: ev.ProjectID,
+			})
+		}
+	}()
+	return w
 }
 
 func CreateProject(cfg *config.Config, name, repoPath string) error {

@@ -152,6 +152,11 @@ type Model struct {
 	sidebarWidth   int
 
 	updateChecker *update.Checker
+
+	// recentSelfWrites tracks (mtime, size, deadline) per path for
+	// suppressing fsnotify echoes of the TUI's own SaveTicket calls.
+	// See internal/ui/reload.go.
+	recentSelfWrites map[string]selfWriteRecord
 }
 
 func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projectRegistry *project.ProjectRegistry, agentMgr *agent.Manager, opencodeServer *agent.OpencodeServer, filterProjectID string, updateChecker *update.Checker) *Model {
@@ -475,6 +480,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			result := update.CheckResult(msg)
 			m.notify(fmt.Sprintf("Update %s available: %s", msg.LatestVersion, result.UpdateHint()))
 		}
+		return m, nil
+
+	case FsChangedMsg:
+		m.handleFsChanged(msg)
 		return m, nil
 	}
 
@@ -2833,7 +2842,9 @@ func (m *Model) notify(msg string) {
 func (m *Model) saveTicket(ticket *board.Ticket) {
 	if err := m.globalStore.Save(ticket); err != nil {
 		m.notify("Failed to save: " + err.Error())
+		return
 	}
+	m.recordSavedTicket(ticket)
 }
 
 // hasClaudeNameFlag returns true if the args slice already contains
