@@ -368,6 +368,10 @@ func (p *Pane) handleOutput(data []byte) {
 		return
 	}
 
+	// Diagnostic: capture the raw byte stream when OPENKANBAN_PTY_DEBUG_LOG
+	// is set. No-op overhead when disabled (a single nil-check).
+	ptyDebugLog(p.id, data)
+
 	p.detectMouseModeChanges(data)
 	p.detectAltScreenChanges(data)
 
