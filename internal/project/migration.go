@@ -8,6 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/techdufus/openkanban/internal/board"
 )
@@ -134,6 +137,22 @@ func runMigration(projectID string) (int, error) {
 		return 0, fmt.Errorf("parse legacy store: %w", err)
 	}
 
+	// Stale-snapshot escape: if the per-ticket dir already exists with
+	// content AND the legacy JSON is a strict-subset older snapshot of
+	// the dir's state, the migration is unneeded. This typically
+	// happens when an old binary (built before the per-ticket schema
+	// existed) was accidentally launched and wrote out a stale
+	// snapshot of its in-memory store. Rename the legacy JSON aside
+	// to .stale-<ts> and return without doing any work.
+	if isStaleSnapshot(legacy.Tickets, finalDir) {
+		stalePath := legacyPath + ".stale-" + strconv.FormatInt(time.Now().Unix(), 10)
+		if err := os.Rename(legacyPath, stalePath); err != nil {
+			return 0, fmt.Errorf("rename stale snapshot aside: %w", err)
+		}
+		log.Printf("openkanban: legacy %s was a stale subset of the per-ticket dir for project %s; renamed to %s (per-ticket dir is the source of truth)", filepath.Base(legacyPath), projectID, filepath.Base(stalePath))
+		return 0, nil
+	}
+
 	if err := os.MkdirAll(workspace, 0o755); err != nil {
 		return 0, fmt.Errorf("create migrating workspace: %w", err)
 	}
@@ -186,7 +205,15 @@ func runMigration(projectID string) (int, error) {
 	// data.
 	if entries, statErr := os.ReadDir(finalDir); statErr == nil {
 		if len(entries) > 0 {
-			return 0, fmt.Errorf("final dir %s already exists and is non-empty; refusing to merge automatically — inspect and resolve manually", finalDir)
+			// We already ran the stale-snapshot check above and it
+			// returned false — the legacy JSON has at least one ticket
+			// the per-ticket dir doesn't (or has newer than). Refusing
+			// is the safe call; auto-merging risks losing data either
+			// way the merge resolves.
+			return 0, fmt.Errorf(
+				"cannot migrate project %s: per-ticket dir %s already exists and is non-empty, AND legacy JSON %s has tickets not present (or newer than) the dir. Compare them manually: e.g. `jq '.tickets | keys' %s` vs `ls %s/`; either remove the legacy JSON if it's stale, or merge any missing tickets into the dir as .md files before retrying",
+				projectID, finalDir, legacyPath, legacyPath, finalDir,
+			)
 		}
 		if err := os.Remove(finalDir); err != nil {
 			return 0, fmt.Errorf("remove empty final dir before rename: %w", err)
@@ -264,3 +291,58 @@ func migratingWorkspacePath(projectID string) string {
 // Sentinel for callers that want to distinguish "I tried but the
 // source was malformed" from other errors.
 var ErrMigrationSourceCorrupt = errors.New("migration: source JSON is malformed")
+
+// isStaleSnapshot returns true if every ticket in legacyTickets is
+// present in finalDir as a .md file with an UpdatedAt no older than
+// the legacy record. When true, the legacy JSON is provably a stale
+// subset of the per-ticket dir — the dir is the source of truth and
+// the JSON can be safely renamed aside without data loss.
+//
+// Conservative: returns false on any uncertainty (missing files,
+// parse errors, an .md older than its legacy peer). Better to error
+// loudly than silently lose data.
+func isStaleSnapshot(legacyTickets map[board.TicketID]*board.Ticket, finalDir string) bool {
+	if len(legacyTickets) == 0 {
+		// An empty legacy JSON next to a populated dir is also "stale"
+		// in the sense that the dir has more data; no risk of loss.
+		entries, err := os.ReadDir(finalDir)
+		if err != nil || len(entries) == 0 {
+			return false
+		}
+		return true
+	}
+
+	dirState := make(map[board.TicketID]time.Time)
+	entries, err := os.ReadDir(finalDir)
+	if err != nil {
+		return false
+	}
+	for _, ent := range entries {
+		if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".md") {
+			continue
+		}
+		data, rerr := os.ReadFile(filepath.Join(finalDir, ent.Name()))
+		if rerr != nil {
+			return false
+		}
+		ticket, perr := UnmarshalTicket(data)
+		if perr != nil {
+			return false
+		}
+		dirState[ticket.ID] = ticket.UpdatedAt
+	}
+
+	for id, lt := range legacyTickets {
+		if lt == nil {
+			continue
+		}
+		dirUpdated, ok := dirState[id]
+		if !ok {
+			return false // legacy has a ticket the dir doesn't — data risk
+		}
+		if dirUpdated.Before(lt.UpdatedAt) {
+			return false // dir's copy is older — legacy might have newer data
+		}
+	}
+	return true
+}

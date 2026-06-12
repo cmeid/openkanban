@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -279,6 +280,117 @@ func TestMigrate_FinalDirExistsNonEmpty(t *testing.T) {
 	// Legacy JSON retained.
 	if _, err := os.Stat(filepath.Join(dir, "tickets", "proj-x.json")); err != nil {
 		t.Errorf("legacy json should be retained on refusal: %v", err)
+	}
+}
+
+// TestMigrate_StaleSnapshotRenamedAside covers the recovery case
+// where a legacy JSON appears AFTER the migration has already
+// completed (e.g. an old binary was accidentally launched and wrote a
+// stale snapshot). If every ticket in the legacy JSON is present in
+// the per-ticket dir with an UpdatedAt no older than the JSON's
+// record, the JSON is provably a stale subset — rename aside and
+// return cleanly.
+func TestMigrate_StaleSnapshotRenamedAside(t *testing.T) {
+	dir := setupTmpConfigDir(t)
+	projectID := "proj-stale"
+	finalDir := filepath.Join(dir, "tickets", projectID)
+	if err := os.MkdirAll(finalDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a current .md ticket (newer state).
+	tk := makeTicket(t, "ffff1111-aaaa-bbbb-cccc-dddddddddddd", "Current title")
+	tk.Status = board.StatusDone
+	tk.UpdatedAt = mustParseTime(t, "2026-06-12T18:40:00Z")
+	mdData, err := MarshalTicket(tk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mdPath := filepath.Join(finalDir, TicketFilename(tk))
+	if err := os.WriteFile(mdPath, mdData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Seed a legacy JSON with the SAME ticket id but OLDER UpdatedAt.
+	staleTicket := *tk
+	staleTicket.Status = board.StatusInProgress
+	staleTicket.UpdatedAt = mustParseTime(t, "2026-06-12T17:00:00Z") // older
+	seedLegacyJSONStore(t, projectID, &staleTicket)
+
+	n, err := MigrateProjectToPerTicket(projectID)
+	if err != nil {
+		t.Fatalf("expected stale-snapshot escape to succeed, got: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("got %d migrated, want 0 (no migration; just stale rename)", n)
+	}
+
+	// Legacy JSON should be renamed to .stale-<ts>; the per-ticket
+	// file should be unchanged.
+	if _, err := os.Stat(filepath.Join(dir, "tickets", projectID+".json")); !os.IsNotExist(err) {
+		t.Error("legacy .json should be renamed away after stale detection")
+	}
+	matches, _ := filepath.Glob(filepath.Join(dir, "tickets", projectID+".json.stale-*"))
+	if len(matches) != 1 {
+		t.Errorf("expected exactly one .stale-* artifact, got %d: %v", len(matches), matches)
+	}
+	if _, err := os.Stat(mdPath); err != nil {
+		t.Errorf("per-ticket .md should be untouched: %v", err)
+	}
+
+	// Next call should be a no-op (state is now MigrationComplete).
+	if n, err := MigrateProjectToPerTicket(projectID); err != nil || n != 0 {
+		t.Errorf("second call should be no-op; got n=%d err=%v", n, err)
+	}
+}
+
+// TestMigrate_NonStaleDirRefusesWithActionableError covers the case
+// where the per-ticket dir is non-empty BUT the legacy JSON contains
+// a ticket that the dir doesn't have (or has it with an older
+// timestamp). Cannot safely auto-resolve — must refuse with a
+// message that names both paths so the user can compare them.
+func TestMigrate_NonStaleDirRefusesWithActionableError(t *testing.T) {
+	dir := setupTmpConfigDir(t)
+	projectID := "proj-conflict"
+	finalDir := filepath.Join(dir, "tickets", projectID)
+	if err := os.MkdirAll(finalDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Put an unrelated ticket in the per-ticket dir.
+	dirTicket := makeTicket(t, "aaaa1111-aaaa-bbbb-cccc-dddddddddddd", "Unrelated")
+	mdData, _ := MarshalTicket(dirTicket)
+	if err := os.WriteFile(filepath.Join(finalDir, TicketFilename(dirTicket)), mdData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Legacy JSON contains a DIFFERENT ticket the dir doesn't have —
+	// auto-resolve must NOT fire because that'd lose data.
+	missingTicket := makeTicket(t, "bbbb2222-aaaa-bbbb-cccc-dddddddddddd", "Only in legacy")
+	seedLegacyJSONStore(t, projectID, missingTicket)
+
+	n, err := MigrateProjectToPerTicket(projectID)
+	if err == nil {
+		t.Fatal("expected error on non-stale non-empty dir, got nil")
+	}
+	if n != 0 {
+		t.Errorf("got %d migrated, want 0 on refusal", n)
+	}
+
+	// Error should name both paths so the user can act on it.
+	msg := err.Error()
+	if !strings.Contains(msg, projectID) {
+		t.Errorf("error should reference project id %q; got: %v", projectID, err)
+	}
+	for _, want := range []string{"legacy", "per-ticket"} {
+		if !strings.Contains(strings.ToLower(msg), want) {
+			t.Errorf("error should mention %q to be actionable; got: %v", want, err)
+		}
+	}
+
+	// Legacy JSON must be retained (not renamed) on refusal.
+	if _, err := os.Stat(filepath.Join(dir, "tickets", projectID+".json")); err != nil {
+		t.Errorf("legacy .json should be retained on refusal: %v", err)
 	}
 }
 
