@@ -98,6 +98,16 @@ func (p *Pane) SetSize(width, height int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	// No-op when dimensions haven't changed. Otherwise every entry
+	// into agent view fires an unnecessary SIGWINCH at the child
+	// process; over a few cycles of leave/re-enter or AskUserQuestion
+	// open/close, ink's layout cache gets re-invalidated repeatedly
+	// and can land in a state where bottom-anchored UI renders at the
+	// top. Skip when there's nothing actually to resize.
+	if p.width == width && p.height == height {
+		return
+	}
+
 	p.width = width
 	p.height = height
 	p.dirty = true
