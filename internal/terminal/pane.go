@@ -193,8 +193,17 @@ func (p *Pane) Start(command string, args ...string) tea.Cmd {
 			p.cmd.Dir = p.workdir
 		}
 
-		// Start PTY first so we can use it as vt10x writer
-		ptmx, err := pty.Start(p.cmd)
+		// Fork the child with the correct PTY size from the start.
+		// pty.Start + pty.Setsize would race: the child renders its
+		// first frame at the OS-default 80x24 before SIGWINCH arrives,
+		// causing bottom-anchored UI (input bars, status lines) to
+		// pin to row 24 of the child's coordinate space — which lands
+		// at the wrong row in our actual-sized vt10x buffer.
+		// StartWithSize sets TIOCSWINSZ atomically with the fork.
+		ptmx, err := pty.StartWithSize(p.cmd, &pty.Winsize{
+			Rows: uint16(p.height),
+			Cols: uint16(p.width),
+		})
 		if err != nil {
 			p.exitErr = err
 			return ExitMsg{PaneID: p.id, Err: err}
@@ -202,12 +211,6 @@ func (p *Pane) Start(command string, args ...string) tea.Cmd {
 		p.pty = ptmx
 		p.running = true
 		p.exitErr = nil
-
-		// Set PTY size
-		pty.Setsize(p.pty, &pty.Winsize{
-			Rows: uint16(p.height),
-			Cols: uint16(p.width),
-		})
 
 		// Create virtual terminal with PTY as writer for escape sequence responses
 		// This allows the terminal emulator to respond to queries like cursor position (DSR)
