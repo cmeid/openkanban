@@ -1,11 +1,14 @@
 package ui
 
 import (
+	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/techdufus/openkanban/internal/board"
+	"github.com/techdufus/openkanban/internal/config"
 	"github.com/techdufus/openkanban/internal/watch"
 )
 
@@ -104,11 +107,34 @@ func (m *Model) handleFsChanged(msg FsChangedMsg) {
 			return
 		}
 		if err := m.globalStore.ReloadTicket(msg.ProjectID, msg.Path); err != nil {
+			// Surface the failure to the user (notification is
+			// transient; log file is persistent for post-mortem).
+			short := filepath.Base(msg.Path)
+			m.notify(fmt.Sprintf("Reload failed: %s — %s", short, err.Error()))
+			appendWatchErrorLog(msg.Path, err)
 			log.Printf("openkanban: reload ticket %s: %v", msg.Path, err)
 			return
 		}
 		m.refreshColumnTickets()
 	}
+}
+
+// appendWatchErrorLog writes a single line to
+// ~/.config/openkanban/watch-errors.log for post-mortem inspection
+// of reload failures (typically malformed YAML in a hand-edited
+// .md). Best-effort: silent if the log can't be written.
+func appendWatchErrorLog(path string, reloadErr error) {
+	cfgDir, err := config.ConfigDir()
+	if err != nil {
+		return
+	}
+	logPath := filepath.Join(cfgDir, "watch-errors.log")
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "%s\t%s\t%v\n", time.Now().Format(time.RFC3339), path, reloadErr)
 }
 
 // recordSavedTicket should be called after globalStore.Save(ticket)

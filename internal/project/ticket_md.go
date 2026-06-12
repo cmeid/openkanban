@@ -12,6 +12,36 @@ import (
 	"github.com/techdufus/openkanban/internal/board"
 )
 
+// validStatuses is the closed set of TicketStatus values openkanban
+// understands. Anything else in frontmatter is a hand-edit typo.
+var validStatuses = map[board.TicketStatus]bool{
+	board.StatusBacklog:    true,
+	board.StatusInProgress: true,
+	board.StatusDone:       true,
+	board.StatusArchived:   true,
+}
+
+// validAgentStatuses mirrors board.AgentStatus enum.
+var validAgentStatuses = map[board.AgentStatus]bool{
+	board.AgentNone:      true,
+	board.AgentIdle:      true,
+	board.AgentWorking:   true,
+	board.AgentWaiting:   true,
+	board.AgentCompleted: true,
+	board.AgentError:     true,
+}
+
+// validAgentTypes are the agent flavours the spawn flow knows.
+// Empty is allowed (legacy / unset).
+var validAgentTypes = map[string]bool{
+	"":         true,
+	"claude":   true,
+	"opencode": true,
+	"aider":    true,
+	"gemini":   true,
+	"codex":    true,
+}
+
 const (
 	frontmatterFence    = "---\n"
 	frontmatterFenceLen = len(frontmatterFence)
@@ -193,7 +223,58 @@ func UnmarshalTicket(data []byte) (*board.Ticket, error) {
 		return nil, fmt.Errorf("parse frontmatter: %w", err)
 	}
 
+	if err := validateFrontmatter(&fm); err != nil {
+		return nil, err
+	}
+
 	return fromFrontmatter(fm, body), nil
+}
+
+// validateFrontmatter checks load-bearing fields against the
+// allowlists and backfills sensible defaults for missing optional
+// values. Mutates fm in place for backfills; returns an error for
+// hard-required failures.
+//
+// Policy: lenient on missing values (so hand-edited or partially-
+// migrated files still load), strict on present-but-invalid values
+// (so typos in enums surface as errors instead of silent loss).
+func validateFrontmatter(fm *ticketFrontmatter) error {
+	if strings.TrimSpace(string(fm.ID)) == "" {
+		return fmt.Errorf("required field id is empty or missing")
+	}
+	if strings.TrimSpace(fm.Title) == "" {
+		return fmt.Errorf("required field title is empty or missing")
+	}
+
+	if fm.Status == "" {
+		fm.Status = board.StatusBacklog
+	} else if !validStatuses[fm.Status] {
+		return fmt.Errorf("invalid status %q (allowed: backlog, in_progress, done, archived)", fm.Status)
+	}
+
+	if fm.AgentStatus == "" {
+		fm.AgentStatus = board.AgentNone
+	} else if !validAgentStatuses[fm.AgentStatus] {
+		return fmt.Errorf("invalid agent_status %q (allowed: none, idle, working, waiting, completed, error)", fm.AgentStatus)
+	}
+
+	if !validAgentTypes[fm.AgentType] {
+		return fmt.Errorf("invalid agent_type %q (allowed: claude, opencode, aider, gemini, codex, or empty)", fm.AgentType)
+	}
+
+	now := time.Now()
+	if fm.CreatedAt.IsZero() {
+		fm.CreatedAt = now
+	}
+	if fm.UpdatedAt.IsZero() {
+		fm.UpdatedAt = now
+	}
+
+	if fm.Priority == 0 {
+		fm.Priority = 3
+	}
+
+	return nil
 }
 
 // TicketFilename returns the canonical on-disk filename for a ticket.

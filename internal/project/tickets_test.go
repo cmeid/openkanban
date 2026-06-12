@@ -360,6 +360,79 @@ func TestSaveTicket_TitleEditRemovesOldFile(t *testing.T) {
 	}
 }
 
+// TestLoadTicketStore_DuplicateIDPrefersNewer covers the interrupted-
+// rename recovery case: title edit wrote the new file but crashed
+// before deleting the old, leaving both on disk with the same
+// frontmatter id. Load must pick the newer (by mtime) and remove
+// the older.
+func TestLoadTicketStore_DuplicateIDPrefersNewer(t *testing.T) {
+	configDir := setupTmpConfigDir(t)
+	repoDir := filepath.Join(t.TempDir(), "repo")
+	os.MkdirAll(repoDir, 0o755)
+
+	// Manually write two .md files with the same frontmatter id but
+	// different titles / filenames / mtimes. The newer one (by mtime)
+	// must win; the older one must be cleaned up.
+	projDir := filepath.Join(configDir, "tickets", "proj-dup")
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	tk := board.NewTicket("Original Title", "proj-dup")
+	tk.CreatedAt = mustParseTime(t, "2026-06-01T00:00:00Z")
+	tk.UpdatedAt = tk.CreatedAt
+
+	stalePath := filepath.Join(projDir, "original-title-"+string(tk.ID)[:8]+".md")
+	staleData, err := MarshalTicket(tk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stalePath, staleData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Backdate the stale file so it's clearly older.
+	oldTime := time.Now().Add(-1 * time.Hour)
+	if err := os.Chtimes(stalePath, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+
+	tk.Title = "Renamed Title"
+	tk.Touch()
+	freshPath := filepath.Join(projDir, "renamed-title-"+string(tk.ID)[:8]+".md")
+	freshData, err := MarshalTicket(tk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(freshPath, freshData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	project := &Project{ID: "proj-dup", RepoPath: repoDir}
+	loaded, err := LoadTicketStore(project)
+	if err != nil {
+		t.Fatalf("LoadTicketStore: %v", err)
+	}
+
+	if loaded.Count() != 1 {
+		t.Errorf("expected 1 ticket post-dedup, got %d", loaded.Count())
+	}
+	got, _ := loaded.Get(tk.ID)
+	if got == nil {
+		t.Fatal("ticket missing after dedup")
+	}
+	if got.Title != "Renamed Title" {
+		t.Errorf("dedup kept the wrong (older) file; got title %q, want %q", got.Title, "Renamed Title")
+	}
+
+	// Stale file should be gone from disk.
+	if _, err := os.Stat(stalePath); !os.IsNotExist(err) {
+		t.Errorf("stale duplicate %s should have been removed; stat err: %v", stalePath, err)
+	}
+	if _, err := os.Stat(freshPath); err != nil {
+		t.Errorf("fresh file should still exist; stat err: %v", err)
+	}
+}
+
 func TestGlobalTicketStore_RemoveProjectArchivesWholeDir(t *testing.T) {
 	configDir := setupTmpConfigDir(t)
 	repoDir := filepath.Join(t.TempDir(), "repo")

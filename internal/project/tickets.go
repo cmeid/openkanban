@@ -70,6 +70,12 @@ func LoadTicketStore(project *Project) (*TicketStore, error) {
 		return nil, fmt.Errorf("create project ticket dir: %w", err)
 	}
 
+	// Track mtime per ticket id so that a duplicate id (e.g. an
+	// interrupted title-edit rename left both old and new files on
+	// disk) is resolved by preferring the newer file -- and the
+	// stale file is removed so the conflict doesn't recur.
+	mtimes := make(map[board.TicketID]time.Time)
+
 	walkErr := filepath.WalkDir(dir, func(path string, d fs.DirEntry, werr error) error {
 		if werr != nil {
 			return werr
@@ -81,6 +87,11 @@ func LoadTicketStore(project *Project) (*TicketStore, error) {
 			return fs.SkipDir
 		}
 		if !strings.HasSuffix(d.Name(), ".md") {
+			return nil
+		}
+		info, ierr := d.Info()
+		if ierr != nil {
+			log.Printf("openkanban: skip %s: stat: %v", path, ierr)
 			return nil
 		}
 		data, rerr := os.ReadFile(path)
@@ -99,8 +110,25 @@ func LoadTicketStore(project *Project) (*TicketStore, error) {
 		if ticket.ProjectID == "" {
 			ticket.ProjectID = project.ID
 		}
+
+		if prevPath, dup := store.paths[ticket.ID]; dup {
+			if info.ModTime().After(mtimes[ticket.ID]) {
+				// New file is newer. Remove the older file from disk
+				// and replace the in-memory entry.
+				if rmErr := os.Remove(prevPath); rmErr != nil && !os.IsNotExist(rmErr) {
+					log.Printf("openkanban: failed to remove stale duplicate %s: %v", prevPath, rmErr)
+				}
+			} else {
+				// New file is older — drop it.
+				if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
+					log.Printf("openkanban: failed to remove stale duplicate %s: %v", path, rmErr)
+				}
+				return nil
+			}
+		}
 		store.Tickets[ticket.ID] = ticket
 		store.paths[ticket.ID] = path
+		mtimes[ticket.ID] = info.ModTime()
 		return nil
 	})
 	if walkErr != nil {
