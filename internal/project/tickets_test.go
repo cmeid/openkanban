@@ -490,3 +490,140 @@ func TestGlobalTicketStore_RemoveProjectArchivesWholeDir(t *testing.T) {
 		t.Errorf("no archived directory found matching project-1_*; entries: %v", entries)
 	}
 }
+
+// TestGlobalTicketStore_MoveProject covers the happy path: a ticket
+// in project src is moved to project dst, the source .md is removed,
+// a new .md appears in the destination dir, and a fresh load of each
+// reflects the move.
+func TestGlobalTicketStore_MoveProject(t *testing.T) {
+	configDir := setupTmpConfigDir(t)
+
+	registry := newRegistry()
+	src := &Project{ID: "src", Name: "Source", RepoPath: filepath.Join(t.TempDir(), "src-repo")}
+	dst := &Project{ID: "dst", Name: "Destination", RepoPath: filepath.Join(t.TempDir(), "dst-repo")}
+	if err := registry.Add(src); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Add(dst); err != nil {
+		t.Fatal(err)
+	}
+
+	g := NewGlobalTicketStore(registry)
+	g.AddProject(src)
+	g.AddProject(dst)
+
+	ticket := board.NewTicket("Migrating ticket", src.ID)
+	if err := g.Add(ticket); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := g.Save(ticket); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	beforeUpdated := ticket.UpdatedAt
+	time.Sleep(5 * time.Millisecond)
+
+	if err := g.MoveProject(ticket.ID, dst.ID); err != nil {
+		t.Fatalf("MoveProject: %v", err)
+	}
+
+	if ticket.ProjectID != dst.ID {
+		t.Errorf("ticket.ProjectID = %q; want %q", ticket.ProjectID, dst.ID)
+	}
+	if !ticket.UpdatedAt.After(beforeUpdated) {
+		t.Error("UpdatedAt should bump on MoveProject")
+	}
+	if _, ok := g.ticketStores[src.ID].Tickets[ticket.ID]; ok {
+		t.Error("ticket should no longer be in source store map")
+	}
+	if _, ok := g.ticketStores[dst.ID].Tickets[ticket.ID]; !ok {
+		t.Error("ticket should be in destination store map")
+	}
+
+	// Source project dir must not contain the .md anymore; destination must.
+	srcEntries, _ := os.ReadDir(filepath.Join(configDir, "tickets", src.ID))
+	if len(srcEntries) != 0 {
+		t.Errorf("source project dir should be empty, got %d entries", len(srcEntries))
+	}
+	dstEntries, _ := os.ReadDir(filepath.Join(configDir, "tickets", dst.ID))
+	if len(dstEntries) != 1 {
+		t.Errorf("destination project dir should have 1 .md, got %d entries", len(dstEntries))
+	}
+
+	// Round-trip via a fresh load: both stores reflect the move.
+	srcReloaded, err := LoadTicketStore(src)
+	if err != nil {
+		t.Fatalf("LoadTicketStore(src): %v", err)
+	}
+	if srcReloaded.Count() != 0 {
+		t.Errorf("reloaded source should have 0 tickets; got %d", srcReloaded.Count())
+	}
+	dstReloaded, err := LoadTicketStore(dst)
+	if err != nil {
+		t.Fatalf("LoadTicketStore(dst): %v", err)
+	}
+	if dstReloaded.Count() != 1 {
+		t.Errorf("reloaded destination should have 1 ticket; got %d", dstReloaded.Count())
+	}
+}
+
+func TestGlobalTicketStore_MoveProject_SameProjectNoop(t *testing.T) {
+	setupTmpConfigDir(t)
+
+	registry := newRegistry()
+	p := &Project{ID: "p", Name: "P", RepoPath: t.TempDir()}
+	if err := registry.Add(p); err != nil {
+		t.Fatal(err)
+	}
+
+	g := NewGlobalTicketStore(registry)
+	g.AddProject(p)
+
+	ticket := board.NewTicket("Stay put", p.ID)
+	if err := g.Add(ticket); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Save(ticket); err != nil {
+		t.Fatal(err)
+	}
+	originalUpdated := ticket.UpdatedAt
+
+	if err := g.MoveProject(ticket.ID, p.ID); err != nil {
+		t.Fatalf("MoveProject same-project: %v", err)
+	}
+
+	if !ticket.UpdatedAt.Equal(originalUpdated) {
+		t.Error("UpdatedAt should NOT change on no-op same-project move")
+	}
+}
+
+func TestGlobalTicketStore_MoveProject_RefusesActiveWorktree(t *testing.T) {
+	setupTmpConfigDir(t)
+
+	registry := newRegistry()
+	src := &Project{ID: "src", Name: "S", RepoPath: t.TempDir()}
+	dst := &Project{ID: "dst", Name: "D", RepoPath: t.TempDir()}
+	registry.Add(src)
+	registry.Add(dst)
+
+	g := NewGlobalTicketStore(registry)
+	g.AddProject(src)
+	g.AddProject(dst)
+
+	ticket := board.NewTicket("Has worktree", src.ID)
+	ticket.WorktreePath = "/tmp/some-worktree" // active worktree
+	if err := g.Add(ticket); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Save(ticket); err != nil {
+		t.Fatal(err)
+	}
+
+	err := g.MoveProject(ticket.ID, dst.ID)
+	if err != ErrTicketHasWorktree {
+		t.Errorf("expected ErrTicketHasWorktree, got %v", err)
+	}
+	if ticket.ProjectID != src.ID {
+		t.Errorf("ticket.ProjectID should be unchanged; got %q", ticket.ProjectID)
+	}
+}
