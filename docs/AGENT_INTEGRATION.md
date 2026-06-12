@@ -89,8 +89,12 @@ User presses 's' on in-progress ticket
 
 ### Implementation
 
+The following is an illustrative sketch — the canonical implementation
+lives in `internal/ui/model.go` and varies in detail (settings cascade,
+opencode server, status-detector wiring, etc.).
+
 ```go
-// internal/ui/model.go - spawnAgent()
+// internal/ui/model.go - spawnAgent() — illustrative
 
 func (m *Model) spawnAgent() (tea.Model, tea.Cmd) {
     ticket := m.selectedTicket()
@@ -189,7 +193,18 @@ case "opencode":
 **Claude Code:**
 ```go
 case "claude":
-    if !isNewSession {
+    if isNewSession {
+        // Title the Claude session after the ticket so it's
+        // identifiable in `claude --resume`'s session picker and in
+        // the terminal title bar. Only on new sessions — resumes
+        // inherit the existing name. Skipped if the user already
+        // configured -n / --name in their agent args.
+        if !hasClaudeNameFlag(args) && strings.TrimSpace(ticket.Title) != "" {
+            args = append(args, "-n", ticket.Title)
+        }
+        // Inject the init-prompt as a positional argument
+        // (see Context Injection above).
+    } else {
         args = append(args, "--continue")
     }
 ```
@@ -290,14 +305,19 @@ func (p *Pane) View() string {
 type AgentStatus string
 
 const (
-    AgentNone      AgentStatus = ""         // No agent
-    AgentIdle      AgentStatus = "idle"     // Waiting for input
-    AgentWorking   AgentStatus = "working"  // Processing
-    AgentWaiting   AgentStatus = "waiting"  // Waiting for user
+    AgentNone      AgentStatus = "none"      // No session spawned
+    AgentIdle      AgentStatus = "idle"      // Waiting for input
+    AgentWorking   AgentStatus = "working"   // Processing
+    AgentWaiting   AgentStatus = "waiting"   // Waiting for user
     AgentCompleted AgentStatus = "completed"
     AgentError     AgentStatus = "error"
 )
 ```
+
+These values are enum-validated when ticket Markdown files are loaded.
+A hand-edited file with `agent_status: running` (not on the allowlist)
+will be rejected at parse with a clear error and surfaced via
+`watch-errors.log` — see [DATA_MODEL.md](DATA_MODEL.md#file-watcher-integration).
 
 ### Detection Methods
 

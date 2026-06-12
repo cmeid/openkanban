@@ -37,30 +37,38 @@ type Ticket struct {
     Title       string       `json:"title"`
     Description string       `json:"description,omitempty"`
     Status      TicketStatus `json:"status"`
-    
+
     // Git integration
+    UseWorktree  bool   `json:"use_worktree"`
     WorktreePath string `json:"worktree_path,omitempty"`
     BranchName   string `json:"branch_name,omitempty"`
     BaseBranch   string `json:"base_branch,omitempty"` // e.g., "main"
-    
+
     // Agent integration (embedded PTY terminals, not tmux)
-    AgentType      string      `json:"agent_type,omitempty"` // "claude", "opencode", "aider"
+    AgentType      string      `json:"agent_type,omitempty"` // "claude", "opencode", "aider", "gemini", "codex"
     AgentStatus    AgentStatus `json:"agent_status"`
     AgentSpawnedAt *time.Time  `json:"agent_spawned_at,omitempty"`
-    AgentPort      int         `json:"agent_port,omitempty"` // Per-ticket opencode port
-    
+    AgentPort      int         `json:"agent_port,omitempty"`        // Per-ticket opencode port
+    AgentSessionID string      `json:"agent_session_id,omitempty"`  // Claude/opencode session UUID once known
+
     // Metadata
     CreatedAt   time.Time  `json:"created_at"`
     UpdatedAt   time.Time  `json:"updated_at"`
     StartedAt   *time.Time `json:"started_at,omitempty"`   // When moved to in_progress
     CompletedAt *time.Time `json:"completed_at,omitempty"` // When moved to done
-    
+
     // User-defined
-    Labels   []string          `json:"labels,omitempty"`
-    Priority int               `json:"priority,omitempty"` // 1=highest, 5=lowest
-    Meta     map[string]string `json:"meta,omitempty"`     // Custom key-value pairs
+    Labels    []string          `json:"labels,omitempty"`
+    Priority  int               `json:"priority,omitempty"` // 1=highest, 5=lowest
+    Meta      map[string]string `json:"meta,omitempty"`     // Custom key-value pairs
+    BlockedBy []TicketID        `json:"blocked_by,omitempty"` // Informational; no enforcement
 }
 ```
+
+The `json:` tags reflect the legacy single-file JSON layout. The
+current on-disk shape is YAML frontmatter inside a Markdown file (see
+[Per-Ticket File Format](#per-ticket-file-format) below) — the
+frontmatter field names match the JSON tags 1:1.
 
 ### Project
 
@@ -142,20 +150,74 @@ const (
 
 ### File-Based Storage
 
-OpenKanban uses a multi-file JSON storage approach:
+OpenKanban uses a multi-file layout with one Markdown file per ticket:
 
 ```
 ~/.config/openkanban/
-├── config.json           # Global configuration
-├── projects.json         # Project registry (all registered projects)
+├── config.json                       # Global configuration
+├── projects.json                     # Project registry
+├── watch-errors.log                  # Reload failures (parse / validation)
 └── tickets/
-    ├── {project_id}.json     # Tickets for each registered project
-    └── archived/             # Archived tickets when projects removed
+    ├── <project_id>/                 # One directory per registered project
+    │   ├── <slug>-<uuid8>.md         # One file per ticket
+    │   └── ...
+    ├── <project_id>.json.migrated    # Rollback artifact after migration (optional)
+    └── archived/
+        └── <project_id>_<ts>/        # Whole project dirs land here when removed
 ```
+
+### Per-Ticket File Format
+
+Each ticket lives in its own `.md` file. The filename is `<slug>-<uuid8>.md`
+where `slug` is a `Slugify(title, 40)` of the title and `uuid8` is the first
+8 characters of the ticket's UUID. **Filename is cosmetic — identity comes
+from the `id` field in the frontmatter.** A title edit writes the new file
+then removes the old; if interrupted, the next load picks the
+newer-by-mtime and deletes the stale duplicate.
+
+```markdown
+---
+id: 7f3a9b2c-1d8e-4a5b-9c3d-2f1e0a8b9c4d
+project_id: proj-abc
+title: Wire fsnotify watcher
+status: in_progress
+priority: 2
+labels:
+  - storage
+  - tui
+created_at: 2026-06-12T10:00:00Z
+updated_at: 2026-06-12T11:42:00Z
+started_at: 2026-06-12T11:00:00Z
+completed_at: null
+use_worktree: true
+worktree_path: /Users/cmeid/wt/task-fsnotify
+branch_name: task/fsnotify
+base_branch: main
+agent_type: claude
+blocked_by: []
+meta: {}
+# runtime fields — overwritten on agent spawn, reset on TUI startup
+agent_status: working
+agent_spawned_at: 2026-06-12T11:30:00Z
+agent_port: 4097
+agent_session_id: sess-42
+---
+
+Multi-line description goes here. Markdown formatting is preserved
+verbatim — this body becomes the ticket's Description field on load.
+```
+
+The frontmatter is parsed with `gopkg.in/yaml.v3`. Enum values
+(`status`, `agent_status`, `agent_type`) are validated against allowlists
+at load time. Missing optional fields default to sensible values: empty
+`status` → `backlog`, empty `agent_status` → `none`, zero timestamps →
+`time.Now()`, missing `priority` → `3`. Hard-required: `id` (non-empty)
+and `title` (non-empty after trim).
 
 ### Project Registry Format
 
-Stored in `~/.config/openkanban/projects.json`:
+Stored in `~/.config/openkanban/projects.json`. Unchanged from prior
+versions:
 
 ```json
 {
@@ -180,118 +242,90 @@ Stored in `~/.config/openkanban/projects.json`:
 }
 ```
 
-### Per-Project Tickets Format
+### Migration from Legacy JSON
 
-Stored in `~/.config/openkanban/tickets/{project_id}.json`:
+Earlier versions stored tickets as a single file per project at
+`tickets/<project_id>.json`. On first load, `LoadTicketStore` invokes
+`MigrateProjectToPerTicket` which:
 
-```json
-{
-  "tickets": {
-    "ticket-uuid-1": {
-      "id": "ticket-uuid-1",
-      "project_id": "proj-uuid-1",
-      "title": "Implement user authentication",
-      "description": "Add JWT-based auth to the API",
-      "status": "in_progress",
-      "worktree_path": "/home/user/projects/myproject-worktrees/task-implement-user-authentication",
-      "branch_name": "task/implement-user-authentication",
-      "base_branch": "main",
-      "agent_type": "opencode",
-      "agent_status": "working",
-      "agent_port": 4097,
-      "created_at": "2025-01-15T10:30:00Z",
-      "updated_at": "2025-01-16T14:30:00Z",
-      "started_at": "2025-01-16T09:00:00Z",
-      "labels": ["backend", "security"],
-      "priority": 1
-    }
-  }
-}
-```
+1. Reads and parses the legacy JSON
+2. Stages each ticket as a `.md` in `tickets/<project_id>.migrating/`
+3. Validates each staged file round-trips with matching id, title, and status
+4. Atomically renames the staging dir to `tickets/<project_id>/`
+5. Renames the legacy JSON to `<project_id>.json.migrated` (rollback artifact)
 
-### SQLite Storage (Optional, for large boards)
+The migration is idempotent (re-running is a no-op when complete) and
+orphan-safe (a `.migrating/` dir from a prior interrupted run is cleaned
+before retry).
 
-For boards with >1000 tickets or complex querying needs.
+**Stale-snapshot recovery**: if a legacy JSON ever reappears after a
+successful migration (e.g. an old binary launched in another shell and
+wrote a stale snapshot of its in-memory store), the migration code
+detects that the JSON is a strict subset of the current per-ticket dir
+state (every ticket present with `updated_at` no older than the JSON's
+record) and renames it to `<project_id>.json.stale-<unix-timestamp>`
+rather than refusing to start.
 
-```sql
--- Schema
-CREATE TABLE boards (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    repo_path TEXT NOT NULL,
-    settings JSON NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
+**Rollback**: `mv <project_id>.json.migrated <project_id>.json && rm -rf <project_id>/`
+and reinstall the older binary.
 
-CREATE TABLE columns (
-    id TEXT PRIMARY KEY,
-    board_id TEXT NOT NULL REFERENCES boards(id),
-    name TEXT NOT NULL,
-    status TEXT NOT NULL,
-    color TEXT,
-    wip_limit INTEGER DEFAULT 0,
-    position INTEGER NOT NULL,
-    UNIQUE(board_id, position)
-);
+### In-Memory Stores
 
-CREATE TABLE tickets (
-    id TEXT PRIMARY KEY,
-    board_id TEXT NOT NULL REFERENCES boards(id),
-    title TEXT NOT NULL,
-    description TEXT,
-    status TEXT NOT NULL DEFAULT 'backlog',
-    worktree_path TEXT,
-    branch_name TEXT,
-    base_branch TEXT,
-    agent_type TEXT,
-    agent_status TEXT DEFAULT 'none',
-    tmux_session TEXT,
-    priority INTEGER DEFAULT 3,
-    labels JSON DEFAULT '[]',
-    meta JSON DEFAULT '{}',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    started_at DATETIME,
-    completed_at DATETIME
-);
-
-CREATE INDEX idx_tickets_board_status ON tickets(board_id, status);
-CREATE INDEX idx_tickets_agent_status ON tickets(agent_status);
-```
-
-### Storage Interface
-
-Abstract storage to support both backends:
+The `internal/project` package exposes two store types:
 
 ```go
-type Storage interface {
-    // Board operations
-    CreateBoard(board *Board) error
-    GetBoard(id string) (*Board, error)
-    UpdateBoard(board *Board) error
-    DeleteBoard(id string) error
-    ListBoards() ([]*Board, error)
-    
-    // Ticket operations
-    CreateTicket(boardID string, ticket *Ticket) error
-    GetTicket(boardID string, ticketID TicketID) (*Ticket, error)
-    UpdateTicket(boardID string, ticket *Ticket) error
-    DeleteTicket(boardID string, ticketID TicketID) error
-    ListTickets(boardID string, filter TicketFilter) ([]*Ticket, error)
-    
-    // Batch operations
-    MoveTicket(boardID string, ticketID TicketID, newStatus TicketStatus) error
-    ReorderTickets(boardID string, status TicketStatus, ticketIDs []TicketID) error
+// One project's tickets. Also caches each ticket's on-disk path so
+// SaveTicket can atomically rewrite a single file without scanning.
+type TicketStore struct {
+    ProjectID string
+    Tickets   map[board.TicketID]*board.Ticket
+    UpdatedAt time.Time
+    // paths (private) maps id → absolute .md path
 }
 
-type TicketFilter struct {
-    Status   []TicketStatus
-    Labels   []string
-    Priority *int
-    Search   string
-}
+func (s *TicketStore) SaveTicket(t *board.Ticket) error     // atomic tmp+rename per file
+func (s *TicketStore) Delete(id board.TicketID) error       // map + on-disk file
+func (s *TicketStore) DeleteTicketFile(id board.TicketID) error  // file only
+func (s *TicketStore) SaveAll() error                       // fan out across in-memory map
+
+// All projects, aggregated. Wraps a TicketStore per project.
+type GlobalTicketStore struct { /* ... */ }
+
+func (g *GlobalTicketStore) Save(ticket *board.Ticket) error                       // delegates to SaveTicket
+func (g *GlobalTicketStore) ReloadTicket(projectID, path string) error             // file-watcher entrypoint
+func (g *GlobalTicketStore) MoveProject(id board.TicketID, newProjectID string) error
+func (g *GlobalTicketStore) RemoveProject(id string) error                         // archives whole dir
 ```
+
+`SaveTicket` writes a single file via tmp+rename. **No other ticket's file
+is touched** — the load-bearing property behind hot-reload safety. A
+parent agent session saving ticket A cannot clobber a child session's
+edits to ticket B; cross-ticket conflicts are impossible by construction.
+
+### File-Watcher Integration
+
+The `internal/watch` package runs an `fsnotify.Watcher` rooted at the
+config dir plus each project's tickets subdir. Events are debounced
+~100ms per path, classified by parent directory + basename, and pushed
+into the Bubble Tea event loop as `ui.FsChangedMsg` via `program.Send`.
+On macOS, fsnotify uses kqueue; OpenKanban watches directories (not
+individual files) to keep the kqueue fd count bounded — one fd per
+project, not per ticket.
+
+Editor swap files (`.tmp`, `.swp`, `~`, leading-dot, vim's `4913`) are
+filtered out at the classifier.
+
+**Self-write suppression**: the TUI's reload handler records
+`(path, mtime, size, deadline)` after each `SaveTicket` call and
+checks incoming events against that window (5 second TTL). This
+prevents fsnotify echoes of the TUI's own writes from triggering
+redundant reloads.
+
+When a reload fails (malformed YAML, invalid enum value, etc.) the
+prior in-memory ticket is kept and the failure is appended to
+`~/.config/openkanban/watch-errors.log` as
+`<RFC3339 timestamp>\t<path>\t<error>`. The user also sees a transient
+TUI notification.
 
 ## State Transitions
 
@@ -496,31 +530,58 @@ type OpencodeSettings struct {
 |---------|------|-------|
 | Global config | `~/.config/openkanban/config.json` | User preferences |
 | Project registry | `~/.config/openkanban/projects.json` | All registered projects |
-| Project tickets | `~/.config/openkanban/tickets/{project_id}.json` | Per-project ticket storage |
-| Archived tickets | `~/.config/openkanban/tickets/archived/` | Tickets from removed projects |
+| Per-ticket file | `~/.config/openkanban/tickets/<project_id>/<slug>-<uuid8>.md` | One Markdown file per ticket |
+| Legacy rollback | `~/.config/openkanban/tickets/<project_id>.json.migrated` | Pre-migration JSON, preserved for rollback |
+| Stale snapshot | `~/.config/openkanban/tickets/<project_id>.json.stale-<ts>` | A legacy JSON renamed aside after stale-snapshot recovery |
+| Archived projects | `~/.config/openkanban/tickets/archived/<project_id>_<ts>/` | Whole project dirs after RemoveProject |
+| Watch errors | `~/.config/openkanban/watch-errors.log` | Reload failures (parse / validation) |
 | Worktrees | `{repo}-worktrees/` | Default sibling to repo |
 | Status cache | `~/.cache/openkanban-status/` | Agent status files |
 
 ## Concurrency Considerations
 
-1. **File locking**: Use `flock` or similar when writing JSON files
-2. **Atomic writes**: Write to temp file, then rename
-3. **Agent polling**: Run in separate goroutine, update state via channels
-4. **PTY operations**: Terminal panes managed per-ticket with mutex protection
+1. **No cross-ticket conflicts by construction**: per-ticket files mean
+   different writers touching different tickets never share a write
+   target. A parent agent saving ticket A and a child agent editing
+   ticket B's file in `$EDITOR` cannot collide.
+2. **Atomic writes**: every persistence path writes to `<dest>.tmp` and
+   then `os.Rename`s onto the destination. No partial-write window.
+3. **Same-ticket simultaneous writes** still race at the file level
+   (last writer wins) but this is a much smaller surface than the
+   legacy whole-file rewrites. The TUI is single-threaded via Bubble
+   Tea's event loop; conflicts only arise across processes.
+4. **No file locking**: OpenKanban does not use `flock`. External
+   writers are expected to use the same tmp+rename pattern (most
+   editors do; openkanban's own writes always do).
+5. **Watcher loop is single-goroutine**: the fsnotify event channel is
+   consumed by one goroutine in `internal/app/app.go` that calls
+   `program.Send`. The model's `Update` handler then mutates state in
+   place. No additional locking needed.
+6. **PTY operations**: terminal panes managed per-ticket with mutex
+   protection in `internal/terminal`.
 
 ```go
-// Atomic write pattern
-func (s *JSONStorage) SaveBoard(board *Board) error {
-    data, err := json.MarshalIndent(board, "", "  ")
-    if err != nil {
-        return err
+// internal/project/tickets.go — SaveTicket pattern
+func (s *TicketStore) SaveTicket(t *board.Ticket) error {
+    dir := s.ticketDir()
+    if err := os.MkdirAll(dir, 0o755); err != nil { return err }
+
+    data, err := MarshalTicket(t)
+    if err != nil { return err }
+
+    newPath := filepath.Join(dir, TicketFilename(t))
+    tmpPath := newPath + ".tmp"
+    if err := os.WriteFile(tmpPath, data, 0o644); err != nil { return err }
+    if err := os.Rename(tmpPath, newPath); err != nil { return err }
+
+    // Title-edit rename: if the cached path differs from the new
+    // path, remove the old file. Frontmatter id is canonical
+    // identity; orphans on interruption are reconciled on next load.
+    if oldPath, hadOld := s.paths[t.ID]; hadOld && oldPath != newPath {
+        _ = os.Remove(oldPath)
     }
-    
-    tmpFile := s.boardPath(board.ID) + ".tmp"
-    if err := os.WriteFile(tmpFile, data, 0644); err != nil {
-        return err
-    }
-    
-    return os.Rename(tmpFile, s.boardPath(board.ID))
+    s.paths[t.ID] = newPath
+    s.Tickets[t.ID] = t
+    return nil
 }
 ```

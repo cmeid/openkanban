@@ -291,6 +291,55 @@ Tickets support labels and priority levels:
 
 Set labels and priority when creating or editing a ticket (`n` or `e`).
 
+## Ticket Storage
+
+Tickets are stored as Markdown files with YAML frontmatter, one file per ticket:
+
+```
+~/.config/openkanban/
+├── config.json
+├── projects.json
+└── tickets/
+    └── <project_id>/
+        ├── <slug>-<uuid8>.md
+        └── ...
+```
+
+Filename is cosmetic — identity comes from the `id` field in frontmatter. Renaming a ticket via the TUI changes the filename but preserves identity; an interrupted rename is reconciled on the next load (newer mtime wins).
+
+**Editability**: Any `.md` file is fair game for `$EDITOR`. Save changes to the frontmatter (status, priority, labels) or the body (description) and the running TUI reflects them within ~150ms via fsnotify.
+
+**Validation**: `status`, `agent_status`, and `agent_type` are validated against enum allowlists on load. A malformed value surfaces as a TUI notification and an entry in `~/.config/openkanban/watch-errors.log`; the prior in-memory copy is kept until you fix and save again.
+
+**Migration**: On first launch after upgrading from a pre-Markdown release, the legacy `tickets/<project_id>.json` is converted to per-ticket `.md` files automatically. The original JSON is preserved as `<project_id>.json.migrated` so you can roll back (`mv <id>.json.migrated <id>.json && rm -rf <id>/` and reinstall the older binary).
+
+If a stale legacy JSON ever reappears (e.g. an old binary was launched in another shell), the next load detects it is a strict subset of the per-ticket dir's state and renames it aside to `.stale-<timestamp>` rather than refusing to start.
+
+## Command Line
+
+In addition to the TUI, OpenKanban exposes a small command-line surface for scripting — useful when a running agent wants to create a ticket without driving the TUI.
+
+```bash
+openkanban ticket new \
+    --project <name|uuid|prefix> \
+    --title "<title>" \
+    [--description "<text>" | --description-file <path>] \
+    [--status backlog|in_progress|done|archived] \
+    [--labels foo,bar] \
+    [--priority 1-5] \
+    [--no-worktree]
+```
+
+`--project` accepts an exact project name, full UUID, or a unique 4+ character UUID prefix. Ambiguous prefixes return an error listing the candidates.
+
+The created `.md` file's absolute path is printed to stdout — a parent agent can capture it and pass it as context to a child agent it spawns.
+
+Description may also be piped on stdin:
+
+```bash
+echo "Long description" | openkanban ticket new --project myapp --title "Do thing"
+```
+
 ## Keybindings
 
 All keybindings are shown in-app with `?`. Custom keybindings coming soon.
