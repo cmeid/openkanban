@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -176,6 +178,140 @@ func TestShouldInjectContext(t *testing.T) {
 				t.Errorf("ShouldInjectContext() = %v; want %v", result, tt.expected)
 			}
 		})
+	}
+}
+
+func TestScrubMissingFileReferences(t *testing.T) {
+	worktree := t.TempDir()
+	// Create one real file the scrubber should consider present.
+	presentRel := "docs/present.md"
+	if err := os.MkdirAll(filepath.Join(worktree, "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, presentRel), []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name           string
+		input          string
+		expectContains []string
+		expectAbsent   []string
+	}{
+		{
+			name:           "no md references is no-op",
+			input:          "## Heading\n\nA paragraph with no file refs.\n\nAnother paragraph.",
+			expectContains: []string{"## Heading", "A paragraph", "Another paragraph"},
+		},
+		{
+			name: "present file path leaves paragraph intact",
+			input: "## Brief\n\nRead `docs/present.md` for context.\n\n" +
+				"## Next\n\nDo the thing.",
+			expectContains: []string{"## Brief", "docs/present.md", "## Next", "Do the thing"},
+		},
+		{
+			name: "missing file path strips containing paragraph",
+			input: "## Locating brief\n\nRead `tickets/missing.md` immediately.\n\n" +
+				"## Next steps\n\nProceed when ready.",
+			expectContains: []string{"## Next steps", "Proceed when ready"},
+			expectAbsent:   []string{"tickets/missing.md", "Read `tickets/missing.md`"},
+		},
+		{
+			name: "orphan header dropped when body fully scrubbed",
+			input: "## Locating brief\n\nThe brief is at `tickets/missing.md`.\n\n" +
+				"If `tickets/missing.md` is absent, stop.\n\n## Next steps\n\nGo.",
+			expectContains: []string{"## Next steps", "Go"},
+			expectAbsent:   []string{"## Locating brief", "tickets/missing.md"},
+		},
+		{
+			name: "literal placeholder path is treated as missing",
+			input: "## Read brief\n\nOpen `tickets/<slug>.md`.\n\n## Next\n\nContinue.",
+			expectContains: []string{"## Next", "Continue"},
+			expectAbsent:   []string{"## Read brief", "tickets/<slug>.md"},
+		},
+		{
+			name:           "absolute missing path stripped",
+			input:          "## A\n\nSee `/definitely/does/not/exist.md`.\n\n## B\n\nKeep me.",
+			expectContains: []string{"## B", "Keep me"},
+			expectAbsent:   []string{"/definitely/does/not/exist.md"},
+		},
+		{
+			name: "multiple paragraphs referencing missing file each stripped",
+			input: "## H\n\nFirst para about `tickets/x.md`.\n\n" +
+				"Second para about `tickets/x.md`.\n\nThird unrelated para.",
+			expectContains: []string{"Third unrelated para"},
+			expectAbsent:   []string{"First para", "Second para", "tickets/x.md"},
+		},
+		{
+			name: "paragraph with both present and missing dropped (any missing wins)",
+			input: "## Mix\n\nRead `docs/present.md` and `tickets/missing.md`.\n\n" +
+				"## Tail\n\nEnd.",
+			expectContains: []string{"## Tail", "End"},
+			expectAbsent:   []string{"tickets/missing.md", "docs/present.md"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := scrubMissingFileReferences(tt.input, worktree)
+			for _, want := range tt.expectContains {
+				if !strings.Contains(got, want) {
+					t.Errorf("missing expected substring %q in:\n%s", want, got)
+				}
+			}
+			for _, absent := range tt.expectAbsent {
+				if strings.Contains(got, absent) {
+					t.Errorf("unexpected substring %q still present in:\n%s", absent, got)
+				}
+			}
+		})
+	}
+}
+
+func TestScrubMissingFileReferences_HomeExpansion(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("no home dir available")
+	}
+	// Create a temp file under home for the present case.
+	tmp, err := os.CreateTemp(home, "okb-scrub-test-*.md")
+	if err != nil {
+		t.Skip("cannot create file in home dir")
+	}
+	t.Cleanup(func() { os.Remove(tmp.Name()) })
+	tmp.Close()
+	rel := "~/" + filepath.Base(tmp.Name())
+
+	prompt := "## A\n\nRead `" + rel + "` for the brief.\n\n## B\n\nKeep."
+	got := scrubMissingFileReferences(prompt, "")
+	if !strings.Contains(got, rel) {
+		t.Errorf("present ~/-path should be kept; got:\n%s", got)
+	}
+
+	missingPrompt := "## A\n\nRead `~/does-not-exist-okb-test.md`.\n\n## B\n\nKeep."
+	got = scrubMissingFileReferences(missingPrompt, "")
+	if strings.Contains(got, "~/does-not-exist") {
+		t.Errorf("missing ~/-path should be stripped; got:\n%s", got)
+	}
+	if !strings.Contains(got, "## B") {
+		t.Errorf("unrelated section should remain; got:\n%s", got)
+	}
+}
+
+func TestBuildContextPrompt_ScrubsMissingFileReferences(t *testing.T) {
+	worktree := t.TempDir()
+	ticket := &board.Ticket{
+		Title:        "Test",
+		BranchName:   "task/foo",
+		WorktreePath: worktree,
+	}
+	template := "## Brief\n\nRead `tickets/foo.md` carefully.\n\n## Tail\n\n{{.Title}} continues."
+	got := BuildContextPrompt(template, ticket)
+	if strings.Contains(got, "tickets/foo.md") {
+		t.Errorf("missing-file directive should be scrubbed; got:\n%s", got)
+	}
+	if !strings.Contains(got, "Test continues") {
+		t.Errorf("unrelated content should remain; got:\n%s", got)
 	}
 }
 
