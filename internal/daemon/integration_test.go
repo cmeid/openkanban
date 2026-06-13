@@ -355,7 +355,7 @@ func TestServerLifecycle_PidLock(t *testing.T) {
 	}
 }
 
-func TestServerLifecycle_AttachNotImplemented(t *testing.T) {
+func TestServerLifecycle_AttachSessionNotFound(t *testing.T) {
 	srv, errCh := startServer(t)
 
 	conn := dialTestClient(t, srv.SocketPath())
@@ -372,8 +372,8 @@ func TestServerLifecycle_AttachNotImplemented(t *testing.T) {
 	if err := json.Unmarshal(raw, &errResp); err != nil {
 		t.Fatalf("decode ErrorResp: %v", err)
 	}
-	if errResp.Code != "not_implemented" {
-		t.Errorf("ErrorResp.Code: got %q want %q", errResp.Code, "not_implemented")
+	if errResp.Code != "session_not_found" {
+		t.Errorf("ErrorResp.Code: got %q want %q", errResp.Code, "session_not_found")
 	}
 	conn.SetReadDeadline(time.Time{})
 

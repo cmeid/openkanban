@@ -293,6 +293,31 @@ func (p *Pane) IsAltScreenActive() bool {
 	return p.altScreenActive
 }
 
+// SnapshotState returns the emulator and the three modal booleans the
+// daemon's redraw serializer needs to reproduce the pane's current
+// view. The returned emulator pointer is the live one — callers MUST
+// only read from it via SafeEmulator's locked methods (CellAt,
+// CursorPosition, Width, Height); they must not mutate it.
+//
+// The cursor-visibility / mouse / alt-screen booleans are tracked on
+// Pane (not on the emulator), so the daemon couldn't reconstruct them
+// from vt alone. This getter is the single seam through which the
+// daemon's snapshot path reads them; PR7 will fold it into a richer
+// Pane.View interface.
+func (p *Pane) SnapshotState() (vt *xvt.SafeEmulator, cursorVisible, mouseEnabled, altScreen bool, title string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	vt = p.vt
+	mouseEnabled = p.mouseEnabled
+	altScreen = p.altScreenActive
+	cursorVisible = !p.cursorHidden.Load()
+	title = ""
+	if v, ok := p.paneTitle.Load().(string); ok {
+		title = v
+	}
+	return vt, cursorVisible, mouseEnabled, altScreen, title
+}
+
 // --- Bubbletea Messages ---
 
 // OutputMsg carries data read from the PTY

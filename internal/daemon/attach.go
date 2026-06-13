@@ -1,0 +1,270 @@
+package daemon
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+
+	"github.com/techdufus/openkanban/internal/terminal"
+)
+
+// snapshotChunkSize is the maximum payload size for a single
+// TypePTYOutput frame carrying snapshot bytes. The protocol-level
+// MaxFrameSize is 1 MiB (including the type byte); we cap chunks well
+// below that so the client's frame-read loop never blocks on a single
+// outsized payload, and so the snapshot can interleave with live
+// output frames as soon as they start arriving from the read pump.
+//
+// 64 KiB matches the PTY read buffer (terminal.readBufferSize) — once
+// the snapshot is over, fanOut's per-event frames will be at most this
+// large too, keeping output cadence smooth.
+const snapshotChunkSize = 64 * 1024
+
+// handleAttach drives the Attach RPC. It runs synchronously on the
+// dispatcher goroutine and BLOCKS until the binary stream ends; that
+// way handleConn's outer JSON read loop sees a clean conn shutdown
+// (EOF or client-side close) once binary mode wraps up, and exits via
+// its existing disconnect path.
+//
+// The function never decrements clientCount on its own — the deferred
+// unregisterClient in handleConn handles that. If we tried to manage
+// it here we'd double-decrement on every attach.
+func (s *Server) handleAttach(c *clientConn, req AttachReq) {
+	// Validate dimensions before grabbing the session — same bounds
+	// as the rest of the daemon defaults.
+	if req.Cols == 0 {
+		req.Cols = 80
+	}
+	if req.Rows == 0 {
+		req.Rows = 24
+	}
+	if req.Cols > 1024 || req.Rows > 1024 {
+		s.writeError(c, "bad_request", fmt.Sprintf("dims out of range: %dx%d", req.Cols, req.Rows))
+		return
+	}
+
+	s.sessionsMu.RLock()
+	sess := s.sessions[req.SessionID]
+	s.sessionsMu.RUnlock()
+
+	if sess == nil {
+		s.writeError(c, "session_not_found", fmt.Sprintf("session %q not found", req.SessionID))
+		return
+	}
+
+	snapshot, ac, err := sess.AttemptAttach(c, req.Cols, req.Rows, req.Takeover)
+	if err != nil {
+		if errors.Is(err, ErrAlreadyAttached) {
+			s.writeError(c, "already_attached", err.Error())
+			return
+		}
+		s.writeError(c, "attach_failed", err.Error())
+		return
+	}
+
+	// AttachResp BEFORE the binary frames so the client can switch
+	// its read loop based on the JSON envelope.
+	s.writeResp(c, MsgAttachResp, AttachResp{
+		ClientID:     c.id,
+		SnapshotSize: len(snapshot),
+	})
+
+	// Ship the snapshot as one or more TypePTYOutput frames. We do
+	// this under writeMu just like fanOut would — keeps any future
+	// JSON pushes from interleaving mid-snapshot.
+	if err := writeSnapshotChunks(c.conn, &c.writeMu, snapshot, c.id); err != nil {
+		log.Printf("openkanbankd: client %d write snapshot: %v", c.id, err)
+		sess.Detach()
+		return
+	}
+
+	// Spawn the fan-out goroutine. It exits when the subscription
+	// channel closes (Detach) or when its conn writes fail.
+	fanOutDone := make(chan struct{})
+	go func() {
+		defer close(fanOutDone)
+		s.fanOut(ac)
+	}()
+
+	// Drive the inbound binary loop on this goroutine. Blocks until
+	// the client cleanly detaches, closes the conn, or sends an
+	// unrecoverable frame.
+	s.binaryLoop(c, sess, ac)
+
+	// Tear down the attach. Detach is idempotent — fanOut may have
+	// already pushed a TypeDetach on ExitEvent and noted the
+	// subscription close, but calling here covers the
+	// client-initiated detach path.
+	sess.Detach()
+
+	// Wait for the fan-out to fully exit before returning. Without
+	// this, a late publish could race the conn close and log a
+	// confusing write error after handleConn already shut down.
+	<-fanOutDone
+}
+
+// writeSnapshotChunks ships data over conn as one or more
+// TypePTYOutput frames, each ≤ snapshotChunkSize bytes. writeMu is
+// taken once per chunk so other potential conn writers (none today,
+// but the JSON push path may grow into one) can interleave between
+// chunks without corrupting frames.
+//
+// Returns the first write error encountered. A short snapshot fits
+// in one frame; a multi-megabyte one chunks into ~16 frames.
+func writeSnapshotChunks(conn net.Conn, writeMu lockable, data []byte, clientID uint16) error {
+	if len(data) == 0 {
+		return nil
+	}
+	for off := 0; off < len(data); off += snapshotChunkSize {
+		end := off + snapshotChunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+		writeMu.Lock()
+		err := WriteFrame(conn, TypePTYOutput, data[off:end])
+		writeMu.Unlock()
+		if err != nil {
+			return fmt.Errorf("snapshot chunk %d-%d (client %d): %w", off, end, clientID, err)
+		}
+	}
+	return nil
+}
+
+// lockable narrows the *sync.Mutex shape we expect for serialized
+// conn writes. Defined as a tiny interface so writeSnapshotChunks can
+// accept either *sync.Mutex (the real callers) or a stub in tests.
+type lockable interface {
+	Lock()
+	Unlock()
+}
+
+// fanOut pumps pane events to the client conn as binary frames. It
+// runs until the subscription channel closes (i.e. the pane was
+// unsubscribed via Detach, or the pane published its final ExitEvent
+// and closed all subscribers).
+//
+// On ExitEvent it emits a TypeDetach so the client learns the child
+// is gone and can release its end of the binary stream. fanOut does
+// not call Detach itself — that's the caller (handleAttach) — but it
+// will close ac.DetachCh on ExitEvent so any goroutine waiting on the
+// channel (e.g. PR6's takeover path) wakes up.
+func (s *Server) fanOut(ac *attachedClient) {
+	if ac == nil || ac.Subscription == nil {
+		return
+	}
+	ch := ac.Subscription.Ch
+
+	for ev := range ch {
+		switch e := ev.(type) {
+		case terminal.OutputEvent:
+			if len(e.Data) == 0 {
+				continue
+			}
+			ac.WriteMu.Lock()
+			err := WriteFrame(ac.Conn, TypePTYOutput, e.Data)
+			ac.WriteMu.Unlock()
+			if err != nil {
+				logWriteFailure("fan-out write", ac.ClientID, err)
+				return
+			}
+		case terminal.ExitEvent:
+			// Notify the client. Best effort — the conn may already
+			// be torn down on this side. After sending we still wait
+			// for the channel close (range loop exit) below.
+			ac.WriteMu.Lock()
+			_ = WriteFrame(ac.Conn, TypeDetach, nil)
+			ac.WriteMu.Unlock()
+			ac.DetachOnce.Do(func() { close(ac.DetachCh) })
+		case terminal.TitleEvent, terminal.ModeEvent:
+			// PR5 does not propagate Title/Mode through the binary
+			// stream — those flips are recoverable by the child's
+			// own emitted escape sequences, which fanOut already
+			// relays as OutputEvent bytes. PR9 will revisit if we
+			// want server-pushed mode notifications for non-attached
+			// subscribers.
+			continue
+		}
+	}
+}
+
+// binaryLoop reads inbound frames from the attached client and
+// dispatches them to the pane. Exits on:
+//   - clean detach (TypeDetach frame)
+//   - conn EOF / closed
+//   - read error of any other kind
+//   - DetachCh closed externally (PR6 takeover)
+//
+// Note we do NOT take any per-session lock here; the pane's own
+// WriteInput / SetSize are concurrent-safe.
+func (s *Server) binaryLoop(c *clientConn, sess *Session, ac *attachedClient) {
+	// Watcher goroutine: if the detach channel is closed externally
+	// (PR6) we want to interrupt the blocked ReadFrame. We do that by
+	// closing the underlying conn — ReadFrame returns net.ErrClosed
+	// and the loop exits.
+	stopWatcher := make(chan struct{})
+	go func() {
+		select {
+		case <-ac.DetachCh:
+			// External detach — break the read loop by closing conn.
+			c.conn.Close()
+		case <-stopWatcher:
+		}
+	}()
+	defer close(stopWatcher)
+
+	for {
+		typ, payload, err := ReadFrame(c.r)
+		if err != nil {
+			if err == io.EOF || errors.Is(err, net.ErrClosed) {
+				return
+			}
+			log.Printf("openkanbankd: client %d binary read: %v", c.id, err)
+			return
+		}
+
+		switch typ {
+		case TypePTYInput:
+			if len(payload) == 0 {
+				continue
+			}
+			if _, werr := sess.pane.WriteInput(payload); werr != nil {
+				if errors.Is(werr, terminal.ErrPaneNotRunning) {
+					// Child gone — emit detach and bail out so the
+					// client knows the session is no longer
+					// accepting input.
+					ac.WriteMu.Lock()
+					_ = WriteFrame(c.conn, TypeDetach, nil)
+					ac.WriteMu.Unlock()
+					return
+				}
+				log.Printf("openkanbankd: client %d WriteInput: %v", c.id, werr)
+				return
+			}
+		case TypeResize:
+			cols, rows, _, derr := DecodeResize(payload)
+			if derr != nil {
+				log.Printf("openkanbankd: client %d bad resize payload: %v", c.id, derr)
+				continue
+			}
+			if cols == 0 || rows == 0 {
+				continue
+			}
+			if cols > 1024 || rows > 1024 {
+				log.Printf("openkanbankd: client %d resize out of range %dx%d", c.id, cols, rows)
+				continue
+			}
+			sess.pane.SetSize(int(cols), int(rows))
+		case TypeDetach:
+			// Client-initiated clean detach. Return so handleAttach
+			// proceeds to its post-loop cleanup.
+			return
+		default:
+			// Unknown frame type during binary mode: log and ignore
+			// rather than tear down — the client may be a slightly
+			// newer version that knows a new frame type.
+			log.Printf("openkanbankd: client %d unexpected binary frame 0x%02x", c.id, typ)
+		}
+	}
+}

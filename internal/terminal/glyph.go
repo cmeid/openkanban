@@ -49,12 +49,15 @@ func (g Glyph) styleEqual(o Glyph) bool {
 		g.BG == o.BG
 }
 
-// cellToGlyph translates a charm/x/vt cell into our internal Glyph.
+// CellToGlyph translates a charm/x/vt cell into our internal Glyph.
 // A nil cell maps to a zero-value Glyph (rendered as a space). The
 // cell's Content is a grapheme cluster; we take only the first rune.
 // Combining marks and ZWJ sequences will not round-trip — known
 // limitation, called out at the boundary.
-func cellToGlyph(c *uv.Cell) Glyph {
+//
+// Exported (PR5) so the daemon's redraw serializer can read cells
+// from a SafeEmulator without duplicating the boundary translation.
+func CellToGlyph(c *uv.Cell) Glyph {
 	if c == nil {
 		return Glyph{Width: 1}
 	}
@@ -80,11 +83,14 @@ func cellToGlyph(c *uv.Cell) Glyph {
 	}
 }
 
-// glyphANSI emits an ANSI SGR sequence that sets the terminal state
+// GlyphANSI emits an ANSI SGR sequence that sets the terminal state
 // to render glyph g. It always emits a full reset+set rather than a
 // diff because the renderer wraps each run with \x1b[0m anyway.
 // Returns "" if g has no styling beyond defaults.
-func glyphANSI(g Glyph) string {
+//
+// Exported (PR5) so the daemon's redraw serializer can emit SGR runs
+// using the same encoding as render.go.
+func GlyphANSI(g Glyph) string {
 	var parts []string
 
 	if code := colorANSI(g.FG, true); code != "" {
@@ -115,31 +121,77 @@ func glyphANSI(g Glyph) string {
 	return fmt.Sprintf("\x1b[%sm", strings.Join(parts, ";"))
 }
 
+// cellToGlyph is an unexported alias for CellToGlyph retained so the
+// existing pane.go / render.go call sites read naturally. New code
+// outside this package should call CellToGlyph.
+var cellToGlyph = CellToGlyph
+
+// glyphANSI is an unexported alias for GlyphANSI.
+var glyphANSI = GlyphANSI
+
 // colorANSI returns the SGR parameter (without the leading CSI or
 // trailing m) for a single color slot. Returns "" for nil (default).
-// Encodes via 256-color palette when the underlying type is an indexed
-// color, and as 24-bit RGB otherwise.
+//
+// Encoding strategy is deliberate so a Glyph -> SGR -> emulator-parse
+// round-trip preserves the concrete color type (needed by the daemon's
+// SerializeRedraw round-trip test — and harmless for the regular
+// renderer path, which only writes to a real terminal):
+//
+//   - ansi.BasicColor (0-15) → basic SGR codes 30-37 / 90-97 (FG)
+//     or 40-47 / 100-107 (BG). The emulator parses these back into
+//     BasicColor, not IndexedColor — so `==` equality survives.
+//   - ansi.IndexedColor (0-255) → 38;5;<idx> / 48;5;<idx>.
+//   - Anything else → 24-bit RGB.
 func colorANSI(c color.Color, isFG bool) string {
 	if c == nil {
 		return ""
+	}
+
+	switch v := c.(type) {
+	case ansi.BasicColor:
+		return basicColorSGR(uint8(v), isFG)
+	case ansi.IndexedColor:
+		idx := uint8(v)
+		// Even an IndexedColor in the low 16 round-trips most
+		// faithfully as the 38;5;<idx> form: the emulator parses it
+		// back as IndexedColor, preserving the concrete type.
+		base := 38
+		if !isFG {
+			base = 48
+		}
+		return fmt.Sprintf("%d;5;%d", base, idx)
 	}
 
 	base := 38
 	if !isFG {
 		base = 48
 	}
-
-	// Indexed colors (ANSI 16 + 256-color palette) round-trip best
-	// as 5;<idx>. ansi.BasicColor is uint8 in [0,15]; IndexedColor is
-	// uint8 in [0,255]. RGBA() returns scaled values that lose the
-	// index, so detect the concrete type.
-	switch v := c.(type) {
-	case ansi.BasicColor:
-		return fmt.Sprintf("%d;5;%d", base, uint8(v))
-	case ansi.IndexedColor:
-		return fmt.Sprintf("%d;5;%d", base, uint8(v))
-	}
-
 	r, g, b, _ := c.RGBA()
 	return fmt.Sprintf("%d;2;%d;%d;%d", base, r>>8, g>>8, b>>8)
+}
+
+// basicColorSGR maps an ANSI BasicColor index (0-15) to a single-token
+// SGR parameter. Values 0-7 are the standard 8 colors; 8-15 are the
+// bright variants emitted as 90-97 / 100-107.
+func basicColorSGR(idx uint8, isFG bool) string {
+	if idx < 8 {
+		base := 30
+		if !isFG {
+			base = 40
+		}
+		return fmt.Sprintf("%d", base+int(idx))
+	}
+	if idx < 16 {
+		base := 90
+		if !isFG {
+			base = 100
+		}
+		return fmt.Sprintf("%d", base+int(idx-8))
+	}
+	// Out of band: fall back to indexed encoding.
+	base := 38
+	if !isFG {
+		base = 48
+	}
+	return fmt.Sprintf("%d;5;%d", base, idx)
 }

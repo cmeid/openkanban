@@ -378,8 +378,16 @@ func (s *Server) dispatch(c *clientConn, typeName string, raw json.RawMessage) {
 		s.writeResp(c, MsgShutdownResp, s.handleShutdown(c, req))
 
 	case MsgAttachReq:
-		// Attach lands in PR5.
-		s.writeError(c, "not_implemented", "attach lands in PR5")
+		var req AttachReq
+		if err := json.Unmarshal(raw, &req); err != nil {
+			s.writeError(c, "bad_request", err.Error())
+			return
+		}
+		// handleAttach BLOCKS for the lifetime of the binary stream.
+		// When it returns the conn is fully drained / closed; the
+		// outer handleConn loop will hit EOF on its next ReadFrame
+		// and exit through the usual disconnect path.
+		s.handleAttach(c, req)
 
 	default:
 		s.writeError(c, "unknown_message", fmt.Sprintf("unknown message type %q", typeName))
