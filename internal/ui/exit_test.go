@@ -5,7 +5,7 @@ import (
 
 	"github.com/techdufus/openkanban/internal/board"
 	"github.com/techdufus/openkanban/internal/project"
-	"github.com/techdufus/openkanban/internal/terminal"
+	"github.com/techdufus/openkanban/internal/daemonclient"
 )
 
 // TestExitMsgSelectsTicket pins the contract that when a focused agent
@@ -50,7 +50,7 @@ func TestExitMsgSelectsTicket(t *testing.T) {
 	t.Run("focused exit jumps cursor to exited ticket", func(t *testing.T) {
 		m := &Model{
 			globalStore:   globalStore,
-			panes:         map[board.TicketID]*terminal.Pane{targetTicket.ID: nil},
+			panes:         map[board.TicketID]*daemonclient.PaneView{targetTicket.ID: nil},
 			columnTickets: columnTickets,
 			columnOffsets: []int{0, 0},
 			mode:          ModeAgentView,
@@ -60,7 +60,7 @@ func TestExitMsgSelectsTicket(t *testing.T) {
 			activeTicket: 0,
 		}
 
-		if _, _ = m.Update(terminal.ExitMsg{PaneID: string(targetTicket.ID)}); m.mode != ModeNormal {
+		if _, _ = m.Update(daemonclient.PaneExitMsg{PaneID: string(targetTicket.ID)}); m.mode != ModeNormal {
 			t.Errorf("mode = %v, want ModeNormal", m.mode)
 		}
 		if m.focusedPane != "" {
@@ -75,7 +75,7 @@ func TestExitMsgSelectsTicket(t *testing.T) {
 	t.Run("backgrounded exit does not steal cursor", func(t *testing.T) {
 		m := &Model{
 			globalStore:   globalStore,
-			panes:         map[board.TicketID]*terminal.Pane{targetTicket.ID: nil},
+			panes:         map[board.TicketID]*daemonclient.PaneView{targetTicket.ID: nil},
 			columnTickets: columnTickets,
 			columnOffsets: []int{0, 0},
 			mode:          ModeNormal,
@@ -86,7 +86,7 @@ func TestExitMsgSelectsTicket(t *testing.T) {
 			activeTicket: 0,
 		}
 
-		_, _ = m.Update(terminal.ExitMsg{PaneID: string(targetTicket.ID)})
+		_, _ = m.Update(daemonclient.PaneExitMsg{PaneID: string(targetTicket.ID)})
 
 		if m.activeColumn != 0 || m.activeTicket != 0 {
 			t.Errorf("active = (col=%d, ticket=%d), want (col=0, ticket=0) unchanged",

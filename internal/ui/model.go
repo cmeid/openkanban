@@ -1,7 +1,10 @@
 package ui
 
 import (
+	"context"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -16,6 +19,8 @@ import (
 	"github.com/techdufus/openkanban/internal/agent"
 	"github.com/techdufus/openkanban/internal/board"
 	"github.com/techdufus/openkanban/internal/config"
+	"github.com/techdufus/openkanban/internal/daemon"
+	"github.com/techdufus/openkanban/internal/daemonclient"
 	"github.com/techdufus/openkanban/internal/git"
 	"github.com/techdufus/openkanban/internal/project"
 	"github.com/techdufus/openkanban/internal/terminal"
@@ -159,9 +164,16 @@ type Model struct {
 	notification string
 	notifyTime   time.Time
 
-	panes          map[board.TicketID]*terminal.Pane
+	panes          map[board.TicketID]*daemonclient.PaneView
 	focusedPane    board.TicketID
 	statusDetector *agent.StatusDetector
+
+	// daemonClient is the long-lived control connection to openkanbankd.
+	// nil when the daemon couldn't be reached at startup — every call
+	// site MUST nil-check before use (the TUI degrades to a no-spawn
+	// state in that case). Reconstructing the client mid-session is the
+	// job of a future PR; this PR is a single-shot New() at startup.
+	daemonClient *daemonclient.Client
 
 	spawningTicketID board.TicketID
 	spawningAgent    string
@@ -192,7 +204,7 @@ type Model struct {
 	lastWindowTitle string
 }
 
-func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projectRegistry *project.ProjectRegistry, agentMgr *agent.Manager, opencodeServer *agent.OpencodeServer, filterProjectID string, updateChecker *update.Checker) *Model {
+func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projectRegistry *project.ProjectRegistry, agentMgr *agent.Manager, opencodeServer *agent.OpencodeServer, filterProjectID string, updateChecker *update.Checker, daemonClient *daemonclient.Client) *Model {
 	ti := textinput.New()
 	ti.Placeholder = "Enter ticket title..."
 	ti.CharLimit = 100
@@ -284,7 +296,7 @@ func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projec
 		selectedBlockers:   make(map[board.TicketID]bool),
 		formFieldLines:     make(map[int]int),
 		spinner:            sp,
-		panes:              make(map[board.TicketID]*terminal.Pane),
+		panes:              make(map[board.TicketID]*daemonclient.PaneView),
 		statusDetector:     agent.NewStatusDetector(),
 		selectedProject:    selectedProject,
 		sidebarVisible:     cfg.UI.SidebarVisible,
@@ -292,14 +304,60 @@ func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projec
 		hoverColumn:        -1,
 		hoverTicket:        -1,
 		updateChecker:      updateChecker,
+		daemonClient:       daemonClient,
 	}
 	if filterProjectID != "" {
 		m.filterProjectIDs[filterProjectID] = true
 	}
 
-	// Reset all agent statuses on startup since there are no active sessions yet.
-	// This prevents stale "working" statuses from persisting after app restart.
+	// Startup reconciliation. Replaces the old unconditional
+	// "wipe all AgentStatus" pass: the daemon may already own live
+	// sessions from a previous TUI run (or a sibling TUI), so blindly
+	// resetting status would lie about the world.
+	//
+	// Algorithm:
+	//   1. If we have a daemon client, ask it for the current set of
+	//      sessions. For every ticket whose ID matches a live session,
+	//      construct a PaneView in Unattached state and keep any status
+	//      we can read from the on-disk marker (until PR9 wires push
+	//      events). For every ticket NOT owned by the daemon, wipe any
+	//      stale "working/waiting/etc" status as before.
+	//   2. If the daemon is unreachable, fall back to the legacy wipe
+	//      so the UI doesn't show ghost-working statuses.
+	ownedByDaemon := map[board.TicketID]daemon.SessionInfo{}
+	if daemonClient != nil {
+		listCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		resp, err := daemonClient.List(listCtx)
+		cancel()
+		if err == nil {
+			for _, s := range resp.Sessions {
+				ownedByDaemon[board.TicketID(s.TicketID)] = s
+			}
+		} else {
+			log.Printf("openkanban: daemon list failed at startup: %v", err)
+		}
+	}
+
 	for _, ticket := range globalStore.All() {
+		if info, ok := ownedByDaemon[ticket.ID]; ok {
+			pv := daemonclient.NewPaneView(daemonClient, string(ticket.ID), info.SessionID, &info)
+			if info.Workdir != "" {
+				pv.SetWorkdir(info.Workdir)
+			}
+			if info.SessionName != "" {
+				pv.SetSessionName(info.SessionName)
+			}
+			m.panes[ticket.ID] = pv
+			// Best-effort status read from the existing on-disk marker.
+			// PR9 will replace this with push events.
+			if st := agent.ReadAgentStatus(info.SessionName); st != board.AgentNone {
+				if ticket.AgentStatus != st {
+					ticket.AgentStatus = st
+					globalStore.Save(ticket)
+				}
+			}
+			continue
+		}
 		if ticket.AgentStatus != board.AgentNone {
 			ticket.AgentStatus = board.AgentNone
 			globalStore.Save(ticket)
@@ -411,7 +469,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.notice != "" {
 				m.notify(msg.notice)
 			}
-			return m, msg.pane.Start(msg.command, msg.args...)
+			// Switch to attached view and start listening for pane msgs.
+			// The pane is already attached (Spawn returned + Attach
+			// happened on the goroutine), so we just need to drain its
+			// tea channel.
+			m.mode = ModeAgentView
+			m.spawningTicketID = ""
+			m.spawningAgent = ""
+			return m, tea.Batch(
+				m.listenPaneMessages(msg.pane),
+				m.maybeSetWindowTitle(),
+			)
 
 		case spawnErrorMsg:
 			if msg.ticketID == m.spawningTicketID {
@@ -422,7 +490,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 
-		case terminal.OutputMsg:
+		case daemonclient.PaneOutputMsg:
+			// Pane started producing output while we're still showing
+			// the "Spawning…" splash (rare — Spawn usually returns
+			// spawnReadyMsg before any output arrives). Promote to
+			// attached view so the user actually sees it.
 			if board.TicketID(msg.PaneID) == m.spawningTicketID {
 				m.mode = ModeAgentView
 				m.spawningTicketID = ""
@@ -430,7 +502,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m.handleTerminalMsg(msg)
 
-		case terminal.ExitMsg:
+		case daemonclient.PaneExitMsg:
 			if board.TicketID(msg.PaneID) == m.spawningTicketID {
 				m.resetSpawnState(board.TicketID(msg.PaneID))
 				if msg.Err != nil {
@@ -503,20 +575,23 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case terminal.OutputMsg, terminal.RenderTickMsg:
+	case daemonclient.PaneOutputMsg, daemonclient.PaneRenderTickMsg, daemonclient.PaneAttachedMsg, daemonclient.PaneDetachedMsg:
 		return m.handleTerminalMsg(msg)
 
-	case terminal.ExitMsg:
+	case daemonclient.PaneExitMsg:
 		ticketID := board.TicketID(msg.PaneID)
-		// Capture the pane's expected-completed-exit flag before we
-		// drop it from the map — the flag tells us whether to preserve
-		// AgentCompleted (set by `openkanban ticket done` + auto-stop)
-		// or reset to AgentNone as we do for any other pane exit.
+		// expectedCompleted preserves AgentCompleted across pane exit when
+		// the exit was a deliberate `openkanban ticket done` finish. With
+		// the daemon model this signal is the SessionEvent.Expected field
+		// (wired in T2 of the integration plan). For PR8 alone the field
+		// stays false; T2 hands the daemonSessionEventMsg path the truth.
 		expectedCompleted := false
-		if pane, ok := m.panes[ticketID]; ok && pane != nil {
-			expectedCompleted = pane.ExpectedCompletedExit()
+		if pv, ok := m.panes[ticketID]; ok {
+			if pv != nil {
+				_ = pv.Close()
+			}
+			delete(m.panes, ticketID)
 		}
-		delete(m.panes, ticketID)
 		if ticket, _ := m.globalStore.Get(ticketID); ticket != nil {
 			if !expectedCompleted {
 				ticket.AgentStatus = board.AgentNone
@@ -528,6 +603,36 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.focusedPane = ""
 			m.notify("Agent exited")
 			m.selectTicketByID(ticketID)
+		}
+		return m, m.maybeSetWindowTitle()
+
+	case daemonclient.AttachFirstMsg:
+		// HandleKey returned this because the user typed into an
+		// unattached pane. Attach (or takeover, if another client is
+		// already attached) and resume listening.
+		ticketID := board.TicketID(msg.PaneID)
+		if pv, ok := m.panes[ticketID]; ok {
+			cmd := m.attachExisting(ticketID, pv)
+			return m, cmd
+		}
+		return m, nil
+
+	case daemonclient.DaemonDisconnectedMsg:
+		// Daemon vanished mid-session. Detach every PaneView; the model
+		// keeps running but with no live attaches. PR8b/PR9 will
+		// auto-reconnect; for PR8 we just degrade gracefully.
+		for id, pv := range m.panes {
+			_ = pv.Close()
+			delete(m.panes, id)
+		}
+		if m.focusedPane != "" {
+			m.mode = ModeNormal
+			m.focusedPane = ""
+		}
+		if msg.Err != nil {
+			m.notify("Daemon disconnected: " + msg.Err.Error())
+		} else {
+			m.notify("Daemon disconnected")
 		}
 		return m, m.maybeSetWindowTitle()
 
@@ -1120,9 +1225,17 @@ func (m *Model) handleAgentViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	if result := pane.HandleKey(msg); result != nil {
-		if _, isExit := result.(terminal.ExitFocusMsg); isExit {
+		switch r := result.(type) {
+		case terminal.ExitFocusMsg:
 			m.mode = ModeNormal
 			m.focusedPane = ""
+		case daemonclient.AttachFirstMsg:
+			// User typed into an unattached pane — attach now and
+			// re-deliver the key would be nice but is out of scope for
+			// PR8. The model just kicks off the attach; the user can
+			// retype after the snapshot arrives.
+			cmd := m.attachExisting(board.TicketID(r.PaneID), pane)
+			return m, tea.Batch(cmd, m.maybeSetWindowTitle())
 		}
 	}
 
@@ -2436,7 +2549,81 @@ func (m *Model) attachToAgent() (tea.Model, tea.Cmd) {
 	m.focusedPane = ticket.ID
 	paneHeight := m.height - 2
 	pane.SetSize(m.width, paneHeight)
-	return m, m.maybeSetWindowTitle()
+
+	// If we have a daemon-owned but unattached pane, do the binary
+	// upgrade now so the user sees a live screen.
+	var attachCmd tea.Cmd
+	if pane.State() == daemonclient.PaneViewUnattached {
+		attachCmd = m.attachExisting(ticket.ID, pane)
+	}
+	return m, tea.Batch(attachCmd, m.maybeSetWindowTitle())
+}
+
+// attachExisting performs the daemon attach (or takeover, if another
+// client owns the binary stream) for a PaneView the model already
+// holds. Returns a tea.Cmd that runs the attach in the background and
+// then arms the pane's tea message reader.
+//
+// Used by:
+//   - attachToAgent (Enter on a daemon-owned ticket from board view)
+//   - handleAgentViewMode (AttachFirstMsg fallback when the user types
+//     into an unattached pane)
+//   - Update's AttachFirstMsg routing.
+func (m *Model) attachExisting(ticketID board.TicketID, pv *daemonclient.PaneView) tea.Cmd {
+	if pv == nil || m.daemonClient == nil {
+		return nil
+	}
+	// Decide attach vs takeover based on the most recent List snapshot.
+	// We don't List again here — the model already has the info that
+	// was attached at construction or refresh time. If another client
+	// holds the binary stream, the daemon would reject a plain Attach;
+	// Takeover unconditionally displaces them. Per the design, takeover
+	// is the desired UX (no destructive prompt).
+	takeover := false
+	if m.daemonClient != nil {
+		listCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		resp, err := m.daemonClient.List(listCtx)
+		cancel()
+		if err == nil {
+			for _, s := range resp.Sessions {
+				if s.SessionID != pv.SessionID() {
+					continue
+				}
+				if s.AttachedClient != 0 && s.AttachedClient != m.daemonClient.ClientID() {
+					takeover = true
+				}
+				pv.Refresh(s)
+				break
+			}
+		}
+	}
+	id := ticketID
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		var err error
+		if takeover {
+			err = pv.Takeover(ctx)
+		} else {
+			err = pv.Attach(ctx)
+		}
+		if err != nil {
+			return spawnErrorMsg{ticketID: id, err: "attach failed: " + err.Error()}
+		}
+		// Drain one message from the pane's tea channel so the update
+		// loop keeps spinning.
+		select {
+		case msg, ok := <-pv.TeaMessages():
+			if !ok {
+				return daemonclient.PaneExitMsg{PaneID: pv.ID(), Err: io.EOF}
+			}
+			return msg
+		case <-time.After(50 * time.Millisecond):
+			// No event yet — return a synthetic attached message so the
+			// model arms the reader.
+			return daemonclient.PaneAttachedMsg{PaneID: pv.ID()}
+		}
+	}
 }
 
 func (m *Model) handleDoubleClick() (tea.Model, tea.Cmd) {
@@ -2716,9 +2903,22 @@ func (m *Model) spawnAgent() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	if _, exists := m.panes[ticket.ID]; exists {
-		m.notify("Agent already running — press Enter to attach")
-		return m, nil
+	if existing, exists := m.panes[ticket.ID]; exists {
+		switch existing.State() {
+		case daemonclient.PaneViewAttached:
+			m.notify("Agent already running — press Enter to attach")
+			return m, nil
+		case daemonclient.PaneViewUnattached:
+			// Daemon owns it (likely from a prior TUI run or sibling
+			// instance). Re-attach instead of spawning a duplicate.
+			m.mode = ModeAgentView
+			m.focusedPane = ticket.ID
+			existing.SetSize(m.width, m.height-2)
+			cmd := m.attachExisting(ticket.ID, existing)
+			return m, tea.Batch(cmd, m.maybeSetWindowTitle())
+		}
+		// PaneViewDetached falls through to the spawn path so a stale
+		// view (daemon vanished, etc.) gets refreshed.
 	}
 
 	proj := m.globalStore.GetProjectForTicket(ticket)
@@ -2856,10 +3056,14 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 
 	mgr := m.worktreeMgrs[proj.ID]
 	cfg := m.config
+	daemonClient := m.daemonClient
 
 	return func() tea.Msg {
 		if mgr == nil {
 			return spawnErrorMsg{ticketID: ticketID, err: "worktree manager not found"}
+		}
+		if daemonClient == nil {
+			return spawnErrorMsg{ticketID: ticketID, err: "daemon unreachable — cannot spawn agent"}
 		}
 
 		generatedBranch := branchName
@@ -2894,10 +3098,10 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 		branchName = generatedBranch
 		baseBranch = base
 
-		pane := terminal.New(string(ticketID), width, height, 0)
-		pane.SetWorkdir(worktreePath)
-
-		// Set session name for terminal identification (priority: AgentSessionID > branch > ticket)
+		// Session name for terminal identification (priority:
+		// AgentSessionID > branch > ticket). The daemon picks this up
+		// in SpawnReq.SessionName and wires it into OPENKANBAN_SESSION
+		// via the terminal pane's buildCleanEnv.
 		sessionName := string(ticketID)
 		if branchName != "" {
 			sessionName = branchName
@@ -2905,8 +3109,8 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 		if ticket.AgentSessionID != "" {
 			sessionName = ticket.AgentSessionID
 		}
-		pane.SetSessionName(sessionName)
-		pane.SetTicketID(string(ticketID))
+		// sessionName + ticketID flow through SpawnReq below; daemon-side
+		// pane.SetSessionName + pane.SetTicketID happen in StartHeadless.
 
 		// Clean up any stale status file from previous sessions that may not have
 		// been properly cleaned up (e.g., if the app was closed while an agent was running)
@@ -2931,7 +3135,10 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 		// file at tickets/<slug>.md (worktree-relative) before rendering
 		// the priming prompt. A brief write failure is logged but does
 		// not abort the spawn — the agent can still proceed with the
-		// inline title/description from the prompt.
+		// inline title/description from the prompt. Stays CLIENT-side
+		// because the daemon doesn't touch the worktree filesystem; the
+		// brief must be written before Spawn so the resumed agent sees
+		// it.
 		var briefRelPath string
 		var hasBrief bool
 		var briefErr error
@@ -2972,23 +3179,14 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 		isExternalResume := isNewSession && ticket.AgentSessionID != "" && agent.SessionUUIDPattern.MatchString(ticket.AgentSessionID)
 		ctxData := agent.NewContextData(ticket, briefRelPath, hasBrief, isExternalResume)
 
+		command := agentCfg.Command
+
 		switch agentType {
 		case "claude":
 			if isNewSession {
-				// Title the Claude session so it's identifiable in the
-				// session picker and terminal title. Only on new sessions
-				// — resumes inherit the existing name. Skip if the user
-				// already set -n / --name via config args.
 				if !hasClaudeNameFlag(args) && strings.TrimSpace(ticket.Title) != "" {
 					args = append(args, "-n", ticket.Title)
 				}
-				// Session linkage: if the ticket was created with
-				// --session, resume it on first spawn. Migrate mode
-				// (SessionOwned=true) resumes in place; link mode
-				// (default) forks to avoid clobbering the source.
-				// The UUID regex check is defensive — if the field
-				// somehow holds something non-UUID-shaped, skip resume
-				// rather than passing garbage to claude.
 				if ticket.AgentSessionID != "" && agent.SessionUUIDPattern.MatchString(ticket.AgentSessionID) {
 					args = append(args, "--resume", ticket.AgentSessionID)
 					if !ticket.SessionOwned {
@@ -3001,7 +3199,7 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 						args = append(args, prompt)
 					}
 				}
-			} else if !isNewSession {
+			} else {
 				hasFlag := false
 				for _, arg := range args {
 					if arg == "--continue" || arg == "-c" {
@@ -3026,9 +3224,7 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 				}
 			}
 		case "opencode":
-			command := agentCfg.Command
 			sessionID := agent.FindOpencodeSession(worktreePath)
-
 			args = []string{worktreePath, "--port", fmt.Sprintf("%d", agentPort)}
 			if isNewSession {
 				if promptTemplate != "" {
@@ -3042,17 +3238,7 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 			} else {
 				args = append(args, "--continue")
 			}
-			return spawnReadyMsg{
-				ticketID:     ticketID,
-				pane:         pane,
-				command:      command,
-				args:         args,
-				worktreePath: worktreePath,
-				branchName:   branchName,
-				baseBranch:   baseBranch,
-			}
 		case "gemini":
-			command := agentCfg.Command
 			if !isNewSession {
 				sessionID := agent.FindGeminiSession(worktreePath)
 				if sessionID != "" {
@@ -3064,17 +3250,7 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 					args = append(args, "-i", prompt)
 				}
 			}
-			return spawnReadyMsg{
-				ticketID:     ticketID,
-				pane:         pane,
-				command:      command,
-				args:         args,
-				worktreePath: worktreePath,
-				branchName:   branchName,
-				baseBranch:   baseBranch,
-			}
 		case "codex":
-			command := agentCfg.Command
 			if !isNewSession {
 				sessionID := agent.FindCodexSession(worktreePath)
 				if sessionID != "" {
@@ -3091,11 +3267,45 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 					args = append(args, prompt)
 				}
 			}
+		}
+
+		// Now actually hand the spawn off to the daemon. The daemon
+		// runs the PTY in its own process; we then build a PaneView and
+		// attach immediately so the snapshot frames flow into the local
+		// emulator before the model sees the spawnReadyMsg.
+		req := daemon.SpawnReq{
+			TicketID:    string(ticketID),
+			SessionName: sessionName,
+			Command:     command,
+			Args:        args,
+			Workdir:     worktreePath,
+			Env:         nil, // daemon's terminal.Pane applies its own clean env + OPENKANBAN_SESSION
+			Cols:        width,
+			Rows:        height,
+			Scrollback:  0,
+		}
+		spawnCtx, spawnCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		resp, err := daemonClient.Spawn(spawnCtx, req)
+		spawnCancel()
+		if err != nil {
+			return spawnErrorMsg{ticketID: ticketID, err: "spawn failed: " + err.Error()}
+		}
+
+		pv := daemonclient.NewPaneView(daemonClient, string(ticketID), resp.SessionID, nil)
+		pv.SetWorkdir(worktreePath)
+		pv.SetSessionName(sessionName)
+		pv.SetSize(width, height)
+
+		attachCtx, attachCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		attachErr := pv.Attach(attachCtx)
+		attachCancel()
+		if attachErr != nil {
+			// Spawn succeeded but we couldn't get a binary channel.
+			// Keep the PaneView so the user can retry attach; surface
+			// the error.
 			return spawnReadyMsg{
 				ticketID:     ticketID,
-				pane:         pane,
-				command:      command,
-				args:         args,
+				pane:         pv,
 				worktreePath: worktreePath,
 				branchName:   branchName,
 				baseBranch:   baseBranch,
@@ -3104,9 +3314,7 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 
 		return spawnReadyMsg{
 			ticketID:     ticketID,
-			pane:         pane,
-			command:      agentCfg.Command,
-			args:         args,
+			pane:         pv,
 			worktreePath: worktreePath,
 			branchName:   branchName,
 			baseBranch:   baseBranch,
@@ -3370,7 +3578,12 @@ func (m *Model) maybeAutoStopCompletedPane(ticketID board.TicketID, ticket *boar
 		}
 	}
 
-	pane.MarkExpectedCompletedExit()
+	// Note: PaneView doesn't expose MarkExpectedCompletedExit yet —
+	// T2 of the integration plan re-routes ticket-done through the
+	// daemon as a TicketDoneReq RPC and propagates the "expected"
+	// signal via SessionEvent.Expected, deleting this whole function
+	// in the process. For PR8 alone the StopGraceful happens here
+	// and the exit reports as unexpected. Acceptable interim state.
 	pane.StopGraceful(gracefulShutdownTimeout)
 }
 
@@ -3458,6 +3671,15 @@ func (m *Model) handleTerminalMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, cmd)
 		}
 	}
+	// Always re-arm the listener on the pane the message was addressed
+	// to, even if Pane.Update returned nil. PaneView.Update only emits
+	// a follow-up readNextMsg Cmd from a small set of messages today;
+	// safe to bridge here regardless.
+	if pid, ok := paneIDOf(msg); ok {
+		if pv, exists := m.panes[board.TicketID(pid)]; exists {
+			cmds = append(cmds, m.listenPaneMessages(pv))
+		}
+	}
 	// The child may have emitted an OSC title sequence in this batch
 	// of output — reflect any change in the host window title. Also
 	// runs on RenderTickMsg as a steady-state safety net.
@@ -3465,6 +3687,46 @@ func (m *Model) handleTerminalMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, cmd)
 	}
 	return m, tea.Batch(cmds...)
+}
+
+// paneIDOf returns the PaneID of any daemonclient pane-scoped message,
+// or "" for messages that aren't pane-scoped. Lets handleTerminalMsg
+// re-arm the right pane's listener without a giant type switch.
+func paneIDOf(msg tea.Msg) (string, bool) {
+	switch m := msg.(type) {
+	case daemonclient.PaneOutputMsg:
+		return m.PaneID, true
+	case daemonclient.PaneRenderTickMsg:
+		return m.PaneID, true
+	case daemonclient.PaneAttachedMsg:
+		return m.PaneID, true
+	case daemonclient.PaneDetachedMsg:
+		return m.PaneID, true
+	}
+	return "", false
+}
+
+// listenPaneMessages returns a tea.Cmd that reads one event from pv's
+// teaMsgs channel and returns it as a tea.Msg. The model's Update
+// re-arms the listener every time it consumes a pane-scoped message
+// (see handleTerminalMsg).
+//
+// The Cmd is also resilient to channel closure (pane Close()) — the
+// reader returns PaneExitMsg in that case so the model can clean up
+// the entry.
+func (m *Model) listenPaneMessages(pv *daemonclient.PaneView) tea.Cmd {
+	if pv == nil {
+		return nil
+	}
+	id := pv.ID()
+	ch := pv.TeaMessages()
+	return func() tea.Msg {
+		msg, ok := <-ch
+		if !ok {
+			return daemonclient.PaneExitMsg{PaneID: id, Err: io.EOF}
+		}
+		return msg
+	}
 }
 
 type agentStatusMsg time.Time
@@ -3475,9 +3737,7 @@ type updateCheckMsg update.CheckResult
 
 type spawnReadyMsg struct {
 	ticketID     board.TicketID
-	pane         *terminal.Pane
-	command      string
-	args         []string
+	pane         *daemonclient.PaneView
 	worktreePath string
 	branchName   string
 	baseBranch   string

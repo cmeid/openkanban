@@ -1,16 +1,19 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/techdufus/openkanban/internal/agent"
 	"github.com/techdufus/openkanban/internal/config"
+	"github.com/techdufus/openkanban/internal/daemonclient"
 	"github.com/techdufus/openkanban/internal/git"
 	"github.com/techdufus/openkanban/internal/project"
 	"github.com/techdufus/openkanban/internal/ui"
@@ -54,10 +57,27 @@ func Run(cfg *config.Config, filterPath, version string) error {
 		defer opencodeServer.Stop()
 	}
 
-	updateChecker := update.NewChecker(version)
-	model := ui.NewModel(cfg, globalStore, registry, agentMgr, opencodeServer, filterProjectID, updateChecker)
+	// Connect to (and autostart if needed) the openkanbankd daemon.
+	// Failure is non-fatal: the TUI degrades to "no spawn, no
+	// daemon-owned panes" but the rest of the board still works. This
+	// matches the design's "client nil-checks everywhere" contract.
+	daemonCtx, daemonCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	daemonClient, daemonErr := daemonclient.New(daemonCtx)
+	daemonCancel()
+	if daemonErr != nil {
+		log.Printf("openkanban: daemon unavailable, agents cannot be spawned (%v)", daemonErr)
+		daemonClient = nil
+	}
 
-	defer model.Cleanup()
+	updateChecker := update.NewChecker(version)
+	model := ui.NewModel(cfg, globalStore, registry, agentMgr, opencodeServer, filterProjectID, updateChecker, daemonClient)
+
+	defer func() {
+		model.Cleanup()
+		if daemonClient != nil {
+			_ = daemonClient.Close()
+		}
+	}()
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)

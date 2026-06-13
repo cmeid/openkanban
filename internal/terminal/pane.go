@@ -440,7 +440,7 @@ func (p *Pane) StartHeadless(command string, args []string, extraEnv []string) e
 	p.mu.Lock()
 
 	p.cmd = exec.Command(command, args...)
-	p.cmd.Env = buildCleanEnv(p.sessionName)
+	p.cmd.Env = buildCleanEnv(p.sessionName, p.ticketID)
 	if len(extraEnv) > 0 {
 		p.cmd.Env = append(p.cmd.Env, extraEnv...)
 	}

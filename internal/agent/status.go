@@ -495,3 +495,31 @@ func ReadStatusFile(sessionName string) (string, error) {
 	}
 	return strings.TrimSpace(string(data)), nil
 }
+
+// ReadAgentStatus reads the on-disk status marker for sessionName and
+// returns the corresponding board.AgentStatus, or board.AgentNone when
+// no marker exists / the marker can't be parsed. Wraps ReadStatusFile
+// for callers (notably the UI startup reconciliation) that want the
+// enum rather than the raw string.
+func ReadAgentStatus(sessionName string) board.AgentStatus {
+	if sessionName == "" {
+		return board.AgentNone
+	}
+	content, err := ReadStatusFile(sessionName)
+	if err != nil {
+		return board.AgentNone
+	}
+	switch content {
+	case "working":
+		return board.AgentWorking
+	case "done", "idle":
+		return board.AgentIdle
+	case "waiting", "permission":
+		return board.AgentWaiting
+	case "error":
+		return board.AgentError
+	case "completed":
+		return board.AgentCompleted
+	}
+	return board.AgentNone
+}
