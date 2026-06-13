@@ -2396,22 +2396,52 @@ func (m *Model) confirmDeleteTicket() (tea.Model, tea.Cmd) {
 		}
 	}
 
+	// performTicketCleanup honors config.Cleanup.DeleteBranch silently.
+	// When that flag is false (the default), the branch survives and we
+	// chain a follow-on confirm so the user has an obvious moment to
+	// drop it without editing config first. Capture proj here — the
+	// store entry is gone by the time the second confirm fires.
+	doDelete := func() tea.Cmd {
+		m.performTicketCleanup(ticket)
+		if ticket.BranchName != "" && !m.config.Cleanup.DeleteBranch && proj != nil {
+			branchName := ticket.BranchName
+			projID := proj.ID
+			m.showConfirm = true
+			m.confirmMsg = "Also delete branch '" + branchName + "'? [y/N]"
+			m.confirmFn = func() tea.Cmd {
+				m.deleteBranchOnly(projID, branchName)
+				return nil
+			}
+		}
+		return nil
+	}
+
 	if hasUncommitted && !m.config.Cleanup.ForceWorktreeRemoval {
 		m.showConfirm = true
 		m.confirmMsg = "Worktree has uncommitted changes. Force delete?"
-		m.confirmFn = func() tea.Cmd {
-			m.performTicketCleanup(ticket)
-			return nil
-		}
+		m.confirmFn = doDelete
 	} else {
 		m.showConfirm = true
 		m.confirmMsg = "Delete ticket: " + ticket.Title + "?"
-		m.confirmFn = func() tea.Cmd {
-			m.performTicketCleanup(ticket)
-			return nil
-		}
+		m.confirmFn = doDelete
 	}
 	return m, nil
+}
+
+// deleteBranchOnly removes the branch via the project's worktree
+// manager. Invoked from the follow-on confirm after a ticket delete
+// when config.Cleanup.DeleteBranch is false. Tolerates a missing
+// manager (project unloaded between confirms) by no-op'ing silently.
+func (m *Model) deleteBranchOnly(projID string, branchName string) {
+	mgr := m.worktreeMgrs[projID]
+	if mgr == nil {
+		return
+	}
+	if err := mgr.DeleteBranch(branchName); err != nil {
+		m.notify("Failed to delete branch: " + err.Error())
+		return
+	}
+	m.notify("Deleted branch: " + branchName)
 }
 
 func (m *Model) performTicketCleanup(ticket *board.Ticket) {
