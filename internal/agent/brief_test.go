@@ -353,6 +353,193 @@ func TestMergeTicketBrief_Idempotent(t *testing.T) {
 	}
 }
 
+func TestPreviewBriefMerge(t *testing.T) {
+	type pre struct {
+		relPath string
+		content string
+	}
+
+	tests := []struct {
+		name            string
+		ticket          *board.Ticket
+		useWorktree     bool // false => pass "" for worktreePath
+		pre             *pre
+		wantPath        string
+		wantHasBrief    bool
+		wantWouldChange bool
+		wantErr         bool
+		// optional checks on the returned content
+		wantContains    []string
+		wantNotContains []string
+		// if non-empty, returned content must equal this exactly
+		wantContentEq string
+	}{
+		{
+			name:            "nil ticket",
+			ticket:          nil,
+			useWorktree:     true,
+			wantPath:        "",
+			wantHasBrief:    false,
+			wantWouldChange: false,
+		},
+		{
+			name:            "empty worktree path",
+			ticket:          &board.Ticket{BranchName: "task/foo", Description: "x"},
+			useWorktree:     false,
+			wantPath:        "",
+			wantHasBrief:    false,
+			wantWouldChange: false,
+		},
+		{
+			name:            "branch task/foo blank desc absent file",
+			ticket:          &board.Ticket{BranchName: "task/foo", Description: ""},
+			useWorktree:     true,
+			wantPath:        "",
+			wantHasBrief:    false,
+			wantWouldChange: false,
+		},
+		{
+			name: "branch task/foo desc set absent file",
+			ticket: &board.Ticket{
+				Title:       "Foo",
+				BranchName:  "task/foo",
+				Description: "implement foo",
+			},
+			useWorktree:     true,
+			wantPath:        "tickets/foo.md",
+			wantHasBrief:    true,
+			wantWouldChange: true,
+			wantContains:    []string{"# Foo", "implement foo"},
+		},
+		{
+			name: "blank desc preexisting file",
+			ticket: &board.Ticket{
+				Title:       "Foo",
+				BranchName:  "task/foo",
+				Description: "",
+			},
+			useWorktree: true,
+			pre: &pre{
+				relPath: "tickets/foo.md",
+				content: "## Brief\nstuff\n",
+			},
+			wantPath:        "tickets/foo.md",
+			wantHasBrief:    true,
+			wantWouldChange: false,
+			wantContentEq:   "## Brief\nstuff\n",
+		},
+		{
+			name: "preexisting block replaced",
+			ticket: &board.Ticket{
+				Title:       "Foo",
+				BranchName:  "task/foo",
+				Description: "new",
+			},
+			useWorktree: true,
+			pre: &pre{
+				relPath: "tickets/foo.md",
+				content: "# Header\n\n" + briefBlockStart + "\n" + briefBlockTitle + "\n\nold\n" + briefBlockEnd + "\n",
+			},
+			wantPath:        "tickets/foo.md",
+			wantHasBrief:    true,
+			wantWouldChange: true,
+			wantContains:    []string{"new"},
+			wantNotContains: []string{"old"},
+		},
+		{
+			name: "already in sync no change",
+			ticket: &board.Ticket{
+				Title:       "Foo",
+				BranchName:  "task/foo",
+				Description: "same",
+			},
+			useWorktree: true,
+			pre: &pre{
+				relPath: "tickets/foo.md",
+				content: "# Header\n\n" + briefBlockStart + "\n" + briefBlockTitle + "\n\nsame\n" + briefBlockEnd + "\n",
+			},
+			wantPath:        "tickets/foo.md",
+			wantHasBrief:    true,
+			wantWouldChange: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			worktreePath := t.TempDir()
+			passPath := worktreePath
+			if !tt.useWorktree {
+				passPath = ""
+			}
+			if tt.pre != nil {
+				writeFile(t, filepath.Join(worktreePath, tt.pre.relPath), tt.pre.content)
+			}
+
+			gotPath, gotHas, gotWould, gotContent, err := PreviewBriefMerge(tt.ticket, passPath)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err = %v, wantErr = %v", err, tt.wantErr)
+			}
+			if gotPath != tt.wantPath {
+				t.Errorf("path = %q, want %q", gotPath, tt.wantPath)
+			}
+			if gotHas != tt.wantHasBrief {
+				t.Errorf("hasBrief = %v, want %v", gotHas, tt.wantHasBrief)
+			}
+			if gotWould != tt.wantWouldChange {
+				t.Errorf("wouldChange = %v, want %v", gotWould, tt.wantWouldChange)
+			}
+			for _, w := range tt.wantContains {
+				if !strings.Contains(gotContent, w) {
+					t.Errorf("missing %q in content:\n%s", w, gotContent)
+				}
+			}
+			for _, w := range tt.wantNotContains {
+				if strings.Contains(gotContent, w) {
+					t.Errorf("unexpected %q in content:\n%s", w, gotContent)
+				}
+			}
+			if tt.wantContentEq != "" && gotContent != tt.wantContentEq {
+				t.Errorf("content = %q, want %q", gotContent, tt.wantContentEq)
+			}
+
+			// Verify read-only: PreviewBriefMerge must never create files.
+			// Only check this when there was no pre-existing file written by the harness.
+			if tt.useWorktree && tt.pre == nil && tt.ticket != nil {
+				slug := BranchSlug(tt.ticket.BranchName)
+				if slug != "" {
+					if _, err := os.Stat(filepath.Join(worktreePath, "tickets", slug+".md")); !os.IsNotExist(err) {
+						t.Errorf("PreviewBriefMerge wrote to disk: stat err = %v", err)
+					}
+				}
+			}
+		})
+	}
+
+	t.Run("idempotency", func(t *testing.T) {
+		worktreePath := t.TempDir()
+		ticket := &board.Ticket{
+			Title:       "Foo",
+			BranchName:  "task/foo",
+			Description: "new notes",
+		}
+		// Establish initial state by performing the merge for real.
+		if _, _, err := MergeTicketBrief(ticket, worktreePath); err != nil {
+			t.Fatalf("initial MergeTicketBrief: %v", err)
+		}
+		// A second preview with identical inputs must report no change.
+		_, hasBrief, wouldChange, _, err := PreviewBriefMerge(ticket, worktreePath)
+		if err != nil {
+			t.Fatalf("PreviewBriefMerge: %v", err)
+		}
+		if !hasBrief {
+			t.Errorf("hasBrief = false, want true")
+		}
+		if wouldChange {
+			t.Errorf("wouldChange = true, want false (already in sync)")
+		}
+	})
+}
+
 func TestUpsertManagedBlock(t *testing.T) {
 	tests := []struct {
 		name     string

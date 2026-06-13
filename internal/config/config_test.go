@@ -1,10 +1,13 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"text/template"
 )
 
 func TestDefaultConfig(t *testing.T) {
@@ -236,6 +239,51 @@ func TestLoad_ValidFile(t *testing.T) {
 
 	if cfg.UI.Theme != "dark" {
 		t.Errorf("UI.Theme = %q; want %q", cfg.UI.Theme, "dark")
+	}
+}
+
+func TestLoad_EmptyArgs(t *testing.T) {
+	tests := []struct {
+		name string
+		args string
+	}{
+		{name: "empty array", args: `[]`},
+		{name: "single empty string", args: `[""]`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmp := filepath.Join(t.TempDir(), "config.json")
+			cfg := `{"agents":{"claude":{"command":"claude","init_prompt":"x","args":` + tt.args + `}}}`
+			if err := os.WriteFile(tmp, []byte(cfg), 0o644); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			c, err := Load(tmp)
+			if err != nil {
+				t.Fatalf("Load() error: %v", err)
+			}
+			if c == nil {
+				t.Fatal("Load() returned nil config")
+			}
+			if _, ok := c.Agents["claude"]; !ok {
+				t.Fatal("claude agent missing from loaded config")
+			}
+		})
+	}
+}
+
+func TestLoad_MissingArgs(t *testing.T) {
+	tmp := filepath.Join(t.TempDir(), "config.json")
+	cfg := `{"agents":{"claude":{"command":"claude","init_prompt":"x"}}}`
+	if err := os.WriteFile(tmp, []byte(cfg), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	c, err := Load(tmp)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if got := c.Agents["claude"].Args; got != nil {
+		t.Errorf("want nil Args, got %v", got)
 	}
 }
 
@@ -556,6 +604,71 @@ func TestLoadWithValidation_NonExistentFile(t *testing.T) {
 
 	if result == nil {
 		t.Error("LoadWithValidation() should return validation result")
+	}
+}
+
+func TestDefaultAgentPrompt_FreshSpawn(t *testing.T) {
+	data := struct {
+		Title, Description, BranchName, BaseBranch, BriefPath string
+		HasBrief, IsExternalResume                            bool
+	}{
+		Title:            "Test ticket",
+		Description:      "do the thing",
+		BranchName:       "task/test",
+		BaseBranch:       "main",
+		BriefPath:        "tickets/test.md",
+		HasBrief:         true,
+		IsExternalResume: false,
+	}
+	tmpl, err := template.New("p").Parse(defaultAgentPrompt)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, data); err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	got := buf.String()
+	for _, want := range []string{
+		"in_progress on spawn",
+		"Work only inside this worktree",
+		"tickets/test.md",
+		"## Notes (from openkanban card)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("want substring %q in:\n%s", want, got)
+		}
+	}
+}
+
+func TestDefaultAgentPrompt_ExternalResume(t *testing.T) {
+	data := struct {
+		Title, Description, BranchName, BaseBranch, BriefPath string
+		HasBrief, IsExternalResume                            bool
+	}{
+		Title:            "Test ticket",
+		BranchName:       "task/test",
+		BaseBranch:       "main",
+		HasBrief:         false,
+		IsExternalResume: true,
+	}
+	tmpl, err := template.New("p").Parse(defaultAgentPrompt)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, data); err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	got := buf.String()
+	for _, want := range []string{
+		"has scoped this session",
+		"scoped to this ticket's worktree",
+		"Test ticket",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("want substring %q in:\n%s", want, got)
+		}
 	}
 }
 

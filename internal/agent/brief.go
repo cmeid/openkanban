@@ -31,11 +31,61 @@ func BranchSlug(branchName string) string {
 	return s
 }
 
+// PreviewBriefMerge computes what MergeTicketBrief WOULD write without
+// touching disk. Returns:
+//   - briefRelPath: the worktree-relative path (e.g. "tickets/foo.md")
+//   - hasBrief: whether the file would exist after the (hypothetical) write
+//   - wouldChange: whether the on-disk bytes would differ after merge.
+//     Defined strictly as "the bytes on disk would not equal the current bytes."
+//   - content: the bytes that MergeTicketBrief would write (only meaningful
+//     when wouldChange == true)
+//   - err: only set for unexpected read errors (not for IsNotExist)
+//
+// The function performs the same 4-case switch as MergeTicketBrief but
+// is strictly read-only.
+func PreviewBriefMerge(ticket *board.Ticket, worktreePath string) (briefRelPath string, hasBrief bool, wouldChange bool, content string, err error) {
+	if worktreePath == "" || ticket == nil {
+		return "", false, false, "", nil
+	}
+	slug := BranchSlug(ticket.BranchName)
+	if slug == "" {
+		return "", false, false, "", nil
+	}
+
+	relPath := briefSubdir + "/" + slug + ".md"
+	fullPath := filepath.Join(worktreePath, briefSubdir, slug+".md")
+	desc := strings.TrimSpace(ticket.Description)
+
+	existing, err := os.ReadFile(fullPath)
+	fileAbsent := err != nil && os.IsNotExist(err)
+	if err != nil && !fileAbsent {
+		return relPath, false, false, "", fmt.Errorf("read brief %s: %w", fullPath, err)
+	}
+
+	switch {
+	case fileAbsent && desc == "":
+		return "", false, false, "", nil
+	case fileAbsent && desc != "":
+		return relPath, true, true, initialBriefContent(ticket.Title, desc), nil
+	case !fileAbsent && desc == "":
+		return relPath, true, false, string(existing), nil
+	default: // !fileAbsent && desc != ""
+		updated := upsertManagedBlock(string(existing), desc)
+		if updated == string(existing) {
+			return relPath, true, false, updated, nil
+		}
+		return relPath, true, true, updated, nil
+	}
+}
+
 // MergeTicketBrief writes/updates the ticket's brief file inside the
 // worktree at tickets/<slug>.md, syncing the openkanban card's
 // Description into a managed block. Returns the path relative to the
 // worktree (forward-slashed for template embedding), whether the file
 // exists after the call, and any non-fatal error.
+//
+// Delegates the merge computation to PreviewBriefMerge and only performs
+// I/O when the on-disk bytes would actually change.
 //
 // Matrix:
 //   - empty worktreePath OR empty slug                              → ("", false, nil)
@@ -49,51 +99,21 @@ func BranchSlug(branchName string) string {
 // errors other than IsNotExist are returned wrapped (caller decides
 // whether to ignore).
 func MergeTicketBrief(ticket *board.Ticket, worktreePath string) (string, bool, error) {
-	if worktreePath == "" || ticket == nil {
-		return "", false, nil
+	relPath, hasBrief, wouldChange, content, err := PreviewBriefMerge(ticket, worktreePath)
+	if err != nil {
+		return relPath, hasBrief, err
 	}
-	slug := BranchSlug(ticket.BranchName)
-	if slug == "" {
-		return "", false, nil
+	if !wouldChange {
+		return relPath, hasBrief, nil
 	}
-
-	relPath := briefSubdir + "/" + slug + ".md"
-	fullPath := filepath.Join(worktreePath, briefSubdir, slug+".md")
-	desc := strings.TrimSpace(ticket.Description)
-
-	existing, err := os.ReadFile(fullPath)
-	fileAbsent := err != nil && os.IsNotExist(err)
-	if err != nil && !fileAbsent {
-		return relPath, false, fmt.Errorf("read brief %s: %w", fullPath, err)
+	fullPath := filepath.Join(worktreePath, briefSubdir, BranchSlug(ticket.BranchName)+".md")
+	if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
+		return relPath, hasBrief, fmt.Errorf("mkdir brief dir: %w", err)
 	}
-
-	switch {
-	case fileAbsent && desc == "":
-		return "", false, nil
-
-	case fileAbsent && desc != "":
-		content := initialBriefContent(ticket.Title, desc)
-		if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
-			return relPath, false, fmt.Errorf("mkdir brief dir: %w", err)
-		}
-		if err := os.WriteFile(fullPath, []byte(content), 0o644); err != nil {
-			return relPath, false, fmt.Errorf("write brief %s: %w", fullPath, err)
-		}
-		return relPath, true, nil
-
-	case !fileAbsent && desc == "":
-		return relPath, true, nil
-
-	default: // !fileAbsent && desc != ""
-		updated := upsertManagedBlock(string(existing), desc)
-		if updated == string(existing) {
-			return relPath, true, nil
-		}
-		if err := os.WriteFile(fullPath, []byte(updated), 0o644); err != nil {
-			return relPath, false, fmt.Errorf("write brief %s: %w", fullPath, err)
-		}
-		return relPath, true, nil
+	if err := os.WriteFile(fullPath, []byte(content), 0o644); err != nil {
+		return relPath, hasBrief, fmt.Errorf("write brief %s: %w", fullPath, err)
 	}
+	return relPath, hasBrief, nil
 }
 
 // initialBriefContent is the bootstrap layout when the brief file

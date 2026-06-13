@@ -67,6 +67,23 @@ const (
 	formFieldProject     = 8
 )
 
+type choiceItem struct {
+	Key   rune
+	Label string
+	Fn    func() tea.Cmd
+}
+
+// spawnPlan is the user's chosen direction when openkanban detects a
+// stale-brief situation (prior session exists AND the merge would
+// change the brief on disk). It is passed by value into prepareSpawnWith
+// so the snapshot is unambiguous across the tea.Cmd goroutine boundary —
+// do NOT convert this to a pointer.
+type spawnPlan struct {
+	SkipMerge          bool // option 'n' — don't write the brief
+	ForceFresh         bool // option 'd' — caller has already cleared AgentSpawnedAt
+	InjectResumeNotice bool // option 'u' — append a "brief updated" message after --continue
+}
+
 type Model struct {
 	config *config.Config
 	theme  config.Theme
@@ -108,6 +125,10 @@ type Model struct {
 	showConfirm bool
 	confirmMsg  string
 	confirmFn   func() tea.Cmd
+
+	showChoice bool
+	choiceMsg  string
+	choices    []choiceItem
 
 	titleInput         textinput.Model
 	descInput          textarea.Model
@@ -387,6 +408,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			m.panes[msg.ticketID] = msg.pane
 			m.focusedPane = msg.ticketID
+			if msg.notice != "" {
+				m.notify(msg.notice)
+			}
 			return m, msg.pane.Start(msg.command, msg.args...)
 
 		case spawnErrorMsg:
@@ -570,6 +594,10 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.showHelp {
 		m.showHelp = false
 		return m, nil
+	}
+
+	if m.showChoice {
+		return m.handleChoice(msg)
 	}
 
 	if m.showConfirm {
@@ -1005,6 +1033,30 @@ func (m *Model) handleConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "n", "N", "esc":
 		m.showConfirm = false
 	}
+	return m, nil
+}
+
+func (m *Model) handleChoice(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	key := msg.String()
+	if key == "esc" {
+		m.showChoice = false
+		m.choices = nil
+		m.choiceMsg = ""
+		return m, nil
+	}
+	for _, c := range m.choices {
+		if string(c.Key) == key {
+			fn := c.Fn
+			m.showChoice = false
+			m.choices = nil
+			m.choiceMsg = ""
+			if fn != nil {
+				return m, fn()
+			}
+			return m, nil
+		}
+	}
+	// Non-matching keys are no-ops while a choice modal is active.
 	return m, nil
 }
 
@@ -2683,14 +2735,69 @@ func (m *Model) spawnAgent() (tea.Model, tea.Cmd) {
 		_ = m.opencodeServer.Start() // Best effort, ignore errors
 	}
 
+	// Stale-brief detection (claude only): if a prior session exists AND
+	// the merge would change the brief on disk, ask the user how to
+	// proceed before transitioning to ModeSpawning.
+	if agentType == "claude" && ticket.AgentSpawnedAt != nil {
+		_, _, wouldChange, _, _ := agent.PreviewBriefMerge(ticket, ticket.WorktreePath)
+		if wouldChange {
+			// Capture ticket/proj/agentCfg into each callback. Each option
+			// sets its own plan and proceeds with the existing tea.Batch.
+			m.showChoice = true
+			m.choiceMsg = "Brief was updated since this session started. What should I do?"
+			ticketCopy := ticket // pointer — fine, the closures don't outlive the ticket
+			projCopy := proj
+			cfgCopy := agentCfg
+			m.choices = []choiceItem{
+				{
+					Key:   'd',
+					Label: "Discard prior session, start fresh",
+					Fn: func() tea.Cmd {
+						ticketCopy.AgentSpawnedAt = nil
+						m.saveTicket(ticketCopy)
+						m.mode = ModeSpawning
+						m.spawningTicketID = ticketCopy.ID
+						m.spawningAgent = agentType
+						return tea.Batch(m.spinner.Tick, m.prepareSpawnWith(ticketCopy, projCopy, cfgCopy, spawnPlan{ForceFresh: true}))
+					},
+				},
+				{
+					Key:   'u',
+					Label: "Resume; tell agent the brief changed",
+					Fn: func() tea.Cmd {
+						m.mode = ModeSpawning
+						m.spawningTicketID = ticketCopy.ID
+						m.spawningAgent = agentType
+						return tea.Batch(m.spinner.Tick, m.prepareSpawnWith(ticketCopy, projCopy, cfgCopy, spawnPlan{InjectResumeNotice: true}))
+					},
+				},
+				{
+					Key:   'n',
+					Label: "Resume; leave brief unchanged",
+					Fn: func() tea.Cmd {
+						m.mode = ModeSpawning
+						m.spawningTicketID = ticketCopy.ID
+						m.spawningAgent = agentType
+						return tea.Batch(m.spinner.Tick, m.prepareSpawnWith(ticketCopy, projCopy, cfgCopy, spawnPlan{SkipMerge: true}))
+					},
+				},
+			}
+			return m, nil
+		}
+	}
+
 	m.mode = ModeSpawning
 	m.spawningTicketID = ticket.ID
 	m.spawningAgent = agentType
 
-	return m, tea.Batch(m.spinner.Tick, m.prepareSpawn(ticket, proj, agentCfg))
+	return m, tea.Batch(m.spinner.Tick, m.prepareSpawnWith(ticket, proj, agentCfg, spawnPlan{}))
 }
 
-func (m *Model) prepareSpawn(ticket *board.Ticket, proj *project.Project, agentCfg config.AgentConfig) tea.Cmd {
+// prepareSpawnWith returns a tea.Cmd that performs the actual spawn off
+// the event loop. The `plan` value is captured by value into the
+// returned closure — keep it a value type (not a pointer) so future
+// callers cannot accidentally mutate it after the modal callback fires.
+func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, agentCfg config.AgentConfig, plan spawnPlan) tea.Cmd {
 	ticketID := ticket.ID
 	worktreePath := ticket.WorktreePath
 	branchName := ticket.BranchName
@@ -2768,8 +2875,17 @@ func (m *Model) prepareSpawn(ticket *board.Ticket, proj *project.Project, agentC
 		agent.CleanupStatusFile(sessionName)
 
 		isNewSession := ticket.AgentSpawnedAt == nil
-		args := make([]string, len(agentCfg.Args))
-		copy(args, agentCfg.Args)
+		// cleanArgs strips empty-string entries from the configured args so a
+		// user can omit a default flag by leaving an empty placeholder without
+		// poisoning argv (claude in particular gets confused by a leading "").
+		cleanArgs := make([]string, 0, len(agentCfg.Args))
+		for _, a := range agentCfg.Args {
+			if a != "" {
+				cleanArgs = append(cleanArgs, a)
+			}
+		}
+		args := make([]string, len(cleanArgs))
+		copy(args, cleanArgs)
 
 		promptTemplate := cfg.GetEffectiveInitPrompt(agentType)
 
@@ -2778,9 +2894,37 @@ func (m *Model) prepareSpawn(ticket *board.Ticket, proj *project.Project, agentC
 		// the priming prompt. A brief write failure is logged but does
 		// not abort the spawn — the agent can still proceed with the
 		// inline title/description from the prompt.
-		briefRelPath, hasBrief, briefErr := agent.MergeTicketBrief(ticket, worktreePath)
+		var briefRelPath string
+		var hasBrief bool
+		var briefErr error
+		if !plan.SkipMerge {
+			briefRelPath, hasBrief, briefErr = agent.MergeTicketBrief(ticket, worktreePath)
+		} else {
+			// SkipMerge: don't write the brief, but still report whether the
+			// file exists on disk so the prompt template's {{if .HasBrief}}
+			// branch behaves correctly. Use a stat — no fancy preview.
+			slug := agent.BranchSlug(ticket.BranchName)
+			if slug != "" && worktreePath != "" {
+				rel := "tickets/" + slug + ".md"
+				full := filepath.Join(worktreePath, "tickets", slug+".md")
+				if _, statErr := os.Stat(full); statErr == nil {
+					briefRelPath = rel
+					hasBrief = true
+				}
+			}
+		}
 		if briefErr != nil {
 			fmt.Fprintf(os.Stderr, "openkanban: merge brief failed: %v\n", briefErr)
+		}
+
+		// readyNotice is surfaced via m.notify() in the spawnReadyMsg
+		// handler. For option 'u' (InjectResumeNotice), we toast the user
+		// so they know the brief was rewritten under the resumed session.
+		var readyNotice string
+		if plan.InjectResumeNotice {
+			if slug := agent.BranchSlug(ticket.BranchName); slug != "" {
+				readyNotice = fmt.Sprintf("Brief at tickets/%s.md updated.", slug)
+			}
 		}
 		// External resume: spawn was given an AgentSessionID up front
 		// (via `openkanban ticket new --session <uuid>`), so this is the
@@ -2829,6 +2973,18 @@ func (m *Model) prepareSpawn(ticket *board.Ticket, proj *project.Project, agentC
 				}
 				if !hasFlag {
 					args = append(args, "--continue")
+					// plan.InjectResumeNotice (option 'u'): append a positional message
+					// after --continue so the resumed claude session sees the brief-
+					// updated notice as the first new user turn. Caveat: claude's
+					// interactive-mode handling of a positional argument alongside
+					// --continue is not empirically verified in this repo — the
+					// notify() toast below is the user-facing source of truth.
+					if plan.InjectResumeNotice {
+						slug := agent.BranchSlug(ticket.BranchName)
+						if slug != "" {
+							args = append(args, fmt.Sprintf("Brief updated at tickets/%s.md — please re-read before continuing.", slug))
+						}
+					}
 				}
 			}
 		case "opencode":
@@ -2889,7 +3045,7 @@ func (m *Model) prepareSpawn(ticket *board.Ticket, proj *project.Project, agentC
 					} else {
 						args = []string{"resume", sessionID}
 					}
-					args = append(args, agentCfg.Args...)
+					args = append(args, cleanArgs...)
 				}
 			} else if promptTemplate != "" {
 				prompt := agent.BuildContextPrompt(promptTemplate, ctxData)
@@ -2916,6 +3072,7 @@ func (m *Model) prepareSpawn(ticket *board.Ticket, proj *project.Project, agentC
 			worktreePath: worktreePath,
 			branchName:   branchName,
 			baseBranch:   baseBranch,
+			notice:       readyNotice,
 		}
 	}
 }
@@ -3242,6 +3399,12 @@ type spawnReadyMsg struct {
 	worktreePath string
 	branchName   string
 	baseBranch   string
+	// notice, if non-empty, is shown via m.notify() once the spawn-ready
+	// handler runs. Used to surface a "Brief at tickets/<slug>.md updated."
+	// toast for option 'u' (InjectResumeNotice) — the closure that emits
+	// this message cannot safely call m.notify() itself, so it routes
+	// through this field.
+	notice string
 }
 
 type spawnErrorMsg struct {

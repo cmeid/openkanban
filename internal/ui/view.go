@@ -53,6 +53,9 @@ func (m *Model) View() string {
 	if m.showHelp {
 		return m.renderWithOverlay(m.renderHelp())
 	}
+	if m.showChoice {
+		return m.renderWithOverlay(m.renderChoiceDialog())
+	}
 	if m.showConfirm {
 		return m.renderWithOverlay(m.renderConfirmDialog())
 	}
@@ -756,6 +759,44 @@ func (m *Model) renderConfirmDialog() string {
 		BorderForeground(m.colors.err).
 		Padding(1, 2).
 		Render(content)
+}
+
+func (m *Model) renderChoiceDialog() string {
+	if !m.showChoice {
+		return ""
+	}
+
+	titleStyle := lipgloss.NewStyle().
+		Foreground(m.colors.err).
+		Bold(true)
+	textStyle := lipgloss.NewStyle().Foreground(m.colors.text)
+	keyStyle := lipgloss.NewStyle().Foreground(m.colors.success)
+	escKeyStyle := lipgloss.NewStyle().Foreground(m.colors.muted)
+
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("⚠ Confirm"))
+	b.WriteString("\n\n")
+	b.WriteString("  ")
+	b.WriteString(textStyle.Render(m.choiceMsg))
+	b.WriteString("\n\n")
+
+	for _, c := range m.choices {
+		b.WriteString("  ")
+		b.WriteString(keyStyle.Render(fmt.Sprintf("[%s]", string(c.Key))))
+		b.WriteString(m.dimStyle().Render(" " + c.Label))
+		b.WriteString("\n")
+	}
+
+	b.WriteString("\n")
+	b.WriteString("  ")
+	b.WriteString(escKeyStyle.Render("[Esc]"))
+	b.WriteString(m.dimStyle().Render(" Cancel"))
+
+	return lipgloss.NewStyle().
+		Border(columnBorder).
+		BorderForeground(m.colors.err).
+		Padding(1, 2).
+		Render(b.String())
 }
 
 func (m *Model) renderShuttingDown() string {
