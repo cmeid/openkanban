@@ -1,9 +1,11 @@
 package terminal
 
 import (
+	"bytes"
 	"fmt"
 	"testing"
 
+	tea "github.com/charmbracelet/bubbletea"
 	xvt "github.com/charmbracelet/x/vt"
 )
 
@@ -239,5 +241,44 @@ func TestViewportScrolling(t *testing.T) {
 	pane.scrollDown(100)
 	if pane.viewportOffset != 0 {
 		t.Errorf("scrollDown beyond 0 should cap at 0, got %d", pane.viewportOffset)
+	}
+}
+
+func TestTranslateKey(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  tea.KeyMsg
+		want []byte
+	}{
+		{
+			name: "Tab",
+			msg:  tea.KeyMsg{Type: tea.KeyTab},
+			want: []byte("\t"),
+		},
+		{
+			name: "Shift+Tab emits CSI Z",
+			msg:  tea.KeyMsg{Type: tea.KeyShiftTab},
+			want: []byte("\x1b[Z"),
+		},
+		{
+			name: "Enter",
+			msg:  tea.KeyMsg{Type: tea.KeyEnter},
+			want: []byte("\r"),
+		},
+		{
+			name: "Up arrow",
+			msg:  tea.KeyMsg{Type: tea.KeyUp},
+			want: []byte("\x1b[A"),
+		},
+	}
+
+	p := &Pane{}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := p.translateKey(tt.msg)
+			if !bytes.Equal(got, tt.want) {
+				t.Errorf("translateKey(%v) = %q, want %q", tt.msg, got, tt.want)
+			}
+		})
 	}
 }

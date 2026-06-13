@@ -955,10 +955,9 @@ func (p *Pane) translateKey(msg tea.KeyMsg) []byte {
 	case tea.KeyBackspace:
 		return []byte{127}
 	case tea.KeyTab:
-		if msg.Alt {
-			return []byte("\x1b[Z") // Shift+Tab
-		}
 		return []byte("\t")
+	case tea.KeyShiftTab:
+		return []byte("\x1b[Z")
 	case tea.KeyUp:
 		return []byte("\x1b[A")
 	case tea.KeyDown:
