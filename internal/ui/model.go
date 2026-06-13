@@ -2442,6 +2442,23 @@ func (m *Model) performTicketCleanup(ticket *board.Ticket) {
 		}
 	}
 
+	// SessionOwned=true is the ticket's explicit claim on the session
+	// JSONL (set via `openkanban ticket new --session ... --migrate`).
+	// Link-mode sessions (SessionOwned=false) belong to the spawning
+	// agent and must survive ticket deletion. The pane.Stop above has
+	// already killed the writer process, so unlink is safe.
+	if ticket.SessionOwned && ticket.AgentSessionID != "" {
+		path, err := agent.SessionPath(ticket.AgentSessionID)
+		switch {
+		case err == nil:
+			if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
+				m.notify("Failed to remove session file: " + rmErr.Error())
+			}
+		case !os.IsNotExist(err):
+			m.notify("Failed to locate session file: " + err.Error())
+		}
+	}
+
 	m.globalStore.RemoveBlockerReferences(ticket.ID)
 	m.globalStore.Delete(ticket.ID)
 	m.refreshColumnTickets()
