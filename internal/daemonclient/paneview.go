@@ -429,6 +429,7 @@ func (p *PaneView) initEmulatorLocked() {
 	}
 	p.vt.RegisterOscHandler(0, titleHandler)
 	p.vt.RegisterOscHandler(2, titleHandler)
+	p.vt.RegisterOscHandler(9, forwardOSC9)
 
 	// charm/x/vt deadlocks on its first device-attributes query
 	// without a Read drain. We DON'T forward the response anywhere —
