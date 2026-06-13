@@ -32,8 +32,17 @@ type Pane struct {
 	exitErr     error
 	workdir     string
 	sessionName string
+	ticketID    string
 	width       int
 	height      int
+
+	// expectedCompletedExit is true when the TUI initiated a
+	// StopGraceful as a reaction to AgentCompleted on a Done ticket
+	// (the `openkanban ticket done` flow). The ExitMsg handler reads
+	// this to know it should preserve AgentCompleted on the ticket
+	// instead of resetting AgentStatus to AgentNone like a normal
+	// pane exit.
+	expectedCompletedExit bool
 
 	cachedView      string
 	lastRender      time.Time
@@ -98,6 +107,30 @@ func (p *Pane) GetWorkdir() string {
 // SetSessionName sets the session name for OPENKANBAN_SESSION env var
 func (p *Pane) SetSessionName(name string) {
 	p.sessionName = name
+}
+
+// SetTicketID sets the openkanban ticket id for OPENKANBAN_TICKET_ID env var.
+// The child reads this to resolve back to the ticket .md when running
+// `openkanban ticket done` from inside the session.
+func (p *Pane) SetTicketID(id string) {
+	p.ticketID = id
+}
+
+// MarkExpectedCompletedExit flags this pane as being stopped because
+// its ticket was marked done by the agent. The ExitMsg handler reads
+// this to preserve AgentCompleted instead of resetting to AgentNone.
+func (p *Pane) MarkExpectedCompletedExit() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.expectedCompletedExit = true
+}
+
+// ExpectedCompletedExit reports whether StopGraceful was initiated via
+// the ticket-done path.
+func (p *Pane) ExpectedCompletedExit() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.expectedCompletedExit
 }
 
 // Running returns whether the pane has a running process
@@ -216,7 +249,7 @@ func (p *Pane) Start(command string, args ...string) tea.Cmd {
 
 		// Build command
 		p.cmd = exec.Command(command, args...)
-		p.cmd.Env = buildCleanEnv(p.sessionName)
+		p.cmd.Env = buildCleanEnv(p.sessionName, p.ticketID)
 
 		// Set working directory if specified
 		if p.workdir != "" {
@@ -1292,7 +1325,7 @@ func (p *Pane) renderLiveScreenUnlocked(cols, rows int) string {
 	return result.String()
 }
 
-func buildCleanEnv(sessionName string) []string {
+func buildCleanEnv(sessionName, ticketID string) []string {
 	var env []string
 	for _, e := range os.Environ() {
 		key := strings.Split(e, "=")[0]
@@ -1308,11 +1341,21 @@ func buildCleanEnv(sessionName string) []string {
 		if key == "CODEX" || strings.HasPrefix(key, "CODEX_") {
 			continue
 		}
+		// Strip any inherited OPENKANBAN_* so each spawn gets exactly the
+		// session + ticket id configured for THIS pane and nothing else.
+		// Without this, nesting openkanban inside an openkanban-spawned
+		// shell would leak the outer pane's identity into the inner child.
+		if strings.HasPrefix(key, "OPENKANBAN_") {
+			continue
+		}
 		env = append(env, e)
 	}
 	env = append(env, "TERM=xterm-256color")
 	if sessionName != "" {
 		env = append(env, "OPENKANBAN_SESSION="+sessionName)
+	}
+	if ticketID != "" {
+		env = append(env, "OPENKANBAN_TICKET_ID="+ticketID)
 	}
 	return env
 }

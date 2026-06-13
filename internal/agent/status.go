@@ -475,3 +475,23 @@ func CleanupStatusFile(sessionName string) error {
 	os.Remove(statusFile)
 	return nil
 }
+
+// ReadStatusFile returns the trimmed contents of the session's status
+// file. A missing file is not an error — empty string is returned. This
+// is an uncached read used by `openkanban status set` to decide whether
+// the incoming state would downgrade a terminal "completed" status.
+// StatusDetector.readStatusFile is intentionally not reused here: its
+// 500ms cache would serve stale values to a guard check made microseconds
+// after a write.
+func ReadStatusFile(sessionName string) (string, error) {
+	homeDir, _ := os.UserHomeDir()
+	statusFile := filepath.Join(homeDir, ".cache", "openkanban-status", sessionName+".status")
+	data, err := os.ReadFile(statusFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
+}

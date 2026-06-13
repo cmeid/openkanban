@@ -508,9 +508,19 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case terminal.ExitMsg:
 		ticketID := board.TicketID(msg.PaneID)
+		// Capture the pane's expected-completed-exit flag before we
+		// drop it from the map — the flag tells us whether to preserve
+		// AgentCompleted (set by `openkanban ticket done` + auto-stop)
+		// or reset to AgentNone as we do for any other pane exit.
+		expectedCompleted := false
+		if pane, ok := m.panes[ticketID]; ok && pane != nil {
+			expectedCompleted = pane.ExpectedCompletedExit()
+		}
 		delete(m.panes, ticketID)
 		if ticket, _ := m.globalStore.Get(ticketID); ticket != nil {
-			ticket.AgentStatus = board.AgentNone
+			if !expectedCompleted {
+				ticket.AgentStatus = board.AgentNone
+			}
 			m.saveTicket(ticket)
 		}
 		if m.focusedPane == ticketID {
@@ -534,8 +544,20 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case agentStatusResultMsg:
 		for ticketID, status := range msg {
-			if ticket, _ := m.globalStore.Get(ticketID); ticket != nil {
-				ticket.AgentStatus = status
+			ticket, _ := m.globalStore.Get(ticketID)
+			if ticket == nil {
+				continue
+			}
+			prev := ticket.AgentStatus
+			ticket.AgentStatus = status
+
+			// Edge-triggered auto-stop: when an agent reports completion
+			// via `openkanban ticket done`, gracefully terminate the
+			// pane so the session exits cleanly (the "/quit equivalent").
+			// Gated on Status == StatusDone so a stray `status set
+			// completed` from an unrelated agent does NOT kill its pane.
+			if prev != board.AgentCompleted && status == board.AgentCompleted {
+				m.maybeAutoStopCompletedPane(ticketID, ticket)
 			}
 		}
 
@@ -2884,6 +2906,7 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 			sessionName = ticket.AgentSessionID
 		}
 		pane.SetSessionName(sessionName)
+		pane.SetTicketID(string(ticketID))
 
 		// Clean up any stale status file from previous sessions that may not have
 		// been properly cleaned up (e.g., if the app was closed while an agent was running)
@@ -3103,7 +3126,11 @@ func (m *Model) stopAgent() (tea.Model, tea.Cmd) {
 		delete(m.panes, ticket.ID)
 	}
 
-	ticket.AgentStatus = board.AgentNone
+	// Preserve AgentCompleted on a Done ticket — manually stopping the
+	// pane after the agent reported completion shouldn't wipe the badge.
+	if ticket.Status != board.StatusDone {
+		ticket.AgentStatus = board.AgentNone
+	}
 	m.saveTicket(ticket)
 	m.notify("Agent stopped")
 	return m, nil
@@ -3230,7 +3257,10 @@ func hasClaudeNameFlag(args []string) bool {
 func (m *Model) resetSpawnState(ticketID board.TicketID) {
 	if ticket, _ := m.globalStore.Get(ticketID); ticket != nil {
 		ticket.AgentSpawnedAt = nil
-		ticket.AgentStatus = board.AgentNone
+		// Same rule as stopAgent: a Done ticket keeps its completed badge.
+		if ticket.Status != board.StatusDone {
+			ticket.AgentStatus = board.AgentNone
+		}
 		m.saveTicket(ticket)
 	}
 	m.mode = ModeNormal
@@ -3306,6 +3336,43 @@ func (m *Model) getAgentIndex(agentName string) int {
 }
 
 const gracefulShutdownTimeout = 3 * time.Second
+
+// maybeAutoStopCompletedPane is called on the AgentStatus transition
+// to AgentCompleted. It gracefully stops the pane iff:
+//
+//  1. The ticket has a live pane in the model, AND
+//  2. ticket.Status == StatusDone — confirming this is the
+//     `openkanban ticket done` path, not a stray `status set completed`.
+//
+// Race tolerance: the child writes the ticket .md (Status=done) and the
+// status file ("completed") in quick succession. The poll arrives via
+// the status file; the .md change arrives via fsnotify -> ReloadTicket.
+// Those two paths are independent. If Status hasn't landed in memory
+// yet when this fires, do one disk reread before giving up — that
+// closes the ~500ms convergence window without us having to poll.
+func (m *Model) maybeAutoStopCompletedPane(ticketID board.TicketID, ticket *board.Ticket) {
+	pane, ok := m.panes[ticketID]
+	if !ok || !pane.Running() {
+		return
+	}
+
+	if ticket.Status != board.StatusDone {
+		// fsnotify reload may not have landed yet — try one direct reread.
+		if path, ok := m.globalStore.PathOf(ticketID); ok {
+			if err := m.globalStore.ReloadTicket(ticket.ProjectID, path); err == nil {
+				if reloaded, _ := m.globalStore.Get(ticketID); reloaded != nil {
+					ticket = reloaded
+				}
+			}
+		}
+		if ticket.Status != board.StatusDone {
+			return
+		}
+	}
+
+	pane.MarkExpectedCompletedExit()
+	pane.StopGraceful(gracefulShutdownTimeout)
+}
 
 func (m *Model) Cleanup() {
 	for _, pane := range m.panes {

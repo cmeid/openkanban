@@ -3,6 +3,7 @@ package terminal
 import (
 	"bytes"
 	"fmt"
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -278,6 +279,76 @@ func TestTranslateKey(t *testing.T) {
 			got := p.translateKey(tt.msg)
 			if !bytes.Equal(got, tt.want) {
 				t.Errorf("translateKey(%v) = %q, want %q", tt.msg, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildCleanEnv(t *testing.T) {
+	tests := []struct {
+		name         string
+		sessionName  string
+		ticketID     string
+		wantSession  string // "" means must be absent
+		wantTicketID string // "" means must be absent
+	}{
+		{
+			name:         "both set",
+			sessionName:  "task/foo",
+			ticketID:     "abc-123",
+			wantSession:  "OPENKANBAN_SESSION=task/foo",
+			wantTicketID: "OPENKANBAN_TICKET_ID=abc-123",
+		},
+		{
+			name:        "session only",
+			sessionName: "task/foo",
+			wantSession: "OPENKANBAN_SESSION=task/foo",
+		},
+		{
+			name:         "ticket only",
+			ticketID:     "abc-123",
+			wantTicketID: "OPENKANBAN_TICKET_ID=abc-123",
+		},
+		{
+			name: "neither",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := buildCleanEnv(tt.sessionName, tt.ticketID)
+
+			contains := func(target string) bool {
+				for _, e := range env {
+					if e == target {
+						return true
+					}
+				}
+				return false
+			}
+			anyWithPrefix := func(prefix string) bool {
+				for _, e := range env {
+					if strings.HasPrefix(e, prefix) {
+						return true
+					}
+				}
+				return false
+			}
+
+			if tt.wantSession != "" && !contains(tt.wantSession) {
+				t.Errorf("missing %q in env", tt.wantSession)
+			}
+			if tt.wantSession == "" && anyWithPrefix("OPENKANBAN_SESSION=") {
+				t.Errorf("OPENKANBAN_SESSION must be absent when sessionName empty; got env=%v", env)
+			}
+			if tt.wantTicketID != "" && !contains(tt.wantTicketID) {
+				t.Errorf("missing %q in env", tt.wantTicketID)
+			}
+			if tt.wantTicketID == "" && anyWithPrefix("OPENKANBAN_TICKET_ID=") {
+				t.Errorf("OPENKANBAN_TICKET_ID must be absent when ticketID empty; got env=%v", env)
+			}
+			if !contains("TERM=xterm-256color") {
+				t.Errorf("expected TERM=xterm-256color in env")
 			}
 		})
 	}

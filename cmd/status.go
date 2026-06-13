@@ -49,6 +49,18 @@ var statusSetCmd = &cobra.Command{
 			return err
 		}
 
+		// Don't downgrade a terminal "completed" status. When the TUI auto-
+		// stops the pane after `openkanban ticket done`, Claude's Stop hook
+		// fires `status set idle` during the SIGTERM grace window — that
+		// must not clobber the completion signal. Only `completed` or
+		// `error` (terminal states) may overwrite `completed`.
+		if status != board.AgentCompleted && status != board.AgentError {
+			current, readErr := agent.ReadStatusFile(session)
+			if readErr == nil && current == "completed" {
+				return nil
+			}
+		}
+
 		if err := agent.WriteStatusFile(session, status); err != nil {
 			return fmt.Errorf("write status file for session %q: %w", session, err)
 		}
