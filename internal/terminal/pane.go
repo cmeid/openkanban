@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/atotto/clipboard"
@@ -418,7 +419,7 @@ func (p *Pane) StopGraceful(timeout time.Duration) error {
 	proc := p.cmd.Process
 	p.mu.Unlock()
 
-	if err := proc.Signal(os.Interrupt); err != nil {
+	if err := proc.Signal(syscall.SIGTERM); err != nil {
 		return p.Stop()
 	}
 
