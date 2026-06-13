@@ -72,6 +72,13 @@ func (s *Server) handleAttach(c *clientConn, req AttachReq) {
 		SnapshotSize: len(snapshot),
 	})
 
+	// Announce the attach to subscribed clients so sibling TUIs learn
+	// the binary stream is now owned. Emitted after AttachResp so the
+	// attaching client sees its response first (the response demuxer
+	// is in JSON-mode; the push interleaves before the connection
+	// upgrades to binary).
+	s.emitEvent(SessionEvent{Event: "attached", SessionID: req.SessionID, TicketID: sess.TicketID()})
+
 	// Ship the snapshot as one or more TypePTYOutput frames. We do
 	// this under writeMu just like fanOut would — keeps any future
 	// JSON pushes from interleaving mid-snapshot.
@@ -101,6 +108,14 @@ func (s *Server) handleAttach(c *clientConn, req AttachReq) {
 	// subscription close, and a takeover may have already done the
 	// per-session cleanup. Detach(ac) is safe in any of these cases.
 	sess.Detach(ac)
+
+	// Announce the detach to subscribed clients. Emitted unconditionally
+	// — whether the detach came from a clean client TypeDetach, a
+	// natural pane exit, or a takeover, the prior owner's binary stream
+	// is now done. Subscribers can treat "detached" as informational
+	// (the session may still be alive with a new attacher) and reconcile
+	// against List/owns-by snapshots if they care.
+	s.emitEvent(SessionEvent{Event: "detached", SessionID: req.SessionID, TicketID: sess.TicketID()})
 
 	// Wait for the fan-out to fully exit before returning. Without
 	// this, a late publish could race the conn close and log a

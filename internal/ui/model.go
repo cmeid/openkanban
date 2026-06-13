@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -175,6 +176,16 @@ type Model struct {
 	// state in that case). Reconstructing the client mid-session is the
 	// job of a future PR; this PR is a single-shot New() at startup.
 	daemonClient *daemonclient.Client
+
+	// daemonEvents is the push channel returned by
+	// daemonClient.Subscribe. nil when the daemon is unreachable or
+	// the subscription has ended. daemonUnsub is its cancel func.
+	// daemonConnected reflects whether the subscription is currently
+	// live — the status-file poll honors this flag to enforce the
+	// daemon-wins precedence rule.
+	daemonEvents    <-chan daemon.SessionEvent
+	daemonUnsub     func()
+	daemonConnected atomic.Bool
 
 	// guardAPI is the subset of daemonclient.Client used by the exit
 	// guard (PrepareExit / Kill / ClientID). Held as an interface so
@@ -380,16 +391,35 @@ func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projec
 	}
 
 	m.refreshColumnTickets()
+
+	// Subscribe to daemon push events so status changes that happen in
+	// OTHER TUIs (or via daemon-internal pane exits) reach this model.
+	// Subscribe in NewModel (rather than Init) so the channel is alive
+	// before the first Update tick — Init only emits the tea.Cmd that
+	// arms the listener.
+	if daemonClient != nil {
+		events, unsub, _ := subscribeDaemonEvents(daemonClient)
+		if events != nil {
+			m.daemonEvents = events
+			m.daemonUnsub = unsub
+			m.daemonConnected.Store(true)
+		}
+	}
+
 	return m
 }
 
 func (m *Model) Init() tea.Cmd {
-	return tea.Batch(
+	cmds := []tea.Cmd{
 		tickAgentStatus(m.agentMgr.StatusPollInterval()),
 		m.spinner.Tick,
 		m.checkForUpdates(),
 		m.maybeSetWindowTitle(),
-	)
+	}
+	if m.daemonEvents != nil {
+		cmds = append(cmds, readNextDaemonEvent(m.daemonEvents))
+	}
+	return tea.Batch(cmds...)
 }
 
 // computeWindowTitle returns the title we want the host terminal to
@@ -659,6 +689,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.mode = ModeNormal
 			m.focusedPane = ""
 		}
+		// Daemon push channel is gone; the file-poll takes over as the
+		// AgentStatus source. Clear the subscribe handles so we don't
+		// keep dangling references.
+		m.daemonConnected.Store(false)
+		if m.daemonUnsub != nil {
+			m.daemonUnsub()
+			m.daemonUnsub = nil
+		}
+		m.daemonEvents = nil
 		if msg.Err != nil {
 			m.notify("Daemon disconnected: " + msg.Err.Error())
 		} else {
@@ -678,7 +717,20 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		)
 
 	case agentStatusResultMsg:
+		// Precedence rule (PR9): when the daemon push channel is live,
+		// daemon-pushed SessionEvents are the authoritative source of
+		// AgentStatus for daemon-owned panes. The local file-poll only
+		// fills in for panes the daemon doesn't own (and as graceful
+		// degradation when the push channel is down).
+		daemonLive := m.daemonConnected.Load()
 		for ticketID, status := range msg {
+			if daemonLive {
+				if _, owned := m.panes[ticketID]; owned {
+					// Daemon-owned pane; let push events drive its
+					// status and ignore the file-poll value.
+					continue
+				}
+			}
 			ticket, _ := m.globalStore.Get(ticketID)
 			if ticket == nil {
 				continue
@@ -691,10 +743,21 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// pane so the session exits cleanly (the "/quit equivalent").
 			// Gated on Status == StatusDone so a stray `status set
 			// completed` from an unrelated agent does NOT kill its pane.
+			// T2 of the integration plan replaces this whole branch with
+			// a daemon-routed TicketDoneReq + SessionEvent broadcast.
 			if prev != board.AgentCompleted && status == board.AgentCompleted {
 				m.maybeAutoStopCompletedPane(ticketID, ticket)
 			}
 		}
+
+	case daemonSessionEventMsg:
+		return m.handleDaemonSessionEvent(msg)
+
+	case daemonSubscribeFailedMsg:
+		return m.handleDaemonSubscribeFailed(msg)
+
+	case daemonSubscribeEndedMsg:
+		return m.handleDaemonSubscribeEnded(msg)
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd

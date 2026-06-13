@@ -11,6 +11,8 @@ import (
 	"net"
 	"os"
 	"sync"
+
+	"github.com/techdufus/openkanban/internal/terminal"
 )
 
 // BinaryVersion is the daemon's reported binary version in HelloResp.
@@ -49,12 +51,13 @@ type Server struct {
 	wg sync.WaitGroup
 
 	// events fans daemon-internal SessionEvent updates out to the
-	// goroutine that pushes them to subscribed clients. PR4 only
-	// emits started/exited; PR9 expands to status. Unbuffered so the
-	// emitter blocks if no consumer is draining — which is fine in
-	// PR4 because there is no consumer yet and only the test path
-	// would observe blocking. We make a real channel so PR9 has a
-	// stable target to wire into.
+	// goroutine that pushes them to subscribed clients (PR9's
+	// broadcastEvents). Buffered so the emit-sites (handleSpawn,
+	// handleKill, attach, the pane-exit watcher) don't block on
+	// transient broadcaster slowness — emitEvent does a non-blocking
+	// send and drops with a log if the buffer fills, since the next
+	// client reconcile (List / status poll) will repair any missed
+	// transition.
 	events chan SessionEvent
 }
 
@@ -119,7 +122,7 @@ func NewServer(sock, pidpath string) (*Server, error) {
 		sessions: make(map[string]*Session),
 		clients:  make(map[uint16]*clientConn),
 		shutdown: make(chan struct{}),
-		events:   make(chan SessionEvent),
+		events:   make(chan SessionEvent, 64),
 	}, nil
 }
 
@@ -146,9 +149,10 @@ func (s *Server) Serve(ctx context.Context) error {
 		}
 	}()
 
-	// Drain the events channel so SessionEvent emitters don't block.
-	// PR9 will replace this with the real fan-out goroutine.
-	go s.drainEvents()
+	// Fan SessionEvent emissions out to subscribed clients. The
+	// goroutine outlives every individual client conn and exits when
+	// the shutdown channel closes.
+	go s.broadcastEvents()
 
 	for {
 		conn, err := s.ln.Accept()
@@ -184,16 +188,68 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 }
 
-// drainEvents consumes the events channel until shutdown. PR4 has no
-// real consumer; PR9 will replace this with a real fan-out goroutine.
-func (s *Server) drainEvents() {
+// broadcastEvents consumes s.events and pushes each SessionEvent to
+// every currently-subscribed client as a TypeJSONPush frame. Exits
+// when s.shutdown closes.
+//
+// Per-client writes are serialized under c.writeMu so push frames don't
+// interleave with concurrent JSON responses or PTY-output binary frames
+// produced by attach.go's fanOut. If a write fails (broken conn, etc.)
+// the client is logged and skipped — broadcastEvents must never block
+// on a single bad client, otherwise an emit-site (handleSpawn / Kill /
+// attach) would back up behind it.
+func (s *Server) broadcastEvents() {
 	for {
 		select {
 		case <-s.shutdown:
 			return
 		case ev := <-s.events:
-			_ = ev
+			s.dispatchSessionEvent(ev)
 		}
+	}
+}
+
+// dispatchSessionEvent encodes ev as MsgSessionEvent inside a
+// TypeJSONPush envelope and writes it to every currently-subscribed
+// client. Snapshots the subscriber set under clientsMu so per-client
+// writes happen without holding the global lock.
+func (s *Server) dispatchSessionEvent(ev SessionEvent) {
+	payload, err := EncodeMsg(MsgSessionEvent, ev)
+	if err != nil {
+		log.Printf("openkanbankd: encode session event %q: %v", ev.Event, err)
+		return
+	}
+
+	s.clientsMu.Lock()
+	subs := make([]*clientConn, 0, len(s.clients))
+	for _, c := range s.clients {
+		if c.subscribed {
+			subs = append(subs, c)
+		}
+	}
+	s.clientsMu.Unlock()
+
+	for _, c := range subs {
+		c.writeMu.Lock()
+		werr := WriteFrame(c.conn, TypeJSONPush, payload)
+		c.writeMu.Unlock()
+		if werr != nil {
+			log.Printf("openkanbankd: client %d push session event %q: %v", c.id, ev.Event, werr)
+		}
+	}
+}
+
+// emitEvent does a non-blocking send to s.events. The broadcaster
+// goroutine should always be draining the channel, but a non-blocking
+// send guards against the broadcaster being momentarily slow (e.g. one
+// subscriber's writeMu is held for an unusual length of time). Dropping
+// an event is preferable to deadlocking the emit-site, since the next
+// List / status poll will reconcile the missed transition.
+func (s *Server) emitEvent(ev SessionEvent) {
+	select {
+	case s.events <- ev:
+	default:
+		log.Printf("openkanbankd: dropped session event %q for session %s (broadcaster busy)", ev.Event, ev.SessionID)
 	}
 }
 
@@ -421,15 +477,57 @@ func (s *Server) handleSpawn(c *clientConn, req SpawnReq) (SpawnResp, error) {
 
 	log.Printf("openkanbankd: client %d spawned session %s (ticket=%s pid=%d)", c.id, sess.ID(), sess.TicketID(), sess.pane.PID())
 
-	// Non-blocking emit: PR4's drainEvents is the only listener and
-	// it never falls behind, but a non-blocking send keeps the spawn
-	// path snappy regardless.
-	select {
-	case s.events <- SessionEvent{Event: "started", SessionID: sess.ID(), TicketID: sess.TicketID()}:
-	default:
-	}
+	// Wire pane-exit observation BEFORE announcing the spawn so we
+	// can't miss an ExitEvent fired by a child that races out the
+	// gate. The watcher emits an "exited" SessionEvent when the pane
+	// publishes its final ExitEvent.
+	s.watchSessionExit(sess)
+
+	s.emitEvent(SessionEvent{Event: "started", SessionID: sess.ID(), TicketID: sess.TicketID(), Status: "working"})
 
 	return SpawnResp{SessionID: sess.ID(), PID: sess.pane.PID()}, nil
+}
+
+// watchSessionExit subscribes to sess.pane's event stream and emits an
+// "exited" SessionEvent when the pane publishes its final ExitEvent
+// (i.e. the underlying child process closed its PTY). Idempotent for
+// the daemon broadcast: if handleKill already emitted "exited",
+// subscribers will see both — fine. If sess is removed from
+// s.sessions before the exit fires, we still emit so cross-instance
+// observers learn the child is gone.
+//
+// The Subscribe registers a fresh subscriber dedicated to lifecycle
+// observation; its OutputEvent/Title/Mode events are discarded.
+//
+// NOTE: the watcher goroutine is intentionally NOT tracked on s.wg.
+// s.wg is the per-client-conn lifecycle group that Serve waits on
+// before tearing down sessions in cleanup(). If we added the watcher
+// to s.wg we'd deadlock at shutdown: Serve.Wait would block on the
+// watcher → the watcher would block on its pane subscription channel
+// → the channel only closes once cleanup() kills the session, which
+// comes AFTER Wait. The watcher is fundamentally tied to the pane
+// lifetime, not the connection lifetime; letting it run to completion
+// in the background after Serve returns is correct.
+func (s *Server) watchSessionExit(sess *Session) {
+	if sess == nil || sess.pane == nil {
+		return
+	}
+	ch, unsub := sess.pane.Subscribe()
+	go func() {
+		defer unsub()
+		sessID := sess.ID()
+		ticketID := sess.TicketID()
+		for ev := range ch {
+			if _, ok := ev.(terminal.ExitEvent); ok {
+				s.emitEvent(SessionEvent{Event: "exited", SessionID: sessID, TicketID: ticketID})
+				return
+			}
+		}
+		// Channel closed without ExitEvent (e.g. Stop tore the loop
+		// down before the read returned). Emit anyway so subscribers
+		// learn the session is gone.
+		s.emitEvent(SessionEvent{Event: "exited", SessionID: sessID, TicketID: ticketID})
+	}()
 }
 
 func (s *Server) handleList(c *clientConn, req ListReq) ListResp {
@@ -461,10 +559,7 @@ func (s *Server) handleKill(c *clientConn, req KillReq) (KillResp, error) {
 
 	log.Printf("openkanbankd: client %d killed session %s", c.id, req.SessionID)
 
-	select {
-	case s.events <- SessionEvent{Event: "exited", SessionID: req.SessionID, TicketID: sess.TicketID()}:
-	default:
-	}
+	s.emitEvent(SessionEvent{Event: "exited", SessionID: req.SessionID, TicketID: sess.TicketID()})
 
 	return KillResp{}, nil
 }
