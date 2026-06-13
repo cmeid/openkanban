@@ -285,7 +285,7 @@ func (m *Model) renderColumn(col board.Column, tickets []*board.Ticket, isActive
 		ticket := tickets[i]
 		isSelected := isActive && i == m.activeTicket
 		isTicketHovered := isHovered && i == m.hoverTicket
-		ticketViews = append(ticketViews, m.renderTicket(ticket, isSelected, isTicketHovered, width-4, headerColor))
+		ticketViews = append(ticketViews, m.renderTicket(ticket, isSelected, isTicketHovered, width-4, headerColor, i+1, len(tickets)))
 	}
 
 	if hasMoreBelow {
@@ -348,7 +348,7 @@ func (m *Model) renderColumn(col board.Column, tickets []*board.Ticket, isActive
 	return style.Render(content)
 }
 
-func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, width int, columnColor lipgloss.Color) string {
+func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, width int, columnColor lipgloss.Color, index, total int) string {
 	pane, hasPane := m.panes[ticket.ID]
 	isRunning := hasPane && pane.Running()
 
@@ -415,7 +415,11 @@ func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, w
 		}
 	}
 
-	var headerParts []string
+	positionBadge := lipgloss.NewStyle().
+		Foreground(m.colors.muted).
+		Render(fmt.Sprintf("%d/%d", index, total))
+
+	headerParts := []string{positionBadge}
 	if priorityBadge != "" {
 		headerParts = append(headerParts, priorityBadge)
 	}
