@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"bufio"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -157,4 +159,133 @@ func ForceExitSession(uuid string, grace time.Duration) error {
 		time.Sleep(100 * time.Millisecond)
 	}
 	return fmt.Errorf("session %s still held after SIGKILL", uuid)
+}
+
+// IsClaudeSessionDead reports whether the most-recent claude session for
+// the given worktree has no real assistant work in its transcript. Used
+// by openkanban to silently clean up never-engaged sessions when the
+// user respawns.
+//
+// "Dead" means: no assistant message has text content other than the
+// auto-response "No response requested.". A missing project directory
+// or missing .jsonl also counts as dead.
+//
+// Returns the path to the most-recent session JSONL (so callers can
+// delete it) and any non-fatal error encountered while walking the
+// directory or reading the file.
+func IsClaudeSessionDead(worktreePath string) (dead bool, sessionPath string, err error) {
+	if worktreePath == "" {
+		return true, "", nil
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return false, "", fmt.Errorf("user home dir: %w", err)
+	}
+	encoded := strings.ReplaceAll(worktreePath, "/", "-")
+	dir := filepath.Join(homeDir, ".claude", "projects", encoded)
+
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return true, "", nil
+	}
+	if err != nil {
+		return false, "", fmt.Errorf("read claude projects dir: %w", err)
+	}
+
+	var latestPath string
+	var latestMtime time.Time
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if latestPath == "" || info.ModTime().After(latestMtime) {
+			latestPath = filepath.Join(dir, e.Name())
+			latestMtime = info.ModTime()
+		}
+	}
+	if latestPath == "" {
+		return true, "", nil
+	}
+
+	f, err := os.Open(latestPath)
+	if err != nil {
+		return false, latestPath, fmt.Errorf("open session %s: %w", latestPath, err)
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 1<<20), 16<<20) // 1MB initial, 16MB max
+
+	for scanner.Scan() {
+		var ev struct {
+			Type    string `json:"type"`
+			Message struct {
+				Role    string          `json:"role"`
+				Content json.RawMessage `json:"content"`
+			} `json:"message"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &ev); err != nil {
+			continue
+		}
+		if ev.Type != "assistant" || ev.Message.Role != "assistant" {
+			continue
+		}
+		text := extractAssistantText(ev.Message.Content)
+		text = strings.TrimSpace(text)
+		if text == "" || text == "No response requested." {
+			continue
+		}
+		// Found a real assistant response → alive
+		return false, latestPath, nil
+	}
+	// No real assistant work in any event → dead
+	return true, latestPath, nil
+}
+
+// extractAssistantText pulls user-visible text from a claude message
+// content field, which may be either a plain string or an array of
+// part objects. Non-text parts (tool_use, etc) are ignored.
+func extractAssistantText(content json.RawMessage) string {
+	if len(content) == 0 {
+		return ""
+	}
+	// Try plain string first
+	var s string
+	if err := json.Unmarshal(content, &s); err == nil {
+		return s
+	}
+	// Try array of parts
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(content, &parts); err == nil {
+		var sb strings.Builder
+		for _, p := range parts {
+			if p.Type == "text" && p.Text != "" {
+				if sb.Len() > 0 {
+					sb.WriteString("\n")
+				}
+				sb.WriteString(p.Text)
+			}
+		}
+		return sb.String()
+	}
+	return ""
+}
+
+// DeleteClaudeSession removes the JSONL transcript at sessionPath.
+// Returns nil if sessionPath is empty. Wraps os.Remove errors.
+func DeleteClaudeSession(sessionPath string) error {
+	if sessionPath == "" {
+		return nil
+	}
+	if err := os.Remove(sessionPath); err != nil {
+		return fmt.Errorf("delete claude session %s: %w", sessionPath, err)
+	}
+	return nil
 }

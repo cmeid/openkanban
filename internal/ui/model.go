@@ -2740,50 +2740,64 @@ func (m *Model) spawnAgent() (tea.Model, tea.Cmd) {
 	// the merge would change the brief on disk, ask the user how to
 	// proceed before transitioning to ModeSpawning.
 	if agentType == "claude" && ticket.AgentSpawnedAt != nil {
-		_, _, wouldChange, _, _ := agent.PreviewBriefMerge(ticket, ticket.WorktreePath)
-		if wouldChange {
-			// Capture ticket/proj/agentCfg into each callback. Each option
-			// sets its own plan and proceeds with the existing tea.Batch.
-			m.showChoice = true
-			m.choiceMsg = "Brief was updated since this session started. What should I do?"
-			ticketCopy := ticket // pointer — fine, the closures don't outlive the ticket
-			projCopy := proj
-			cfgCopy := agentCfg
-			m.choices = []choiceItem{
-				{
-					Key:   'd',
-					Label: "Discard prior session, start fresh",
-					Fn: func() tea.Cmd {
-						ticketCopy.AgentSpawnedAt = nil
-						m.saveTicket(ticketCopy)
-						m.mode = ModeSpawning
-						m.spawningTicketID = ticketCopy.ID
-						m.spawningAgent = agentType
-						return tea.Batch(m.spinner.Tick, m.prepareSpawnWith(ticketCopy, projCopy, cfgCopy, spawnPlan{ForceFresh: true}))
-					},
-				},
-				{
-					Key:   'u',
-					Label: "Resume; tell agent the brief changed",
-					Fn: func() tea.Cmd {
-						m.mode = ModeSpawning
-						m.spawningTicketID = ticketCopy.ID
-						m.spawningAgent = agentType
-						return tea.Batch(m.spinner.Tick, m.prepareSpawnWith(ticketCopy, projCopy, cfgCopy, spawnPlan{InjectResumeNotice: true}))
-					},
-				},
-				{
-					Key:   'n',
-					Label: "Resume; leave brief unchanged",
-					Fn: func() tea.Cmd {
-						m.mode = ModeSpawning
-						m.spawningTicketID = ticketCopy.ID
-						m.spawningAgent = agentType
-						return tea.Batch(m.spinner.Tick, m.prepareSpawnWith(ticketCopy, projCopy, cfgCopy, spawnPlan{SkipMerge: true}))
-					},
-				},
+		// Dead-session auto-cleanup: if the prior session has no real
+		// assistant work (e.g., user spawned then immediately /exit'd),
+		// silently discard it and spawn fresh. No modal — the user's
+		// intent is unambiguous when there's nothing to preserve.
+		dead, deadPath, _ := agent.IsClaudeSessionDead(ticket.WorktreePath)
+		if dead {
+			if deadPath != "" {
+				_ = agent.DeleteClaudeSession(deadPath)
 			}
-			return m, nil
+			ticket.AgentSpawnedAt = nil
+			m.saveTicket(ticket)
+			// fall through to the empty-plan spawn path below
+		} else {
+			_, _, wouldChange, _, _ := agent.PreviewBriefMerge(ticket, ticket.WorktreePath)
+			if wouldChange {
+				// Capture ticket/proj/agentCfg into each callback. Each option
+				// sets its own plan and proceeds with the existing tea.Batch.
+				m.showChoice = true
+				m.choiceMsg = "Brief was updated since this session started. What should I do?"
+				ticketCopy := ticket // pointer — fine, the closures don't outlive the ticket
+				projCopy := proj
+				cfgCopy := agentCfg
+				m.choices = []choiceItem{
+					{
+						Key:   'd',
+						Label: "Discard prior session, start fresh",
+						Fn: func() tea.Cmd {
+							ticketCopy.AgentSpawnedAt = nil
+							m.saveTicket(ticketCopy)
+							m.mode = ModeSpawning
+							m.spawningTicketID = ticketCopy.ID
+							m.spawningAgent = agentType
+							return tea.Batch(m.spinner.Tick, m.prepareSpawnWith(ticketCopy, projCopy, cfgCopy, spawnPlan{ForceFresh: true}))
+						},
+					},
+					{
+						Key:   'u',
+						Label: "Resume; tell agent the brief changed",
+						Fn: func() tea.Cmd {
+							m.mode = ModeSpawning
+							m.spawningTicketID = ticketCopy.ID
+							m.spawningAgent = agentType
+							return tea.Batch(m.spinner.Tick, m.prepareSpawnWith(ticketCopy, projCopy, cfgCopy, spawnPlan{InjectResumeNotice: true}))
+						},
+					},
+					{
+						Key:   'n',
+						Label: "Resume; leave brief unchanged",
+						Fn: func() tea.Cmd {
+							m.mode = ModeSpawning
+							m.spawningTicketID = ticketCopy.ID
+							m.spawningAgent = agentType
+							return tea.Batch(m.spinner.Tick, m.prepareSpawnWith(ticketCopy, projCopy, cfgCopy, spawnPlan{SkipMerge: true}))
+						},
+					},
+				}
+				return m, nil
+			}
 		}
 	}
 
