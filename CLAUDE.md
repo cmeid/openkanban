@@ -60,3 +60,12 @@ Context-specific guidance lives in nested CLAUDE.md files:
 - internal/ui/CLAUDE.md - BubbleTea patterns
 - internal/agent/CLAUDE.md - Agent integration
 - internal/terminal/CLAUDE.md - PTY/terminal handling
+
+## Relevant workspace memories
+
+When spawned to work on this repo (e.g. from an openkanban ticket via a git worktree), the calling user's project-scoped memory directory may carry context that's not in this repo. For Chris (this fork's maintainer), those memories live at `~/.claude/projects/-Users-cmeid-manifold-dev/memory/`. Read these after `/prime` if they exist — they describe how openkanban is actually used here, not just how the code works:
+
+- `project_openkanban_personal_fork.md` — the fork's diverged state, key features beyond upstream, why there's no upstream PR pending
+- `feedback_openkanban_session_linking.md` — `openkanban ticket new --session` link vs migrate semantics, and the "don't `--migrate --force` from inside the session you're migrating" trap
+- `feedback_openkanban_store_volatile.md` — openkanban's on-disk store is operational state, not source of truth; canonical ticket briefs live in repo `tickets/<slug>.md` files
+- `reference_openkanban_dev_loop.md` — `update-openkanban` install script, fork remote setup, branch + commit conventions, the 50/72/no-AI commit hook
