@@ -495,6 +495,52 @@ func buildCleanEnv() []string {
 }
 ```
 
+## Agent-callable commands (in-session)
+
+When openkanban spawns an agent, it injects two env vars the child can
+use to report back:
+
+- `OPENKANBAN_SESSION` — session identifier used as the basename of
+  `~/.cache/openkanban-status/<session>.status`. Used by Claude Code
+  hooks (see `openkanban hooks install`) to write working / idle /
+  waiting status that the TUI polls.
+- `OPENKANBAN_TICKET_ID` — the ticket's frontmatter UUID. Used by
+  `openkanban ticket done` to resolve the .md file authoritatively.
+
+Two CLI subcommands are designed to be invoked from inside a spawned
+session:
+
+### `openkanban status set <state>`
+
+Writes the session's status file. `state` is one of `working`, `idle`,
+`waiting`, `completed`, `error`. Silently no-ops when
+`$OPENKANBAN_SESSION` is unset (safe for globally-installed hooks).
+
+Once the status file holds `completed`, a subsequent `status set idle`
+/ `working` / `waiting` is silently dropped — only `completed` or
+`error` (terminal states) may overwrite it. This prevents Claude's
+`Stop` hook from clobbering the completion signal during the SIGTERM
+grace window that follows `openkanban ticket done`.
+
+### `openkanban ticket done`
+
+The agent-side "/quit equivalent." Marks the current session's ticket
+as `Status=done` + `AgentStatus=completed` (atomic .md write), then
+writes `completed` to the status file. Reads `$OPENKANBAN_TICKET_ID`;
+exits non-zero if unset or if the ticket .md is missing.
+
+When the TUI sees the resulting `AgentCompleted` transition on a ticket
+whose `Status == StatusDone`, it gracefully stops the pane
+(SIGTERM → 3s grace → SIGKILL) — the Claude process exits cleanly and
+the ticket lands in the Done column with the completed badge.
+
+Idempotent: a second invocation does not re-stamp `CompletedAt`, but
+the status file is re-written so a freshly-spawned pane (re-opened
+after the previous completion) re-arms the auto-stop transition.
+
+Worktree, branch, and session-JSONL teardown remain reserved for
+ticket deletion — `ticket done` does not touch them.
+
 ## Adding New Agents
 
 ### 1. Add Configuration
