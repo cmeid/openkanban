@@ -14,14 +14,20 @@ import (
 )
 
 // daemonGuardAPI is the subset of *daemonclient.Client used by the TUI
-// exit-guard. Held as an interface (rather than a concrete type) so
-// tests can swap in a fake without bringing up a real daemon. The real
-// daemonclient.Client satisfies this interface by virtue of its
-// PrepareExit / Kill / ClientID methods.
+// exit-guard AND the spawn-path dead-session gate. Held as an interface
+// (rather than a concrete type) so tests can swap in a fake without
+// bringing up a real daemon. The real daemonclient.Client satisfies
+// this interface by virtue of its PrepareExit / Kill / ClientID / Owns
+// methods.
+//
+// Owns is used by spawnAgent to short-circuit the on-disk JSONL
+// dead-session check when the daemon already has a live PTY for the
+// session UUID — see internal/ui/model.go's spawnAgent.
 type daemonGuardAPI interface {
 	PrepareExit(ctx context.Context) (daemon.PrepareExitResp, error)
 	Kill(ctx context.Context, sessionID string, grace time.Duration) error
 	ClientID() uint16
+	Owns(ctx context.Context, sessionUUID string) (daemon.OwnsResp, error)
 }
 
 // confirmExitState carries the modal's transient bookkeeping. Lives on

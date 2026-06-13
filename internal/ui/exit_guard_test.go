@@ -58,6 +58,14 @@ func (f *fakeGuardAPI) Kill(_ context.Context, sessionID string, _ time.Duration
 
 func (f *fakeGuardAPI) ClientID() uint16 { return 1 }
 
+// Owns is unused by the exit-guard tests but required to satisfy
+// daemonGuardAPI (the spawn-path gate calls it — see model.go's
+// shouldCleanupDeadSession). Always answers "not owned" so any
+// accidental Owns call during an exit-guard test resolves cleanly.
+func (f *fakeGuardAPI) Owns(_ context.Context, _ string) (daemon.OwnsResp, error) {
+	return daemon.OwnsResp{Owned: false}, nil
+}
+
 func (f *fakeGuardAPI) killCallsCopy() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()

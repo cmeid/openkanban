@@ -3006,6 +3006,56 @@ func (m *Model) allocateAgentPort() int {
 	return port
 }
 
+// ownsProbeTimeout is the cap we put on the daemon Owns RPC during the
+// spawn-path dead-session gate. The probe is best-effort — if the
+// daemon is slow or unreachable we fall back to the on-disk dead-check.
+// Keep this small: the user just pressed Enter on a ticket and is
+// waiting for the spawn flow to proceed.
+const ownsProbeTimeout = 500 * time.Millisecond
+
+// shouldCleanupDeadSession decides whether spawnAgent should fire the
+// IsClaudeSessionDead / DeleteClaudeSession cleanup for ticket's prior
+// session. Returns (cleanup, deadJSONLPath).
+//
+// The decision tree is:
+//  1. If the daemon owns a live PTY for ticket.AgentSessionID, return
+//     (false, "") — never delete the JSONL of a session the daemon is
+//     actively writing. The on-disk transcript may look "dead" because
+//     the assistant hasn't replied yet; deleting it would break a
+//     future `--continue`.
+//  2. Otherwise, fall through to agent.IsClaudeSessionDead and report
+//     its verdict (and the JSONL path so the caller can unlink it).
+//
+// The Owns probe is bounded by ownsProbeTimeout; on timeout / RPC
+// error we conservatively fall through to the disk check (and log so
+// the timeout is visible).
+func (m *Model) shouldCleanupDeadSession(ticket *board.Ticket) (bool, string) {
+	if ticket == nil {
+		return false, ""
+	}
+	if m.guardAPI != nil && ticket.AgentSessionID != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), ownsProbeTimeout)
+		resp, err := m.guardAPI.Owns(ctx, ticket.AgentSessionID)
+		cancel()
+		switch {
+		case err == nil && resp.Owned:
+			// Daemon owns the live session — skip the dead-session
+			// cleanup entirely. The wouldChange/modal path in
+			// spawnAgent still runs.
+			return false, ""
+		case err != nil:
+			// Probe failed (timeout, connection refused, etc.). Log
+			// and fall through to the on-disk check — refusing to
+			// spawn because we couldn't reach the daemon would be
+			// strictly worse than the rare edge case of cleaning up
+			// a session whose ownership we couldn't confirm.
+			log.Printf("openkanban: spawn-gate Owns(%s) failed: %v", ticket.AgentSessionID, err)
+		}
+	}
+	dead, deadPath, _ := agent.IsClaudeSessionDead(ticket.WorktreePath)
+	return dead, deadPath
+}
+
 func (m *Model) spawnAgent() (tea.Model, tea.Cmd) {
 	ticket := m.selectedTicket()
 	if ticket == nil {
@@ -3076,12 +3126,15 @@ func (m *Model) spawnAgent() (tea.Model, tea.Cmd) {
 	// the merge would change the brief on disk, ask the user how to
 	// proceed before transitioning to ModeSpawning.
 	if agentType == "claude" && ticket.AgentSpawnedAt != nil {
-		// Dead-session auto-cleanup: if the prior session has no real
-		// assistant work (e.g., user spawned then immediately /exit'd),
-		// silently discard it and spawn fresh. No modal — the user's
-		// intent is unambiguous when there's nothing to preserve.
-		dead, deadPath, _ := agent.IsClaudeSessionDead(ticket.WorktreePath)
-		if dead {
+		// T3: Dead-session auto-cleanup is gated by daemon ownership.
+		// If the daemon currently owns the live PTY for this session
+		// UUID, the on-disk JSONL may legitimately look "dead" (no
+		// assistant content yet, mid-write) while the runtime session
+		// is fine. Deleting the JSONL in that case would break a
+		// future `--continue`. shouldCleanupDeadSession encapsulates
+		// the Owns probe + IsClaudeSessionDead decision.
+		shouldCleanup, deadPath := m.shouldCleanupDeadSession(ticket)
+		if shouldCleanup {
 			if deadPath != "" {
 				_ = agent.DeleteClaudeSession(deadPath)
 			}
