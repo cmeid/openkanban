@@ -20,59 +20,28 @@ const defaultGlobalPrompt = `You have been spawned by OpenKanban to work on a ti
 
 Focus on completing this ticket. Ask clarifying questions if the description is unclear.`
 
-const defaultOpencodePrompt = `You have been spawned by OpenKanban, a kanban board system for managing development tasks.
+const defaultAgentPrompt = `{{if .IsExternalResume}}OpenKanban has scoped this session to ticket "{{.Title}}". Continue with your prior context; what follows is the ticket metadata.
 
-## Your Assignment
+**Title:** {{.Title}}{{if .Description}}
 
-You are now working on a specific ticket. This ticket represents a discrete unit of work that needs to be completed.
+**Description:**
+{{.Description}}{{end}}
 
-**Ticket Title:** {{.Title}}
+**Branch:** {{.BranchName}} (from {{.BaseBranch}}){{if .HasBrief}}
 
-**Ticket Description:**
-{{.Description}}
+Full brief: ` + "`{{.BriefPath}}`" + ` in your worktree.{{end}}
+{{else}}You have been spawned by OpenKanban to work on one ticket.
 
-## Technical Context
+**Title:** {{.Title}}{{if .Description}}
 
-- **Git Branch:** {{.BranchName}}
-- **Base Branch:** {{.BaseBranch}}
-- **Working Directory:** This session is scoped to an isolated git worktree for this ticket
+**Description:**
+{{.Description}}{{end}}
 
-## Expectations
+**Branch:** {{.BranchName}} (from {{.BaseBranch}}){{if .HasBrief}}
 
-1. Focus exclusively on completing the work described in this ticket
-2. The ticket description above is your primary specification - implement what it describes
-3. If the description is unclear or incomplete, ask clarifying questions before proceeding
-4. Make commits as appropriate for the work being done
-5. When the work is complete, summarize what was accomplished
+Your full brief lives at ` + "`{{.BriefPath}}`" + ` in this worktree. Read it before you start — that file is your primary specification. Any "## Notes (from openkanban card)" section was synced from the openkanban card by OpenKanban; treat it as the latest user-supplied additions to the brief.{{end}}
 
-Begin by analyzing the ticket requirements and proposing your approach.`
-
-const defaultClaudePrompt = `You have been spawned by OpenKanban, a kanban board system for managing development tasks.
-
-## Your Assignment
-
-You are now working on a specific ticket. This ticket represents a discrete unit of work that needs to be completed.
-
-**Ticket Title:** {{.Title}}
-
-**Ticket Description:**
-{{.Description}}
-
-## Technical Context
-
-- **Git Branch:** {{.BranchName}}
-- **Base Branch:** {{.BaseBranch}}
-- **Working Directory:** This session is scoped to an isolated git worktree for this ticket
-
-## Expectations
-
-1. Focus exclusively on completing the work described in this ticket
-2. The ticket description above is your primary specification - implement what it describes
-3. If the description is unclear or incomplete, ask clarifying questions before proceeding
-4. Make commits as appropriate for the work being done
-5. When the work is complete, summarize what was accomplished
-
-Begin by analyzing the ticket requirements and proposing your approach.`
+Focus on completing this ticket. Ask clarifying questions if anything is unclear.{{end}}`
 
 const defaultAiderPrompt = `OpenKanban Ticket: {{.Title}}
 
@@ -82,60 +51,6 @@ Description:
 Branch: {{.BranchName}} (from {{.BaseBranch}})
 
 This is your assigned task. Implement what the description specifies.`
-
-const defaultGeminiPrompt = `You have been spawned by OpenKanban, a kanban board system for managing development tasks.
-
-## Your Assignment
-
-You are now working on a specific ticket. This ticket represents a discrete unit of work that needs to be completed.
-
-**Ticket Title:** {{.Title}}
-
-**Ticket Description:**
-{{.Description}}
-
-## Technical Context
-
-- **Git Branch:** {{.BranchName}}
-- **Base Branch:** {{.BaseBranch}}
-- **Working Directory:** This session is scoped to an isolated git worktree for this ticket
-
-## Expectations
-
-1. Focus exclusively on completing the work described in this ticket
-2. The ticket description above is your primary specification - implement what it describes
-3. If the description is unclear or incomplete, ask clarifying questions before proceeding
-4. Make commits as appropriate for the work being done
-5. When the work is complete, summarize what was accomplished
-
-Begin by analyzing the ticket requirements and proposing your approach.`
-
-const defaultCodexPrompt = `You have been spawned by OpenKanban, a kanban board system for managing development tasks.
-
-## Your Assignment
-
-You are now working on a specific ticket. This ticket represents a discrete unit of work that needs to be completed.
-
-**Ticket Title:** {{.Title}}
-
-**Ticket Description:**
-{{.Description}}
-
-## Technical Context
-
-- **Git Branch:** {{.BranchName}}
-- **Base Branch:** {{.BaseBranch}}
-- **Working Directory:** This session is scoped to an isolated git worktree for this ticket
-
-## Expectations
-
-1. Focus exclusively on completing the work described in this ticket
-2. The ticket description above is your primary specification - implement what it describes
-3. If the description is unclear or incomplete, ask clarifying questions before proceeding
-4. Make commits as appropriate for the work being done
-5. When the work is complete, summarize what was accomplished
-
-Begin by analyzing the ticket requirements and proposing your approach.`
 
 // AgentPriority defines the order in which agents are preferred when auto-detecting.
 // The first available agent in this list becomes the default.
@@ -228,14 +143,14 @@ func defaultAgents() map[string]AgentConfig {
 			Args:       []string{"--dangerously-skip-permissions"},
 			Env:        map[string]string{},
 			StatusFile: ".claude/status.json",
-			InitPrompt: defaultClaudePrompt,
+			InitPrompt: defaultAgentPrompt,
 		},
 		"opencode": {
 			Command:    "opencode",
 			Args:       []string{},
 			Env:        map[string]string{},
 			StatusFile: ".opencode/status.json",
-			InitPrompt: defaultOpencodePrompt,
+			InitPrompt: defaultAgentPrompt,
 		},
 		"aider": {
 			Command:    "aider",
@@ -249,14 +164,14 @@ func defaultAgents() map[string]AgentConfig {
 			Args:       []string{"--yolo"},
 			Env:        map[string]string{},
 			StatusFile: "",
-			InitPrompt: defaultGeminiPrompt,
+			InitPrompt: defaultAgentPrompt,
 		},
 		"codex": {
 			Command:    "codex",
 			Args:       []string{"--full-auto"},
 			Env:        map[string]string{},
 			StatusFile: "",
-			InitPrompt: defaultCodexPrompt,
+			InitPrompt: defaultAgentPrompt,
 		},
 	}
 }

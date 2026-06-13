@@ -2773,6 +2773,23 @@ func (m *Model) prepareSpawn(ticket *board.Ticket, proj *project.Project, agentC
 
 		promptTemplate := cfg.GetEffectiveInitPrompt(agentType)
 
+		// Sync the openkanban card's description into the in-repo brief
+		// file at tickets/<slug>.md (worktree-relative) before rendering
+		// the priming prompt. A brief write failure is logged but does
+		// not abort the spawn — the agent can still proceed with the
+		// inline title/description from the prompt.
+		briefRelPath, hasBrief, briefErr := agent.MergeTicketBrief(ticket, worktreePath)
+		if briefErr != nil {
+			fmt.Fprintf(os.Stderr, "openkanban: merge brief failed: %v\n", briefErr)
+		}
+		// External resume: spawn was given an AgentSessionID up front
+		// (via `openkanban ticket new --session <uuid>`), so this is the
+		// first openkanban-spawn but the underlying claude session is
+		// already populated with prior context. The template uses this
+		// to shorten the priming preamble.
+		isExternalResume := isNewSession && ticket.AgentSessionID != "" && agent.SessionUUIDPattern.MatchString(ticket.AgentSessionID)
+		ctxData := agent.NewContextData(ticket, briefRelPath, hasBrief, isExternalResume)
+
 		switch agentType {
 		case "claude":
 			if isNewSession {
@@ -2797,7 +2814,7 @@ func (m *Model) prepareSpawn(ticket *board.Ticket, proj *project.Project, agentC
 					}
 				}
 				if promptTemplate != "" {
-					prompt := agent.BuildContextPrompt(promptTemplate, ticket)
+					prompt := agent.BuildContextPrompt(promptTemplate, ctxData)
 					if prompt != "" {
 						args = append(args, prompt)
 					}
@@ -2821,7 +2838,7 @@ func (m *Model) prepareSpawn(ticket *board.Ticket, proj *project.Project, agentC
 			args = []string{worktreePath, "--port", fmt.Sprintf("%d", agentPort)}
 			if isNewSession {
 				if promptTemplate != "" {
-					prompt := agent.BuildContextPrompt(promptTemplate, ticket)
+					prompt := agent.BuildContextPrompt(promptTemplate, ctxData)
 					if prompt != "" {
 						args = append(args, "--prompt", prompt)
 					}
@@ -2848,7 +2865,7 @@ func (m *Model) prepareSpawn(ticket *board.Ticket, proj *project.Project, agentC
 					args = append(args, "--resume")
 				}
 			} else if promptTemplate != "" {
-				prompt := agent.BuildContextPrompt(promptTemplate, ticket)
+				prompt := agent.BuildContextPrompt(promptTemplate, ctxData)
 				if prompt != "" {
 					args = append(args, "-i", prompt)
 				}
@@ -2875,7 +2892,7 @@ func (m *Model) prepareSpawn(ticket *board.Ticket, proj *project.Project, agentC
 					args = append(args, agentCfg.Args...)
 				}
 			} else if promptTemplate != "" {
-				prompt := agent.BuildContextPrompt(promptTemplate, ticket)
+				prompt := agent.BuildContextPrompt(promptTemplate, ctxData)
 				if prompt != "" {
 					args = append(args, prompt)
 				}

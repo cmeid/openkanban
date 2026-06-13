@@ -1,11 +1,8 @@
 package agent
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/techdufus/openkanban/internal/board"
 )
@@ -15,6 +12,9 @@ func TestBuildContextPrompt(t *testing.T) {
 		name           string
 		template       string
 		ticket         *board.Ticket
+		briefRelPath   string
+		hasBrief       bool
+		isResume       bool
 		expectContains []string
 		expectEmpty    bool
 	}{
@@ -78,11 +78,33 @@ func TestBuildContextPrompt(t *testing.T) {
 			},
 			expectContains: []string{"Title=Only title", "Desc="},
 		},
+		{
+			name:           "slug field rendered from branch",
+			template:       "Slug={{.Slug}}",
+			ticket:         &board.Ticket{Title: "T", BranchName: "task/foo-bar"},
+			expectContains: []string{"Slug=foo-bar"},
+		},
+		{
+			name:           "brief fields rendered",
+			template:       "HasBrief={{.HasBrief}} BriefPath={{.BriefPath}}",
+			ticket:         &board.Ticket{Title: "T"},
+			briefRelPath:   "tickets/foo.md",
+			hasBrief:       true,
+			expectContains: []string{"HasBrief=true", "BriefPath=tickets/foo.md"},
+		},
+		{
+			name:           "resume flag rendered",
+			template:       "Resume={{.IsExternalResume}}",
+			ticket:         &board.Ticket{Title: "T"},
+			isResume:       true,
+			expectContains: []string{"Resume=true"},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := BuildContextPrompt(tt.template, tt.ticket)
+			data := NewContextData(tt.ticket, tt.briefRelPath, tt.hasBrief, tt.isResume)
+			result := BuildContextPrompt(tt.template, data)
 
 			if tt.expectEmpty {
 				if result != "" {
@@ -106,7 +128,7 @@ func TestBuildContextPrompt_InvalidTemplate(t *testing.T) {
 		Description: "Some description",
 	}
 
-	result := BuildContextPrompt("{{.InvalidSyntax", ticket)
+	result := BuildContextPrompt("{{.InvalidSyntax", NewContextData(ticket, "", false, false))
 
 	if result == "" {
 		t.Error("BuildContextPrompt with invalid template should return fallback, not empty")
@@ -119,19 +141,19 @@ func TestBuildContextPrompt_InvalidTemplate(t *testing.T) {
 func TestBuildFallbackPrompt(t *testing.T) {
 	tests := []struct {
 		name           string
-		ticket         *board.Ticket
+		data           ContextData
 		expectContains []string
 	}{
 		{
 			name: "title only",
-			ticket: &board.Ticket{
+			data: ContextData{
 				Title: "Simple task",
 			},
 			expectContains: []string{"Task: Simple task"},
 		},
 		{
 			name: "title and description",
-			ticket: &board.Ticket{
+			data: ContextData{
 				Title:       "Complex task",
 				Description: "Do these things",
 			},
@@ -141,7 +163,7 @@ func TestBuildFallbackPrompt(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := buildFallbackPrompt(tt.ticket)
+			result := buildFallbackPrompt(tt.data)
 			for _, expected := range tt.expectContains {
 				if !strings.Contains(result, expected) {
 					t.Errorf("buildFallbackPrompt() = %q; want to contain %q", result, expected)
@@ -151,186 +173,145 @@ func TestBuildFallbackPrompt(t *testing.T) {
 	}
 }
 
-func TestShouldInjectContext(t *testing.T) {
-	tests := []struct {
-		name     string
-		ticket   *board.Ticket
-		expected bool
-	}{
-		{
-			name:     "new ticket without spawn time",
-			ticket:   &board.Ticket{AgentSpawnedAt: nil},
-			expected: true,
-		},
-		{
-			name: "previously spawned ticket",
-			ticket: &board.Ticket{
-				AgentSpawnedAt: func() *time.Time { t := time.Now(); return &t }(),
-			},
-			expected: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := ShouldInjectContext(tt.ticket)
-			if result != tt.expected {
-				t.Errorf("ShouldInjectContext() = %v; want %v", result, tt.expected)
-			}
-		})
-	}
-}
-
-func TestScrubMissingFileReferences(t *testing.T) {
-	worktree := t.TempDir()
-	// Create one real file the scrubber should consider present.
-	presentRel := "docs/present.md"
-	if err := os.MkdirAll(filepath.Join(worktree, "docs"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(worktree, presentRel), []byte("ok"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	tests := []struct {
-		name           string
-		input          string
-		expectContains []string
-		expectAbsent   []string
-	}{
-		{
-			name:           "no md references is no-op",
-			input:          "## Heading\n\nA paragraph with no file refs.\n\nAnother paragraph.",
-			expectContains: []string{"## Heading", "A paragraph", "Another paragraph"},
-		},
-		{
-			name: "present file path leaves paragraph intact",
-			input: "## Brief\n\nRead `docs/present.md` for context.\n\n" +
-				"## Next\n\nDo the thing.",
-			expectContains: []string{"## Brief", "docs/present.md", "## Next", "Do the thing"},
-		},
-		{
-			name: "missing file path strips containing paragraph",
-			input: "## Locating brief\n\nRead `tickets/missing.md` immediately.\n\n" +
-				"## Next steps\n\nProceed when ready.",
-			expectContains: []string{"## Next steps", "Proceed when ready"},
-			expectAbsent:   []string{"tickets/missing.md", "Read `tickets/missing.md`"},
-		},
-		{
-			name: "orphan header dropped when body fully scrubbed",
-			input: "## Locating brief\n\nThe brief is at `tickets/missing.md`.\n\n" +
-				"If `tickets/missing.md` is absent, stop.\n\n## Next steps\n\nGo.",
-			expectContains: []string{"## Next steps", "Go"},
-			expectAbsent:   []string{"## Locating brief", "tickets/missing.md"},
-		},
-		{
-			name: "literal placeholder path is treated as missing",
-			input: "## Read brief\n\nOpen `tickets/<slug>.md`.\n\n## Next\n\nContinue.",
-			expectContains: []string{"## Next", "Continue"},
-			expectAbsent:   []string{"## Read brief", "tickets/<slug>.md"},
-		},
-		{
-			name:           "absolute missing path stripped",
-			input:          "## A\n\nSee `/definitely/does/not/exist.md`.\n\n## B\n\nKeep me.",
-			expectContains: []string{"## B", "Keep me"},
-			expectAbsent:   []string{"/definitely/does/not/exist.md"},
-		},
-		{
-			name: "multiple paragraphs referencing missing file each stripped",
-			input: "## H\n\nFirst para about `tickets/x.md`.\n\n" +
-				"Second para about `tickets/x.md`.\n\nThird unrelated para.",
-			expectContains: []string{"Third unrelated para"},
-			expectAbsent:   []string{"First para", "Second para", "tickets/x.md"},
-		},
-		{
-			name: "paragraph with both present and missing dropped (any missing wins)",
-			input: "## Mix\n\nRead `docs/present.md` and `tickets/missing.md`.\n\n" +
-				"## Tail\n\nEnd.",
-			expectContains: []string{"## Tail", "End"},
-			expectAbsent:   []string{"tickets/missing.md", "docs/present.md"},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := scrubMissingFileReferences(tt.input, worktree)
-			for _, want := range tt.expectContains {
-				if !strings.Contains(got, want) {
-					t.Errorf("missing expected substring %q in:\n%s", want, got)
-				}
-			}
-			for _, absent := range tt.expectAbsent {
-				if strings.Contains(got, absent) {
-					t.Errorf("unexpected substring %q still present in:\n%s", absent, got)
-				}
-			}
-		})
-	}
-}
-
-func TestScrubMissingFileReferences_HomeExpansion(t *testing.T) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		t.Skip("no home dir available")
-	}
-	// Create a temp file under home for the present case.
-	tmp, err := os.CreateTemp(home, "okb-scrub-test-*.md")
-	if err != nil {
-		t.Skip("cannot create file in home dir")
-	}
-	t.Cleanup(func() { os.Remove(tmp.Name()) })
-	tmp.Close()
-	rel := "~/" + filepath.Base(tmp.Name())
-
-	prompt := "## A\n\nRead `" + rel + "` for the brief.\n\n## B\n\nKeep."
-	got := scrubMissingFileReferences(prompt, "")
-	if !strings.Contains(got, rel) {
-		t.Errorf("present ~/-path should be kept; got:\n%s", got)
-	}
-
-	missingPrompt := "## A\n\nRead `~/does-not-exist-okb-test.md`.\n\n## B\n\nKeep."
-	got = scrubMissingFileReferences(missingPrompt, "")
-	if strings.Contains(got, "~/does-not-exist") {
-		t.Errorf("missing ~/-path should be stripped; got:\n%s", got)
-	}
-	if !strings.Contains(got, "## B") {
-		t.Errorf("unrelated section should remain; got:\n%s", got)
-	}
-}
-
-func TestBuildContextPrompt_ScrubsMissingFileReferences(t *testing.T) {
-	worktree := t.TempDir()
-	ticket := &board.Ticket{
-		Title:        "Test",
-		BranchName:   "task/foo",
-		WorktreePath: worktree,
-	}
-	template := "## Brief\n\nRead `tickets/foo.md` carefully.\n\n## Tail\n\n{{.Title}} continues."
-	got := BuildContextPrompt(template, ticket)
-	if strings.Contains(got, "tickets/foo.md") {
-		t.Errorf("missing-file directive should be scrubbed; got:\n%s", got)
-	}
-	if !strings.Contains(got, "Test continues") {
-		t.Errorf("unrelated content should remain; got:\n%s", got)
-	}
-}
-
 func TestContextData_AllFieldsMapped(t *testing.T) {
 	ticket := &board.Ticket{
 		ID:           "test-id-123",
 		Title:        "Test Title",
 		Description:  "Test Description",
-		BranchName:   "feature/test",
+		BranchName:   "task/feature-test",
 		BaseBranch:   "main",
 		Status:       board.StatusInProgress,
 		WorktreePath: "/home/user/project-worktrees/test",
 	}
 
-	template := "{{.TicketID}}|{{.Title}}|{{.Description}}|{{.BranchName}}|{{.BaseBranch}}|{{.Status}}|{{.WorktreePath}}"
-	result := BuildContextPrompt(template, ticket)
+	data := NewContextData(ticket, "tickets/test.md", true, true)
 
-	expected := "test-id-123|Test Title|Test Description|feature/test|main|in_progress|/home/user/project-worktrees/test"
+	template := "{{.TicketID}}|{{.Title}}|{{.Description}}|{{.BranchName}}|{{.BaseBranch}}|{{.Status}}|{{.WorktreePath}}|{{.Slug}}|{{.HasBrief}}|{{.BriefPath}}|{{.IsExternalResume}}"
+	result := BuildContextPrompt(template, data)
+
+	expected := "test-id-123|Test Title|Test Description|task/feature-test|main|in_progress|/home/user/project-worktrees/test|feature-test|true|tickets/test.md|true"
 	if result != expected {
 		t.Errorf("All fields mapping:\ngot:  %q\nwant: %q", result, expected)
 	}
+}
+
+func TestNewContextData(t *testing.T) {
+	tests := []struct {
+		name         string
+		ticket       *board.Ticket
+		briefRelPath string
+		hasBrief     bool
+		isResume     bool
+		want         ContextData
+	}{
+		{
+			name:         "nil ticket sets only brief and resume fields",
+			ticket:       nil,
+			briefRelPath: "tickets/x.md",
+			hasBrief:     true,
+			isResume:     true,
+			want: ContextData{
+				BriefPath:        "tickets/x.md",
+				HasBrief:         true,
+				IsExternalResume: true,
+			},
+		},
+		{
+			name: "non-nil ticket derives slug from branch",
+			ticket: &board.Ticket{
+				Title:      "T",
+				BranchName: "task/foo-bar",
+			},
+			briefRelPath: "",
+			hasBrief:     false,
+			isResume:     false,
+			want: ContextData{
+				Title:      "T",
+				BranchName: "task/foo-bar",
+				Slug:       "foo-bar",
+			},
+		},
+		{
+			name: "hasBrief false yields HasBrief false",
+			ticket: &board.Ticket{
+				Title:      "T",
+				BranchName: "task/abc",
+			},
+			briefRelPath: "tickets/abc.md",
+			hasBrief:     false,
+			isResume:     false,
+			want: ContextData{
+				Title:      "T",
+				BranchName: "task/abc",
+				Slug:       "abc",
+				BriefPath:  "tickets/abc.md",
+				HasBrief:   false,
+			},
+		},
+		{
+			name: "isExternalResume true is propagated",
+			ticket: &board.Ticket{
+				Title:      "T",
+				BranchName: "task/zz",
+			},
+			briefRelPath:     "",
+			hasBrief:         false,
+			isResume:         true,
+			want: ContextData{
+				Title:            "T",
+				BranchName:       "task/zz",
+				Slug:             "zz",
+				IsExternalResume: true,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := NewContextData(tt.ticket, tt.briefRelPath, tt.hasBrief, tt.isResume)
+			if got != tt.want {
+				t.Errorf("NewContextData() = %+v; want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildContextPrompt_BriefConditional(t *testing.T) {
+	tmpl := "{{if .HasBrief}}brief: {{.BriefPath}}{{else}}no brief{{end}}"
+
+	t.Run("has brief renders path", func(t *testing.T) {
+		data := ContextData{HasBrief: true, BriefPath: "tickets/x.md"}
+		got := BuildContextPrompt(tmpl, data)
+		if got != "brief: tickets/x.md" {
+			t.Errorf("got %q; want %q", got, "brief: tickets/x.md")
+		}
+	})
+
+	t.Run("no brief renders else branch", func(t *testing.T) {
+		data := ContextData{HasBrief: false}
+		got := BuildContextPrompt(tmpl, data)
+		if got != "no brief" {
+			t.Errorf("got %q; want %q", got, "no brief")
+		}
+	})
+}
+
+func TestBuildContextPrompt_ResumeConditional(t *testing.T) {
+	tmpl := "{{if .IsExternalResume}}resume{{else}}fresh{{end}}"
+
+	t.Run("resume true", func(t *testing.T) {
+		data := ContextData{IsExternalResume: true}
+		got := BuildContextPrompt(tmpl, data)
+		if got != "resume" {
+			t.Errorf("got %q; want %q", got, "resume")
+		}
+	})
+
+	t.Run("resume false", func(t *testing.T) {
+		data := ContextData{IsExternalResume: false}
+		got := BuildContextPrompt(tmpl, data)
+		if got != "fresh" {
+			t.Errorf("got %q; want %q", got, "fresh")
+		}
+	})
 }

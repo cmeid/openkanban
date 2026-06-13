@@ -21,17 +21,28 @@ Returns session ID or empty string.
 
 ## Context Prompts
 
-`BuildContextPrompt()` uses Go templates:
+`BuildContextPrompt(promptTemplate string, data ContextData) string` renders Go templates:
 ```go
 type ContextData struct {
-    TicketTitle       string
-    TicketDescription string
-    ProjectName       string
-    // ...
+    Title            string
+    Description      string
+    BranchName       string
+    BaseBranch       string
+    TicketID         string
+    Status           string
+    WorktreePath     string
+    Slug             string
+    HasBrief         bool
+    BriefPath        string
+    IsExternalResume bool
 }
 ```
 
-Template in config: `"init_prompt": "Work on: {{.TicketTitle}}"`
+Use `NewContextData(ticket, briefRelPath, hasBrief, isExternalResume) ContextData` to construct.
+
+`HasBrief` / `BriefPath` are populated by `MergeTicketBrief` at spawn time. The brief lives at `<worktree>/tickets/<slug>.md` and contains a managed block (`<!-- openkanban:card-notes ... -->`) carrying the openkanban card's Description.
+
+Template in config: `"init_prompt": "Work on: {{.Title}}"`
 
 ## Status Detection
 
