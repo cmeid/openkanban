@@ -37,6 +37,7 @@ const (
 	ModeCommand       Mode = "COMMAND"
 	ModeHelp          Mode = "HELP"
 	ModeConfirm       Mode = "CONFIRM"
+	ModeConfirmExit   Mode = "CONFIRM_EXIT"
 	ModeCreateTicket  Mode = "CREATE"
 	ModeEditTicket    Mode = "EDIT"
 	ModeAgentView     Mode = "AGENT"
@@ -175,6 +176,17 @@ type Model struct {
 	// job of a future PR; this PR is a single-shot New() at startup.
 	daemonClient *daemonclient.Client
 
+	// guardAPI is the subset of daemonclient.Client used by the exit
+	// guard (PrepareExit / Kill / ClientID). Held as an interface so
+	// tests can substitute a fake without standing up a real daemon. Set
+	// from daemonClient in NewModel; nil when the daemon is unreachable.
+	guardAPI daemonGuardAPI
+
+	// confirmExit carries modal state for ModeConfirmExit. Populated by
+	// handlePrepareExitResult when the user requests quit, cleared when
+	// the modal exits (either to ModeNormal on cancel or to tea.Quit).
+	confirmExit confirmExitState
+
 	spawningTicketID board.TicketID
 	spawningAgent    string
 
@@ -305,6 +317,9 @@ func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projec
 		hoverTicket:        -1,
 		updateChecker:      updateChecker,
 		daemonClient:       daemonClient,
+	}
+	if daemonClient != nil {
+		m.guardAPI = daemonClient
 	}
 	if filterProjectID != "" {
 		m.filterProjectIDs[filterProjectID] = true
@@ -538,6 +553,21 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 
+	case quitRequestedMsg:
+		return m.handleQuitRequested()
+
+	case prepareExitResultMsg:
+		return m.handlePrepareExitResult(msg)
+
+	case prepareExitFailedMsg:
+		return m.handlePrepareExitFailed(msg)
+
+	case sessionKilledMsg:
+		return m.handleSessionKilled(msg)
+
+	case sessionKillFailedMsg:
+		return m.handleSessionKillFailed(msg)
+
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -693,6 +723,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// ModeConfirmExit owns the keyboard entirely while the exit-guard
+	// modal is up — including q / Ctrl-C / Esc / ?. Route to its
+	// dedicated handler before the global key map runs, so the modal's
+	// own bindings (x kill, X kill-all, Esc cancel) take precedence.
+	if m.mode == ModeConfirmExit {
+		return m.handleConfirmExitMode(msg)
+	}
+
 	switch msg.String() {
 	case "ctrl+c", "q":
 		if m.mode == ModeNormal {
@@ -1189,6 +1227,17 @@ func (m *Model) handleChoice(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleQuit() (tea.Model, tea.Cmd) {
+	// If a daemon client is wired up, defer to the daemon-aware exit
+	// guard so we never silently kill (or orphan) live agent sessions.
+	// The guard's PrepareExit RPC tells us the authoritative ClientCount
+	// + Sessions snapshot, and the modal (ModeConfirmExit) gates exit on
+	// the user explicitly killing them. See handleQuitRequested.
+	if m.guardAPI != nil {
+		return m.handleQuitRequested()
+	}
+
+	// Daemon unreachable — fall back to the legacy local-only path so the
+	// user is never trapped in the TUI when the daemon is missing.
 	runningCount := m.RunningAgentCount()
 	if runningCount == 0 {
 		return m, tea.Quit

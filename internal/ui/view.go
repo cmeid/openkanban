@@ -56,6 +56,9 @@ func (m *Model) View() string {
 	if m.showChoice {
 		return m.renderWithOverlay(m.renderChoiceDialog())
 	}
+	if m.mode == ModeConfirmExit {
+		return m.renderWithOverlay(m.renderConfirmExitDialog())
+	}
 	if m.showConfirm {
 		return m.renderWithOverlay(m.renderConfirmDialog())
 	}
@@ -585,6 +588,7 @@ func (m *Model) renderStatusBar() string {
 		ModeSettings:      {"⚙", m.colors.secondary},
 		ModeHelp:          {"?", m.colors.primary},
 		ModeConfirm:       {"!", m.colors.err},
+		ModeConfirmExit:   {"⚠", m.colors.err},
 		ModeFilter:        {"/", m.colors.info},
 		ModeCreateProject: {"📁", m.colors.success},
 	}
