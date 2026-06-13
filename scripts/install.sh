@@ -46,6 +46,20 @@ step "Checking prerequisites"
 command -v git >/dev/null 2>&1 || fail "git not found. Install git (e.g. \`xcode-select --install\` on macOS, \`apt install git\` on Debian/Ubuntu)."
 command -v go  >/dev/null 2>&1 || fail "go not found. Install Go from https://go.dev/dl/."
 
+# Defensively handle a stale GOROOT env var. If it's set to a directory
+# that doesn't exist, `go version` fails with "cannot find GOROOT
+# directory". This usually means the Go install moved (e.g. Homebrew
+# x86_64 → arm64) and a shell rc kept exporting the old path. Try
+# unsetting and re-running; if that works, drop GOROOT for this script.
+if ! go version >/dev/null 2>&1; then
+  if [ -n "${GOROOT:-}" ] && [ ! -d "${GOROOT}" ] && (unset GOROOT && go version >/dev/null 2>&1); then
+    warn "GOROOT=$GOROOT does not exist — unsetting for this install. Consider removing the stale export from your shell rc."
+    unset GOROOT
+  else
+    fail "\`go version\` failed and the cause isn't a stale GOROOT. Run \`go version\` manually for the real error."
+  fi
+fi
+
 # Parse minimum Go version from go.mod (tracks the module, no hardcoded version).
 REQUIRED_GO="$(grep -E '^go [0-9]' go.mod | awk '{print $2}' | head -n1)"
 if [ -z "$REQUIRED_GO" ]; then
