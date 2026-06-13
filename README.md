@@ -46,6 +46,31 @@ OpenKanban gives you a single view of all your work. Each ticket gets its own gi
 
 ## Install
 
+### From source (recommended)
+
+```bash
+git clone https://github.com/techdufus/openkanban.git
+cd openkanban
+./scripts/install.sh
+```
+
+`scripts/install.sh` checks prerequisites, builds and `go install`s the
+binary into `$GOBIN`, and — if Claude Code is detected — offers to wire
+session-status hooks into `~/.claude/settings.json`. It's idempotent;
+safe to re-run.
+
+Every launch of `openkanban` checks `origin/main` for newer commits and
+prompts before applying them: **Enter** to update + relaunch, **Esc** to
+skip, **Q** to quit. Skip the check entirely with `--no-update-check`
+or by setting `behavior.check_for_updates_on_launch: false` in
+`~/.config/openkanban/config.json`.
+
+You can also update on demand: `openkanban update --check` to print
+status, `openkanban update` to pull + rebuild + reinstall.
+
+See [docs/INSTALL.md](docs/INSTALL.md) for prerequisites, troubleshooting,
+and removal instructions.
+
 ### Homebrew (macOS/Linux)
 
 ```bash
@@ -64,18 +89,29 @@ brew upgrade openkanban
 go install github.com/techdufus/openkanban@latest
 ```
 
+> Builds installed via Homebrew or `go install` are tagged as "release
+> builds": the launch-time update check and `openkanban update` print
+> upgrade instructions (`brew upgrade openkanban` / `go install ...@latest`)
+> instead of attempting an in-place git pull.
+
 ## Quick Start
 
-Launch the TUI:
+From a fresh clone to a running board in four commands:
 
 ```bash
-cd ~/projects/my-app
-openkanban new "My App"
-openkanban
+git clone https://github.com/techdufus/openkanban.git
+cd openkanban && ./scripts/install.sh   # build + install + (optional) Claude Code hooks
+cd ~/projects/my-app                    # any git repo you want to track
+openkanban new "My App"                 # register it as an openkanban project
+openkanban                              # launch the TUI
 ```
 
-Or create a ticket directly from the command line — useful when a
-running agent wants to spin off a subtask:
+On launch, openkanban checks `origin/main` for newer commits and
+prompts before applying — **Enter** to update + relaunch, **Esc** to
+skip. Skip permanently with `--no-update-check`.
+
+Create tickets from the TUI with `n`, or from the command line — useful
+when a running agent wants to spin off a subtask:
 
 ```bash
 openkanban ticket new --project "My App" --title "Add login flow"
