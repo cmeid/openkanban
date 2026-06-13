@@ -115,6 +115,14 @@ func NewSession(req SpawnReq) (*Session, error) {
 	if req.SessionName != "" {
 		pane.SetSessionName(req.SessionName)
 	}
+	// req.TicketID also drives buildCleanEnv's OPENKANBAN_TICKET_ID line
+	// (terminal.New uses the value as the pane ID, but the env-var path
+	// reads pane.ticketID which is a separate field). Without this call
+	// the spawned agent has OPENKANBAN_SESSION but no OPENKANBAN_TICKET_ID,
+	// which breaks `openkanban ticket done` resolving back to the ticket.
+	if req.TicketID != "" {
+		pane.SetTicketID(req.TicketID)
+	}
 
 	if err := pane.StartHeadless(req.Command, req.Args, req.Env); err != nil {
 		return nil, fmt.Errorf("daemon: start pane: %w", err)

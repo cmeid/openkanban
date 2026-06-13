@@ -3197,6 +3197,195 @@ func (m *Model) spawnAgent() (tea.Model, tea.Cmd) {
 	return m, tea.Batch(m.spinner.Tick, m.prepareSpawnWith(ticket, proj, agentCfg, spawnPlan{}))
 }
 
+// resolveBrief decides what to do with the in-repo brief file at
+// tickets/<slug>.md based on the spawnPlan:
+//
+//   - SkipMerge=false (default / ForceFresh / InjectResumeNotice):
+//     call agent.MergeTicketBrief which writes the card description
+//     into the brief file (atomic rename).
+//   - SkipMerge=true: leave the file's bytes untouched, but still stat
+//     it so the prompt template's {{if .HasBrief}} branch behaves
+//     correctly.
+//
+// Returns the worktree-relative path (or "" if no brief), whether the
+// file exists on disk after the operation, and any merge error.
+// Extracted as a separate function so the SkipMerge "file bytes
+// preserved" property can be unit-tested in isolation from the rest
+// of prepareSpawnWith.
+func resolveBrief(ticket *board.Ticket, worktreePath string, plan spawnPlan) (string, bool, error) {
+	if !plan.SkipMerge {
+		return agent.MergeTicketBrief(ticket, worktreePath)
+	}
+	slug := agent.BranchSlug(ticket.BranchName)
+	if slug == "" || worktreePath == "" {
+		return "", false, nil
+	}
+	rel := "tickets/" + slug + ".md"
+	full := filepath.Join(worktreePath, "tickets", slug+".md")
+	if _, statErr := os.Stat(full); statErr != nil {
+		return "", false, nil
+	}
+	return rel, true, nil
+}
+
+// spawnReqInputs collects the resolved inputs needed to construct a
+// daemon.SpawnReq. All fields are values (no Model receiver, no live
+// filesystem lookups) so buildSpawnReq below is a pure function and
+// can be unit-tested per spawnPlan branch in isolation.
+//
+// Callers (today: prepareSpawnWith's closure) are responsible for
+// performing the filesystem I/O — agent.FindOpencodeSession,
+// agent.MergeTicketBrief, etc. — and passing the resolved values in.
+// That separation keeps the SpawnReq shape decisions in one tested
+// place; the I/O side-effects live in the closure.
+type spawnReqInputs struct {
+	ticket         *board.Ticket
+	plan           spawnPlan
+	sessionName    string
+	command        string
+	workdir        string
+	cols           int
+	rows           int
+	agentType      string
+	cleanArgs      []string // agentCfg.Args with empty entries stripped
+	isNewSession   bool
+	promptTemplate string
+	ctxData        agent.ContextData
+	agentPort      int
+	// Session IDs resolved by the caller via agent.Find{Opencode,Gemini,Codex}Session.
+	// Empty when the corresponding session-file isn't present on disk.
+	opencodeSessionID string
+	geminiSessionID   string
+	codexSessionID    string
+}
+
+// buildSpawnReq constructs the daemon.SpawnReq for a ticket given the
+// chosen spawnPlan. Pure function — no I/O, no Model receiver. Tested
+// separately from the prepareSpawnWith integration path so each
+// spawnPlan branch's argv + env shape is pinned by the test suite and
+// cannot regress.
+//
+// The Env field carries OPENKANBAN_SESSION and OPENKANBAN_TICKET_ID
+// explicitly so the wire-level SpawnReq is self-describing. The daemon
+// side ALSO synthesizes them from req.SessionName / req.TicketID via
+// terminal.Pane.SetSessionName / SetTicketID + buildCleanEnv — the two
+// paths agree, and a downstream consumer of SpawnReq.Env (e.g. a
+// future RPC log) sees the env contract on the wire.
+func buildSpawnReq(in spawnReqInputs) daemon.SpawnReq {
+	args := make([]string, len(in.cleanArgs))
+	copy(args, in.cleanArgs)
+
+	switch in.agentType {
+	case "claude":
+		if in.isNewSession {
+			if !hasClaudeNameFlag(args) && strings.TrimSpace(in.ticket.Title) != "" {
+				args = append(args, "-n", in.ticket.Title)
+			}
+			if in.ticket.AgentSessionID != "" && agent.SessionUUIDPattern.MatchString(in.ticket.AgentSessionID) {
+				args = append(args, "--resume", in.ticket.AgentSessionID)
+				if !in.ticket.SessionOwned {
+					args = append(args, "--fork-session")
+				}
+			}
+			if in.promptTemplate != "" {
+				prompt := agent.BuildContextPrompt(in.promptTemplate, in.ctxData)
+				if prompt != "" {
+					args = append(args, prompt)
+				}
+			}
+		} else {
+			hasFlag := false
+			for _, arg := range args {
+				if arg == "--continue" || arg == "-c" {
+					hasFlag = true
+					break
+				}
+			}
+			if !hasFlag {
+				args = append(args, "--continue")
+				// plan.InjectResumeNotice (option 'u'): append a positional
+				// message after --continue so the resumed claude session
+				// sees the brief-updated notice as the first new user turn.
+				if in.plan.InjectResumeNotice {
+					slug := agent.BranchSlug(in.ticket.BranchName)
+					if slug != "" {
+						args = append(args, fmt.Sprintf("Brief updated at tickets/%s.md — please re-read before continuing.", slug))
+					}
+				}
+			}
+		}
+	case "opencode":
+		args = []string{in.workdir, "--port", fmt.Sprintf("%d", in.agentPort)}
+		if in.isNewSession {
+			if in.promptTemplate != "" {
+				prompt := agent.BuildContextPrompt(in.promptTemplate, in.ctxData)
+				if prompt != "" {
+					args = append(args, "--prompt", prompt)
+				}
+			}
+		} else if in.opencodeSessionID != "" {
+			args = append(args, "--session", in.opencodeSessionID)
+		} else {
+			args = append(args, "--continue")
+		}
+	case "gemini":
+		if !in.isNewSession {
+			if in.geminiSessionID != "" {
+				args = append(args, "--resume")
+			}
+		} else if in.promptTemplate != "" {
+			prompt := agent.BuildContextPrompt(in.promptTemplate, in.ctxData)
+			if prompt != "" {
+				args = append(args, "-i", prompt)
+			}
+		}
+	case "codex":
+		if !in.isNewSession {
+			if in.codexSessionID != "" {
+				if in.codexSessionID == "last" {
+					args = []string{"resume", "--last"}
+				} else {
+					args = []string{"resume", in.codexSessionID}
+				}
+				args = append(args, in.cleanArgs...)
+			}
+		} else if in.promptTemplate != "" {
+			prompt := agent.BuildContextPrompt(in.promptTemplate, in.ctxData)
+			if prompt != "" {
+				args = append(args, prompt)
+			}
+		}
+	}
+
+	// SpawnReq.Env duplicates OPENKANBAN_SESSION + OPENKANBAN_TICKET_ID
+	// that the daemon-side buildCleanEnv would synthesize anyway. That
+	// redundancy is intentional: the wire shape now carries the env
+	// contract explicitly, so the test asserts on req.Env directly and
+	// any future caller of Spawn (not just this closure) automatically
+	// inherits the same env without a separate plumbing step.
+	var env []string
+	if in.sessionName != "" {
+		env = append(env, "OPENKANBAN_SESSION="+in.sessionName)
+	}
+	ticketIDStr := string(in.ticket.ID)
+	if ticketIDStr != "" {
+		env = append(env, "OPENKANBAN_TICKET_ID="+ticketIDStr)
+	}
+
+	return daemon.SpawnReq{
+		TicketID:         ticketIDStr,
+		SessionName:      in.sessionName,
+		Command:          in.command,
+		Args:             args,
+		Workdir:          in.workdir,
+		Env:              env,
+		Cols:             in.cols,
+		Rows:             in.rows,
+		Scrollback:       0,
+		AgentSessionUUID: in.ticket.AgentSessionID,
+	}
+}
+
 // prepareSpawnWith returns a tea.Cmd that performs the actual spawn off
 // the event loop. The `plan` value is captured by value into the
 // returned closure — keep it a value type (not a pointer) so future
@@ -3293,8 +3482,6 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 				cleanArgs = append(cleanArgs, a)
 			}
 		}
-		args := make([]string, len(cleanArgs))
-		copy(args, cleanArgs)
 
 		promptTemplate := cfg.GetEffectiveInitPrompt(agentType)
 
@@ -3306,25 +3493,7 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 		// because the daemon doesn't touch the worktree filesystem; the
 		// brief must be written before Spawn so the resumed agent sees
 		// it.
-		var briefRelPath string
-		var hasBrief bool
-		var briefErr error
-		if !plan.SkipMerge {
-			briefRelPath, hasBrief, briefErr = agent.MergeTicketBrief(ticket, worktreePath)
-		} else {
-			// SkipMerge: don't write the brief, but still report whether the
-			// file exists on disk so the prompt template's {{if .HasBrief}}
-			// branch behaves correctly. Use a stat — no fancy preview.
-			slug := agent.BranchSlug(ticket.BranchName)
-			if slug != "" && worktreePath != "" {
-				rel := "tickets/" + slug + ".md"
-				full := filepath.Join(worktreePath, "tickets", slug+".md")
-				if _, statErr := os.Stat(full); statErr == nil {
-					briefRelPath = rel
-					hasBrief = true
-				}
-			}
-		}
+		briefRelPath, hasBrief, briefErr := resolveBrief(ticket, worktreePath, plan)
 		if briefErr != nil {
 			fmt.Fprintf(os.Stderr, "openkanban: merge brief failed: %v\n", briefErr)
 		}
@@ -3348,113 +3517,45 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 
 		command := agentCfg.Command
 
+		// Resolve agent-specific session IDs from the worktree
+		// filesystem. These are inputs to buildSpawnReq below — the
+		// helper itself is pure, so the I/O happens here.
+		var opencodeSessionID, geminiSessionID, codexSessionID string
 		switch agentType {
-		case "claude":
-			if isNewSession {
-				if !hasClaudeNameFlag(args) && strings.TrimSpace(ticket.Title) != "" {
-					args = append(args, "-n", ticket.Title)
-				}
-				if ticket.AgentSessionID != "" && agent.SessionUUIDPattern.MatchString(ticket.AgentSessionID) {
-					args = append(args, "--resume", ticket.AgentSessionID)
-					if !ticket.SessionOwned {
-						args = append(args, "--fork-session")
-					}
-				}
-				if promptTemplate != "" {
-					prompt := agent.BuildContextPrompt(promptTemplate, ctxData)
-					if prompt != "" {
-						args = append(args, prompt)
-					}
-				}
-			} else {
-				hasFlag := false
-				for _, arg := range args {
-					if arg == "--continue" || arg == "-c" {
-						hasFlag = true
-						break
-					}
-				}
-				if !hasFlag {
-					args = append(args, "--continue")
-					// plan.InjectResumeNotice (option 'u'): append a positional message
-					// after --continue so the resumed claude session sees the brief-
-					// updated notice as the first new user turn. Caveat: claude's
-					// interactive-mode handling of a positional argument alongside
-					// --continue is not empirically verified in this repo — the
-					// notify() toast below is the user-facing source of truth.
-					if plan.InjectResumeNotice {
-						slug := agent.BranchSlug(ticket.BranchName)
-						if slug != "" {
-							args = append(args, fmt.Sprintf("Brief updated at tickets/%s.md — please re-read before continuing.", slug))
-						}
-					}
-				}
-			}
 		case "opencode":
-			sessionID := agent.FindOpencodeSession(worktreePath)
-			args = []string{worktreePath, "--port", fmt.Sprintf("%d", agentPort)}
-			if isNewSession {
-				if promptTemplate != "" {
-					prompt := agent.BuildContextPrompt(promptTemplate, ctxData)
-					if prompt != "" {
-						args = append(args, "--prompt", prompt)
-					}
-				}
-			} else if sessionID != "" {
-				args = append(args, "--session", sessionID)
-			} else {
-				args = append(args, "--continue")
-			}
+			opencodeSessionID = agent.FindOpencodeSession(worktreePath)
 		case "gemini":
 			if !isNewSession {
-				sessionID := agent.FindGeminiSession(worktreePath)
-				if sessionID != "" {
-					args = append(args, "--resume")
-				}
-			} else if promptTemplate != "" {
-				prompt := agent.BuildContextPrompt(promptTemplate, ctxData)
-				if prompt != "" {
-					args = append(args, "-i", prompt)
-				}
+				geminiSessionID = agent.FindGeminiSession(worktreePath)
 			}
 		case "codex":
 			if !isNewSession {
-				sessionID := agent.FindCodexSession(worktreePath)
-				if sessionID != "" {
-					if sessionID == "last" {
-						args = []string{"resume", "--last"}
-					} else {
-						args = []string{"resume", sessionID}
-					}
-					args = append(args, cleanArgs...)
-				}
-			} else if promptTemplate != "" {
-				prompt := agent.BuildContextPrompt(promptTemplate, ctxData)
-				if prompt != "" {
-					args = append(args, prompt)
-				}
+				codexSessionID = agent.FindCodexSession(worktreePath)
 			}
 		}
 
-		// Now actually hand the spawn off to the daemon. The daemon
-		// runs the PTY in its own process; we then build a PaneView and
-		// attach immediately so the snapshot frames flow into the local
+		// Hand the spawn off to the daemon. The daemon runs the PTY in
+		// its own process; we then build a PaneView and attach
+		// immediately so the snapshot frames flow into the local
 		// emulator before the model sees the spawnReadyMsg.
-		req := daemon.SpawnReq{
-			TicketID:    string(ticketID),
-			SessionName: sessionName,
-			Command:     command,
-			Args:        args,
-			Workdir:     worktreePath,
-			Env:         nil, // daemon's terminal.Pane applies its own clean env + OPENKANBAN_SESSION
-			Cols:        width,
-			Rows:        height,
-			Scrollback:  0,
-			// Pass the Claude UUID (if any) through so the daemon can
-			// answer Owns queries for migrate / delete flows in
-			// cmd/ticket.go without rummaging through the agent process.
-			AgentSessionUUID: ticket.AgentSessionID,
-		}
+		req := buildSpawnReq(spawnReqInputs{
+			ticket:            ticket,
+			plan:              plan,
+			sessionName:       sessionName,
+			command:           command,
+			workdir:           worktreePath,
+			cols:              width,
+			rows:              height,
+			agentType:         agentType,
+			cleanArgs:         cleanArgs,
+			isNewSession:      isNewSession,
+			promptTemplate:    promptTemplate,
+			ctxData:           ctxData,
+			agentPort:         agentPort,
+			opencodeSessionID: opencodeSessionID,
+			geminiSessionID:   geminiSessionID,
+			codexSessionID:    codexSessionID,
+		})
 		spawnCtx, spawnCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		resp, err := daemonClient.Spawn(spawnCtx, req)
 		spawnCancel()
