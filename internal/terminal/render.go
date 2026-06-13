@@ -6,7 +6,12 @@ import (
 	xvt "github.com/charmbracelet/x/vt"
 )
 
-// renderVT is the top-level render dispatch. It returns the cached
+// renderVT is the unexported alias retained so existing intra-package
+// call sites (Pane.View) read unchanged after RenderVT was exported in
+// PR7.
+var renderVT = RenderVT
+
+// RenderVT is the top-level render dispatch. It returns the cached
 // view for a pane's current state without touching any pane mutable
 // state: callers must hold whatever lock guards the inputs while this
 // runs (the Pane.View call site holds p.mu).
@@ -15,7 +20,12 @@ import (
 // has a zero-sized viewport. When viewportOffset > 0 and scrollback
 // is non-nil, renders a mixed scrollback + live view; otherwise just
 // the live screen.
-func renderVT(vt *xvt.SafeEmulator, scrollback *ScrollbackBuffer, viewportOffset int, cursorVisible bool, selection *SelectionState) string {
+//
+// Exported (PR7) so daemonclient.PaneView can render its locally-
+// maintained emulator the same way Pane.View does. The lowercase
+// renderVT alias below keeps the existing intra-package call sites
+// readable.
+func RenderVT(vt *xvt.SafeEmulator, scrollback *ScrollbackBuffer, viewportOffset int, cursorVisible bool, selection *SelectionState) string {
 	if vt == nil {
 		return "Terminal not initialized"
 	}
