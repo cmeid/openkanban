@@ -493,6 +493,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.mode = ModeNormal
 			m.focusedPane = ""
 			m.notify("Agent exited")
+			m.selectTicketByID(ticketID)
 		}
 		return m, m.maybeSetWindowTitle()
 
