@@ -246,23 +246,9 @@ func TestAttach_AlreadyAttached(t *testing.T) {
 	if errResp.Code != "already_attached" {
 		t.Errorf("ErrorResp.Code: got %q want %q", errResp.Code, "already_attached")
 	}
-
-	// Same with Takeover=true — PR5 still refuses.
-	name, raw = sendAttach(t, c2, r2, AttachReq{
-		SessionID: sessID,
-		Cols:      80,
-		Rows:      24,
-		Takeover:  true,
-	})
-	if name != MsgErrorResp {
-		t.Fatalf("takeover attach (PR5): got %q want %q", name, MsgErrorResp)
-	}
-	if err := json.Unmarshal(raw, &errResp); err != nil {
-		t.Fatalf("decode ErrorResp: %v", err)
-	}
-	if errResp.Code != "already_attached" {
-		t.Errorf("takeover ErrorResp.Code: got %q want %q (PR5 always refuses)", errResp.Code, "already_attached")
-	}
+	// Takeover semantics are exercised separately in
+	// TestAttach_Takeover_* — here we only assert the Takeover=false
+	// refusal path.
 
 	// Drop c2 first, then c1 (with detach), then clean up the session.
 	c2.Close()
@@ -570,4 +556,277 @@ func gridDump(em *xvt.SafeEmulator) string {
 		sb.WriteByte('\n')
 	}
 	return sb.String()
+}
+
+// waitForDetachFrame reads frames on conn until it sees TypeDetach,
+// the conn closes, or the deadline elapses. Returns true if TypeDetach
+// was observed. Useful for assertions in takeover tests where the
+// displaced client must receive a TypeDetach frame regardless of how
+// much fan-out output preceded it.
+func waitForDetachFrame(t *testing.T, conn net.Conn, r *bufio.Reader, deadline time.Duration) bool {
+	t.Helper()
+	end := time.Now().Add(deadline)
+	for time.Now().Before(end) {
+		conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		typ, _, err := ReadFrame(r)
+		if err != nil {
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				continue
+			}
+			if errors.Is(err, io.EOF) {
+				return false
+			}
+			t.Logf("waitForDetachFrame: ReadFrame err: %v", err)
+			return false
+		}
+		if typ == TypeDetach {
+			conn.SetReadDeadline(time.Time{})
+			return true
+		}
+		// TypePTYOutput and any other frame: drain and keep looking.
+	}
+	conn.SetReadDeadline(time.Time{})
+	return false
+}
+
+// TestAttach_Takeover_DisplacesOldClient verifies the core takeover
+// semantics: when client B attaches with Takeover=true to a session
+// already held by client A, A receives a TypeDetach frame, B's attach
+// succeeds with a non-empty snapshot, the underlying agent process
+// keeps running, and B continues receiving output.
+func TestAttach_Takeover_DisplacesOldClient(t *testing.T) {
+	srv, errCh := startServer(t)
+
+	c1 := dialTestClient(t, srv.SocketPath())
+	r1 := bufio.NewReader(c1)
+	helloAndUnpack(t, c1, r1)
+
+	sessID := spawnHelper(t, c1, r1, SpawnReq{
+		TicketID:    "TKO-1",
+		SessionName: "takeover-test",
+		Command:     "/bin/sh",
+		Args:        []string{"-c", "while true; do echo tick; sleep 0.05; done"},
+		Cols:        80,
+		Rows:        24,
+		Scrollback:  1000,
+	})
+
+	// C1 attaches and reads a couple of output frames so we know the
+	// agent loop is running.
+	_, _ = attachAndUnpack(t, c1, r1, AttachReq{
+		SessionID: sessID,
+		Cols:      80,
+		Rows:      24,
+	})
+	if got, _ := readBinaryFrames(t, c1, r1, 4, 2*time.Second); len(got) == 0 {
+		t.Fatalf("c1 received no output before takeover")
+	}
+
+	// C2 attaches with Takeover=true.
+	c2 := dialTestClient(t, srv.SocketPath())
+	r2 := bufio.NewReader(c2)
+	helloAndUnpack(t, c2, r2)
+
+	resp2, snap2 := attachAndUnpack(t, c2, r2, AttachReq{
+		SessionID: sessID,
+		Cols:      80,
+		Rows:      24,
+		Takeover:  true,
+	})
+	if resp2.ClientID == 0 {
+		t.Errorf("takeover AttachResp.ClientID is 0")
+	}
+	if len(snap2) == 0 {
+		t.Errorf("takeover snapshot empty: expected at least the RIS/CUP prologue")
+	}
+
+	// C1 must have received a TypeDetach frame.
+	if !waitForDetachFrame(t, c1, r1, 2*time.Second) {
+		t.Fatalf("c1 did not receive TypeDetach within 2s of takeover")
+	}
+
+	// Agent must still be running — takeover changes wire state only.
+	srv.sessionsMu.RLock()
+	sess := srv.sessions[sessID]
+	srv.sessionsMu.RUnlock()
+	if sess == nil {
+		t.Fatalf("session not registered post-spawn")
+	}
+	if !sess.Running() {
+		t.Errorf("agent stopped running after takeover")
+	}
+
+	// C2 should keep receiving output: the new fan-out is wired to
+	// the same pane, which still has a live child.
+	if got, _ := readBinaryFrames(t, c2, r2, 6, 2*time.Second); !bytes.Contains(got, []byte("tick")) {
+		t.Errorf("c2 expected to receive 'tick' output after takeover, got %q", got)
+	}
+
+	// Cleanup.
+	writeBinaryFrame(t, c2, TypeDetach, nil)
+
+	c3 := dialTestClient(t, srv.SocketPath())
+	r3 := bufio.NewReader(c3)
+	helloAndUnpack(t, c3, r3)
+	writeReq(t, c3, MsgKillReq, KillReq{SessionID: sessID, GraceSeconds: 1})
+	c3.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_, _ = readResp(t, r3)
+	c3.SetReadDeadline(time.Time{})
+	c3.Close()
+
+	c1.Close()
+	c2.Close()
+	waitServerDone(t, errCh, 5*time.Second)
+}
+
+// TestAttach_Takeover_AgentUnaffected proves the agent process keeps
+// its stdin/stdout intact across a takeover by using /bin/cat as a
+// simple echo: C1 writes "first" and reads it back, then C2 takes
+// over, writes "second", and reads "second" back.
+func TestAttach_Takeover_AgentUnaffected(t *testing.T) {
+	srv, errCh := startServer(t)
+
+	c1 := dialTestClient(t, srv.SocketPath())
+	r1 := bufio.NewReader(c1)
+	helloAndUnpack(t, c1, r1)
+
+	sessID := spawnHelper(t, c1, r1, SpawnReq{
+		TicketID:    "TKO-2",
+		SessionName: "takeover-cat",
+		Command:     "/bin/cat",
+		Cols:        80,
+		Rows:        24,
+		Scrollback:  1000,
+	})
+
+	_, _ = attachAndUnpack(t, c1, r1, AttachReq{
+		SessionID: sessID,
+		Cols:      80,
+		Rows:      24,
+	})
+
+	// C1 writes "first" and observes the echo.
+	writeBinaryFrame(t, c1, TypePTYInput, []byte("first\n"))
+	if got, _ := readBinaryFrames(t, c1, r1, 5, 2*time.Second); !bytes.Contains(got, []byte("first")) {
+		t.Fatalf("c1 did not see 'first' echo: got %q", got)
+	}
+
+	// C2 takes over.
+	c2 := dialTestClient(t, srv.SocketPath())
+	r2 := bufio.NewReader(c2)
+	helloAndUnpack(t, c2, r2)
+	_, _ = attachAndUnpack(t, c2, r2, AttachReq{
+		SessionID: sessID,
+		Cols:      80,
+		Rows:      24,
+		Takeover:  true,
+	})
+
+	// Drain C1's pending detach frame so handleConn can resume JSON
+	// reads on c1 cleanly.
+	if !waitForDetachFrame(t, c1, r1, 2*time.Second) {
+		t.Fatalf("c1 did not receive TypeDetach")
+	}
+
+	// C2 writes "second" and reads it back. This proves cat's
+	// stdin/stdout are intact — i.e. the agent process was not
+	// touched by the takeover.
+	writeBinaryFrame(t, c2, TypePTYInput, []byte("second\n"))
+	if got, _ := readBinaryFrames(t, c2, r2, 6, 2*time.Second); !bytes.Contains(got, []byte("second")) {
+		t.Errorf("c2 did not see 'second' echo (agent broken by takeover): got %q", got)
+	}
+
+	// Cleanup.
+	writeBinaryFrame(t, c2, TypeDetach, nil)
+
+	c3 := dialTestClient(t, srv.SocketPath())
+	r3 := bufio.NewReader(c3)
+	helloAndUnpack(t, c3, r3)
+	writeReq(t, c3, MsgKillReq, KillReq{SessionID: sessID, GraceSeconds: 1})
+	c3.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_, _ = readResp(t, r3)
+	c3.SetReadDeadline(time.Time{})
+	c3.Close()
+
+	c1.Close()
+	c2.Close()
+	waitServerDone(t, errCh, 5*time.Second)
+}
+
+// TestAttach_Takeover_OldClientConnStaysAlive proves that a takeover
+// only ends the displaced client's binary loop — its underlying conn
+// is left open so it can resume JSON-mode RPCs. After being displaced,
+// C1 sends a List request and the daemon answers it on the same conn.
+func TestAttach_Takeover_OldClientConnStaysAlive(t *testing.T) {
+	srv, errCh := startServer(t)
+
+	c1 := dialTestClient(t, srv.SocketPath())
+	r1 := bufio.NewReader(c1)
+	helloAndUnpack(t, c1, r1)
+
+	sessID := spawnHelper(t, c1, r1, SpawnReq{
+		TicketID:    "TKO-3",
+		SessionName: "takeover-conn-alive",
+		Command:     "/bin/cat",
+		Cols:        80,
+		Rows:        24,
+		Scrollback:  1000,
+	})
+
+	_, _ = attachAndUnpack(t, c1, r1, AttachReq{
+		SessionID: sessID,
+		Cols:      80,
+		Rows:      24,
+	})
+
+	// C2 takes over.
+	c2 := dialTestClient(t, srv.SocketPath())
+	r2 := bufio.NewReader(c2)
+	helloAndUnpack(t, c2, r2)
+	_, _ = attachAndUnpack(t, c2, r2, AttachReq{
+		SessionID: sessID,
+		Cols:      80,
+		Rows:      24,
+		Takeover:  true,
+	})
+
+	// C1 receives TypeDetach.
+	if !waitForDetachFrame(t, c1, r1, 2*time.Second) {
+		t.Fatalf("c1 did not receive TypeDetach after takeover")
+	}
+
+	// C1's conn must still be alive: send a List request and expect
+	// a List response back. handleConn's outer JSON read loop should
+	// have resumed reading from c1.r as soon as binaryLoop returned.
+	writeReq(t, c1, MsgListReq, ListReq{})
+	c1.SetReadDeadline(time.Now().Add(3 * time.Second))
+	name, raw := readResp(t, r1)
+	c1.SetReadDeadline(time.Time{})
+	if name != MsgListResp {
+		t.Fatalf("post-takeover List on c1: got %q want %q (conn broken?)", name, MsgListResp)
+	}
+	var lr ListResp
+	if err := json.Unmarshal(raw, &lr); err != nil {
+		t.Fatalf("decode ListResp: %v", err)
+	}
+	if len(lr.Sessions) == 0 {
+		t.Errorf("post-takeover List: expected at least the takeover session, got 0")
+	}
+
+	// Cleanup.
+	writeBinaryFrame(t, c2, TypeDetach, nil)
+
+	c3 := dialTestClient(t, srv.SocketPath())
+	r3 := bufio.NewReader(c3)
+	helloAndUnpack(t, c3, r3)
+	writeReq(t, c3, MsgKillReq, KillReq{SessionID: sessID, GraceSeconds: 1})
+	c3.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_, _ = readResp(t, r3)
+	c3.SetReadDeadline(time.Time{})
+	c3.Close()
+
+	c1.Close()
+	c2.Close()
+	waitServerDone(t, errCh, 5*time.Second)
 }

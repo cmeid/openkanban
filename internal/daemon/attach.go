@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"time"
 
 	"github.com/techdufus/openkanban/internal/terminal"
 )
@@ -76,16 +77,18 @@ func (s *Server) handleAttach(c *clientConn, req AttachReq) {
 	// JSON pushes from interleaving mid-snapshot.
 	if err := writeSnapshotChunks(c.conn, &c.writeMu, snapshot, c.id); err != nil {
 		log.Printf("openkanbankd: client %d write snapshot: %v", c.id, err)
-		sess.Detach()
+		sess.Detach(ac)
 		return
 	}
 
 	// Spawn the fan-out goroutine. It exits when the subscription
-	// channel closes (Detach) or when its conn writes fail.
+	// channel closes (Detach) or when its conn writes fail. ac.Ch
+	// is set once at construction and never mutated, so it's safe
+	// to read here without holding attachMu.
 	fanOutDone := make(chan struct{})
 	go func() {
 		defer close(fanOutDone)
-		s.fanOut(ac)
+		s.fanOut(ac, ac.Ch)
 	}()
 
 	// Drive the inbound binary loop on this goroutine. Blocks until
@@ -95,9 +98,9 @@ func (s *Server) handleAttach(c *clientConn, req AttachReq) {
 
 	// Tear down the attach. Detach is idempotent — fanOut may have
 	// already pushed a TypeDetach on ExitEvent and noted the
-	// subscription close, but calling here covers the
-	// client-initiated detach path.
-	sess.Detach()
+	// subscription close, and a takeover may have already done the
+	// per-session cleanup. Detach(ac) is safe in any of these cases.
+	sess.Detach(ac)
 
 	// Wait for the fan-out to fully exit before returning. Without
 	// this, a late publish could race the conn close and log a
@@ -150,11 +153,10 @@ type lockable interface {
 // not call Detach itself — that's the caller (handleAttach) — but it
 // will close ac.DetachCh on ExitEvent so any goroutine waiting on the
 // channel (e.g. PR6's takeover path) wakes up.
-func (s *Server) fanOut(ac *attachedClient) {
-	if ac == nil || ac.Subscription == nil {
+func (s *Server) fanOut(ac *attachedClient, ch <-chan terminal.Event) {
+	if ac == nil || ch == nil {
 		return
 	}
-	ch := ac.Subscription.Ch
 
 	for ev := range ch {
 		switch e := ev.(type) {
@@ -194,31 +196,74 @@ func (s *Server) fanOut(ac *attachedClient) {
 //   - clean detach (TypeDetach frame)
 //   - conn EOF / closed
 //   - read error of any other kind
-//   - DetachCh closed externally (PR6 takeover)
+//   - DetachCh closed externally (takeover or pane Exit)
+//
+// On an externally-driven detach (DetachCh close), the watcher
+// goroutine writes a TypeDetach frame to the client (so the client
+// knows binary mode is over) and interrupts the blocked ReadFrame via
+// SetReadDeadline. We do NOT close the conn — the displaced client's
+// conn remains open so handleConn's outer JSON-read loop can resume.
+// After binaryLoop returns we clear the read deadline so that resumed
+// JSON read isn't immediately killed by a stale past-deadline.
 //
 // Note we do NOT take any per-session lock here; the pane's own
 // WriteInput / SetSize are concurrent-safe.
 func (s *Server) binaryLoop(c *clientConn, sess *Session, ac *attachedClient) {
-	// Watcher goroutine: if the detach channel is closed externally
-	// (PR6) we want to interrupt the blocked ReadFrame. We do that by
-	// closing the underlying conn — ReadFrame returns net.ErrClosed
-	// and the loop exits.
+	// Watcher goroutine: when DetachCh closes (PR6 takeover or pane
+	// Exit), we (a) push a TypeDetach frame to the client so it
+	// learns binary mode is over, then (b) interrupt the blocked
+	// ReadFrame by setting an immediate read deadline. The conn
+	// stays alive — only the binary read loop ends.
 	stopWatcher := make(chan struct{})
+	watcherDone := make(chan struct{})
 	go func() {
+		defer close(watcherDone)
 		select {
 		case <-ac.DetachCh:
-			// External detach — break the read loop by closing conn.
-			c.conn.Close()
+			// fanOut may have already emitted a TypeDetach on
+			// ExitEvent — duplicate frames are fine for the client
+			// (it stops reading binary anyway) and we explicitly
+			// ignore the write error here since the conn may have
+			// already gone away on the other side.
+			ac.WriteMu.Lock()
+			_ = WriteFrame(ac.Conn, TypeDetach, nil)
+			ac.WriteMu.Unlock()
+			// Trip the read deadline so the next ReadFrame returns.
+			// Use a sentinel past time so the ongoing read fails
+			// immediately regardless of clock skew.
+			_ = c.conn.SetReadDeadline(time.Unix(1, 0))
 		case <-stopWatcher:
 		}
 	}()
-	defer close(stopWatcher)
+	defer func() {
+		close(stopWatcher)
+		// Wait for the watcher to finish so its SetReadDeadline call
+		// can't race the deadline-clear below. Otherwise a delayed
+		// watcher firing after binaryLoop returns would set a stale
+		// deadline that handleConn's JSON read loop would inherit.
+		<-watcherDone
+		// Clear any deadline the watcher set so handleConn's resumed
+		// JSON read loop on the same conn works normally.
+		_ = c.conn.SetReadDeadline(time.Time{})
+	}()
 
 	for {
 		typ, payload, err := ReadFrame(c.r)
 		if err != nil {
 			if err == io.EOF || errors.Is(err, net.ErrClosed) {
 				return
+			}
+			// Deadline errors during an external-detach interruption
+			// are expected: the watcher trips the deadline on
+			// purpose to break the blocked read. Don't log as a
+			// failure in that case.
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				select {
+				case <-ac.DetachCh:
+					return
+				default:
+				}
 			}
 			log.Printf("openkanbankd: client %d binary read: %v", c.id, err)
 			return

@@ -40,29 +40,27 @@ type Session struct {
 // currently upgraded to binary mode for this session.
 //
 // Conn / WriteMu are the wire handles fanOut and binaryLoop use to
-// emit PTY-output frames and read PTY-input frames respectively. The
-// Subscription is the pane event channel feeding fanOut; cancelling
-// it both removes the subscriber from the pane and closes the channel,
-// which lets fanOut return cleanly.
+// emit PTY-output frames and read PTY-input frames respectively. Ch
+// is the pane event channel feeding fanOut; Unsubscribe (guarded by
+// the session's attachMu) cancels the subscription, which closes Ch
+// and lets fanOut return cleanly.
+//
+// Ch is set once at construction and never mutated, so fanOut can read
+// it without taking attachMu. Unsubscribe may be cleared to nil by the
+// takeover path or Detach() under attachMu — readers of Unsubscribe
+// must hold attachMu.
 //
 // DetachCh is closed exactly once (DetachOnce) when this attach is
 // torn down — by the client clean-detach path, by the binary loop
-// observing the conn close, or (in PR6) by a takeover request.
+// observing the conn close, or by a takeover request.
 type attachedClient struct {
-	ClientID     uint16
-	Conn         net.Conn
-	WriteMu      *sync.Mutex
-	Subscription *subscriptionHandle
-	DetachOnce   sync.Once
-	DetachCh     chan struct{}
-}
-
-// subscriptionHandle bundles a pane.Subscribe() result so attachedClient
-// can carry both the channel and the unsubscribe func without leaking
-// the closure shape across the package.
-type subscriptionHandle struct {
+	ClientID    uint16
+	Conn        net.Conn
+	WriteMu     *sync.Mutex
 	Ch          <-chan terminal.Event
-	Unsubscribe func()
+	Unsubscribe func() // guarded by Session.attachMu
+	DetachOnce  sync.Once
+	DetachCh    chan struct{}
 }
 
 // subscriberConn is a placeholder for the per-connection event-push
@@ -73,8 +71,8 @@ type subscriberConn struct {
 }
 
 // ErrAlreadyAttached is returned by AttemptAttach when the session
-// already has an attached client and Takeover=false. PR5 always returns
-// this even when Takeover=true; PR6 will land the real takeover path.
+// already has an attached client and Takeover=false. With Takeover=true
+// the daemon instead displaces the current attacher (see AttemptAttach).
 var ErrAlreadyAttached = errors.New("daemon: session already has an attached client")
 
 // NewSession allocates a fresh Session ID, constructs the underlying
@@ -192,8 +190,23 @@ func (s *Session) Kill(graceSeconds int) error {
 }
 
 // AttemptAttach registers c as the session's sole attacher. Returns
-// ErrAlreadyAttached if the session already has one — Takeover=true is
-// not yet honored in PR5 and still returns ErrAlreadyAttached.
+// ErrAlreadyAttached if the session already has one and takeover is
+// false.
+//
+// Takeover semantics (PR6): when takeover=true and another client is
+// currently attached, AttemptAttach displaces that client by closing
+// its DetachCh. The displaced client's binaryLoop watcher reacts by
+// writing a TypeDetach frame to the displaced client's connection and
+// interrupting its blocked ReadFrame so the loop returns. The displaced
+// client's handleAttach defer then calls Detach(), which clears
+// s.attached and unsubscribes it from the pane. AttemptAttach waits
+// up to takeoverWaitDeadline for that to complete; if the displaced
+// client is unresponsive it force-clears s.attached itself so the
+// agent is not held hostage. The agent process (pane.cmd) is never
+// touched during takeover — only the wire-side attachment changes.
+// The displaced client's net.Conn stays open: only its binary loop
+// exits. handleConn then resumes JSON reads on the same conn, so the
+// displaced client can re-attach or run other RPCs.
 //
 // On success it:
 //   - subscribes to the pane's event stream
@@ -218,13 +231,37 @@ func (s *Session) AttemptAttach(c *clientConn, cols, rows uint16, takeover bool)
 	defer s.attachMu.Unlock()
 
 	if s.attached != nil {
-		// TODO(PR6): implement Takeover. For PR5 we always refuse a
-		// second attach. The takeover path will (a) signal the
-		// existing client's binary loop to detach cleanly, (b) wait
-		// for it to release s.attached, then (c) install the new
-		// client below. Returning ErrAlreadyAttached here is the
-		// conservative pre-PR6 shape — tests assert it.
-		return nil, nil, ErrAlreadyAttached
+		if !takeover {
+			return nil, nil, ErrAlreadyAttached
+		}
+
+		// Takeover. We hold attachMu, so no other Attach/Detach can
+		// race us. The cleanest sequence is for the takeover path to
+		// own the displacement entirely:
+		//
+		//   1. close(old.DetachCh) under DetachOnce — wakes the
+		//      displaced client's binary-loop watcher, which writes
+		//      a TypeDetach frame to the old conn and interrupts its
+		//      blocked ReadFrame so the loop returns.
+		//   2. Unsubscribe old from the pane right now under our
+		//      lock — fanOut sees the channel close and exits.
+		//   3. Clear s.attached so the slot is free for the new ac.
+		//
+		// The displaced client's handleAttach defer will still call
+		// sess.Detach(old). That call is now a no-op: Detach checks
+		// s.attached == old (false; we've already cleared or
+		// replaced it) and the per-ac subscription/DetachCh state is
+		// guarded by DetachOnce + nil-out. No grace period needed —
+		// the agent (pane.cmd) is untouched throughout.
+		old := s.attached
+		old.DetachOnce.Do(func() { close(old.DetachCh) })
+		if old.Unsubscribe != nil {
+			old.Unsubscribe()
+			old.Unsubscribe = nil
+		}
+		s.attached = nil
+		// Fall through to the normal "install new attacher" path
+		// below.
 	}
 
 	// Snapshot first so the bytes describe the pre-resize grid. If we
@@ -239,11 +276,12 @@ func (s *Session) AttemptAttach(c *clientConn, cols, rows uint16, takeover bool)
 	ch, unsub := s.pane.Subscribe()
 
 	ac = &attachedClient{
-		ClientID:     c.id,
-		Conn:         c.conn,
-		WriteMu:      &c.writeMu,
-		Subscription: &subscriptionHandle{Ch: ch, Unsubscribe: unsub},
-		DetachCh:     make(chan struct{}),
+		ClientID:    c.id,
+		Conn:        c.conn,
+		WriteMu:     &c.writeMu,
+		Ch:          ch,
+		Unsubscribe: unsub,
+		DetachCh:    make(chan struct{}),
 	}
 	s.attached = ac
 
@@ -256,30 +294,45 @@ func (s *Session) AttemptAttach(c *clientConn, cols, rows uint16, takeover bool)
 	return snap, ac, nil
 }
 
-// Detach releases the current attacher and tears down its
-// subscription. Idempotent: safe to call when no client is attached.
+// Detach releases the attacher identified by ac and tears down its
+// subscription. Idempotent: safe to call when no client is attached,
+// when ac has already been detached, or when a different ac (e.g. a
+// takeover replacement) has taken its place — in any of those cases
+// Detach is a no-op on s.attached and only tears down the per-ac
+// resources (subscription, DetachCh) if they're still owned by ac.
 //
-// Called by the server after the binary loop returns. PR6's takeover
-// path will also call Detach() on the displaced client before
-// installing the new one.
-func (s *Session) Detach() {
-	s.attachMu.Lock()
-	ac := s.attached
-	s.attached = nil
-	s.attachMu.Unlock()
-
+// Called by the server after each binary loop returns. The takeover
+// path in AttemptAttach also tears down the displaced client's
+// resources, so the displaced client's eventual Detach call is
+// reduced to a DetachOnce-guarded no-op.
+//
+// Passing nil is safe and does nothing.
+func (s *Session) Detach(ac *attachedClient) {
 	if ac == nil {
 		return
 	}
+
+	s.attachMu.Lock()
+	// Only clear s.attached if it still points at ac — a takeover
+	// may have already installed a new attacher, and we must not
+	// wipe the new one.
+	if s.attached == ac {
+		s.attached = nil
+	}
+	// Capture and clear the unsubscribe func under the lock so we
+	// don't race the takeover path which may also be unsubscribing.
+	unsub := ac.Unsubscribe
+	ac.Unsubscribe = nil
+	s.attachMu.Unlock()
 
 	// Close the detach channel exactly once so any goroutine still
 	// blocked on it unblocks.
 	ac.DetachOnce.Do(func() { close(ac.DetachCh) })
 
-	// Cancel pane subscription. This closes the channel — fanOut's
-	// range loop will exit.
-	if ac.Subscription != nil && ac.Subscription.Unsubscribe != nil {
-		ac.Subscription.Unsubscribe()
+	// Cancel pane subscription. This closes ac.Ch — fanOut's range
+	// loop will exit.
+	if unsub != nil {
+		unsub()
 	}
 }
 
