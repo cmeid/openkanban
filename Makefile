@@ -1,11 +1,15 @@
-.PHONY: build test test-unit test-integration test-all coverage lint clean help
+.PHONY: build install test test-unit test-integration test-all coverage lint clean help
 
 GO := go
 BINARY := openkanban
 COVERAGE_FILE := coverage.out
+LDFLAGS := -X github.com/techdufus/openkanban/cmd.SourcePath=$(CURDIR)
 
 build:
-	$(GO) build -o $(BINARY) .
+	$(GO) build -ldflags "$(LDFLAGS)" -o $(BINARY) .
+
+install:
+	@./scripts/install.sh
 
 test: test-unit
 
@@ -35,6 +39,7 @@ clean:
 help:
 	@echo "Available targets:"
 	@echo "  build             - Build the binary"
+	@echo "  install           - Run scripts/install.sh (build + go install + optional Claude hooks)"
 	@echo "  test              - Run unit tests (default)"
 	@echo "  test-unit         - Run unit tests only"
 	@echo "  test-integration  - Run integration tests only"
