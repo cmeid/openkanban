@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -470,4 +472,190 @@ func TestValidate_ValidTemplatePrompt(t *testing.T) {
 			t.Errorf("valid template should not produce error: %s", e.Message)
 		}
 	}
+}
+
+// writeGlobalClaudeMd writes a fake global CLAUDE.md into a temp dir and
+// points OPENKANBAN_GLOBAL_CLAUDE_MD at it for the duration of the test.
+// Pass an empty content string to simulate the file being absent.
+func writeGlobalClaudeMd(t *testing.T, content string) {
+	t.Helper()
+	if content == "" {
+		t.Setenv("OPENKANBAN_GLOBAL_CLAUDE_MD", filepath.Join(t.TempDir(), "nonexistent.md"))
+		return
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "CLAUDE.md")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write fake CLAUDE.md: %v", err)
+	}
+	t.Setenv("OPENKANBAN_GLOBAL_CLAUDE_MD", path)
+}
+
+func TestValidateInitPromptOverlap(t *testing.T) {
+	const globalWithPushSection = `# Global config
+
+## Sending code out (pushes and PRs)
+
+Pushes are gated on the destination repo.
+
+## Git commit signing on this machine
+
+SSH-signed via 1Password.
+`
+
+	tests := []struct {
+		name           string
+		prompt         string
+		globalContent  string // "" means no global file
+		wantWarnSubstr []string
+		wantNoWarn     bool
+	}{
+		{
+			name:           "strong marker: HARD RULE",
+			prompt:         "## PR guardrail (HARD RULE)\nDo not push.",
+			globalContent:  globalWithPushSection,
+			wantWarnSubstr: []string{"HARD RULE"},
+		},
+		{
+			name:           "strong marker: NEVER run gh pr create",
+			prompt:         "Do this: NEVER run `gh pr create` without approval.",
+			globalContent:  globalWithPushSection,
+			wantWarnSubstr: []string{"NEVER", "gh pr create"},
+		},
+		{
+			name:           "strong marker: every repo, every project",
+			prompt:         "Approval required, every repo, every project, every context.",
+			globalContent:  globalWithPushSection,
+			wantWarnSubstr: []string{"every repo, every project"},
+		},
+		{
+			name:           "section header overlap on PR",
+			prompt:         "## PR guardrail\nSome rule.",
+			globalContent:  globalWithPushSection,
+			wantWarnSubstr: []string{"PR guardrail", "Sending code out"},
+		},
+		{
+			name:           "no overlap, clean prompt with global present",
+			prompt:         "## First action\nRun /prime.\n\n## Your assignment\nTitle here.",
+			globalContent:  globalWithPushSection,
+			wantNoWarn:     true,
+		},
+		{
+			name:           "no overlap, clean prompt with global absent",
+			prompt:         "## First action\nRun /prime.\n\n## Your assignment\nTitle here.",
+			globalContent:  "",
+			wantNoWarn:     true,
+		},
+		{
+			name:           "strong marker fires even when global is absent",
+			prompt:         "## Guardrail (HARD RULE)\nNo PRs.",
+			globalContent:  "",
+			wantWarnSubstr: []string{"HARD RULE"},
+		},
+		{
+			name:           "section header overlap on signing",
+			prompt:         "## Commit signing\nUse PGP.",
+			globalContent:  globalWithPushSection,
+			wantWarnSubstr: []string{"Commit signing", "Git commit signing"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			writeGlobalClaudeMd(t, tt.globalContent)
+
+			cfg := DefaultConfig()
+			cfg.Agents["custom"] = AgentConfig{
+				Command:    "echo",
+				InitPrompt: tt.prompt,
+			}
+			result := cfg.Validate()
+
+			var overlapWarnings []ValidationError
+			for _, w := range result.Warnings {
+				if w.Section == "agents.custom" && w.Field == "init_prompt" {
+					overlapWarnings = append(overlapWarnings, w)
+				}
+			}
+
+			if tt.wantNoWarn {
+				if len(overlapWarnings) > 0 {
+					t.Errorf("expected no init_prompt overlap warnings, got %d:\n%s",
+						len(overlapWarnings), formatWarnings(overlapWarnings))
+				}
+				return
+			}
+
+			if len(overlapWarnings) == 0 {
+				t.Fatalf("expected warning(s) containing %v, got none", tt.wantWarnSubstr)
+			}
+
+			joined := joinWarningMessages(overlapWarnings)
+			for _, want := range tt.wantWarnSubstr {
+				if !strings.Contains(joined, want) {
+					t.Errorf("warning text missing %q\ngot:\n%s", want, joined)
+				}
+			}
+		})
+	}
+}
+
+func TestValidateInitPromptOverlap_OnDefaults(t *testing.T) {
+	writeGlobalClaudeMd(t, "## Sending code out\nPushes gated by destination.\n")
+
+	cfg := DefaultConfig()
+	cfg.Defaults.InitPrompt = "## PR guardrail (HARD RULE)\nDo not push."
+
+	result := cfg.Validate()
+
+	found := false
+	for _, w := range result.Warnings {
+		if w.Section == "defaults" && w.Field == "init_prompt" {
+			found = true
+			if !strings.Contains(w.Message, "HARD RULE") && !strings.Contains(w.Message, "PR guardrail") {
+				t.Errorf("expected message to mention HARD RULE or PR guardrail; got %q", w.Message)
+			}
+		}
+	}
+	if !found {
+		t.Error("expected warning on defaults.init_prompt for HARD RULE marker")
+	}
+}
+
+func TestValidateInitPromptOverlap_NeverError(t *testing.T) {
+	writeGlobalClaudeMd(t, "## Sending code out\nPushes gated.\n")
+
+	cfg := DefaultConfig()
+	cfg.Agents["custom"] = AgentConfig{
+		Command:    "echo",
+		InitPrompt: "## PR guardrail (HARD RULE)\nNEVER run `gh pr create`. Every repo, every project, every context.",
+	}
+
+	result := cfg.Validate()
+
+	for _, e := range result.Errors {
+		if e.Section == "agents.custom" && e.Field == "init_prompt" {
+			t.Errorf("contradiction check should warn, never error; got error: %s", e.Message)
+		}
+	}
+}
+
+// formatWarnings is a test helper for readable failure output.
+func formatWarnings(ws []ValidationError) string {
+	var sb strings.Builder
+	for _, w := range ws {
+		sb.WriteString("  - ")
+		sb.WriteString(w.Message)
+		sb.WriteString("\n")
+	}
+	return sb.String()
+}
+
+func joinWarningMessages(ws []ValidationError) string {
+	var sb strings.Builder
+	for _, w := range ws {
+		sb.WriteString(w.Message)
+		sb.WriteString("\n")
+	}
+	return sb.String()
 }

@@ -2,7 +2,10 @@ package config
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"text/template"
 )
@@ -140,6 +143,9 @@ func (c *Config) validateDefaults(r *ValidationResult) {
 				fmt.Sprintf("invalid Go template syntax: %v", err),
 				nil)
 		}
+		for _, msg := range validateInitPromptOverlap(c.Defaults.InitPrompt, findGlobalClaudeMd()) {
+			r.AddWarning("defaults", "init_prompt", msg, nil)
+		}
 	}
 }
 
@@ -162,6 +168,9 @@ func (c *Config) validateAgents(r *ValidationResult) {
 				r.AddError(section, "init_prompt",
 					fmt.Sprintf("invalid Go template syntax: %v", err),
 					nil)
+			}
+			for _, msg := range validateInitPromptOverlap(agent.InitPrompt, findGlobalClaudeMd()) {
+				r.AddWarning(section, "init_prompt", msg, nil)
 			}
 		}
 	}
@@ -214,4 +223,148 @@ func (c *Config) validateOpencode(r *ValidationResult) {
 func validateTemplate(tmpl string) error {
 	_, err := template.New("check").Parse(tmpl)
 	return err
+}
+
+// findGlobalClaudeMd returns the path to the user's global CLAUDE.md if it
+// exists, or "" otherwise. The OPENKANBAN_GLOBAL_CLAUDE_MD env var, when set,
+// overrides the default path lookup — useful for tests and for users who
+// want to opt out of the contradiction check by pointing at a nonexistent
+// file. A returned "" tells callers to skip global-dependent checks
+// silently; it's the expected state for openkanban users who don't run
+// Claude Code.
+func findGlobalClaudeMd() string {
+	if override, ok := os.LookupEnv("OPENKANBAN_GLOBAL_CLAUDE_MD"); ok {
+		if _, err := os.Stat(override); err == nil {
+			return override
+		}
+		return ""
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	path := filepath.Join(home, ".claude", "CLAUDE.md")
+	if _, err := os.Stat(path); err != nil {
+		return ""
+	}
+	return path
+}
+
+// strongRuleMarkers are textual patterns whose presence in an init_prompt
+// signals that the prompt is restating a global rule. Each entry is a
+// compiled regexp + a human-friendly label used in the warning message.
+var strongRuleMarkers = []struct {
+	pattern *regexp.Regexp
+	label   string
+}{
+	{regexp.MustCompile(`(?i)HARD RULE`), "HARD RULE"},
+	{regexp.MustCompile("(?i)NEVER\\s+(?:run\\s+)?[`']?(?:gh pr create|git push)"), "NEVER gh pr create / git push"},
+	{regexp.MustCompile(`(?i)every repo,\s*every project`), "every repo, every project"},
+	{regexp.MustCompile(`(?i)Per\s+\w+'s\s+global\s+rule`), "Per <name>'s global rule"},
+}
+
+// globalRuleKeywords are topic keywords used to flag when a local
+// init_prompt H2 section overlaps with a global CLAUDE.md H2 section.
+// Match is case-insensitive on whole-word boundaries. Kept short and
+// high-confidence — false positives are tolerable; missed contradictions
+// are not.
+var globalRuleKeywords = []string{
+	"push",
+	"PR",
+	"pull request",
+	"gh pr",
+	"git push",
+	"signing",
+	"gpg",
+	"ssh",
+	"ticket creation",
+}
+
+// h2Pattern matches Markdown level-2 headers at the start of a line.
+var h2Pattern = regexp.MustCompile(`(?m)^##\s+(.+)$`)
+
+// validateInitPromptOverlap returns zero or more warning messages
+// describing places where prompt appears to restate or contradict rules
+// in the global CLAUDE.md at claudeMdPath. Pass an empty claudeMdPath to
+// skip the header-overlap stage; the strong-marker stage runs in either
+// case so a poisoned prompt is caught even without the global file.
+//
+// Detection is heuristic (regexp / keyword based) on purpose: this runs
+// at config load and must be fast and warning-only. False positives are
+// tolerable; users can suppress by editing the prompt or pointing
+// OPENKANBAN_GLOBAL_CLAUDE_MD at a nonexistent file.
+func validateInitPromptOverlap(prompt, claudeMdPath string) []string {
+	var warnings []string
+
+	// Stage 1: strong textual markers. Runs regardless of whether the
+	// global file is present — these patterns are diagnostic on their
+	// own.
+	for _, m := range strongRuleMarkers {
+		if m.pattern.FindString(prompt) != "" {
+			warnings = append(warnings,
+				fmt.Sprintf("init_prompt contains %q — looks like a restated global rule; "+
+					"prefer to defer to ~/.claude/CLAUDE.md", m.label))
+		}
+	}
+
+	// Stage 2: H2 section-header overlap. Needs the global file.
+	if claudeMdPath == "" {
+		return warnings
+	}
+	data, err := os.ReadFile(claudeMdPath)
+	if err != nil {
+		// File disappeared between findGlobalClaudeMd() and now (rare).
+		// Skip silently; the strong-marker stage above already ran.
+		return warnings
+	}
+
+	localHeaders := extractH2Headers(prompt)
+	globalHeaders := extractH2Headers(string(data))
+
+	seen := map[string]bool{}
+	for _, lh := range localHeaders {
+		for _, gh := range globalHeaders {
+			kw := sharedRuleKeyword(lh, gh)
+			if kw == "" {
+				continue
+			}
+			key := lh + "|" + gh
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			warnings = append(warnings, fmt.Sprintf(
+				"init_prompt section %q overlaps with global CLAUDE.md section %q "+
+					"(shared topic %q) — consider deferring to global",
+				lh, gh, kw))
+		}
+	}
+
+	return warnings
+}
+
+func extractH2Headers(md string) []string {
+	matches := h2Pattern.FindAllStringSubmatch(md, -1)
+	out := make([]string, 0, len(matches))
+	for _, m := range matches {
+		out = append(out, strings.TrimSpace(m[1]))
+	}
+	return out
+}
+
+// sharedRuleKeyword returns the first keyword from globalRuleKeywords
+// that appears (case-insensitive, as a substring) in BOTH headers, or ""
+// if none. Substring rather than whole-word so headers like
+// "PR guardrail" and "Sending code out (pushes and PRs)" both match "PR"
+// and "push".
+func sharedRuleKeyword(a, b string) string {
+	la := strings.ToLower(a)
+	lb := strings.ToLower(b)
+	for _, kw := range globalRuleKeywords {
+		lk := strings.ToLower(kw)
+		if strings.Contains(la, lk) && strings.Contains(lb, lk) {
+			return kw
+		}
+	}
+	return ""
 }
