@@ -137,7 +137,8 @@ type CleanupSettings struct {
 
 // BehaviorSettings controls application behavior preferences
 type BehaviorSettings struct {
-	ConfirmQuitWithAgents bool `json:"confirm_quit_with_agents"` // Prompt before quitting with running agents
+	ConfirmQuitWithAgents   bool `json:"confirm_quit_with_agents"`    // Prompt before quitting with running agents
+	CheckForUpdatesOnLaunch bool `json:"check_for_updates_on_launch"` // Quick update check before entering the TUI
 }
 
 func defaultAgents() map[string]AgentConfig {
@@ -211,7 +212,8 @@ func DefaultConfig() *Config {
 			ForceWorktreeRemoval: false,
 		},
 		Behavior: BehaviorSettings{
-			ConfirmQuitWithAgents: true,
+			ConfirmQuitWithAgents:   true,
+			CheckForUpdatesOnLaunch: true,
 		},
 		Opencode: OpencodeSettings{
 			ServerEnabled:  true,

@@ -6,14 +6,17 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
+
 	"github.com/techdufus/openkanban/internal/app"
 	"github.com/techdufus/openkanban/internal/config"
 )
 
 var (
-	cfgFile     string
-	projectPath string
+	cfgFile        string
+	projectPath    string
+	noUpdateCheck  bool
 )
 
 var rootCmd = &cobra.Command{
@@ -46,6 +49,18 @@ for safe parallel development.`,
 			fmt.Fprintf(os.Stderr, "Config warnings:\n%s\n", result.FormatWarnings())
 		}
 
+		isTTY := isatty.IsTerminal(os.Stdin.Fd()) && isatty.IsTerminal(os.Stderr.Fd())
+		if handled, err := MaybePromptForUpdate(cfg, isTTY, noUpdateCheck); handled {
+			// Either we re-exec'd into the freshly installed binary
+			// (in which case this line is unreachable on success) or
+			// the user chose to quit. Either way, don't run the TUI.
+			return nil
+		} else if err != nil {
+			fmt.Fprintf(os.Stderr, "update check: %v\n", err)
+			// Fall through to app.Run anyway — a failed update should
+			// not block the user from working on tickets.
+		}
+
 		return app.Run(cfg, projectPath, Version)
 	},
 }
@@ -57,6 +72,7 @@ func Execute() error {
 func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.config/openkanban/config.json)")
 	rootCmd.PersistentFlags().StringVarP(&projectPath, "project", "p", "", "project or repository path")
+	rootCmd.PersistentFlags().BoolVar(&noUpdateCheck, "no-update-check", false, "Skip the launch-time check for openkanban updates")
 
 	rootCmd.AddCommand(newCmd)
 	rootCmd.AddCommand(listCmd)
