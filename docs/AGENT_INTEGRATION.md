@@ -11,6 +11,86 @@ OpenKanban runs AI agents in embedded PTY terminals within the TUI. This approac
 - **Full terminal emulation**: Colors, cursor movement, interactive prompts
 - **Easy navigation**: `ctrl+g` returns to board view
 
+## Daemon architecture (openkanbankd)
+
+The PTY-owning machinery does not live in the TUI process. It lives in a per-user daemon, `openkanbankd`. The TUI is a client: it tells the daemon what to spawn, attaches to one pane at a time over a Unix socket, and renders bytes the daemon streams. Detach the TUI (or kill it, or `kill -9` it) and the agent keeps running inside the daemon. Reopen the TUI and reattach.
+
+```
+                    ┌──────────────────────────────┐
+                    │       openkanbankd           │
+                    │  (cmd/daemon.go, internal/   │
+   ┌───────────┐    │   daemon/)                   │
+   │ TUI A     │◄──►│                              │
+   │ (model.go)│    │  per-session:                │
+   └───────────┘    │   - *terminal.Pane (PTY +    │
+                    │     vt + scrollback + drain) │◄── PTY ◄── claude/opencode/...
+   ┌───────────┐    │   - subscriber list (≤1      │
+   │ TUI B     │◄──►│     attached client + N      │
+   │ (model.go)│    │     status subscribers)      │
+   └───────────┘    │                              │
+                    │  Unix socket:                │
+                    │  ~/.cache/openkanban/        │
+                    │    daemon.sock (0600)        │
+                    └──────────────────────────────┘
+```
+
+### Why it exists
+
+Two problems the old single-process design could not solve:
+
+1. **Detach-survival across TUI restarts.** Before the daemon, every PTY was owned by the TUI goroutine. Closing the TUI killed the PTY, killed the agent. Iterating on the TUI itself — even a clean `q`-quit — meant losing the agent session. With the daemon, the TUI is a thin frontend; agents survive a TUI restart so you can run `go install` mid-session.
+2. **Cross-instance visibility and Takeover.** Multiple TUI instances (e.g. one per worktree) need to see each other's spawned sessions and, occasionally, take one over. The daemon is the single source of truth; both TUIs subscribe to the same event stream.
+
+### Where it runs
+
+Per-user, single instance, locked by `flock(LOCK_EX|LOCK_NB)` on a pidfile.
+
+- Socket: `~/.cache/openkanban/daemon.sock` (mode 0600, override via `OPENKANBAN_DAEMON_SOCK`)
+- Pidfile: `~/.cache/openkanban/daemon.pid` (override via `OPENKANBAN_DAEMON_PID`)
+- Log: `~/.cache/openkanban/daemon.log` (override via `OPENKANBAN_DAEMON_LOG`; tail with `openkanban daemon log`)
+
+The daemon is autostarted on the first TUI invocation that needs it — `daemonclient.DialOrStart` (see `internal/daemonclient/dial.go`) forks `<self> daemon` with `Setsid` and stdio redirected to the log file, then polls the socket until it binds. No systemd unit, no launchd plist; the user-facing model is "openkanban runs it for you, you mostly don't need to know."
+
+### Lifecycle: bound to ≥1 live TUI
+
+This is **not** a tmux-style long-running service. The daemon's contract is "be alive while there's a TUI that needs me." Concretely:
+
+- Last-client-disconnect triggers shutdown. When the connected-clients count drops to zero, the daemon waits a short grace period; if it stays at zero, it kills any still-live sessions (defensively — the TUI's exit-guard should have caught this) and exits. See `internal/daemon/server.go:handleLastClientDisconnect`.
+- The TUI's exit-guard (see `internal/ui/exit_guard.go`) prompts the user before quitting if doing so would leave the daemon as the last client with live sessions.
+
+This means a daemon process never outlives its useful work. It also means `openkanban daemon` from a fresh shell with no TUI running will start and immediately exit — that's expected; pair it with a TUI or a long-lived `openkanban daemon list` to keep it up for debugging.
+
+### One attacher per session, with Takeover
+
+The PTY's output stream is a single producer (the agent) and the daemon multiplexes it. Only one client is the *attached* client at a time — the one whose keystrokes reach stdin and whose viewport sets the resize. Additional clients can subscribe to *status* events without attaching.
+
+Takeover is explicit: a second TUI sends `AttachReq{Takeover: true}`, the daemon sends a `TypeDetach` signal to the current attacher, then accepts the new one. The agent process is untouched; only the wire-level attachment swaps. See `internal/daemon/session.go` and PR6's commit message for the design notes.
+
+### Snapshot redraw on attach
+
+When a client attaches, the daemon serializes the current screen state — emulator cell grid, cursor position, alt-screen flag, mouse-mode flag, cursor visibility, title — into a synthetic ANSI redraw blob and sends it before any new live bytes. The client's local `xvt.SafeEmulator` consumes it and ends up in a state cell-grid-equivalent to the daemon's. See `internal/daemon/redraw.go` and its tests for fixture-driven round-trip verification.
+
+This is why a TUI reattach "just shows the current screen" — there is no scrollback replay, no cold start. Scrollback bytes prior to the snapshot are not transmitted across a detach/reattach.
+
+### `--migrate` and the 3×3 matrix
+
+`openkanban ticket new --session <uuid> --migrate` declares "this Claude/opencode session belongs to openkanban now." The daemon participates: if the daemon already owns a session for that UUID, migrate proceeds as a re-link (the existing daemon-owned session stands; the ticket gets the UUID and `session_owned: true`). Across the three orthogonal axes — `--migrate` set?, daemon up?, daemon owns this UUID? — the CLI exhibits nine concrete behaviors covered in `cmd/ticket_daemon_test.go`. Summary:
+
+|              | daemon down | daemon up, doesn't own | daemon up, owns |
+|--------------|-------------|------------------------|-----------------|
+| **link**     | record uuid | record uuid            | record uuid     |
+| **migrate**  | lsof probe + stamp | lsof probe + stamp | re-link only (no kill) |
+| **migrate --force** | SIGTERM holders + stamp | SIGTERM holders + stamp | re-link only (no kill) |
+
+Migrating an openkanban-owned session is the case the daemon makes safer: the daemon knows it holds the JSONL open, so the CLI does not need to lsof the world and SIGTERM strangers.
+
+### What is *not* supported
+
+- **Concurrent shared attach.** One attacher; status subscribers do not see keystrokes.
+- **Daemon survives its own upgrade.** Replacing the `openkanban` binary requires `openkanban daemon restart`. The protocol-version check in the client fails loudly with that exact hint if the user forgets. "Upgrade in place" was considered and rejected — every reasonable implementation requires either ABI freezing or an in-band handshake migration, both of which cost more than the user does by re-killing N sessions once a release.
+- **Persistent scrollback across restarts.** Scrollback lives in the per-session ring buffer in the daemon process. Daemon restart loses it. (The agent's own conversation history is in its session JSONL, which is independent.)
+- **Networking.** The socket is `AF_UNIX`, mode 0600, in the user's `~/.cache`. There is no TCP listener and no auth layer; the security model is "you trust everything else under your uid."
+
 ## Supported Agents
 
 ### Tier 1: Full Support

@@ -120,6 +120,18 @@ func newClient(ctx context.Context, conn net.Conn) (*Client, error) {
 		c.Close()
 		return nil, fmt.Errorf("daemonclient: hello: %w", err)
 	}
+	// Version-skew guard: if the daemon was started from an older (or
+	// newer) openkanban binary, its wire protocol won't match the
+	// client's compiled-in ProtocolVersion. Fail fast with a clear,
+	// actionable error so the TUI degrades to no-daemon mode instead of
+	// soldiering on with a mismatched codec.
+	if resp.ProtocolVersion != daemon.ProtocolVersion {
+		clientVer := daemon.ProtocolVersion
+		daemonVer := resp.ProtocolVersion
+		c.Close()
+		return nil, fmt.Errorf("%w: client=%d, daemon=%d — run `openkanban daemon restart`",
+			ErrProtocolVersionSkew, clientVer, daemonVer)
+	}
 	c.clientID = resp.ClientID
 	c.protocolVer = resp.ProtocolVersion
 	c.binaryVer = resp.BinaryVersion

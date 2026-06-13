@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -155,6 +156,90 @@ var daemonStopCmd = &cobra.Command{
 	},
 }
 
+// daemonRestartFlagForce is the --force flag on `daemon restart` — when
+// set, skip the interactive prompt even if sessions are alive.
+var daemonRestartFlagForce bool
+
+// daemonRestartCmd shuts the running daemon down (terminating any live
+// sessions) and lets the next `openkanban` invocation autostart a fresh
+// one. The point of "restart" is "pick up a new binary after upgrade";
+// the daemon does not survive its own upgrade (see docs/AGENT_INTEGRATION.md).
+//
+// Safety:
+//   - If sessions > 0 AND stderr is a TTY AND --force is NOT set, prompt
+//     interactively before tearing them down.
+//   - --force or a non-TTY stderr skips the prompt (so the command is
+//     scriptable from CI / pipelines without blocking).
+var daemonRestartCmd = &cobra.Command{
+	Use:           "restart",
+	Short:         "Terminate the running daemon (next openkanban will autostart a fresh one)",
+	Long:          "Asks the running openkanbankd to shut down. Any live agent PTYs it owns are killed. The next `openkanban` invocation will autostart a fresh daemon (typically built from a newer binary — that's the whole point). With sessions still alive, prompts on an interactive TTY; pass --force to skip the prompt.",
+	SilenceUsage:  true,
+	SilenceErrors: false,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		conn, err := dialDaemon(cmd.Context())
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+
+		r := bufio.NewReader(conn)
+		if _, err := exchange(conn, r, daemon.MsgHelloReq, daemon.HelloReq{
+			ProtocolVersion: daemon.ProtocolVersion,
+			BinaryVersion:   Version,
+			ClientName:      "openkanban-cli",
+		}); err != nil {
+			return fmt.Errorf("hello: %w", err)
+		}
+
+		// Learn the live-session count before pulling the trigger.
+		raw, err := exchange(conn, r, daemon.MsgPrepareExitReq, daemon.PrepareExitReq{})
+		if err != nil {
+			return fmt.Errorf("prepare_exit: %w", err)
+		}
+		var prep daemon.PrepareExitResp
+		if err := json.Unmarshal(raw, &prep); err != nil {
+			return fmt.Errorf("decode PrepareExitResp: %w", err)
+		}
+
+		liveSessions := len(prep.Sessions)
+		if liveSessions > 0 && !daemonRestartFlagForce && stderrIsTTY() {
+			fmt.Fprintf(os.Stderr, "daemon restart will terminate %d live agent session(s). Continue? [y/N] ", liveSessions)
+			line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+			ans := strings.TrimSpace(line)
+			if ans != "y" && ans != "Y" {
+				fmt.Fprintln(os.Stderr, "aborted")
+				os.Exit(1)
+			}
+		}
+
+		raw, err = exchange(conn, r, daemon.MsgShutdownReq, daemon.ShutdownReq{Force: false})
+		if err != nil {
+			return fmt.Errorf("shutdown: %w", err)
+		}
+		var resp daemon.ShutdownResp
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			return fmt.Errorf("decode ShutdownResp: %w", err)
+		}
+		fmt.Printf("daemon restart: terminated %d session(s); next openkanban will autostart a fresh daemon\n", resp.KilledSessions)
+		return nil
+	},
+}
+
+// stderrIsTTY reports whether stderr is attached to a character device.
+// Used to decide whether `daemon restart` should prompt the user before
+// killing live sessions. We deliberately use os.Stderr.Stat instead of
+// pulling in golang.org/x/term so the project stays dependency-free for
+// this single check; the trade-off is "no terminfo-aware detection," but
+// for "is this a pipe/file vs a terminal" os.ModeCharDevice is correct.
+func stderrIsTTY() bool {
+	fi, err := os.Stderr.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
 // daemonLogCmd replaces the current process with `tail -F <log>` so the
 // user sees a live stream of the daemon's log. We don't reimplement
 // tail in-process — exec'ing the system tool is shorter, safer, and
@@ -251,8 +336,11 @@ func exchange(conn net.Conn, r *bufio.Reader, msgType string, payload any) (json
 }
 
 func init() {
+	daemonRestartCmd.Flags().BoolVar(&daemonRestartFlagForce, "force", false, "skip the interactive 'continue?' prompt even if live sessions exist")
+
 	daemonCmd.AddCommand(daemonListCmd)
 	daemonCmd.AddCommand(daemonStopCmd)
+	daemonCmd.AddCommand(daemonRestartCmd)
 	daemonCmd.AddCommand(daemonLogCmd)
 	rootCmd.AddCommand(daemonCmd)
 }

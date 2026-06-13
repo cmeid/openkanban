@@ -44,6 +44,13 @@ const (
 // it up within the start-wait window.
 var ErrDaemonUnavailable = errors.New("daemonclient: cannot reach openkanbankd")
 
+// ErrProtocolVersionSkew is the public sentinel returned by New /
+// NewWithConn when the daemon's ProtocolVersion in HelloResp does not
+// match the client's compiled-in daemon.ProtocolVersion. The caller is
+// expected to surface a "run `openkanban daemon restart`" hint and
+// continue in degraded (daemonless) mode rather than crash.
+var ErrProtocolVersionSkew = errors.New("daemonclient: protocol version skew between client and daemon")
+
 const (
 	dialTimeout = 1 * time.Second
 	startWait   = 3 * time.Second

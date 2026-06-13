@@ -1,5 +1,7 @@
 # Terminal Package
 
+**This package is now the daemon-side library.** PR7 cut the TUI over to `internal/daemonclient.PaneView`, which mirrors the surface (Title/Start/Stop/StopGraceful/SetSize/HandleKey/HandleMouse/Running/SetWorkdir/GetWorkdir/SetSessionName/GetContent/Update) but uses its own local emulator fed by the daemon's binary stream. The `*terminal.Pane` type defined here is instantiated inside `openkanbankd` (see `internal/daemon/session.go`) to own the actual PTY, scrollback ring, vt drain goroutine, and mode flags. UI code should not import this package — go through `daemonclient` instead.
+
 PTY management and terminal emulation for agent processes.
 
 ## Core Components

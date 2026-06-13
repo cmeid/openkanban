@@ -57,7 +57,9 @@ Return `tea.Cmd` from `Update()` for async work.
 
 ## Terminal Panes
 
-`panes map[board.TicketID]*terminal.Pane` - one per spawned agent
+`panes map[board.TicketID]*daemonclient.PaneView` — one per spawned agent.
+
+PaneView is the client-side handle; the PTY itself lives in openkanbankd. Lifecycle is daemon-driven: `Spawn` happens server-side at construction time, `Attach` / `Detach` swap which TUI is the one attached client, and `daemonclient.PaneViewAttached` vs `PaneViewUnattached` describe what this TUI sees, not whether the agent is alive (the agent can be alive in the daemon while every TUI is `Unattached`). Methods preserve the old `*terminal.Pane` surface — see `internal/daemonclient/paneview.go` for the full 13-method shape and the unattached-state behavior table.
 
 ## Anti-Patterns
 

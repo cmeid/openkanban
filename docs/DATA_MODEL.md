@@ -196,7 +196,10 @@ base_branch: main
 agent_type: claude
 blocked_by: []
 meta: {}
-# runtime fields — overwritten on agent spawn, reset on TUI startup
+# runtime fields — overwritten on agent spawn; on TUI startup, reset
+# unless openkanbankd still owns a session for this ticket (in which
+# case the on-disk values are believed and the daemon's reality reconciles
+# them via subscribed events).
 agent_status: working
 agent_spawned_at: 2026-06-12T11:30:00Z
 agent_port: 4097
@@ -550,9 +553,15 @@ type OpencodeSettings struct {
    (last writer wins) but this is a much smaller surface than the
    legacy whole-file rewrites. The TUI is single-threaded via Bubble
    Tea's event loop; conflicts only arise across processes.
-4. **No file locking**: OpenKanban does not use `flock`. External
-   writers are expected to use the same tmp+rename pattern (most
-   editors do; openkanban's own writes always do).
+4. **File locking scope**: Per-ticket `.md` files do not use `flock` —
+   external writers (and openkanban itself) coordinate via the
+   tmp+rename pattern in (2) instead, which most editors already do.
+   The one exception is the daemon's pidfile at
+   `~/.cache/openkanban/daemon.pid`, which uses
+   `flock(LOCK_EX|LOCK_NB)` to enforce single-instance: a second
+   `openkanban daemon` invocation observes the lock held and exits
+   non-zero. The lock is on the daemon's *runtime state*, not on
+   ticket content; ticket files are still lock-free.
 5. **Watcher loop is single-goroutine**: the fsnotify event channel is
    consumed by one goroutine in `internal/app/app.go` that calls
    `program.Send`. The model's `Update` handler then mutates state in

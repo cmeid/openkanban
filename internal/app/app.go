@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -61,11 +62,22 @@ func Run(cfg *config.Config, filterPath, version string) error {
 	// Failure is non-fatal: the TUI degrades to "no spawn, no
 	// daemon-owned panes" but the rest of the board still works. This
 	// matches the design's "client nil-checks everywhere" contract.
+	//
+	// Version-skew is called out separately: it almost always means the
+	// user upgraded the openkanban binary but a daemon from the previous
+	// version is still running. We print an actionable hint to stderr
+	// (the daemon's log eats log.Printf output if launched from autostart,
+	// but app.Run is reached from the foreground TUI command, so stderr
+	// goes to the user's terminal) and then continue in degraded mode.
 	daemonCtx, daemonCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	daemonClient, daemonErr := daemonclient.New(daemonCtx)
 	daemonCancel()
 	if daemonErr != nil {
-		log.Printf("openkanban: daemon unavailable, agents cannot be spawned (%v)", daemonErr)
+		if errors.Is(daemonErr, daemonclient.ErrProtocolVersionSkew) {
+			fmt.Fprintln(os.Stderr, "openkanban: daemon version skew detected — run `openkanban daemon restart` to refresh; running in degraded mode without the daemon.")
+		} else {
+			log.Printf("openkanban: daemon unavailable, agents cannot be spawned (%v)", daemonErr)
+		}
 		daemonClient = nil
 	}
 
