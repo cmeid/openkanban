@@ -391,14 +391,20 @@ func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, w
 	}
 
 	var priorityBadge string
-	if ticket.Priority > 0 && ticket.Priority <= 2 {
+	if ticket.Priority >= 1 && ticket.Priority <= 5 {
 		priorityColors := map[int]lipgloss.Color{
 			1: m.colors.err,
 			2: lipgloss.Color("#fab387"),
+			3: m.colors.warning,
+			4: m.colors.primary,
+			5: m.colors.muted,
 		}
 		priorityLabels := map[int]string{
-			1: "!!",
-			2: "!",
+			1: "⌃⌃",
+			2: "⌃⎯",
+			3: "⎯⎯",
+			4: "⎯⌄",
+			5: "⌄⌄",
 		}
 		pColor := priorityColors[ticket.Priority]
 		priorityBadge = lipgloss.NewStyle().Foreground(pColor).Bold(true).Render(priorityLabels[ticket.Priority])
