@@ -567,12 +567,23 @@ func (s *Server) handleKill(c *clientConn, req KillReq) (KillResp, error) {
 // handleOwns answers whether the daemon currently owns the agent
 // session whose Claude / opencode UUID matches req.SessionUUID.
 //
-// TODO(PR10): Sessions don't currently track the inner agent's UUID;
-// only the openkanban-side SessionName the pane was spawned with. PR10
-// will plumb agent.UUID extraction through and complete this lookup.
-// For now we conservatively report Owned=false for every request so
-// callers don't latch onto a wrong session.
+// Sessions record their agent UUID at spawn time
+// (SpawnReq.AgentSessionUUID → Session.agentSessionUUID). We walk
+// the live sessions under sessionsMu.RLock and return the first match.
+// Empty UUIDs never match: a Spawn made without --session carries
+// AgentSessionUUID="" and an Owns query with SessionUUID="" is
+// ill-formed and reported as Owned=false.
 func (s *Server) handleOwns(c *clientConn, req OwnsReq) OwnsResp {
+	if req.SessionUUID == "" {
+		return OwnsResp{Owned: false}
+	}
+	s.sessionsMu.RLock()
+	defer s.sessionsMu.RUnlock()
+	for _, sess := range s.sessions {
+		if sess.AgentSessionUUID() == req.SessionUUID {
+			return OwnsResp{Owned: true, SessionID: sess.ID()}
+		}
+	}
 	return OwnsResp{Owned: false}
 }
 

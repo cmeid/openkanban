@@ -87,7 +87,22 @@ func New(ctx context.Context) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	return newClient(ctx, conn)
+}
 
+// NewWithConn wraps an already-dialed net.Conn in a Client without
+// dialing or autostarting. Used by short-lived probe paths (e.g.
+// cmd/ticket.go's Owns / Kill flows) that have already done their own
+// Dial — typically because they want a quick negative answer when the
+// daemon isn't running, rather than the multi-second autostart wait
+// New() does. On Hello failure the conn is closed.
+func NewWithConn(ctx context.Context, conn net.Conn) (*Client, error) {
+	return newClient(ctx, conn)
+}
+
+// newClient is the shared body of New / NewWithConn: install the conn,
+// start the read loop, do the Hello handshake.
+func newClient(ctx context.Context, conn net.Conn) (*Client, error) {
 	c := &Client{
 		conn:        conn,
 		r:           bufio.NewReader(conn),

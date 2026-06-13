@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +14,8 @@ import (
 
 	"github.com/techdufus/openkanban/internal/agent"
 	"github.com/techdufus/openkanban/internal/board"
+	"github.com/techdufus/openkanban/internal/daemon"
+	"github.com/techdufus/openkanban/internal/daemonclient"
 	"github.com/techdufus/openkanban/internal/project"
 )
 
@@ -30,6 +33,9 @@ var (
 	ticketNewMigrate         bool
 	ticketNewForce           bool
 	ticketNewCreatedBy       string
+
+	ticketDeleteProject string
+	ticketDeleteID      string
 )
 
 var ticketCmd = &cobra.Command{
@@ -150,6 +156,83 @@ Description sources (mutually exclusive, in priority order):
 	},
 }
 
+var ticketDeleteCmd = &cobra.Command{
+	Use:   "delete",
+	Short: "Delete a ticket from a project",
+	Long: `Delete a ticket from a project, removing both the ticket's .md
+file and (if the daemon is up and currently owns the agent session) the
+running daemon-side session.
+
+The --project flag follows the same matching rules as 'ticket new': an
+exact name, an exact UUID, or a unique UUID prefix of at least 4
+characters.
+
+If the daemon is down or doesn't own the ticket's AgentSessionID, the
+delete is a pure file-system operation — the lsof / SIGTERM dance from
+'ticket new --migrate --force' is NOT replicated here, since deleting a
+ticket should not, on its own, kill a foreign Claude process.
+
+This command does NOT autostart the daemon: a scripted invocation must
+remain quiet when the daemon happens to be down.`,
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if ticketDeleteProject == "" {
+			return fmt.Errorf("--project is required")
+		}
+		if ticketDeleteID == "" {
+			return fmt.Errorf("--id is required")
+		}
+
+		registry, err := project.LoadRegistry()
+		if err != nil {
+			return fmt.Errorf("load project registry: %w", err)
+		}
+		proj, err := resolveProject(registry, ticketDeleteProject)
+		if err != nil {
+			return err
+		}
+
+		state := project.MigrationStateFor(proj.ID)
+		if state == project.MigrationPending {
+			return fmt.Errorf("project %q (%s) has legacy single-file ticket "+
+				"storage; launch openkanban once to migrate it before deleting",
+				proj.Name, shortID(proj.ID))
+		}
+
+		store, err := project.LoadTicketStore(proj)
+		if err != nil {
+			return fmt.Errorf("load ticket store: %w", err)
+		}
+		t, err := store.Get(board.TicketID(ticketDeleteID))
+		if err != nil {
+			return fmt.Errorf("ticket %s: %w", ticketDeleteID, err)
+		}
+
+		// Daemon-side cleanup BEFORE the file-system delete: if we
+		// remove the .md first and then the daemon RPC fails, we've
+		// orphaned the daemon session AND lost the on-disk record.
+		// Order: kill the live daemon session, then unlink the ticket.
+		if t.AgentSessionID != "" {
+			ownsResp, daemonUp, daemonOwns, perr := probeDaemonOwnership(t.AgentSessionID)
+			if perr != nil {
+				return fmt.Errorf("probe daemon ownership for session %s: %w", t.AgentSessionID, perr)
+			}
+			if daemonUp && daemonOwns {
+				if kerr := killDaemonSession(ownsResp.SessionID, 3*time.Second); kerr != nil {
+					return fmt.Errorf("kill daemon session %s: %w", ownsResp.SessionID, kerr)
+				}
+			}
+		}
+
+		if err := store.Delete(board.TicketID(ticketDeleteID)); err != nil {
+			return fmt.Errorf("delete ticket: %w", err)
+		}
+		fmt.Printf("deleted %s\n", ticketDeleteID)
+		return nil
+	},
+}
+
 // resolveProject matches the CLI --project arg against the registry.
 //
 // Match precedence:
@@ -245,8 +328,19 @@ func configTicketsDir() (string, error) {
 // Order of checks (cheap → expensive):
 //  1. Argument-shape sanity (combinations + UUID format).
 //  2. File-existence in the Claude projects dir.
-//  3. lsof probe (only when --migrate).
-//  4. SIGTERM/SIGKILL the holder (only when --force).
+//  3. Ownership probe (only when --migrate):
+//     a. Ask the daemon (if reachable, no autostart) whether IT owns
+//        the session.
+//     b. If the daemon owns it, --force routes the SIGTERM through the
+//        daemon's Kill RPC so the daemon's bookkeeping stays consistent
+//        (sessions map, subscribers, last-client shutdown).
+//     c. Otherwise fall back to the lsof + ForceExitSession path. This
+//        covers daemon-down, daemon-up-but-doesn't-own (the session is
+//        held by some foreign Claude process), or both.
+//
+// We deliberately do NOT autostart the daemon for this probe — the
+// caller may be running `openkanban ticket new` from a script, and
+// surprise-spawning a long-lived background daemon would be hostile.
 //
 // The audit field is independent of the operational fields and is
 // applied unconditionally if set.
@@ -275,21 +369,43 @@ func applySessionFlags(ticket *board.Ticket) error {
 		}
 
 		if ticketNewMigrate {
-			holder, err := agent.SessionActive(uuid)
+			ownsResp, daemonUp, daemonOwns, err := probeDaemonOwnership(uuid)
 			if err != nil {
-				return fmt.Errorf("check session %s in-use: %w", uuid, err)
+				return err
 			}
-			if holder.PID != 0 {
+
+			switch {
+			case daemonUp && daemonOwns:
 				if !ticketNewForce {
 					return fmt.Errorf("--migrate refused: session %s is "+
-						"currently held by pid %d (%s); exit that "+
-						"session first, or re-run with --force to "+
-						"terminate it (any unsubmitted prompt will be lost)",
-						uuid, holder.PID, path)
+						"currently held by openkanbankd (daemon session "+
+						"%s); re-run with --force to terminate it via "+
+						"the daemon (any unsubmitted prompt will be lost)",
+						uuid, ownsResp.SessionID)
 				}
-				if err := agent.ForceExitSession(uuid, 3*time.Second); err != nil {
-					return fmt.Errorf("force-exit session %s (pid %d): %w",
-						uuid, holder.PID, err)
+				if err := killDaemonSession(ownsResp.SessionID, 3*time.Second); err != nil {
+					return fmt.Errorf("force-exit daemon session %s: %w",
+						ownsResp.SessionID, err)
+				}
+			default:
+				// Daemon down, or daemon up but doesn't own. Fall back
+				// to the lsof probe + direct SIGTERM path.
+				holder, err := agent.SessionActive(uuid)
+				if err != nil {
+					return fmt.Errorf("check session %s in-use: %w", uuid, err)
+				}
+				if holder.PID != 0 {
+					if !ticketNewForce {
+						return fmt.Errorf("--migrate refused: session %s is "+
+							"currently held by pid %d (%s); exit that "+
+							"session first, or re-run with --force to "+
+							"terminate it (any unsubmitted prompt will be lost)",
+							uuid, holder.PID, path)
+					}
+					if err := agent.ForceExitSession(uuid, 3*time.Second); err != nil {
+						return fmt.Errorf("force-exit session %s (pid %d): %w",
+							uuid, holder.PID, err)
+					}
 				}
 			}
 		}
@@ -304,8 +420,82 @@ func applySessionFlags(ticket *board.Ticket) error {
 	return nil
 }
 
+// probeDaemonOwnership asks openkanbankd, if it is reachable, whether
+// the daemon currently owns the given Claude session UUID. Crucially
+// it uses Dial (not DialOrStart) so a script-driven `ticket new`
+// doesn't unexpectedly autostart a background daemon.
+//
+// Return tuple:
+//   - ownsResp:  the OwnsResp from the daemon (zero value when daemon down)
+//   - daemonUp:  true iff the dial + Hello succeeded
+//   - daemonOwns: convenience alias for ownsResp.Owned when daemonUp
+//   - err:       only set if the daemon was reachable but the RPC itself
+//     failed (encode / decode / unexpected error). Daemon-not-running
+//     is NOT an error here — it's the expected fallback path.
+func probeDaemonOwnership(uuid string) (daemon.OwnsResp, bool, bool, error) {
+	// Brief timeout: this is a quick probe on a local socket, and we
+	// must not stall ticket creation if something is wedged.
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	conn, err := daemonclient.Dial(ctx)
+	if err != nil {
+		if errors.Is(err, daemonclient.ErrDaemonUnavailable) {
+			return daemon.OwnsResp{}, false, false, nil
+		}
+		return daemon.OwnsResp{}, false, false, fmt.Errorf("dial daemon: %w", err)
+	}
+
+	client, err := daemonclient.NewWithConn(ctx, conn)
+	if err != nil {
+		// NewWithConn closes the conn on Hello failure. Treat a hello
+		// timeout against a wedged daemon as "not reachable" rather
+		// than a hard error — same conservative stance as Dial-not-up.
+		return daemon.OwnsResp{}, false, false, nil
+	}
+	defer client.Close()
+
+	resp, err := client.Owns(ctx, uuid)
+	if err != nil {
+		return daemon.OwnsResp{}, true, false, fmt.Errorf("daemon owns query: %w", err)
+	}
+	return resp, true, resp.Owned, nil
+}
+
+// killDaemonSession opens a short-lived client connection (no autostart)
+// and asks the daemon to terminate the named session with the given
+// grace window. Returns ErrDaemonUnavailable if the daemon is down by
+// the time we try to dial — caller has already proven it was up via
+// probeDaemonOwnership, but races happen.
+func killDaemonSession(sessionID string, grace time.Duration) error {
+	// Allow grace plus a bit for the RPC round-trip.
+	ctx, cancel := context.WithTimeout(context.Background(), grace+2*time.Second)
+	defer cancel()
+
+	conn, err := daemonclient.Dial(ctx)
+	if err != nil {
+		return err
+	}
+
+	client, err := daemonclient.NewWithConn(ctx, conn)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+
+	return client.Kill(ctx, sessionID, grace)
+}
+
 func init() {
 	ticketCmd.AddCommand(ticketNewCmd)
+	ticketCmd.AddCommand(ticketDeleteCmd)
+
+	ticketDeleteCmd.Flags().StringVar(&ticketDeleteProject, "project", "",
+		"Project name, UUID, or unique 4+ char UUID prefix (required)")
+	ticketDeleteCmd.Flags().StringVar(&ticketDeleteID, "id", "",
+		"Ticket ID to delete (required)")
+	_ = ticketDeleteCmd.MarkFlagRequired("project")
+	_ = ticketDeleteCmd.MarkFlagRequired("id")
 
 	ticketNewCmd.Flags().StringVar(&ticketNewProject, "project", "",
 		"Project name, UUID, or unique 4+ char UUID prefix (required)")

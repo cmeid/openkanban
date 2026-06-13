@@ -27,6 +27,12 @@ type Session struct {
 	pane        *terminal.Pane
 	startedAt   time.Time
 
+	// agentSessionUUID is the Claude / opencode session UUID this
+	// session was spawned with (from SpawnReq.AgentSessionUUID). Empty
+	// for sessions spawned without --session. Read-only after
+	// NewSession; consulted by handleOwns.
+	agentSessionUUID string
+
 	// attachMu protects attached and serializes Attach/Detach.
 	attachMu sync.Mutex
 	attached *attachedClient // nil = no current attacher
@@ -106,13 +112,25 @@ func NewSession(req SpawnReq) (*Session, error) {
 	}
 
 	return &Session{
-		id:          id,
-		ticketID:    req.TicketID,
-		sessionName: req.SessionName,
-		workdir:     req.Workdir,
-		pane:        pane,
-		startedAt:   time.Now().UTC(),
+		id:               id,
+		ticketID:         req.TicketID,
+		sessionName:      req.SessionName,
+		workdir:          req.Workdir,
+		pane:             pane,
+		startedAt:        time.Now().UTC(),
+		agentSessionUUID: req.AgentSessionUUID,
 	}, nil
+}
+
+// AgentSessionUUID returns the Claude / opencode session UUID this
+// session was spawned with, or "" if it was spawned without a --session
+// link. Used by handleOwns to answer "do you own session <UUID>?"
+// queries without poking at the agent process.
+func (s *Session) AgentSessionUUID() string {
+	if s == nil {
+		return ""
+	}
+	return s.agentSessionUUID
 }
 
 // newSessionID returns a fresh 16-character hex string drawn from

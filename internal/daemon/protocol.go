@@ -235,16 +235,25 @@ type HelloResp struct {
 }
 
 // SpawnReq asks the daemon to start a new PTY-backed session.
+//
+// AgentSessionUUID is the Claude / opencode session UUID this spawn is
+// linked to (i.e. the value that ended up in ticket.AgentSessionID, if
+// set). It is recorded on the daemon-side Session so that Owns queries
+// can answer "do you own session <UUID>?" without rummaging through the
+// pane / agent process internals. It is purely informational on the
+// daemon side — the spawn command line still drives whether the agent
+// actually resumes that UUID.
 type SpawnReq struct {
-	TicketID    string   `json:"ticket_id"`
-	SessionName string   `json:"session_name"`
-	Command     string   `json:"command"`
-	Workdir     string   `json:"workdir"`
-	Args        []string `json:"args,omitempty"`
-	Env         []string `json:"env,omitempty"`
-	Cols        int      `json:"cols"`
-	Rows        int      `json:"rows"`
-	Scrollback  int      `json:"scrollback"`
+	TicketID         string   `json:"ticket_id"`
+	SessionName      string   `json:"session_name"`
+	Command          string   `json:"command"`
+	Workdir          string   `json:"workdir"`
+	Args             []string `json:"args,omitempty"`
+	Env              []string `json:"env,omitempty"`
+	Cols             int      `json:"cols"`
+	Rows             int      `json:"rows"`
+	Scrollback       int      `json:"scrollback"`
+	AgentSessionUUID string   `json:"agent_session_uuid,omitempty"`
 }
 
 // SpawnResp acknowledges a successful spawn.

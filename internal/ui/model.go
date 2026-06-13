@@ -3395,6 +3395,10 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 			Cols:        width,
 			Rows:        height,
 			Scrollback:  0,
+			// Pass the Claude UUID (if any) through so the daemon can
+			// answer Owns queries for migrate / delete flows in
+			// cmd/ticket.go without rummaging through the agent process.
+			AgentSessionUUID: ticket.AgentSessionID,
 		}
 		spawnCtx, spawnCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		resp, err := daemonClient.Spawn(spawnCtx, req)
