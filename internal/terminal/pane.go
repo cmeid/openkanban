@@ -21,7 +21,62 @@ import (
 const (
 	renderInterval = 50 * time.Millisecond
 	readBufferSize = 65536
+
+	// subscriberChanCapacity is the buffer depth of channels returned by
+	// Pane.Subscribe. Sized for short bursts of OutputEvents at typical
+	// agent throughput; if a subscriber falls further behind, the read
+	// loop drops events for that subscriber rather than block the PTY
+	// pipeline. See Subscribe / startReadLoop.
+	subscriberChanCapacity = 256
 )
+
+// --- Event subscription API ---
+//
+// Subscribe returns a channel that receives every Event observed by the
+// pane: OutputEvent for each PTY read, ExitEvent on PTY close, and
+// TitleEvent / ModeEvent when the child mutates window title or
+// mouse / alt-screen / cursor-visibility state.
+//
+// Lives ALONGSIDE the existing tea.Cmd path (OutputMsg / ExitMsg) so
+// non-BubbleTea consumers — namely the daemon process in PR4 — can
+// observe pane traffic without dragging tea.Program along.
+
+// Event is the sum type emitted to Subscribers. The unexported
+// paneEvent() marker forces variants to live in this package.
+type Event interface {
+	paneEvent()
+}
+
+// OutputEvent carries a chunk of bytes read from the PTY. The byte
+// slice is unique to this event; subscribers may retain it.
+type OutputEvent struct {
+	Data []byte
+}
+
+// ExitEvent is published once when the PTY read returns an error
+// (typically io.EOF after the child process exits).
+type ExitEvent struct {
+	Err error
+}
+
+// TitleEvent fires when the child sets the OSC 0/2 window title.
+type TitleEvent struct {
+	Title string
+}
+
+// ModeEvent reports the current value of the three booleans whenever
+// any of them transitions. Carries the full snapshot so a fresh
+// subscriber doesn't need to query the pane to learn the state.
+type ModeEvent struct {
+	Mouse        bool
+	AltScreen    bool
+	CursorHidden bool
+}
+
+func (OutputEvent) paneEvent() {}
+func (ExitEvent) paneEvent()   {}
+func (TitleEvent) paneEvent()  {}
+func (ModeEvent) paneEvent()   {}
 
 type Pane struct {
 	id          string
@@ -77,6 +132,26 @@ type Pane struct {
 	// the model when computing the host-window title. atomic.Value lets
 	// the read be lock-free.
 	paneTitle atomic.Value // string
+
+	// Event subscription state (see Subscribe / startReadLoop). The
+	// subscribers slice is mutated only under subscribersMu; the read
+	// loop holds subscribersMu briefly during fan-out, so subscribersMu
+	// MUST NOT be acquired while p.mu is held (the read loop drops p.mu
+	// before fan-out to keep the lock order one-way).
+	subscribers     []chan Event
+	subscribersMu   sync.Mutex
+	readLoopOnce    sync.Once
+	readLoopStop    chan struct{}
+	readLoopWG      sync.WaitGroup
+	stopReadLoopMu  sync.Mutex // serializes one-shot close of readLoopStop
+	readLoopStopped bool
+
+	// teaBridgeCh is the dedicated subscriber feeding readOutputUnlocked's
+	// tea.Cmd. We allocate it once per Pane lifetime (during the first
+	// readOutputUnlocked call) so the tea path doesn't race with consumer
+	// Subscribe()s and so re-arming the Cmd doesn't churn subscriptions.
+	teaBridgeCh   <-chan Event
+	teaBridgeOnce sync.Once
 }
 
 func New(id string, width, height int, scrollbackSize int) *Pane {
@@ -246,7 +321,11 @@ type ExitFocusMsg struct{}
 func (p *Pane) Start(command string, args ...string) tea.Cmd {
 	return func() tea.Msg {
 		p.mu.Lock()
-		defer p.mu.Unlock()
+		// No `defer Unlock` here — the final `readOutputUnlocked()()`
+		// invocation blocks waiting for the first event from the
+		// subscription channel, which is filled by a goroutine that
+		// must acquire p.mu (handleOutput → p.mu). We MUST release
+		// p.mu before invoking the bridge Cmd.
 
 		// Build command
 		p.cmd = exec.Command(command, args...)
@@ -270,6 +349,7 @@ func (p *Pane) Start(command string, args ...string) tea.Cmd {
 		})
 		if err != nil {
 			p.exitErr = err
+			p.mu.Unlock()
 			return ExitMsg{PaneID: p.id, Err: err}
 		}
 		p.pty = ptmx
@@ -283,7 +363,21 @@ func (p *Pane) Start(command string, args ...string) tea.Cmd {
 		p.vt = xvt.NewSafeEmulator(p.width, p.height)
 		p.vt.SetCallbacks(xvt.Callbacks{
 			CursorVisibility: func(visible bool) {
-				p.cursorHidden.Store(!visible)
+				newHidden := !visible
+				prev := p.cursorHidden.Swap(newHidden)
+				if prev != newHidden {
+					// We're inside p.vt.Write, which runs under
+					// p.mu inside handleOutput. The mouse/alt-screen
+					// flags are stable while p.mu is held, so it's
+					// safe to read them directly here. publish takes
+					// only subscribersMu (lock order: p.mu →
+					// subscribersMu).
+					p.publish(ModeEvent{
+						Mouse:        p.mouseEnabled,
+						AltScreen:    p.altScreenActive,
+						CursorHidden: newHidden,
+					})
+				}
 			},
 		})
 		p.cursorHidden.Store(false)
@@ -293,8 +387,15 @@ func (p *Pane) Start(command string, args ...string) tea.Cmd {
 		p.scrollback = NewScrollbackBuffer(p.scrollbackSize)
 		p.selection = NewSelectionState()
 
-		// Start read loop
-		return p.readOutputUnlocked()()
+		// Build the read Cmd while we still hold p.mu (so the nil-
+		// check on p.pty sees a stable value), then release the lock
+		// BEFORE invoking it. The Cmd lazily Subscribes — which
+		// kicks off the read goroutine — and then blocks on the
+		// channel. The read goroutine grabs p.mu for handleOutput,
+		// so we cannot still be holding it here.
+		readCmd := p.readOutputUnlocked()
+		p.mu.Unlock()
+		return readCmd()
 	}
 }
 
@@ -334,7 +435,12 @@ func (p *Pane) registerTitleHandlersUnlocked() {
 		return
 	}
 	handler := func(data []byte) bool {
-		p.paneTitle.Store(parseOscTitlePayload(data))
+		title := parseOscTitlePayload(data)
+		p.paneTitle.Store(title)
+		// Title handlers fire from within p.vt.Write, which is
+		// invoked under p.mu by handleOutput. publish takes only
+		// subscribersMu — see lock-order note on publish().
+		p.publish(TitleEvent{Title: title})
 		return true
 	}
 	p.vt.RegisterOscHandler(0, handler)
@@ -374,28 +480,201 @@ func (p *Pane) startDrainUnlocked() {
 	}()
 }
 
+// Subscribe registers a new event subscriber and returns the receive
+// end of a buffered channel plus an unsubscribe func. Calling the
+// unsubscribe func removes the channel from the registry and closes
+// it; calling it more than once is a no-op.
+//
+// Safe to call before or after Start. The first call (regardless of
+// who makes it — public consumer or the internal tea bridge) starts
+// the PTY-read goroutine via sync.Once. Subsequent calls share the
+// same loop.
+func (p *Pane) Subscribe() (<-chan Event, func()) {
+	ch := make(chan Event, subscriberChanCapacity)
+
+	p.subscribersMu.Lock()
+	p.subscribers = append(p.subscribers, ch)
+	p.subscribersMu.Unlock()
+
+	p.readLoopOnce.Do(p.startReadLoop)
+
+	var once sync.Once
+	cancel := func() {
+		once.Do(func() {
+			p.subscribersMu.Lock()
+			defer p.subscribersMu.Unlock()
+			for i, c := range p.subscribers {
+				if c == ch {
+					p.subscribers = append(p.subscribers[:i], p.subscribers[i+1:]...)
+					close(ch)
+					return
+				}
+			}
+			// Not found means the read loop already closed it on
+			// shutdown; nothing to do.
+		})
+	}
+	return ch, cancel
+}
+
+// startReadLoop spawns the single PTY-read goroutine. Called via
+// p.readLoopOnce.Do, so exactly one runs across a Pane's lifetime.
+// Callers MUST ensure Pane.Start has completed before the first
+// Subscribe (which triggers this) — otherwise p.pty is nil and the
+// loop publishes an immediate ExitEvent.
+//
+// The loop reads bytes from p.pty, hands them to handleOutput (which
+// takes p.mu) to update emulator/scrollback/mode flags, then fans the
+// resulting OutputEvent out to all subscribers. ModeEvent / TitleEvent
+// are emitted from handleOutput's helpers and the emulator callbacks,
+// not from this function directly.
+//
+// On p.pty.Read error (typically io.EOF after the child exits) the
+// loop publishes a final ExitEvent and returns.
+//
+// IMPORTANT: This function does NOT take p.mu. It would be a deadlock
+// when invoked from Subscribe under sync.Once during Start's critical
+// section (Start holds p.mu while calling the returned tea.Cmd which
+// in turn Subscribes). The read of p.pty here is safe because
+// sync.Once / Subscribe is only called via the tea.Cmd returned from
+// Start, which the tea runtime invokes after the Cmd closure returns
+// — by which point Start's p.mu critical section has finished
+// publishing p.pty.
+//
+// We DO acquire p.mu briefly to allocate readLoopStop, but only via
+// stopReadLoopMu (a finer-grained lock dedicated to lifecycle). This
+// avoids the Start re-entry deadlock.
+func (p *Pane) startReadLoop() {
+	p.stopReadLoopMu.Lock()
+	p.readLoopStop = make(chan struct{})
+	stop := p.readLoopStop
+	p.stopReadLoopMu.Unlock()
+
+	ptyFile := p.pty
+	if ptyFile == nil {
+		// Defensive: Subscribe was called before Start finished.
+		// Publish exit so subscribers don't hang.
+		p.publishExit(fmt.Errorf("pane %s: read loop started before PTY ready", p.id))
+		return
+	}
+
+	p.readLoopWG.Add(1)
+	go func() {
+		defer p.readLoopWG.Done()
+		buf := make([]byte, readBufferSize)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+
+			n, err := ptyFile.Read(buf)
+			if n > 0 {
+				// Copy bytes — buf is reused on the next iteration
+				// and we want each subscriber to own the slice it
+				// receives.
+				data := make([]byte, n)
+				copy(data, buf[:n])
+
+				p.handleOutput(data)
+				p.publish(OutputEvent{Data: data})
+			}
+			if err != nil {
+				p.publishExit(err)
+				return
+			}
+		}
+	}()
+}
+
+// publish fans an event out to all current subscribers. Subscribers
+// whose buffer is full receive a dropped event (logged once per drop
+// to stderr) — the read loop never blocks on a slow consumer.
+//
+// Safe to call with p.mu held: publish takes only subscribersMu and
+// performs only non-blocking channel sends. Lock order is
+// p.mu → subscribersMu (never the reverse).
+func (p *Pane) publish(ev Event) {
+	p.subscribersMu.Lock()
+	defer p.subscribersMu.Unlock()
+	for _, ch := range p.subscribers {
+		select {
+		case ch <- ev:
+		default:
+			fmt.Fprintf(os.Stderr, "pane %s: dropped event for slow subscriber\n", p.id)
+		}
+	}
+}
+
+// publishExit emits a final ExitEvent and closes every subscriber
+// channel. After this returns no further publishes will succeed
+// (subscribers slice is nil'd).
+func (p *Pane) publishExit(err error) {
+	p.subscribersMu.Lock()
+	defer p.subscribersMu.Unlock()
+	for _, ch := range p.subscribers {
+		// Best-effort delivery of the terminal event. If the buffer
+		// is full, drop it: subscribers learn about exit via the
+		// channel close that follows.
+		select {
+		case ch <- ExitEvent{Err: err}:
+		default:
+			fmt.Fprintf(os.Stderr, "pane %s: dropped ExitEvent for slow subscriber\n", p.id)
+		}
+		close(ch)
+	}
+	p.subscribers = nil
+}
+
+// stopReadLoop closes the stop channel exactly once and waits for the
+// read goroutine to exit. Safe to call from Stop / StopGraceful (which
+// also close p.pty, unblocking any in-flight Read). Must be called
+// with p.mu released to avoid deadlocking with publish().
+func (p *Pane) stopReadLoop() {
+	p.stopReadLoopMu.Lock()
+	if !p.readLoopStopped && p.readLoopStop != nil {
+		close(p.readLoopStop)
+		p.readLoopStopped = true
+	}
+	p.stopReadLoopMu.Unlock()
+	p.readLoopWG.Wait()
+}
+
 // stopDrainUnlocked terminates the response-drain goroutine. Must be
-// called with p.mu held. Closing the emulator unblocks any in-flight
-// Read so the goroutine actually exits.
+// called with p.mu held.
+//
+// To unblock the drain goroutine's vt.Read we write a sentinel byte
+// into the emulator's response pipe (InputPipe is the writer end of
+// pr/pw; pr is what the drain reads). vt.Read returns with the
+// byte, the drain loop iterates, sees drainStop closed, and exits.
+//
+// This avoids calling Emulator.Close(), which mutates an internal
+// `closed` field without a lock — a benign race in practice but one
+// the -race detector trips on against the concurrent Read.
 func (p *Pane) stopDrainUnlocked() {
 	if p.drainStop == nil {
 		return
 	}
 	close(p.drainStop)
 	if p.vt != nil {
-		// Close the emulator to unblock Read().
-		_ = p.vt.Emulator.Close()
+		// One-byte wakeup. The byte itself is irrelevant — drain
+		// will write it to ptyFile (which is likely already closed,
+		// so the write errors and is ignored) and then re-enter the
+		// for-loop which sees the closed stop channel and returns.
+		if w := p.vt.Emulator.InputPipe(); w != nil {
+			_, _ = w.Write([]byte{0})
+		}
 	}
 	p.drainStop = nil
-	// Don't Wait here while holding p.mu — the drain goroutine
-	// doesn't grab p.mu, but a future caller might want Stop() to
-	// return promptly. The wait is cheap regardless.
+	// Wait without holding p.mu — currently callers already hold
+	// p.mu, but the drain goroutine doesn't touch p.mu so the Wait
+	// is safe. (We did NOT take p.mu in the goroutine itself.)
 	p.drainWG.Wait()
 }
 
 func (p *Pane) Stop() error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	if p.cmd != nil && p.cmd.Process != nil {
 		p.cmd.Process.Kill()
@@ -405,6 +684,13 @@ func (p *Pane) Stop() error {
 	}
 	p.stopDrainUnlocked()
 	p.running = false
+	p.mu.Unlock()
+
+	// Tear down the read loop without holding p.mu: stopReadLoop
+	// waits for the goroutine to exit, and that goroutine calls
+	// handleOutput (which takes p.mu) — Wait()ing under p.mu would
+	// self-deadlock.
+	p.stopReadLoop()
 	return nil
 }
 
@@ -443,6 +729,8 @@ func (p *Pane) StopGraceful(timeout time.Duration) error {
 	p.running = false
 	p.mu.Unlock()
 
+	// See Stop(): tear down the read loop outside p.mu.
+	p.stopReadLoop()
 	return nil
 }
 
@@ -465,22 +753,53 @@ func (p *Pane) readOutput() tea.Cmd {
 	return p.readOutputUnlocked()
 }
 
-// readOutputUnlocked must be called with mu held
+// readOutputUnlocked must be called with mu held.
+//
+// Bridges the new channel-based subscription API back into BubbleTea's
+// Cmd model. Returns a Cmd that, on first invocation, lazily
+// Subscribes the Pane (which kicks off startReadLoop the first time
+// any subscriber appears) and caches the channel. Subsequent
+// invocations read one event from that cached channel and translate
+// it to an OutputMsg or ExitMsg. Title/ModeEvents are silently
+// dropped by this bridge — the UI does not yet wire them through
+// tea.Msg.
+//
+// The lazy Subscribe is deliberately deferred into the Cmd closure
+// (not done eagerly here). The closure runs from the tea runtime
+// without p.mu held; Subscribe → startReadLoop wants p.mu briefly,
+// which would self-deadlock if we Subscribed inline while Start still
+// holds the lock.
 func (p *Pane) readOutputUnlocked() tea.Cmd {
 	if p.pty == nil {
 		return nil
 	}
 
-	ptyFile := p.pty
 	paneID := p.id
 
 	return func() tea.Msg {
-		buf := make([]byte, readBufferSize)
-		n, err := ptyFile.Read(buf)
-		if err != nil {
-			return ExitMsg{PaneID: paneID, Err: err}
+		p.teaBridgeOnce.Do(func() {
+			ch, _ := p.Subscribe()
+			p.teaBridgeCh = ch
+		})
+		ch := p.teaBridgeCh
+
+		for ev := range ch {
+			switch e := ev.(type) {
+			case OutputEvent:
+				return OutputMsg{PaneID: paneID, Data: e.Data}
+			case ExitEvent:
+				return ExitMsg{PaneID: paneID, Err: e.Err}
+			default:
+				// TitleEvent / ModeEvent: drop. The UI learns
+				// about these through other paths (Pane.Title()
+				// is polled by the model; mouse/alt-screen are
+				// checked at use-time).
+				continue
+			}
 		}
-		return OutputMsg{PaneID: paneID, Data: buf[:n]}
+		// Channel closed without ExitEvent (e.g. Stop torn the
+		// pane down). Synthesize an exit so the UI cleans up.
+		return ExitMsg{PaneID: paneID, Err: io.EOF}
 	}
 }
 
@@ -493,7 +812,11 @@ func (p *Pane) Update(msg tea.Msg) tea.Cmd {
 		if msg.PaneID != p.id {
 			return nil
 		}
-		p.handleOutput(msg.Data)
+		// Bytes were already processed by the read goroutine
+		// (handleOutput is invoked there before fan-out). The
+		// OutputMsg arriving here is purely a signal to schedule a
+		// render tick and re-arm the Cmd that reads from the tea
+		// bridge channel.
 		return tea.Batch(p.readOutput(), p.scheduleRenderTick())
 
 	case RenderTickMsg:
@@ -517,6 +840,10 @@ func (p *Pane) Update(msg tea.Msg) tea.Cmd {
 		}
 		p.stopDrainUnlocked()
 		p.mu.Unlock()
+		// The read loop has already exited (it's what produced
+		// this ExitMsg). stopReadLoop is a cheap no-op in that
+		// case but ensures readLoopStop is closed exactly once.
+		p.stopReadLoop()
 		return nil
 	}
 
@@ -547,7 +874,8 @@ func (p *Pane) handleOutput(data []byte) {
 }
 
 // detectMouseModeChanges scans output for mouse tracking mode escape sequences.
-// Called with mutex held.
+// Called with mutex held. Emits a ModeEvent on transition so subscribers
+// learn about mouse-tracking flips without parsing bytes themselves.
 func (p *Pane) detectMouseModeChanges(data []byte) {
 	// Mouse tracking enable sequences (any of these enables mouse mode)
 	enableSeqs := [][]byte{
@@ -568,7 +896,10 @@ func (p *Pane) detectMouseModeChanges(data []byte) {
 	// Check for enable sequences
 	for _, seq := range enableSeqs {
 		if bytes.Contains(data, seq) {
-			p.mouseEnabled = true
+			if !p.mouseEnabled {
+				p.mouseEnabled = true
+				p.publishModeEventLocked()
+			}
 			return
 		}
 	}
@@ -576,14 +907,29 @@ func (p *Pane) detectMouseModeChanges(data []byte) {
 	// Check for disable sequences
 	for _, seq := range disableSeqs {
 		if bytes.Contains(data, seq) {
-			p.mouseEnabled = false
+			if p.mouseEnabled {
+				p.mouseEnabled = false
+				p.publishModeEventLocked()
+			}
 			return
 		}
 	}
 }
 
+// publishModeEventLocked snapshots the three flags and publishes a
+// ModeEvent. Must be called with p.mu held. publish only takes
+// subscribersMu, so this is safe under p.mu (see publish docstring).
+func (p *Pane) publishModeEventLocked() {
+	p.publish(ModeEvent{
+		Mouse:        p.mouseEnabled,
+		AltScreen:    p.altScreenActive,
+		CursorHidden: p.cursorHidden.Load(),
+	})
+}
+
 // detectAltScreenChanges scans output for alternate screen mode escape sequences.
-// Called with mutex held.
+// Called with mutex held. Emits a ModeEvent on transition so subscribers
+// can react without re-parsing bytes.
 func (p *Pane) detectAltScreenChanges(data []byte) {
 	// Alternate screen enable sequences (smcup)
 	enableSeqs := [][]byte{
@@ -600,8 +946,11 @@ func (p *Pane) detectAltScreenChanges(data []byte) {
 	// Check for enable sequences
 	for _, seq := range enableSeqs {
 		if bytes.Contains(data, seq) {
-			p.altScreenActive = true
-			p.viewportOffset = 0 // Reset viewport when entering alt screen
+			if !p.altScreenActive {
+				p.altScreenActive = true
+				p.viewportOffset = 0 // Reset viewport when entering alt screen
+				p.publishModeEventLocked()
+			}
 			return
 		}
 	}
@@ -609,7 +958,10 @@ func (p *Pane) detectAltScreenChanges(data []byte) {
 	// Check for disable sequences
 	for _, seq := range disableSeqs {
 		if bytes.Contains(data, seq) {
-			p.altScreenActive = false
+			if p.altScreenActive {
+				p.altScreenActive = false
+				p.publishModeEventLocked()
+			}
 			return
 		}
 	}
