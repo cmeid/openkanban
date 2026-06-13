@@ -399,6 +399,89 @@ func (p *Pane) Start(command string, args ...string) tea.Cmd {
 	}
 }
 
+// StartHeadless launches a command in a PTY exactly like Start, but
+// returns synchronously and does not use BubbleTea's tea.Cmd. The read
+// loop is spawned via the same subscription machinery as Start; the
+// caller is expected to Subscribe() if they want to observe output.
+//
+// The optional env slice fully replaces the per-process env (after the
+// pane's buildCleanEnv pass). Pass nil to use the inherited environment
+// with the OPENKANBAN_SESSION addition.
+//
+// Used by the openkanbankd daemon, which owns Panes without a tea
+// runtime to drive the Cmd indirection. Mirrors Start's body byte-for-
+// byte aside from the tea.Cmd plumbing at the end.
+func (p *Pane) StartHeadless(command string, args []string, extraEnv []string) error {
+	p.mu.Lock()
+
+	p.cmd = exec.Command(command, args...)
+	p.cmd.Env = buildCleanEnv(p.sessionName)
+	if len(extraEnv) > 0 {
+		p.cmd.Env = append(p.cmd.Env, extraEnv...)
+	}
+
+	if p.workdir != "" {
+		p.cmd.Dir = p.workdir
+	}
+
+	ptmx, err := pty.StartWithSize(p.cmd, &pty.Winsize{
+		Rows: uint16(p.height),
+		Cols: uint16(p.width),
+	})
+	if err != nil {
+		p.exitErr = err
+		p.mu.Unlock()
+		return err
+	}
+	p.pty = ptmx
+	p.running = true
+	p.exitErr = nil
+
+	p.vt = xvt.NewSafeEmulator(p.width, p.height)
+	p.vt.SetCallbacks(xvt.Callbacks{
+		CursorVisibility: func(visible bool) {
+			newHidden := !visible
+			prev := p.cursorHidden.Swap(newHidden)
+			if prev != newHidden {
+				p.publish(ModeEvent{
+					Mouse:        p.mouseEnabled,
+					AltScreen:    p.altScreenActive,
+					CursorHidden: newHidden,
+				})
+			}
+		},
+	})
+	p.cursorHidden.Store(false)
+	p.registerTitleHandlersUnlocked()
+	p.startDrainUnlocked()
+
+	p.scrollback = NewScrollbackBuffer(p.scrollbackSize)
+	p.selection = NewSelectionState()
+
+	p.mu.Unlock()
+
+	// Kick the read loop without going through the tea bridge. Any
+	// Subscribe call (including the very first one a daemon-side
+	// caller makes) will hit readLoopOnce, but we start the loop
+	// here eagerly so the PTY is being drained immediately even if
+	// no one has Subscribed yet. This matches Start's behavior
+	// (where the returned tea.Cmd Subscribes lazily on first call).
+	p.readLoopOnce.Do(p.startReadLoop)
+	return nil
+}
+
+// PID returns the OS pid of the child process, or 0 if the pane has
+// not started or the process has exited. Safe to call from any
+// goroutine.
+func (p *Pane) PID() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cmd == nil || p.cmd.Process == nil {
+		return 0
+	}
+	return p.cmd.Process.Pid
+}
+
 // Title returns the most recent title the child process set via OSC 0/2
 // escape sequences. Empty string if the child has not set a title (yet).
 func (p *Pane) Title() string {
