@@ -6,9 +6,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/atotto/clipboard"
 	tea "github.com/charmbracelet/bubbletea"
+	xvt "github.com/charmbracelet/x/vt"
 
 	"github.com/techdufus/openkanban/internal/daemon"
+	"github.com/techdufus/openkanban/internal/terminal"
 )
 
 // spawnSessionForTest spins up a /bin/cat session that we can attach to
@@ -270,6 +273,83 @@ func TestPaneView_SetSize_Cached_WhenUnattached(t *testing.T) {
 	}
 	if pv.State() != PaneViewUnattached {
 		t.Errorf("State after SetSize unattached: got %s want unattached", pv.State())
+	}
+}
+
+// TestPaneView_HandleMouse_BareDragAutoCopies drives a bare-modifier
+// left-button Press/Motion/Release through HandleMouse and verifies
+// the selected text lands in the system clipboard. This is the core
+// invariant of the "cmd-c without shift" fix — on macOS the terminal
+// emulator (Ghostty / iTerm2) intercepts ⌘C before the app sees it,
+// so the user needs the auto-copy on selection finish to actually get
+// any text into the clipboard.
+//
+// Skipped when clipboard syscalls aren't available (CI without
+// pbcopy / xclip / wl-copy).
+func TestPaneView_HandleMouse_BareDragAutoCopies(t *testing.T) {
+	if err := clipboard.WriteAll(""); err != nil {
+		t.Skipf("clipboard unavailable: %v", err)
+	}
+
+	sentinel := "openkanban-paneview-test-sentinel"
+	if err := clipboard.WriteAll(sentinel); err != nil {
+		t.Fatalf("seed clipboard: %v", err)
+	}
+
+	pv := &PaneView{
+		state:     PaneViewAttached,
+		vt:        xvt.NewSafeEmulator(80, 24),
+		selection: terminal.NewSelectionState(),
+	}
+	pv.vt.Write([]byte("hello world"))
+
+	pv.HandleMouse(tea.MouseMsg{Button: tea.MouseButtonLeft, Action: tea.MouseActionPress, X: 0, Y: 0})
+	pv.HandleMouse(tea.MouseMsg{Button: tea.MouseButtonLeft, Action: tea.MouseActionMotion, X: 4, Y: 0})
+	pv.HandleMouse(tea.MouseMsg{Button: tea.MouseButtonLeft, Action: tea.MouseActionRelease, X: 4, Y: 0})
+
+	got, err := clipboard.ReadAll()
+	if err != nil {
+		t.Fatalf("clipboard.ReadAll: %v", err)
+	}
+	if got == sentinel {
+		t.Fatalf("clipboard unchanged from sentinel %q — auto-copy did not fire", sentinel)
+	}
+	if want := "hello"; !strings.Contains(got, want) {
+		t.Errorf("clipboard = %q, want it to contain %q", got, want)
+	}
+}
+
+// TestPaneView_HandleMouse_BareClickDoesNotCopy confirms that a
+// Press-Release without any motion (anchor == cursor) does NOT write
+// to the clipboard. selection.Finish() returns the state to Idle in
+// that case, so the auto-copy guard (Mode == SelectionSelected) must
+// not fire.
+func TestPaneView_HandleMouse_BareClickDoesNotCopy(t *testing.T) {
+	if err := clipboard.WriteAll(""); err != nil {
+		t.Skipf("clipboard unavailable: %v", err)
+	}
+
+	sentinel := "openkanban-paneview-click-sentinel"
+	if err := clipboard.WriteAll(sentinel); err != nil {
+		t.Fatalf("seed clipboard: %v", err)
+	}
+
+	pv := &PaneView{
+		state:     PaneViewAttached,
+		vt:        xvt.NewSafeEmulator(80, 24),
+		selection: terminal.NewSelectionState(),
+	}
+	pv.vt.Write([]byte("hello world"))
+
+	pv.HandleMouse(tea.MouseMsg{Button: tea.MouseButtonLeft, Action: tea.MouseActionPress, X: 3, Y: 0})
+	pv.HandleMouse(tea.MouseMsg{Button: tea.MouseButtonLeft, Action: tea.MouseActionRelease, X: 3, Y: 0})
+
+	got, err := clipboard.ReadAll()
+	if err != nil {
+		t.Fatalf("clipboard.ReadAll: %v", err)
+	}
+	if got != sentinel {
+		t.Errorf("clipboard changed after bare click: got %q, want sentinel %q", got, sentinel)
 	}
 }
 

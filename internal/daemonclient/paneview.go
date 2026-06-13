@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/atotto/clipboard"
 	tea "github.com/charmbracelet/bubbletea"
 	xvt "github.com/charmbracelet/x/vt"
 
@@ -966,6 +967,16 @@ func (p *PaneView) HandleMouse(msg tea.MouseMsg) {
 			case tea.MouseActionRelease:
 				p.selection.Finish()
 				p.dirty = true
+				// Auto-copy a real drag to the system clipboard so
+				// the user gets the text without needing ⌘C (which
+				// the terminal emulator intercepts before it reaches
+				// us on macOS). Keep the highlight so the user sees
+				// what was copied.
+				if p.selection.Mode == terminal.SelectionSelected {
+					if text := p.extractSelectionTextLocked(); text != "" {
+						_ = clipboard.WriteAll(text)
+					}
+				}
 			}
 		case tea.MouseButtonNone:
 			if p.selection.Mode == terminal.SelectionSelecting {
@@ -1010,13 +1021,16 @@ func (p *PaneView) HandleMouse(msg tea.MouseMsg) {
 	if y > 223 {
 		y = 223
 	}
+	// Left-button events are intentionally not forwarded to the daemon:
+	// they belong to openkanban's local selection. Forwarding left
+	// drags caused the child to re-render and shift content under the
+	// selection coordinates. Trade-off: mouse-aware child TUIs no
+	// longer receive left clicks; revisit if a real user hits this.
 	switch msg.Button {
 	case tea.MouseButtonWheelUp:
 		seq = []byte{'\x1b', '[', 'M', byte(64 + 32), byte(x + 32), byte(y + 32)}
 	case tea.MouseButtonWheelDown:
 		seq = []byte{'\x1b', '[', 'M', byte(65 + 32), byte(x + 32), byte(y + 32)}
-	case tea.MouseButtonLeft:
-		seq = []byte{'\x1b', '[', 'M', byte(0 + 32), byte(x + 32), byte(y + 32)}
 	case tea.MouseButtonRight:
 		seq = []byte{'\x1b', '[', 'M', byte(2 + 32), byte(x + 32), byte(y + 32)}
 	case tea.MouseButtonMiddle:
@@ -1060,36 +1074,35 @@ func (p *PaneView) scrollDownLocked(lines int) {
 	p.dirty = true
 }
 
-// copySelectionLocked extracts selected text and writes it to the
-// system clipboard. Must be called with p.mu held. Mirrors
-// terminal.Pane.copySelectionUnlocked but reads cells directly from
-// our local emulator.
-func (p *PaneView) copySelectionLocked() {
-	// PaneView does not currently maintain scrollback cell extraction
-	// — the daemon's snapshot only captures the live grid, so older
-	// scrollback content lives only on the daemon side. For PR7 we
-	// support selection on the visible portion only.
-	if p.selection == nil || p.vt == nil {
-		return
+// extractSelectionTextLocked returns the currently-selected text from
+// the local emulator. Must be called with p.mu held. PaneView does not
+// currently maintain scrollback cell extraction — the daemon's
+// snapshot only captures the live grid, so older scrollback content
+// lives only on the daemon side. Selection on visible content only.
+func (p *PaneView) extractSelectionTextLocked() string {
+	if p.selection == nil || !p.selection.IsActive() || p.vt == nil {
+		return ""
 	}
 	rows := p.vt.Height()
-	cols := p.vt.Width()
 	liveScreen := func(col, row int) terminal.Glyph {
 		return terminal.CellToGlyph(p.vt.CellAt(col, row))
 	}
-	_ = cols // silence unused if extraction stub changes
-	_ = liveScreen
-	// Use SelectionState.ExtractText with no scrollback lines.
-	text := p.selection.ExtractText(nil, liveScreen, rows, 0)
-	if text != "" {
-		// clipboard interaction is best-effort; we deliberately don't
-		// import atotto/clipboard at this layer to keep the daemonclient
-		// free of UI deps. The model can copy via its own clipboard
-		// shim after pulling text via GetContent if it wants explicit
-		// behavior. (PR7 accepts this limitation; PR8 may wire a
-		// callback through.)
+	return p.selection.ExtractText(nil, liveScreen, rows, 0)
+}
+
+// copySelectionLocked extracts selected text, writes it to the system
+// clipboard, and clears the selection. Must be called with p.mu held.
+// Mirrors terminal.Pane.copySelectionUnlocked. The ctrl+c/cmd+c
+// keystroke path uses this; the auto-copy on drag-release path writes
+// to the clipboard directly so the highlight persists for the user to
+// see what was copied.
+func (p *PaneView) copySelectionLocked() {
+	if text := p.extractSelectionTextLocked(); text != "" {
+		_ = clipboard.WriteAll(text)
 	}
-	p.selection.Clear()
+	if p.selection != nil {
+		p.selection.Clear()
+	}
 	p.dirty = true
 }
 
