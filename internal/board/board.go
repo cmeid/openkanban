@@ -83,6 +83,10 @@ type Ticket struct {
 	AgentSpawnedAt *time.Time  `json:"agent_spawned_at,omitempty"`
 	AgentPort      int         `json:"agent_port,omitempty"`
 	AgentSessionID string      `json:"agent_session_id,omitempty"`
+	// Session linkage. AgentSessionID is the existing field used to
+	// resume; SessionOwned + CreatedBySession are new.
+	SessionOwned     bool   `json:"session_owned,omitempty"`      // false = link (fork on spawn); true = migrate (resume in place)
+	CreatedBySession string `json:"created_by_session,omitempty"` // free-form audit, e.g., a session name the user typed
 
 	CreatedAt   time.Time  `json:"created_at"`
 	UpdatedAt   time.Time  `json:"updated_at"`

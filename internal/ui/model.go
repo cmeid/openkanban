@@ -2693,6 +2693,19 @@ func (m *Model) prepareSpawn(ticket *board.Ticket, proj *project.Project, agentC
 				if !hasClaudeNameFlag(args) && strings.TrimSpace(ticket.Title) != "" {
 					args = append(args, "-n", ticket.Title)
 				}
+				// Session linkage: if the ticket was created with
+				// --session, resume it on first spawn. Migrate mode
+				// (SessionOwned=true) resumes in place; link mode
+				// (default) forks to avoid clobbering the source.
+				// The UUID regex check is defensive — if the field
+				// somehow holds something non-UUID-shaped, skip resume
+				// rather than passing garbage to claude.
+				if ticket.AgentSessionID != "" && agent.SessionUUIDPattern.MatchString(ticket.AgentSessionID) {
+					args = append(args, "--resume", ticket.AgentSessionID)
+					if !ticket.SessionOwned {
+						args = append(args, "--fork-session")
+					}
+				}
 				if promptTemplate != "" {
 					prompt := agent.BuildContextPrompt(promptTemplate, ticket)
 					if prompt != "" {

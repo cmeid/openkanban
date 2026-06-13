@@ -343,6 +343,12 @@ Other candidates considered:
 - If charm/x/vt's API surface stabilizes enough to expose `CursorVisible()` directly, we can drop the callback machinery.
 - If grapheme-width support becomes a felt issue (CJK users, emoji-heavy output), the rendering path needs to be reworked to iterate `Glyph.Width` for spacing — that's a larger change touching the column-major loops in pane.go.
 
+## Session Linking on Ticket Creation
+
+`openkanban ticket new` can attach an existing Claude Code session UUID to a ticket via `--session <uuid>`. The session JSONL lives at `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`; the CLI globs that path to verify the session exists before recording it. Two operational sub-modes are exposed: **link mode** (default — recorded with `session_owned: false` in the frontmatter) and **migrate mode** (set via `--migrate`, recorded as `session_owned: true`). Link mode is the safe default: the original session is left running untouched. Migrate mode declares "this session belongs to openkanban now," so any further driving of the session happens through the ticket. Before stamping migrate mode the CLI probes with `lsof` for processes holding the JSONL open; if anything still has it, it refuses unless `--force` is also set, in which case it sends SIGTERM with a 3s grace window and then SIGKILL. A separate `--created-by <name>` flag stores a free-form audit string in `created_by_session` — provenance only, never read by the spawn logic.
+
+The spawn flow consumes these two frontmatter fields together. On a ticket's first agent spawn (`AgentSpawnedAt == nil`), the Claude branch in `internal/ui/model.go` appends `--resume <AgentSessionID>` to the command line and additionally appends `--fork-session` when `SessionOwned` is false. The UUID is re-validated against `agent.SessionUUIDPattern` at spawn time as a defensive belt-and-braces check; non-UUID-shaped values are skipped silently rather than passed to `claude` as garbage. Subsequent spawns of the same ticket follow the existing `--continue` resume path and ignore the linkage fields. See the `--session` / `--migrate` / `--force` / `--created-by` flag descriptions in CONFIGURATION.md for the CLI surface.
+
 ## Status Detection
 
 ### Status Types

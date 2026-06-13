@@ -1,14 +1,17 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/techdufus/openkanban/internal/agent"
 	"github.com/techdufus/openkanban/internal/board"
 	"github.com/techdufus/openkanban/internal/project"
 )
@@ -23,6 +26,10 @@ var (
 	ticketNewPriority        int
 	ticketNewNoWorktree      bool
 	ticketNewAllowMigration  bool
+	ticketNewSession         string
+	ticketNewMigrate         bool
+	ticketNewForce           bool
+	ticketNewCreatedBy       string
 )
 
 var ticketCmd = &cobra.Command{
@@ -121,6 +128,10 @@ Description sources (mutually exclusive, in priority order):
 		}
 		if ticketNewNoWorktree {
 			ticket.UseWorktree = false
+		}
+
+		if err := applySessionFlags(ticket); err != nil {
+			return err
 		}
 
 		if err := store.SaveTicket(ticket); err != nil {
@@ -228,6 +239,71 @@ func configTicketsDir() (string, error) {
 	return ticketsRootDir()
 }
 
+// applySessionFlags validates the --session/--migrate/--force/--created-by
+// combination and stamps the corresponding fields on the ticket.
+//
+// Order of checks (cheap → expensive):
+//  1. Argument-shape sanity (combinations + UUID format).
+//  2. File-existence in the Claude projects dir.
+//  3. lsof probe (only when --migrate).
+//  4. SIGTERM/SIGKILL the holder (only when --force).
+//
+// The audit field is independent of the operational fields and is
+// applied unconditionally if set.
+func applySessionFlags(ticket *board.Ticket) error {
+	if ticketNewMigrate && ticketNewSession == "" {
+		return fmt.Errorf("--migrate requires --session")
+	}
+	if ticketNewForce && !ticketNewMigrate {
+		return fmt.Errorf("--force only makes sense with --migrate")
+	}
+
+	if ticketNewSession != "" {
+		uuid := strings.TrimSpace(ticketNewSession)
+		if !agent.SessionUUIDPattern.MatchString(uuid) {
+			return fmt.Errorf("--session %q is not a Claude Code session UUID; "+
+				"session ref must be a Claude Code session UUID; "+
+				"find yours via /cost or the claude --resume picker", uuid)
+		}
+		path, err := agent.SessionPath(uuid)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("--session %s: no Claude Code session file "+
+					"found at ~/.claude/projects/*/%s.jsonl", uuid, uuid)
+			}
+			return fmt.Errorf("locate session %s: %w", uuid, err)
+		}
+
+		if ticketNewMigrate {
+			holder, err := agent.SessionActive(uuid)
+			if err != nil {
+				return fmt.Errorf("check session %s in-use: %w", uuid, err)
+			}
+			if holder.PID != 0 {
+				if !ticketNewForce {
+					return fmt.Errorf("--migrate refused: session %s is "+
+						"currently held by pid %d (%s); exit that "+
+						"session first, or re-run with --force to "+
+						"terminate it (any unsubmitted prompt will be lost)",
+						uuid, holder.PID, path)
+				}
+				if err := agent.ForceExitSession(uuid, 3*time.Second); err != nil {
+					return fmt.Errorf("force-exit session %s (pid %d): %w",
+						uuid, holder.PID, err)
+				}
+			}
+		}
+
+		ticket.AgentSessionID = uuid
+		ticket.SessionOwned = ticketNewMigrate
+	}
+
+	if ticketNewCreatedBy != "" {
+		ticket.CreatedBySession = ticketNewCreatedBy
+	}
+	return nil
+}
+
 func init() {
 	ticketCmd.AddCommand(ticketNewCmd)
 
@@ -249,6 +325,14 @@ func init() {
 		"Don't use a git worktree for this ticket")
 	ticketNewCmd.Flags().BoolVar(&ticketNewAllowMigration, "allow-migration", false,
 		"Allow migrating legacy single-file ticket storage instead of refusing")
+	ticketNewCmd.Flags().StringVar(&ticketNewSession, "session", "",
+		"Link a Claude Code session UUID to this ticket. On first spawn, openkanban resumes it (forking by default)")
+	ticketNewCmd.Flags().BoolVar(&ticketNewMigrate, "migrate", false,
+		"Treat --session as a migration: openkanban will resume in place (no fork) on spawn. Refuses if the session is currently in use unless --force is also set")
+	ticketNewCmd.Flags().BoolVar(&ticketNewForce, "force", false,
+		"With --migrate: kill the process currently holding the session JSONL (SIGTERM, 3s grace, SIGKILL). Unsubmitted prompts in that session are lost")
+	ticketNewCmd.Flags().StringVar(&ticketNewCreatedBy, "created-by", "",
+		"Free-form name of the session that created this ticket (audit/provenance only)")
 
 	_ = ticketNewCmd.MarkFlagRequired("project")
 	_ = ticketNewCmd.MarkFlagRequired("title")

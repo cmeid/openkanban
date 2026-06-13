@@ -327,7 +327,9 @@ openkanban ticket new \
     [--status backlog|in_progress|done|archived] \
     [--labels foo,bar] \
     [--priority 1-5] \
-    [--no-worktree]
+    [--no-worktree] \
+    [--session <uuid> [--migrate [--force]]] \
+    [--created-by <name>]
 ```
 
 `--project` accepts an exact project name, full UUID, or a unique 4+ character UUID prefix. Ambiguous prefixes return an error listing the candidates.
@@ -339,6 +341,10 @@ Description may also be piped on stdin:
 ```bash
 echo "Long description" | openkanban ticket new --project myapp --title "Do thing"
 ```
+
+**Session linking**: `--session <uuid>` attaches a Claude Code session as starting context. On first spawn, openkanban runs `claude --resume <uuid> --fork-session` so the original session is unaffected. Pass `--migrate` to skip the fork (the ticket then owns the session outright); openkanban will refuse to migrate if the session is currently held by another process. Use `--force` with `--migrate` to terminate that process (SIGTERM with 3s grace, then SIGKILL); any unsubmitted prompt in the source session will be lost.
+
+`--created-by <name>` is a free-form audit field. It's not used by the spawn logic — just preserved in the ticket's frontmatter for "where did this come from" provenance.
 
 ## Keybindings
 

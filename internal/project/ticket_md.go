@@ -71,11 +71,13 @@ type ticketFrontmatter struct {
 	BranchName   string `yaml:"branch_name,omitempty"`
 	BaseBranch   string `yaml:"base_branch,omitempty"`
 
-	AgentType      string             `yaml:"agent_type,omitempty"`
-	AgentStatus    board.AgentStatus  `yaml:"agent_status"`
-	AgentSpawnedAt *time.Time         `yaml:"agent_spawned_at,omitempty"`
-	AgentPort      int                `yaml:"agent_port,omitempty"`
-	AgentSessionID string             `yaml:"agent_session_id,omitempty"`
+	AgentType        string            `yaml:"agent_type,omitempty"`
+	AgentStatus      board.AgentStatus `yaml:"agent_status"`
+	AgentSpawnedAt   *time.Time        `yaml:"agent_spawned_at,omitempty"`
+	AgentPort        int               `yaml:"agent_port,omitempty"`
+	AgentSessionID   string            `yaml:"agent_session_id,omitempty"`
+	SessionOwned     bool              `yaml:"session_owned,omitempty"`
+	CreatedBySession string            `yaml:"created_by_session,omitempty"`
 
 	BlockedBy []board.TicketID  `yaml:"blocked_by"`
 	Meta      map[string]string `yaml:"meta"`
@@ -96,27 +98,29 @@ func toFrontmatter(t *board.Ticket) ticketFrontmatter {
 	}
 
 	return ticketFrontmatter{
-		ID:             t.ID,
-		ProjectID:      t.ProjectID,
-		Title:          t.Title,
-		Status:         t.Status,
-		Priority:       t.Priority,
-		Labels:         labels,
-		CreatedAt:      t.CreatedAt,
-		UpdatedAt:      t.UpdatedAt,
-		StartedAt:      t.StartedAt,
-		CompletedAt:    t.CompletedAt,
-		UseWorktree:    t.UseWorktree,
-		WorktreePath:   t.WorktreePath,
-		BranchName:     t.BranchName,
-		BaseBranch:     t.BaseBranch,
-		AgentType:      t.AgentType,
-		AgentStatus:    t.AgentStatus,
-		AgentSpawnedAt: t.AgentSpawnedAt,
-		AgentPort:      t.AgentPort,
-		AgentSessionID: t.AgentSessionID,
-		BlockedBy:      blocked,
-		Meta:           meta,
+		ID:               t.ID,
+		ProjectID:        t.ProjectID,
+		Title:            t.Title,
+		Status:           t.Status,
+		Priority:         t.Priority,
+		Labels:           labels,
+		CreatedAt:        t.CreatedAt,
+		UpdatedAt:        t.UpdatedAt,
+		StartedAt:        t.StartedAt,
+		CompletedAt:      t.CompletedAt,
+		UseWorktree:      t.UseWorktree,
+		WorktreePath:     t.WorktreePath,
+		BranchName:       t.BranchName,
+		BaseBranch:       t.BaseBranch,
+		AgentType:        t.AgentType,
+		AgentStatus:      t.AgentStatus,
+		AgentSpawnedAt:   t.AgentSpawnedAt,
+		AgentPort:        t.AgentPort,
+		AgentSessionID:   t.AgentSessionID,
+		SessionOwned:     t.SessionOwned,
+		CreatedBySession: t.CreatedBySession,
+		BlockedBy:        blocked,
+		Meta:             meta,
 	}
 }
 
@@ -135,28 +139,30 @@ func fromFrontmatter(fm ticketFrontmatter, body string) *board.Ticket {
 	}
 
 	return &board.Ticket{
-		ID:             fm.ID,
-		ProjectID:      fm.ProjectID,
-		Title:          fm.Title,
-		Description:    body,
-		Status:         fm.Status,
-		UseWorktree:    fm.UseWorktree,
-		WorktreePath:   fm.WorktreePath,
-		BranchName:     fm.BranchName,
-		BaseBranch:     fm.BaseBranch,
-		AgentType:      fm.AgentType,
-		AgentStatus:    fm.AgentStatus,
-		AgentSpawnedAt: fm.AgentSpawnedAt,
-		AgentPort:      fm.AgentPort,
-		AgentSessionID: fm.AgentSessionID,
-		CreatedAt:      fm.CreatedAt,
-		UpdatedAt:      fm.UpdatedAt,
-		StartedAt:      fm.StartedAt,
-		CompletedAt:    fm.CompletedAt,
-		Labels:         labels,
-		Priority:       fm.Priority,
-		Meta:           meta,
-		BlockedBy:      blocked,
+		ID:               fm.ID,
+		ProjectID:        fm.ProjectID,
+		Title:            fm.Title,
+		Description:      body,
+		Status:           fm.Status,
+		UseWorktree:      fm.UseWorktree,
+		WorktreePath:     fm.WorktreePath,
+		BranchName:       fm.BranchName,
+		BaseBranch:       fm.BaseBranch,
+		AgentType:        fm.AgentType,
+		AgentStatus:      fm.AgentStatus,
+		AgentSpawnedAt:   fm.AgentSpawnedAt,
+		AgentPort:        fm.AgentPort,
+		AgentSessionID:   fm.AgentSessionID,
+		SessionOwned:     fm.SessionOwned,
+		CreatedBySession: fm.CreatedBySession,
+		CreatedAt:        fm.CreatedAt,
+		UpdatedAt:        fm.UpdatedAt,
+		StartedAt:        fm.StartedAt,
+		CompletedAt:      fm.CompletedAt,
+		Labels:           labels,
+		Priority:         fm.Priority,
+		Meta:             meta,
+		BlockedBy:        blocked,
 	}
 }
 
