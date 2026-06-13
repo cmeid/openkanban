@@ -3,6 +3,8 @@ package terminal
 import (
 	"fmt"
 	"testing"
+
+	xvt "github.com/charmbracelet/x/vt"
 )
 
 func TestDetectMouseModeChanges(t *testing.T) {
@@ -151,6 +153,58 @@ func TestDetectAltScreenChanges(t *testing.T) {
 				t.Errorf("expected altScreenActive=%v, got %v", tc.expectedState, pane.altScreenActive)
 			}
 		})
+	}
+}
+
+func TestParseOscTitlePayload(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "OSC 0 prefix", in: "0;hello-title", want: "hello-title"},
+		{name: "OSC 2 prefix", in: "2;window-title", want: "window-title"},
+		{name: "OSC 1 prefix", in: "1;icon name", want: "icon name"},
+		{name: "Multi-digit prefix", in: "10;color-payload", want: "color-payload"},
+		{name: "No prefix", in: "bare title", want: "bare title"},
+		{name: "Empty payload after prefix", in: "2;", want: ""},
+		{name: "Title contains semicolons", in: "2;a;b;c", want: "a;b;c"},
+		{name: "Empty input", in: "", want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseOscTitlePayload([]byte(tt.in))
+			if got != tt.want {
+				t.Errorf("parseOscTitlePayload(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestPaneOscTitleCapture wires the title handlers onto a fresh emulator
+// and writes a raw OSC 2 escape sequence through it. Exercises the full
+// path from emulator parse → registered handler → atomic Title()
+// without spinning up a PTY (which would require a forked subprocess).
+func TestPaneOscTitleCapture(t *testing.T) {
+	p := New("test", 80, 24, 1000)
+	p.vt = xvt.NewSafeEmulator(80, 24)
+	p.registerTitleHandlersUnlocked()
+
+	if got := p.Title(); got != "" {
+		t.Fatalf("Title before any OSC = %q, want empty", got)
+	}
+
+	// OSC 2 (set window title), terminated with BEL.
+	p.vt.Write([]byte("\x1b]2;hello-title\x07"))
+	if got := p.Title(); got != "hello-title" {
+		t.Errorf("after OSC 2, Title = %q, want %q", got, "hello-title")
+	}
+
+	// OSC 0 (set window title + icon name), terminated with ST.
+	p.vt.Write([]byte("\x1b]0;next-title\x1b\\"))
+	if got := p.Title(); got != "next-title" {
+		t.Errorf("after OSC 0, Title = %q, want %q", got, "next-title")
 	}
 }
 

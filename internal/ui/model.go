@@ -164,6 +164,11 @@ type Model struct {
 	// suppressing fsnotify echoes of the TUI's own SaveTicket calls.
 	// See internal/ui/reload.go.
 	recentSelfWrites map[string]selfWriteRecord
+
+	// lastWindowTitle is the most recent value passed to
+	// tea.SetWindowTitle, used to dedupe redundant title updates.
+	// See computeWindowTitle / maybeSetWindowTitle.
+	lastWindowTitle string
 }
 
 func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projectRegistry *project.ProjectRegistry, agentMgr *agent.Manager, opencodeServer *agent.OpencodeServer, filterProjectID string, updateChecker *update.Checker) *Model {
@@ -289,7 +294,45 @@ func (m *Model) Init() tea.Cmd {
 		tickAgentStatus(m.agentMgr.StatusPollInterval()),
 		m.spinner.Tick,
 		m.checkForUpdates(),
+		m.maybeSetWindowTitle(),
 	)
+}
+
+// computeWindowTitle returns the title we want the host terminal to
+// display. Reflects the focused pane's OSC-set title when in agent
+// view, falling back to the ticket title, with an "openkanban: "
+// prefix. Returns "openkanban" outside of agent view.
+func (m *Model) computeWindowTitle() string {
+	const prefix = "openkanban"
+	if m.mode != ModeAgentView || m.focusedPane == "" {
+		return prefix
+	}
+	pane, ok := m.panes[m.focusedPane]
+	var sub string
+	if ok {
+		sub = pane.Title()
+	}
+	if sub == "" {
+		if ticket, _ := m.globalStore.Get(m.focusedPane); ticket != nil {
+			sub = ticket.Title
+		}
+	}
+	if sub == "" {
+		return prefix
+	}
+	return prefix + ": " + sub
+}
+
+// maybeSetWindowTitle returns a tea.Cmd to update the host terminal's
+// window title if the desired title has changed. Returns nil if no
+// change.
+func (m *Model) maybeSetWindowTitle() tea.Cmd {
+	want := m.computeWindowTitle()
+	if want == m.lastWindowTitle {
+		return nil
+	}
+	m.lastWindowTitle = want
+	return tea.SetWindowTitle(want)
 }
 
 func (m *Model) checkForUpdates() tea.Cmd {
@@ -451,12 +494,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.focusedPane = ""
 			m.notify("Agent exited")
 		}
-		return m, nil
+		return m, m.maybeSetWindowTitle()
 
 	case terminal.ExitFocusMsg:
 		m.mode = ModeNormal
 		m.focusedPane = ""
-		return m, nil
+		return m, m.maybeSetWindowTitle()
 
 	case agentStatusMsg:
 		return m, tea.Batch(
@@ -998,7 +1041,7 @@ func (m *Model) handleAgentViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if !ok {
 		m.mode = ModeNormal
 		m.focusedPane = ""
-		return m, nil
+		return m, m.maybeSetWindowTitle()
 	}
 
 	if result := pane.HandleKey(msg); result != nil {
@@ -1008,7 +1051,7 @@ func (m *Model) handleAgentViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	return m, nil
+	return m, m.maybeSetWindowTitle()
 }
 
 func (m *Model) handleAgentViewMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
@@ -1020,7 +1063,7 @@ func (m *Model) handleAgentViewMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
 		if msg.Y == 0 && msg.X >= m.width-25 {
 			m.mode = ModeNormal
-			return m, nil
+			return m, m.maybeSetWindowTitle()
 		}
 	}
 
@@ -2318,7 +2361,7 @@ func (m *Model) attachToAgent() (tea.Model, tea.Cmd) {
 	m.focusedPane = ticket.ID
 	paneHeight := m.height - 2
 	pane.SetSize(m.width, paneHeight)
-	return m, nil
+	return m, m.maybeSetWindowTitle()
 }
 
 func (m *Model) handleDoubleClick() (tea.Model, tea.Cmd) {
@@ -3111,6 +3154,12 @@ func (m *Model) handleTerminalMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if cmd := pane.Update(msg); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
+	}
+	// The child may have emitted an OSC title sequence in this batch
+	// of output — reflect any change in the host window title. Also
+	// runs on RenderTickMsg as a steady-state safety net.
+	if cmd := m.maybeSetWindowTitle(); cmd != nil {
+		cmds = append(cmds, cmd)
 	}
 	return m, tea.Batch(cmds...)
 }

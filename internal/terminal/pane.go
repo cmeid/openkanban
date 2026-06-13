@@ -61,6 +61,12 @@ type Pane struct {
 	// deadlocks on its first device-attributes write.
 	drainStop chan struct{}
 	drainWG   sync.WaitGroup
+
+	// paneTitle holds the most recent title the child set via OSC 0/2.
+	// Updated from the emulator callback (sync, during Write); read by
+	// the model when computing the host-window title. atomic.Value lets
+	// the read be lock-free.
+	paneTitle atomic.Value // string
 }
 
 func New(id string, width, height int, scrollbackSize int) *Pane {
@@ -247,6 +253,7 @@ func (p *Pane) Start(command string, args ...string) tea.Cmd {
 			},
 		})
 		p.cursorHidden.Store(false)
+		p.registerTitleHandlersUnlocked()
 		p.startDrainUnlocked()
 
 		p.scrollback = NewScrollbackBuffer(p.scrollbackSize)
@@ -255,6 +262,49 @@ func (p *Pane) Start(command string, args ...string) tea.Cmd {
 		// Start read loop
 		return p.readOutputUnlocked()()
 	}
+}
+
+// Title returns the most recent title the child process set via OSC 0/2
+// escape sequences. Empty string if the child has not set a title (yet).
+func (p *Pane) Title() string {
+	if v, ok := p.paneTitle.Load().(string); ok {
+		return v
+	}
+	return ""
+}
+
+// parseOscTitlePayload extracts the title from an OSC 0/1/2 payload as
+// delivered by charm/x/vt. The handler sees the raw payload bytes
+// including the leading "<cmd>;" parameter (e.g. "2;hello-title"),
+// because charm/x/vt's handleTitle does its own bytes.Split on ';'.
+// We strip a leading run of digits followed by ';' if present.
+func parseOscTitlePayload(data []byte) string {
+	i := 0
+	for i < len(data) && data[i] >= '0' && data[i] <= '9' {
+		i++
+	}
+	if i > 0 && i < len(data) && data[i] == ';' {
+		return string(data[i+1:])
+	}
+	return string(data)
+}
+
+// registerTitleHandlersUnlocked wires OSC 0/2 handlers on the emulator
+// to capture the child process's window title. OSC 0 sets both window
+// title and icon name; OSC 2 sets only the window title. Both feed the
+// same Pane field — we only care about the window title.
+//
+// Must be called with p.mu held and after p.vt has been constructed.
+func (p *Pane) registerTitleHandlersUnlocked() {
+	if p.vt == nil {
+		return
+	}
+	handler := func(data []byte) bool {
+		p.paneTitle.Store(parseOscTitlePayload(data))
+		return true
+	}
+	p.vt.RegisterOscHandler(0, handler)
+	p.vt.RegisterOscHandler(2, handler)
 }
 
 // startDrainUnlocked spawns the goroutine that forwards emulator
