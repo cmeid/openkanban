@@ -353,3 +353,63 @@ func TestBuildCleanEnv(t *testing.T) {
 		})
 	}
 }
+
+// TestBuildCleanEnv_StripsInheritedOpenkanban guards the env-leak fix
+// in T2 of the integration plan: any OPENKANBAN_* in the inherited
+// process env MUST be stripped before the freshly-spawned values are
+// appended, so a nested openkanban pane (or a daemon-spawned session
+// whose daemon process itself has those vars set) doesn't accidentally
+// inherit the outer pane's identity.
+func TestBuildCleanEnv_StripsInheritedOpenkanban(t *testing.T) {
+	t.Setenv("OPENKANBAN_SESSION", "leaky")
+	t.Setenv("OPENKANBAN_TICKET_ID", "stale-id")
+	t.Setenv("OPENKANBAN_PTY_DEBUG_LOG", "/tmp/whatever")
+
+	env := buildCleanEnv("fresh-session", "T-1")
+
+	contains := func(target string) bool {
+		for _, e := range env {
+			if e == target {
+				return true
+			}
+		}
+		return false
+	}
+	anyWithPrefix := func(prefix string) bool {
+		for _, e := range env {
+			if strings.HasPrefix(e, prefix) {
+				return true
+			}
+		}
+		return false
+	}
+
+	if !contains("OPENKANBAN_SESSION=fresh-session") {
+		t.Errorf("expected OPENKANBAN_SESSION=fresh-session; env=%v", env)
+	}
+	if !contains("OPENKANBAN_TICKET_ID=T-1") {
+		t.Errorf("expected OPENKANBAN_TICKET_ID=T-1; env=%v", env)
+	}
+	// Specifically: the inherited leaky values must NOT have made it
+	// through. Each var must appear exactly once, with the fresh value.
+	for _, e := range env {
+		if e == "OPENKANBAN_SESSION=leaky" {
+			t.Errorf("inherited OPENKANBAN_SESSION=leaky leaked through; env=%v", env)
+		}
+		if e == "OPENKANBAN_TICKET_ID=stale-id" {
+			t.Errorf("inherited OPENKANBAN_TICKET_ID=stale-id leaked through; env=%v", env)
+		}
+	}
+	// And no other OPENKANBAN_* (e.g. OPENKANBAN_PTY_DEBUG_LOG) should
+	// have survived the strip.
+	for _, e := range env {
+		if strings.HasPrefix(e, "OPENKANBAN_") &&
+			!strings.HasPrefix(e, "OPENKANBAN_SESSION=") &&
+			!strings.HasPrefix(e, "OPENKANBAN_TICKET_ID=") {
+			t.Errorf("unexpected inherited OPENKANBAN_* survived strip: %q", e)
+		}
+	}
+	if anyWithPrefix("OPENKANBAN_PTY_DEBUG_LOG") {
+		t.Errorf("OPENKANBAN_PTY_DEBUG_LOG should have been stripped; env=%v", env)
+	}
+}

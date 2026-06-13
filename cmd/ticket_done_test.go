@@ -1,12 +1,19 @@
 package cmd
 
 import (
+	"bytes"
+	"context"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/techdufus/openkanban/internal/board"
+	"github.com/techdufus/openkanban/internal/daemon"
+	"github.com/techdufus/openkanban/internal/daemonclient"
 	"github.com/techdufus/openkanban/internal/project"
 )
 
@@ -141,6 +148,192 @@ func TestTicketDone_TicketNotFound(t *testing.T) {
 	err := ticketDoneCmd.RunE(ticketDoneCmd, nil)
 	if err == nil {
 		t.Fatal("expected error when ticket id refers to a deleted/missing ticket")
+	}
+}
+
+// captureStderr swaps os.Stderr with an os.Pipe for the duration of fn
+// and returns whatever was written to it. Used by the ticket-done tests
+// to inspect the "openkanbankd: ..." warning lines without coupling to
+// log.Printf or fmt destinations elsewhere.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	origStderr := os.Stderr
+	os.Stderr = w
+
+	var buf bytes.Buffer
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(&buf, r)
+	}()
+
+	fn()
+
+	_ = w.Close()
+	os.Stderr = origStderr
+	wg.Wait()
+	_ = r.Close()
+	return buf.String()
+}
+
+// spawnDaemonSessionForTicket spawns a /bin/cat session bound to the
+// given ticketID. Holds a long-lived client open via t.Cleanup so the
+// daemon doesn't shut down between this call and the RPC under test.
+// Returns the daemon-internal session ID.
+func spawnDaemonSessionForTicket(t *testing.T, ticketID string) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	c, err := daemonclient.New(ctx)
+	if err != nil {
+		t.Fatalf("daemonclient.New: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
+
+	resp, err := c.Spawn(ctx, daemon.SpawnReq{
+		TicketID:    ticketID,
+		SessionName: "test-session",
+		Command:     "/bin/cat",
+		Cols:        80,
+		Rows:        24,
+		Scrollback:  1000,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	return resp.SessionID
+}
+
+// TestTicketDone_DaemonUp_OwnsTicket_SendsTicketDoneReq verifies that
+// when the daemon is up and owns a session for the ticket, the CLI
+// successfully delivers a TicketDoneReq and the daemon responds by
+// killing the session. The List RPC after the run shows no remaining
+// sessions for the ticket.
+func TestTicketDone_DaemonUp_OwnsTicket_SendsTicketDoneReq(t *testing.T) {
+	sock, _ := daemonTestEnv(t)
+	startDaemonServer(t, sock)
+
+	proj, tk, _ := scaffoldTicketDoneEnv(t)
+	t.Setenv("OPENKANBAN_TICKET_ID", string(tk.ID))
+	t.Setenv("OPENKANBAN_SESSION", "test-session")
+
+	// Pre-stage a daemon-owned session for the ticket.
+	daemonSessionID := spawnDaemonSessionForTicket(t, string(tk.ID))
+
+	stderr := captureStderr(t, func() {
+		if err := ticketDoneCmd.RunE(ticketDoneCmd, nil); err != nil {
+			t.Fatalf("ticketDoneCmd.RunE: %v", err)
+		}
+	})
+
+	// On success there's no warning line (Killed=true).
+	if strings.Contains(stderr, "openkanbankd:") {
+		t.Errorf("unexpected openkanbankd warning on happy path: %q", stderr)
+	}
+
+	// Ticket .md write should have happened (existing behavior).
+	got := loadTicket(t, proj, tk.ID)
+	if got.Status != board.StatusDone {
+		t.Errorf("Status = %q; want %q", got.Status, board.StatusDone)
+	}
+
+	// And the daemon should no longer hold that session. Use a fresh
+	// short-lived client to ask.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	c, err := daemonclient.New(ctx)
+	if err != nil {
+		t.Fatalf("daemonclient.New (post-check): %v", err)
+	}
+	defer c.Close()
+
+	// Give the kill goroutine a moment to do its work.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		list, err := c.List(ctx)
+		if err != nil {
+			t.Fatalf("List: %v", err)
+		}
+		stillThere := false
+		for _, s := range list.Sessions {
+			if s.SessionID == daemonSessionID {
+				stillThere = true
+				break
+			}
+		}
+		if !stillThere {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Errorf("daemon still holds session %s after ticket-done", daemonSessionID)
+}
+
+// TestTicketDone_DaemonUp_DoesNotOwn_StderrWarningExit0 verifies the
+// soft-no-op path: when the daemon is up but doesn't have a session
+// for the ticket, the CLI prints a stderr warning and exits 0. The
+// on-disk .md write still happens.
+func TestTicketDone_DaemonUp_DoesNotOwn_StderrWarningExit0(t *testing.T) {
+	sock, _ := daemonTestEnv(t)
+	startDaemonServer(t, sock)
+	// Hold the daemon open so it doesn't shut down between our
+	// scaffolding and the CLI's probe.
+	holdDaemonOpen(t)
+
+	proj, tk, _ := scaffoldTicketDoneEnv(t)
+	t.Setenv("OPENKANBAN_TICKET_ID", string(tk.ID))
+	t.Setenv("OPENKANBAN_SESSION", "test-session")
+
+	var runErr error
+	stderr := captureStderr(t, func() {
+		runErr = ticketDoneCmd.RunE(ticketDoneCmd, nil)
+	})
+	if runErr != nil {
+		t.Fatalf("ticketDoneCmd.RunE: %v", runErr)
+	}
+	if !strings.Contains(stderr, "openkanbankd:") {
+		t.Errorf("expected stderr to mention openkanbankd; got %q", stderr)
+	}
+	if !strings.Contains(stderr, "no live session") {
+		t.Errorf("expected stderr to say 'no live session'; got %q", stderr)
+	}
+	got := loadTicket(t, proj, tk.ID)
+	if got.Status != board.StatusDone {
+		t.Errorf("Status = %q; want %q", got.Status, board.StatusDone)
+	}
+}
+
+// TestTicketDone_DaemonDown_StderrWarningExit0 verifies that with no
+// daemon running, the CLI completes successfully (.md write done) but
+// emits a stderr warning line. We intentionally do NOT call
+// startDaemonServer.
+func TestTicketDone_DaemonDown_StderrWarningExit0(t *testing.T) {
+	daemonTestEnv(t)
+	// NOT starting the daemon.
+
+	proj, tk, _ := scaffoldTicketDoneEnv(t)
+	t.Setenv("OPENKANBAN_TICKET_ID", string(tk.ID))
+	t.Setenv("OPENKANBAN_SESSION", "test-session")
+
+	var runErr error
+	stderr := captureStderr(t, func() {
+		runErr = ticketDoneCmd.RunE(ticketDoneCmd, nil)
+	})
+	if runErr != nil {
+		t.Fatalf("ticketDoneCmd.RunE: %v", runErr)
+	}
+	if !strings.Contains(stderr, "openkanbankd:") {
+		t.Errorf("expected stderr to mention openkanbankd; got %q", stderr)
+	}
+	got := loadTicket(t, proj, tk.ID)
+	if got.Status != board.StatusDone {
+		t.Errorf("Status = %q; want %q", got.Status, board.StatusDone)
 	}
 }
 

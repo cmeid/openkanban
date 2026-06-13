@@ -169,6 +169,9 @@ const (
 	MsgKillReq   = "kill.req"
 	MsgKillResp  = "kill.resp"
 
+	MsgTicketDoneReq  = "ticket_done.req"
+	MsgTicketDoneResp = "ticket_done.resp"
+
 	MsgListReq  = "list.req"
 	MsgListResp = "list.resp"
 	MsgOwnsReq  = "owns.req"
@@ -273,6 +276,29 @@ type KillReq struct {
 // KillResp acknowledges a successful kill.
 type KillResp struct{}
 
+// TicketDoneReq asks the daemon to terminate the live session bound to
+// ticket TicketID (if any). The daemon is the source of truth for what
+// "expected completion" means: when handleTicketDone fires, it flips
+// the session's expected-completion flag and kills the pane itself,
+// then broadcasts a SessionEvent{Event:"exited", Expected:true,
+// Reason:"ticket_done"} to all subscribers. The CLI is expected to
+// have already written the ticket .md and status file before sending
+// this; the daemon does NOT touch the worktree.
+type TicketDoneReq struct {
+	TicketID string `json:"ticket_id"`
+}
+
+// TicketDoneResp reports whether the daemon found and killed a live
+// session for the ticket. Killed=false is a soft no-op: the .md and
+// status file writes the CLI already performed are still authoritative;
+// the daemon just didn't have a pane to terminate (e.g. the session was
+// spawned by a different openkanban instance whose daemon is on a
+// different socket, or no agent is currently running).
+type TicketDoneResp struct {
+	SessionID string `json:"session_id,omitempty"`
+	Killed    bool   `json:"killed,omitempty"`
+}
+
 // ListReq asks for the current set of daemon-owned sessions.
 type ListReq struct{}
 
@@ -338,11 +364,29 @@ type SubscribeResp struct{}
 
 // SessionEvent is a server-push update about a session. Event is one
 // of "started", "exited", "attached", "detached", "status".
+//
+// Expected is only meaningful when Event == "exited". It is true when
+// the daemon initiated the kill via handleTicketDone (i.e. the agent
+// invoked `openkanban ticket done`), and false for natural process
+// exits and plain Kill RPCs. Subscribers use this to decide whether to
+// preserve AgentCompleted (Expected=true) or reset to AgentNone
+// (Expected=false).
+//
+// Reason is a diagnostic hint paired with Expected. Possible values:
+//
+//	"ticket_done"   - kill initiated by handleTicketDone
+//	"natural_exit"  - the child closed its PTY on its own
+//	"kill"          - a Kill RPC initiated the termination
+//
+// Subscribers should treat unknown Reason values as informational only —
+// the load-bearing signal is Expected.
 type SessionEvent struct {
 	Event     string `json:"event"`
 	SessionID string `json:"session_id"`
 	TicketID  string `json:"ticket_id"`
 	Status    string `json:"status"`
+	Expected  bool   `json:"expected,omitempty"`
+	Reason    string `json:"reason,omitempty"`
 }
 
 // PrepareExitReq is sent by a TUI client that is about to quit; it

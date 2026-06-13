@@ -640,12 +640,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case daemonclient.PaneExitMsg:
 		ticketID := board.TicketID(msg.PaneID)
-		// expectedCompleted preserves AgentCompleted across pane exit when
-		// the exit was a deliberate `openkanban ticket done` finish. With
-		// the daemon model this signal is the SessionEvent.Expected field
-		// (wired in T2 of the integration plan). For PR8 alone the field
-		// stays false; T2 hands the daemonSessionEventMsg path the truth.
-		expectedCompleted := false
+		// The PaneExitMsg path fires when the local PaneView's binary
+		// reader saw the conn close (e.g. detach + remote pane death).
+		// The authoritative "was this exit expected?" signal arrives
+		// separately as daemonSessionEventMsg{Event:"exited", Expected:...}
+		// and is handled in handleDaemonSessionEvent, which preserves
+		// AgentCompleted when appropriate. From this path we cannot
+		// know intent, so we conservatively reset to AgentNone here;
+		// when the daemon event lands (which it will, before or after
+		// this msg) it will overwrite to AgentCompleted if Expected=true.
 		if pv, ok := m.panes[ticketID]; ok {
 			if pv != nil {
 				_ = pv.Close()
@@ -653,10 +656,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			delete(m.panes, ticketID)
 		}
 		if ticket, _ := m.globalStore.Get(ticketID); ticket != nil {
-			if !expectedCompleted {
+			// Only reset if not already AgentCompleted — the daemon
+			// session-event may have raced ahead and set Completed,
+			// in which case we must not clobber it.
+			if ticket.AgentStatus != board.AgentCompleted {
 				ticket.AgentStatus = board.AgentNone
+				m.saveTicket(ticket)
 			}
-			m.saveTicket(ticket)
 		}
 		if m.focusedPane == ticketID {
 			m.mode = ModeNormal
@@ -735,19 +741,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if ticket == nil {
 				continue
 			}
-			prev := ticket.AgentStatus
 			ticket.AgentStatus = status
 
-			// Edge-triggered auto-stop: when an agent reports completion
-			// via `openkanban ticket done`, gracefully terminate the
-			// pane so the session exits cleanly (the "/quit equivalent").
-			// Gated on Status == StatusDone so a stray `status set
-			// completed` from an unrelated agent does NOT kill its pane.
-			// T2 of the integration plan replaces this whole branch with
-			// a daemon-routed TicketDoneReq + SessionEvent broadcast.
-			if prev != board.AgentCompleted && status == board.AgentCompleted {
-				m.maybeAutoStopCompletedPane(ticketID, ticket)
-			}
+			// T2 of the integration plan removed the edge-triggered
+			// auto-stop on AgentCompleted: ticket-done now flows
+			// CLI → daemon (TicketDoneReq) → SessionEvent broadcast,
+			// and the daemon's authoritative Expected=true signal lands
+			// via handleDaemonSessionEvent. The poll's job is reduced
+			// to refreshing AgentStatus for visibility — it no longer
+			// kills panes.
 		}
 
 	case daemonSessionEventMsg:
@@ -3661,47 +3663,11 @@ func (m *Model) getAgentIndex(agentName string) int {
 
 const gracefulShutdownTimeout = 3 * time.Second
 
-// maybeAutoStopCompletedPane is called on the AgentStatus transition
-// to AgentCompleted. It gracefully stops the pane iff:
-//
-//  1. The ticket has a live pane in the model, AND
-//  2. ticket.Status == StatusDone — confirming this is the
-//     `openkanban ticket done` path, not a stray `status set completed`.
-//
-// Race tolerance: the child writes the ticket .md (Status=done) and the
-// status file ("completed") in quick succession. The poll arrives via
-// the status file; the .md change arrives via fsnotify -> ReloadTicket.
-// Those two paths are independent. If Status hasn't landed in memory
-// yet when this fires, do one disk reread before giving up — that
-// closes the ~500ms convergence window without us having to poll.
-func (m *Model) maybeAutoStopCompletedPane(ticketID board.TicketID, ticket *board.Ticket) {
-	pane, ok := m.panes[ticketID]
-	if !ok || !pane.Running() {
-		return
-	}
-
-	if ticket.Status != board.StatusDone {
-		// fsnotify reload may not have landed yet — try one direct reread.
-		if path, ok := m.globalStore.PathOf(ticketID); ok {
-			if err := m.globalStore.ReloadTicket(ticket.ProjectID, path); err == nil {
-				if reloaded, _ := m.globalStore.Get(ticketID); reloaded != nil {
-					ticket = reloaded
-				}
-			}
-		}
-		if ticket.Status != board.StatusDone {
-			return
-		}
-	}
-
-	// Note: PaneView doesn't expose MarkExpectedCompletedExit yet —
-	// T2 of the integration plan re-routes ticket-done through the
-	// daemon as a TicketDoneReq RPC and propagates the "expected"
-	// signal via SessionEvent.Expected, deleting this whole function
-	// in the process. For PR8 alone the StopGraceful happens here
-	// and the exit reports as unexpected. Acceptable interim state.
-	pane.StopGraceful(gracefulShutdownTimeout)
-}
+// T2 of the integration plan removed maybeAutoStopCompletedPane.
+// Ticket-done now flows CLI → daemon (TicketDoneReq) → SessionEvent
+// broadcast; subscribed TUIs react via handleDaemonSessionEvent with
+// the authoritative Expected=true signal. No per-TUI poll-driven kill
+// path remains.
 
 func (m *Model) Cleanup() {
 	for _, pane := range m.panes {

@@ -1,13 +1,16 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/techdufus/openkanban/internal/agent"
 	"github.com/techdufus/openkanban/internal/board"
+	"github.com/techdufus/openkanban/internal/daemonclient"
 	"github.com/techdufus/openkanban/internal/project"
 )
 
@@ -82,8 +85,53 @@ still react.`,
 			}
 		}
 
+		// Tell openkanbankd that this ticket is done so it can terminate
+		// the live PTY and broadcast the expected-exit signal to other
+		// TUIs. Strictly best-effort: a scripted CLI invocation must
+		// NEVER autostart a daemon, and any failure here is downgraded
+		// to a stderr warning — the .md + status-file writes above are
+		// the authoritative ticket-done signal.
+		notifyDaemonTicketDone(ticketID)
+
 		return nil
 	},
+}
+
+// notifyDaemonTicketDone makes a best-effort daemon RPC announcing the
+// ticket-done event. All failure modes (daemon unreachable, dial timeout,
+// hello failure, RPC failure) result in a single stderr line prefixed
+// with "openkanbankd:" and exit code 0 — the on-disk writes performed
+// before this call are authoritative.
+//
+// Timeouts are pinned tight (500ms dial / 2s overall RPC) so the agent's
+// exit doesn't hang on a flaky daemon.
+func notifyDaemonTicketDone(ticketID string) {
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer dialCancel()
+	conn, err := daemonclient.Dial(dialCtx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "openkanbankd: %v\n", err)
+		return
+	}
+
+	rpcCtx, rpcCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer rpcCancel()
+	client, err := daemonclient.NewWithConn(rpcCtx, conn)
+	if err != nil {
+		_ = conn.Close()
+		fmt.Fprintf(os.Stderr, "openkanbankd: hello failed: %v\n", err)
+		return
+	}
+	defer client.Close()
+
+	resp, err := client.TicketDone(rpcCtx, ticketID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "openkanbankd: %v\n", err)
+		return
+	}
+	if !resp.Killed {
+		fmt.Fprintf(os.Stderr, "openkanbankd: no live session for ticket %s (was it spawned by a different instance?)\n", ticketID)
+	}
 }
 
 // findTicketAcrossProjects searches every project's ticket store for the

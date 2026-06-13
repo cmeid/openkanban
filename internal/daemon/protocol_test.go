@@ -229,6 +229,24 @@ func TestEnvelope_RoundTrip(t *testing.T) {
 			&KillResp{},
 		},
 		{
+			"TicketDoneReq",
+			MsgTicketDoneReq,
+			&TicketDoneReq{TicketID: "abc-123"},
+			&TicketDoneReq{},
+		},
+		{
+			"TicketDoneResp",
+			MsgTicketDoneResp,
+			&TicketDoneResp{SessionID: "sess-1", Killed: true},
+			&TicketDoneResp{},
+		},
+		{
+			"SessionEventExpected",
+			MsgSessionEvent,
+			&SessionEvent{Event: "exited", SessionID: "sess-1", TicketID: "T-1", Expected: true, Reason: "ticket_done"},
+			&SessionEvent{},
+		},
+		{
 			"ListReq",
 			MsgListReq,
 			&ListReq{},

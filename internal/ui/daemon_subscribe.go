@@ -92,9 +92,11 @@ func (e daemonSubscribeErr) Error() string { return string(e) }
 // The mapping is intentionally minimal:
 //
 //   - "started"   → AgentStatus = AgentWorking (unless already higher).
-//   - "exited"    → AgentStatus = AgentNone. PaneView (if held) is
-//                   closed; the focused-pane mode unwinds to ModeNormal
-//                   when the event lands on the focused ticket.
+//   - "exited"    → If ev.Expected (daemon-initiated `openkanban ticket
+//                   done`), preserve AgentCompleted; else reset to
+//                   AgentNone. PaneView (if held) is closed; the
+//                   focused-pane mode unwinds to ModeNormal when the
+//                   event lands on the focused ticket.
 //   - "attached"  → informational; no AgentStatus change.
 //   - "detached"  → informational; no AgentStatus change. The local
 //                   PaneView may already have transitioned to
@@ -118,9 +120,22 @@ func (m *Model) handleDaemonSessionEvent(msg daemonSessionEventMsg) (tea.Model, 
 					m.saveTicket(ticket)
 				}
 			case "exited":
-				if ticket.AgentStatus != board.AgentNone {
-					ticket.AgentStatus = board.AgentNone
-					m.saveTicket(ticket)
+				// Expected=true means the daemon initiated the kill via
+				// handleTicketDone (i.e. the agent invoked `openkanban
+				// ticket done`). Preserve AgentCompleted so the card
+				// renders as done rather than getting reset to AgentNone.
+				// Expected=false is a natural exit / plain Kill — reset
+				// to AgentNone as before.
+				if ev.Expected {
+					if ticket.AgentStatus != board.AgentCompleted {
+						ticket.AgentStatus = board.AgentCompleted
+						m.saveTicket(ticket)
+					}
+				} else {
+					if ticket.AgentStatus != board.AgentNone {
+						ticket.AgentStatus = board.AgentNone
+						m.saveTicket(ticket)
+					}
 				}
 				if pv, ok := m.panes[ticketID]; ok {
 					_ = pv.Close()

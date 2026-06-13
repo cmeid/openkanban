@@ -40,6 +40,15 @@ type Session struct {
 	// subscribers reserved for PR9 fan-out — declared here so the
 	// slice type is stable across PRs. Not populated in PR5.
 	subscribers []*subscriberConn
+
+	// expectedMu guards expectedCompletion. Set by
+	// MarkExpectedCompletion (invoked from handleTicketDone before the
+	// kill goroutine fires) and read by watchSessionExit to decide
+	// whether to broadcast Expected=true. Tiny field, dedicated mutex
+	// rather than reusing attachMu so the exit-watch hot path doesn't
+	// contend with attach lifecycle.
+	expectedMu         sync.Mutex
+	expectedCompletion bool
 }
 
 // attachedClient identifies the single client whose connection is
@@ -131,6 +140,40 @@ func (s *Session) AgentSessionUUID() string {
 		return ""
 	}
 	return s.agentSessionUUID
+}
+
+// MarkExpectedCompletion flags the session as terminating because the
+// agent invoked `openkanban ticket done`. Called by handleTicketDone
+// BEFORE the kill goroutine fires so the pane-exit watcher's
+// SessionEvent broadcast can carry Expected=true. Also forwarded to the
+// underlying pane via MarkExpectedCompletedExit so any local consumers
+// of pane state observe the same signal.
+//
+// Idempotent: subsequent calls are no-ops. Safe to call concurrently;
+// guarded by expectedMu so the watcher's read in watchSessionExit sees
+// a happens-before write.
+func (s *Session) MarkExpectedCompletion() {
+	if s == nil {
+		return
+	}
+	s.expectedMu.Lock()
+	s.expectedCompletion = true
+	s.expectedMu.Unlock()
+	if s.pane != nil {
+		s.pane.MarkExpectedCompletedExit()
+	}
+}
+
+// ExpectedCompletion reports whether MarkExpectedCompletion was called
+// on this session. Consulted by watchSessionExit before emitting the
+// "exited" SessionEvent.
+func (s *Session) ExpectedCompletion() bool {
+	if s == nil {
+		return false
+	}
+	s.expectedMu.Lock()
+	defer s.expectedMu.Unlock()
+	return s.expectedCompletion
 }
 
 // newSessionID returns a fresh 16-character hex string drawn from

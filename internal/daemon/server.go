@@ -410,6 +410,19 @@ func (s *Server) dispatch(c *clientConn, typeName string, raw json.RawMessage) {
 		}
 		s.writeResp(c, MsgKillResp, resp)
 
+	case MsgTicketDoneReq:
+		var req TicketDoneReq
+		if err := json.Unmarshal(raw, &req); err != nil {
+			s.writeError(c, "bad_request", err.Error())
+			return
+		}
+		resp, err := s.handleTicketDone(c, req)
+		if err != nil {
+			s.writeError(c, "ticket_done_failed", err.Error())
+			return
+		}
+		s.writeResp(c, MsgTicketDoneResp, resp)
+
 	case MsgOwnsReq:
 		var req OwnsReq
 		if err := json.Unmarshal(raw, &req); err != nil {
@@ -517,16 +530,30 @@ func (s *Server) watchSessionExit(sess *Session) {
 		defer unsub()
 		sessID := sess.ID()
 		ticketID := sess.TicketID()
+		emit := func() {
+			expected := sess.ExpectedCompletion()
+			reason := "natural_exit"
+			if expected {
+				reason = "ticket_done"
+			}
+			s.emitEvent(SessionEvent{
+				Event:     "exited",
+				SessionID: sessID,
+				TicketID:  ticketID,
+				Expected:  expected,
+				Reason:    reason,
+			})
+		}
 		for ev := range ch {
 			if _, ok := ev.(terminal.ExitEvent); ok {
-				s.emitEvent(SessionEvent{Event: "exited", SessionID: sessID, TicketID: ticketID})
+				emit()
 				return
 			}
 		}
 		// Channel closed without ExitEvent (e.g. Stop tore the loop
 		// down before the read returned). Emit anyway so subscribers
 		// learn the session is gone.
-		s.emitEvent(SessionEvent{Event: "exited", SessionID: sessID, TicketID: ticketID})
+		emit()
 	}()
 }
 
@@ -550,7 +577,12 @@ func (s *Server) handleKill(c *clientConn, req KillReq) (KillResp, error) {
 	s.sessionsMu.Unlock()
 
 	if !ok {
-		return KillResp{}, fmt.Errorf("session %q not found", req.SessionID)
+		// Idempotent: a concurrent Kill / TicketDone / delete path may
+		// have already removed the session. Return success rather than
+		// an error so callers don't toast "session not found" for what
+		// is functionally a no-op.
+		log.Printf("openkanbankd: client %d kill on unknown session %s (no-op)", c.id, req.SessionID)
+		return KillResp{}, nil
 	}
 
 	if err := sess.Kill(req.GraceSeconds); err != nil {
@@ -559,9 +591,65 @@ func (s *Server) handleKill(c *clientConn, req KillReq) (KillResp, error) {
 
 	log.Printf("openkanbankd: client %d killed session %s", c.id, req.SessionID)
 
-	s.emitEvent(SessionEvent{Event: "exited", SessionID: req.SessionID, TicketID: sess.TicketID()})
+	// watchSessionExit emits the "exited" SessionEvent once the pane
+	// publishes its final ExitEvent; emitting again here would result
+	// in subscribers seeing two "exited" frames for one death. The Kill
+	// path inherits whatever Expected/Reason the watcher decides (false
+	// / "natural_exit" by default, true / "ticket_done" if the
+	// TicketDone path got there first).
 
 	return KillResp{}, nil
+}
+
+// handleTicketDone is the load-bearing handler for `openkanban ticket
+// done`. It scans the live sessions for one bound to req.TicketID; if
+// found, it flips that session's expected-completion flag, removes it
+// from the registry, and kicks off the kill in a goroutine. The
+// resulting "exited" SessionEvent (emitted by watchSessionExit when the
+// pane publishes ExitEvent) carries Expected=true / Reason="ticket_done"
+// so subscribers preserve AgentCompleted instead of resetting to
+// AgentNone.
+//
+// Returns synchronously: Killed:true plus the daemon-internal SessionID
+// on hit; Killed:false (no error) on miss. The CLI treats the miss as
+// informational — the .md and status-file writes are authoritative.
+func (s *Server) handleTicketDone(c *clientConn, req TicketDoneReq) (TicketDoneResp, error) {
+	if req.TicketID == "" {
+		return TicketDoneResp{}, nil
+	}
+
+	s.sessionsMu.Lock()
+	var match *Session
+	for _, sess := range s.sessions {
+		if sess.TicketID() == req.TicketID {
+			match = sess
+			break
+		}
+	}
+	if match != nil {
+		delete(s.sessions, match.ID())
+	}
+	s.sessionsMu.Unlock()
+
+	if match == nil {
+		return TicketDoneResp{Killed: false}, nil
+	}
+
+	match.MarkExpectedCompletion()
+
+	log.Printf("openkanbankd: client %d ticket-done session %s (ticket=%s)", c.id, match.ID(), req.TicketID)
+
+	// Kill in a goroutine so the RPC returns synchronously. The grace
+	// window matches shutdownGraceSeconds — agents may have a few
+	// seconds of cleanup. The watcher emits the "exited" event when
+	// the pane's ExitEvent lands.
+	go func(sess *Session) {
+		if err := sess.Kill(shutdownGraceSeconds); err != nil {
+			log.Printf("openkanbankd: ticket-done kill session %s: %v", sess.ID(), err)
+		}
+	}(match)
+
+	return TicketDoneResp{SessionID: match.ID(), Killed: true}, nil
 }
 
 // handleOwns answers whether the daemon currently owns the agent

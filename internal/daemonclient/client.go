@@ -428,6 +428,23 @@ func (c *Client) Owns(ctx context.Context, sessionUUID string) (daemon.OwnsResp,
 	return resp, err
 }
 
+// TicketDone informs the daemon that the agent invoked `openkanban
+// ticket done` for ticketID. The daemon scans its live sessions for
+// one bound to that ticket, flips its expected-completion flag, and
+// kills the pane — the resulting SessionEvent broadcast carries
+// Expected=true / Reason="ticket_done" so subscribed TUIs preserve
+// AgentCompleted instead of resetting to AgentNone.
+//
+// On miss (no live session for ticketID), the response carries
+// Killed=false with no error. The caller is expected to treat the .md
+// and status-file writes as authoritative either way.
+func (c *Client) TicketDone(ctx context.Context, ticketID string) (daemon.TicketDoneResp, error) {
+	var resp daemon.TicketDoneResp
+	err := c.do(ctx, daemon.MsgTicketDoneReq, daemon.TicketDoneReq{TicketID: ticketID},
+		daemon.MsgTicketDoneResp, &resp)
+	return resp, err
+}
+
 // Subscribe registers a fresh in-process channel for daemon push
 // events. The first call sends MsgSubscribeReq to the daemon so it
 // knows to start pushing; subsequent calls just register a local
