@@ -42,6 +42,7 @@ OpenKanban gives you a single view of all your work. Each ticket gets its own gi
 - **Any agent** - OpenCode, Claude Code, Gemini, Codex, Aider, or whatever CLI tool you prefer
 - **Multi-project** - Manage tickets across all your repositories from one board
 - **Scriptable** - `openkanban ticket new` creates tickets from the command line, ideal for a running agent that wants to spin off a subtask without driving the TUI
+- **Agent self-completion** - `openkanban ticket done` lets a spawned agent mark its own ticket as complete and exit gracefully; the TUI auto-stops the pane on completion
 
 ## Install
 
@@ -102,6 +103,29 @@ vim ~/.config/openkanban/tickets/$PROJECT/wire-fsnotify-7f3a9b2c.md
 If you have a config from before this version, your existing
 `tickets/<project_id>.json` is auto-migrated on first launch and
 preserved as `.json.migrated` for rollback.
+
+## Agent self-completion
+
+When openkanban spawns an agent on a ticket, the child process can
+mark the ticket complete and exit cleanly by running:
+
+```bash
+openkanban ticket done
+```
+
+This:
+
+- Sets the ticket to `status: done` and stamps `completed_at`.
+- Sets `agent_status: completed` so the badge sticks.
+- Signals the TUI, which gracefully stops the pane (SIGTERM, 3s
+  grace, SIGKILL) — the agent process exits, the ticket lands in
+  the Done column, no manual `/quit` or column-move required.
+
+Worktrees and branches are deliberately preserved — only ticket
+deletion tears those down. See
+[docs/AGENT_INTEGRATION.md](./docs/AGENT_INTEGRATION.md#agent-callable-commands-in-session)
+for the env vars, status-file mechanics, and how this interacts
+with Claude Code's `Stop` hook.
 
 ## Keybindings
 

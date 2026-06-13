@@ -468,14 +468,17 @@ case agentStatusMsg:
 
 ## Environment Isolation
 
-When spawning agents, OpenKanban filters environment variables to prevent nested session detection:
+When spawning agents, OpenKanban filters environment variables to
+prevent nested-session detection and inherited identity leakage, and
+injects the two openkanban-specific vars the child can use to report
+back (`OPENKANBAN_SESSION`, `OPENKANBAN_TICKET_ID`):
 
 ```go
-func buildCleanEnv() []string {
+func buildCleanEnv(sessionName, ticketID string) []string {
     var env []string
     for _, e := range os.Environ() {
         key := strings.Split(e, "=")[0]
-        // Skip agent-specific vars that might cause issues
+        // Strip agent-specific vars so the child agent starts clean.
         if key == "OPENCODE" || strings.HasPrefix(key, "OPENCODE_") {
             continue
         }
@@ -488,9 +491,20 @@ func buildCleanEnv() []string {
         if key == "CODEX" || strings.HasPrefix(key, "CODEX_") {
             continue
         }
+        // Strip any inherited OPENKANBAN_* so nested spawns can't
+        // leak an outer pane's session/ticket identity to the child.
+        if strings.HasPrefix(key, "OPENKANBAN_") {
+            continue
+        }
         env = append(env, e)
     }
     env = append(env, "TERM=xterm-256color")
+    if sessionName != "" {
+        env = append(env, "OPENKANBAN_SESSION="+sessionName)
+    }
+    if ticketID != "" {
+        env = append(env, "OPENKANBAN_TICKET_ID="+ticketID)
+    }
     return env
 }
 ```
