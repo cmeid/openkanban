@@ -216,6 +216,16 @@ type Model struct {
 
 	updateChecker *update.Checker
 
+	// binaryStaleNotified records whether the user has already been
+	// shown the "binary has been updated on disk" notification for the
+	// current stale-transition. Set when the periodic check first
+	// detects update.BinaryStale() == true; reset back to false if the
+	// check returns false (defensive — mtime can't go backwards in
+	// practice, but rebuilding atop the running binary while it's open
+	// could in theory drop us out of stale, and we want a clean
+	// re-trigger if it ever does).
+	binaryStaleNotified bool
+
 	// recentSelfWrites tracks (mtime, size, deadline) per path for
 	// suppressing fsnotify echoes of the TUI's own SaveTicket calls.
 	// See internal/ui/reload.go.
@@ -415,6 +425,7 @@ func (m *Model) Init() tea.Cmd {
 		m.spinner.Tick,
 		m.checkForUpdates(),
 		m.maybeSetWindowTitle(),
+		checkBinaryStaleness(),
 	}
 	if m.daemonEvents != nil {
 		cmds = append(cmds, readNextDaemonEvent(m.daemonEvents))
@@ -779,6 +790,23 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case binaryStaleCheckMsg:
+		// Periodic self-staleness check. The binary may have been
+		// replaced under us by `go install` / `openkanban update`
+		// running in another shell; long-lived TUI sessions otherwise
+		// have no signal that an upgrade has landed. We surface the
+		// notification once per stale-transition (not every 30s) and
+		// re-arm the tick unconditionally. See update.BinaryStale.
+		if update.BinaryStale() {
+			if !m.binaryStaleNotified {
+				m.notify("openkanban binary updated on disk — press Ctrl-R to restart, or 'q' to quit and relaunch")
+				m.binaryStaleNotified = true
+			}
+		} else {
+			m.binaryStaleNotified = false
+		}
+		return m, checkBinaryStaleness()
+
 	case FsChangedMsg:
 		m.handleFsChanged(msg)
 		return m, nil
@@ -877,6 +905,18 @@ func (m *Model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch msg.String() {
+	case "ctrl+r":
+		// Stale-binary restart shortcut. We only honor this when the
+		// on-disk binary has actually been replaced — otherwise an
+		// errant Ctrl-R would silently kill the TUI. The exit path
+		// reuses the existing quit-with-guard flow so live agent
+		// sessions are not orphaned; the user re-launches with
+		// `openkanban` after the guard clears.
+		if update.BinaryStale() {
+			m.notify("Restarting to pick up new binary — re-launch with `openkanban`")
+			return m.handleQuit()
+		}
+		return m, nil
 	case "h", "left":
 		if m.activeColumn == 0 && m.sidebarVisible {
 			m.sidebarFocused = true
@@ -3973,6 +4013,13 @@ type notificationMsg time.Time
 type shutdownCompleteMsg struct{}
 type updateCheckMsg update.CheckResult
 
+// binaryStaleCheckMsg fires every update.BinaryStaleCheckInterval to
+// trigger a re-stat of os.Executable() against the captured process
+// start time. Handled by the main Update loop, which surfaces a
+// one-shot notification when the binary on disk is newer than the
+// running process. See checkBinaryStaleness.
+type binaryStaleCheckMsg struct{}
+
 type spawnReadyMsg struct {
 	ticketID     board.TicketID
 	pane         *daemonclient.PaneView
@@ -3995,5 +4042,16 @@ type spawnErrorMsg struct {
 func tickAgentStatus(d time.Duration) tea.Cmd {
 	return tea.Tick(d, func(t time.Time) tea.Msg {
 		return agentStatusMsg(t)
+	})
+}
+
+// checkBinaryStaleness returns a tea.Cmd that fires a
+// binaryStaleCheckMsg after update.BinaryStaleCheckInterval. The Update
+// handler re-arms it on every receipt; the work itself (an os.Stat of
+// the executable) happens on the bubbletea goroutine and is effectively
+// free.
+func checkBinaryStaleness() tea.Cmd {
+	return tea.Tick(update.BinaryStaleCheckInterval, func(t time.Time) tea.Msg {
+		return binaryStaleCheckMsg{}
 	})
 }

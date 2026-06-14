@@ -11,8 +11,10 @@ import (
 	"net"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/techdufus/openkanban/internal/terminal"
+	"github.com/techdufus/openkanban/internal/update"
 )
 
 // BinaryVersion is the daemon's reported binary version in HelloResp.
@@ -59,6 +61,24 @@ type Server struct {
 	// client reconcile (List / status poll) will repair any missed
 	// transition.
 	events chan SessionEvent
+
+	// pendingRestart is flipped to true by watchBinaryStaleness when
+	// it first observes update.BinaryStale() == true (i.e. the daemon
+	// binary on disk has been replaced under us by go install /
+	// openkanban update). Once set:
+	//   - if zero sessions are attached at that moment, the watcher
+	//     initiates immediate shutdown so the next TUI launch picks
+	//     up the new binary;
+	//   - otherwise the daemon keeps running but logs a loud warning,
+	//     and the existing last-client-disconnect path handles the
+	//     exit naturally once sessions wind down.
+	// Read/written only from the watchBinaryStaleness goroutine and
+	// handleLastClientDisconnect; both already hold the relevant
+	// per-call mutexes for the data they care about, and the flag
+	// itself is byte-sized — protected by stalenessMu to keep go's
+	// race detector quiet across the two goroutines.
+	stalenessMu    sync.Mutex
+	pendingRestart bool
 }
 
 // clientConn tracks one open connection's per-client state.
@@ -154,6 +174,13 @@ func (s *Server) Serve(ctx context.Context) error {
 	// the shutdown channel closes.
 	go s.broadcastEvents()
 
+	// Watch the daemon's own binary for replacement (go install /
+	// openkanban update from another shell). When the on-disk binary
+	// is newer than this process, flip pendingRestart and exit cleanly
+	// if no sessions are attached — the next TUI launch will autostart
+	// a fresh daemon from the new binary. Exits with the daemon.
+	go s.watchBinaryStaleness()
+
 	for {
 		conn, err := s.ln.Accept()
 		if err != nil {
@@ -185,6 +212,57 @@ func (s *Server) Serve(ctx context.Context) error {
 			defer s.wg.Done()
 			s.handleConn(c)
 		}()
+	}
+}
+
+// watchBinaryStaleness periodically checks whether the daemon's own
+// binary on disk has been replaced under it (e.g. by `go install` or
+// `openkanban update` from another shell). The check runs every
+// update.BinaryStaleCheckInterval and exits when s.shutdown closes.
+//
+// When the binary first goes stale, we set pendingRestart and decide
+// what to do based on the live session count:
+//   - zero sessions: initiate immediate shutdown so the next TUI
+//     launch will autostart a fresh daemon from the new binary;
+//   - >0 sessions: log a loud warning and keep running. The
+//     handleLastClientDisconnect path will exit cleanly when the last
+//     client drops, and the next launch picks up the new binary.
+//
+// We deliberately don't kill live sessions to "force" a restart —
+// that would surprise the user and orphan in-progress agent work.
+func (s *Server) watchBinaryStaleness() {
+	ticker := time.NewTicker(update.BinaryStaleCheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.shutdown:
+			return
+		case <-ticker.C:
+			if !update.BinaryStale() {
+				continue
+			}
+
+			s.stalenessMu.Lock()
+			alreadyNotified := s.pendingRestart
+			s.pendingRestart = true
+			s.stalenessMu.Unlock()
+			if alreadyNotified {
+				// Already logged on first detection; don't spam.
+				continue
+			}
+
+			s.sessionsMu.RLock()
+			liveSessions := len(s.sessions)
+			s.sessionsMu.RUnlock()
+
+			if liveSessions == 0 {
+				log.Printf("openkanbankd: binary on disk is newer than running process and no sessions are attached; shutting down so the next launch picks up the update")
+				s.initiateShutdown("binary updated on disk")
+				return
+			}
+
+			log.Printf("WARN: openkanbankd binary on disk is newer than running process (%d live session(s) still attached); will exit when the last client disconnects so the next launch picks up the update", liveSessions)
+		}
 	}
 }
 
