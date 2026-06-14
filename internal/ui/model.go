@@ -3809,10 +3809,17 @@ func (m *Model) previousStatus(current board.TicketStatus) board.TicketStatus {
 func (m *Model) notify(msg string) {
 	m.notification = msg
 	m.notifyTime = time.Now()
+	// Mirror every notification to stderr so the user has a durable
+	// record after the TUI exits — the in-UI toast disappears on
+	// timeout (and is hard to even select for copy without the click
+	// hitting another control). With stderr logging, the same message
+	// is in /tmp/<wherever-the-user-redirects>.log.
+	log.Printf("openkanban notify: %s", msg)
 }
 
 func (m *Model) saveTicket(ticket *board.Ticket) {
 	if err := m.globalStore.Save(ticket); err != nil {
+		log.Printf("openkanban saveTicket: ticket=%s err: %v", ticket.ID, err)
 		m.notify("Failed to save: " + err.Error())
 		return
 	}
