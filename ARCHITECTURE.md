@@ -7,12 +7,12 @@ OpenKanban is a TUI application built with Go and Bubbletea that orchestrates AI
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                       OpenKanban TUI                             │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐              │
-│  │   Backlog   │  │ In Progress │  │    Done     │              │
-│  │  ┌───────┐  │  │  ┌───────┐  │  │  ┌───────┐  │              │
-│  │  │Ticket │  │  │  │Ticket │  │  │  │Ticket │  │              │
-│  │  └───────┘  │  │  └───────┘  │  │  └───────┘  │              │
-│  └─────────────┘  └─────────────┘  └─────────────┘              │
+│ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ │
+│ │   Backlog   │ │ In Progress │ │  In Review  │ │    Done     │ │
+│ │  ┌───────┐  │ │  ┌───────┐  │ │  ┌───────┐  │ │  ┌───────┐  │ │
+│ │  │Ticket │  │ │  │Ticket │  │ │  │Ticket │  │ │  │Ticket │  │ │
+│ │  └───────┘  │ │  └───────┘  │ │  └───────┘  │ │  └───────┘  │ │
+│ └─────────────┘ └─────────────┘ └─────────────┘ └─────────────┘ │
 └─────────────────────────────────────────────────────────────────┘
          │                   │                   │
          ▼                   ▼                   ▼
@@ -172,6 +172,7 @@ type TicketStatus string
 const (
     StatusBacklog    TicketStatus = "backlog"
     StatusInProgress TicketStatus = "in_progress"
+    StatusInReview   TicketStatus = "in_review"
     StatusDone       TicketStatus = "done"
 )
 
