@@ -39,6 +39,12 @@ type hookEntry struct {
 var managedHooks = []hookEntry{
 	{Event: "SessionStart", Command: "openkanban status set working"},
 	{Event: "UserPromptSubmit", Command: "openkanban status set working"},
+	// PostToolUse brings the file back to "working" after a tool runs.
+	// Critical for recovering from Notification (permission prompt): no
+	// hook fires between the user's grant and the tool's eventual return,
+	// so without this the file stays at "waiting" until Stop fires —
+	// which can be long after the agent is actually back to work.
+	{Event: "PostToolUse", Command: "openkanban status set working"},
 	{Event: "Stop", Command: "openkanban status set idle"},
 	{Event: "Notification", Command: "openkanban status set waiting"},
 }

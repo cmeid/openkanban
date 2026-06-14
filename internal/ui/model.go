@@ -791,29 +791,38 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		)
 
 	case agentStatusResultMsg:
-		// Precedence rule (PR9): when the daemon push channel is live,
-		// daemon-pushed SessionEvents are the authoritative source of
-		// AgentStatus for daemon-owned tickets. The local file-poll only
-		// fills in for tickets the daemon doesn't own (and as graceful
-		// degradation when the push channel is down).
+		// The file-poll value is the authoritative source for the
+		// intra-session transitions Claude Code's hooks emit
+		// (working / idle / waiting / error), regardless of whether
+		// the ticket is daemon-owned. Two narrow guards:
 		//
-		// We key on m.daemonOwned (maintained by handleDaemonSessionEvent)
-		// rather than m.panes — a sibling TUI that did NOT spawn the
-		// session still receives push events and tracks ownership, but
-		// has no local PaneView until the user attaches. Using m.panes
-		// here lets the poll clobber AgentWorking with the file's stale
-		// "idle" on every TUI but the one that spawned.
-		daemonLive := m.daemonConnected.Load()
+		//   - A poll value of AgentNone means the file is absent and
+		//     the terminal scrape produced no hit. That's "I don't
+		//     know," not a transition — preserve whatever was set
+		//     (typically AgentWorking from the daemon's "started"
+		//     SessionEvent, or AgentCompleted from ticket-done).
+		//
+		//   - AgentCompleted is terminal. Only another terminal value
+		//     (Completed, Error) may overwrite it. This mirrors the
+		//     symmetric guard in cmd/status.go that prevents Claude's
+		//     Stop hook racing TicketDone during the SIGTERM grace
+		//     window from downgrading the completion signal to idle.
+		//
+		// The pre-fix rule unconditionally skipped poll values for
+		// daemon-owned tickets, which froze AgentStatus at the daemon's
+		// "started" event (AgentWorking) for the entire session — hooks
+		// updated the file but the TUI never reflected it.
 		for ticketID, status := range msg {
-			if daemonLive {
-				if _, owned := m.daemonOwned[ticketID]; owned {
-					// Daemon-owned ticket; let push events drive its
-					// status and ignore the file-poll value.
-					continue
-				}
+			if status == board.AgentNone {
+				continue
 			}
 			ticket, _ := m.globalStore.Get(ticketID)
 			if ticket == nil {
+				continue
+			}
+			if ticket.AgentStatus == board.AgentCompleted &&
+				status != board.AgentCompleted &&
+				status != board.AgentError {
 				continue
 			}
 			ticket.AgentStatus = status

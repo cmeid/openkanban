@@ -321,3 +321,35 @@ func TestInstallHooks_DryRunNoExistingFile(t *testing.T) {
 		t.Errorf("unexpected stat error: %v", err)
 	}
 }
+
+// TestManagedHooksCoversPostToolUse pins the expected event coverage so a
+// future edit that drops PostToolUse fails loudly. PostToolUse → working
+// is what brings the file back to "working" after a Notification +
+// permission grant — without it the status stays stuck at "waiting"
+// until the next Stop hook, which can be a long time away.
+func TestManagedHooksCoversPostToolUse(t *testing.T) {
+	wantEvents := map[string]string{
+		"SessionStart":     "openkanban status set working",
+		"UserPromptSubmit": "openkanban status set working",
+		"PostToolUse":      "openkanban status set working",
+		"Stop":             "openkanban status set idle",
+		"Notification":     "openkanban status set waiting",
+	}
+	got := map[string]string{}
+	for _, h := range managedHooks {
+		if existing, dup := got[h.Event]; dup {
+			t.Errorf("event %q listed twice in managedHooks (%q vs %q)", h.Event, existing, h.Command)
+		}
+		got[h.Event] = h.Command
+	}
+	for event, wantCmd := range wantEvents {
+		gotCmd, ok := got[event]
+		if !ok {
+			t.Errorf("managedHooks missing event %q", event)
+			continue
+		}
+		if gotCmd != wantCmd {
+			t.Errorf("managedHooks[%q] = %q; want %q", event, gotCmd, wantCmd)
+		}
+	}
+}
