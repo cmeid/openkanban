@@ -274,6 +274,13 @@ case "opencode":
 ```go
 case "claude":
     if isNewSession {
+        // New claude sessions always start in plan mode so the
+        // agent reviews the proposed approach before touching
+        // the tree. Any conflicting permission flag from the
+        // user's agent config (--dangerously-skip-permissions
+        // or another --permission-mode pair) is stripped first.
+        args = stripPermissionFlags(args)
+        args = append(args, "--permission-mode", "plan")
         // Title the Claude session after the ticket so it's
         // identifiable in `claude --resume`'s session picker and in
         // the terminal title bar. Only on new sessions — resumes
@@ -285,6 +292,8 @@ case "claude":
         // Inject the init-prompt as a positional argument
         // (see Context Injection above).
     } else {
+        // Resumed sessions keep whatever permission mode they
+        // had at exit — only new sessions are forced into plan.
         args = append(args, "--continue")
     }
 ```
