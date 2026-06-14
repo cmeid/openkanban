@@ -259,8 +259,8 @@ func TestTicket_SetStatus(t *testing.T) {
 func TestDefaultColumns(t *testing.T) {
 	columns := DefaultColumns()
 
-	if len(columns) != 3 {
-		t.Fatalf("DefaultColumns() returned %d columns; want 3", len(columns))
+	if len(columns) != 4 {
+		t.Fatalf("DefaultColumns() returned %d columns; want 4", len(columns))
 	}
 
 	expected := []struct {
@@ -270,6 +270,7 @@ func TestDefaultColumns(t *testing.T) {
 	}{
 		{"backlog", "Backlog", StatusBacklog},
 		{"in-progress", "In Progress", StatusInProgress},
+		{"in-review", "In Review", StatusInReview},
 		{"done", "Done", StatusDone},
 	}
 
@@ -309,6 +310,9 @@ func TestTicketStatus_Constants(t *testing.T) {
 	}
 	if StatusInProgress != "in_progress" {
 		t.Errorf("StatusInProgress = %q; want %q", StatusInProgress, "in_progress")
+	}
+	if StatusInReview != "in_review" {
+		t.Errorf("StatusInReview = %q; want %q", StatusInReview, "in_review")
 	}
 	if StatusDone != "done" {
 		t.Errorf("StatusDone = %q; want %q", StatusDone, "done")

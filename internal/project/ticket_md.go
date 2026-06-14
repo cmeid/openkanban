@@ -17,6 +17,7 @@ import (
 var validStatuses = map[board.TicketStatus]bool{
 	board.StatusBacklog:    true,
 	board.StatusInProgress: true,
+	board.StatusInReview:   true,
 	board.StatusDone:       true,
 	board.StatusArchived:   true,
 }
@@ -255,7 +256,7 @@ func validateFrontmatter(fm *ticketFrontmatter) error {
 	if fm.Status == "" {
 		fm.Status = board.StatusBacklog
 	} else if !validStatuses[fm.Status] {
-		return fmt.Errorf("invalid status %q (allowed: backlog, in_progress, done, archived)", fm.Status)
+		return fmt.Errorf("invalid status %q (allowed: backlog, in_progress, in_review, done, archived)", fm.Status)
 	}
 
 	if fm.AgentStatus == "" {

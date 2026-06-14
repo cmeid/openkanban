@@ -3969,6 +3969,8 @@ func (m *Model) nextStatus(current board.TicketStatus) board.TicketStatus {
 	case board.StatusBacklog:
 		return board.StatusInProgress
 	case board.StatusInProgress:
+		return board.StatusInReview
+	case board.StatusInReview:
 		return board.StatusDone
 	default:
 		return current
@@ -3978,6 +3980,8 @@ func (m *Model) nextStatus(current board.TicketStatus) board.TicketStatus {
 func (m *Model) previousStatus(current board.TicketStatus) board.TicketStatus {
 	switch current {
 	case board.StatusDone:
+		return board.StatusInReview
+	case board.StatusInReview:
 		return board.StatusInProgress
 	case board.StatusInProgress:
 		return board.StatusBacklog

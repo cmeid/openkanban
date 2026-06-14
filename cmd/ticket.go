@@ -83,9 +83,9 @@ Description sources (mutually exclusive, in priority order):
 		}
 		if ticketNewStatus != "" {
 			switch board.TicketStatus(ticketNewStatus) {
-			case board.StatusBacklog, board.StatusInProgress, board.StatusDone, board.StatusArchived:
+			case board.StatusBacklog, board.StatusInProgress, board.StatusInReview, board.StatusDone, board.StatusArchived:
 			default:
-				return fmt.Errorf("--status %q is not one of: backlog, in_progress, done, archived", ticketNewStatus)
+				return fmt.Errorf("--status %q is not one of: backlog, in_progress, in_review, done, archived", ticketNewStatus)
 			}
 		}
 

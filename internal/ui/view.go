@@ -237,6 +237,7 @@ func (m *Model) renderColumn(col board.Column, tickets []*board.Ticket, isActive
 	columnIcons := map[board.TicketStatus]string{
 		board.StatusBacklog:    "📋",
 		board.StatusInProgress: "⚡",
+		board.StatusInReview:   "👀",
 		board.StatusDone:       "✅",
 	}
 	icon := columnIcons[col.Status]
@@ -2031,6 +2032,8 @@ func (m *Model) columnColor(status board.TicketStatus) lipgloss.Color {
 		return m.colors.primary
 	case board.StatusInProgress:
 		return m.colors.warning
+	case board.StatusInReview:
+		return m.colors.secondary
 	case board.StatusDone:
 		return m.colors.success
 	default:
