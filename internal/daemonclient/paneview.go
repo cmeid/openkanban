@@ -666,20 +666,30 @@ func (p *PaneView) detach(sendFrame bool) error {
 // the daemon, or on any read error.
 func (p *PaneView) attachLoop(conn net.Conn, r *bufio.Reader) {
 	defer p.attachLoopWG.Done()
+	log.Printf("openkanban paneview: attachLoop started session=%s", p.sessionID)
+	frameCount := 0
+	outputBytes := 0
 	for {
 		typ, payload, err := daemon.ReadFrame(r)
 		if err != nil {
 			if err == io.EOF || errors.Is(err, net.ErrClosed) {
+				log.Printf("openkanban paneview: attachLoop EOF session=%s frames=%d outputBytes=%d", p.sessionID, frameCount, outputBytes)
 				p.handleAttachExit(nil, true)
 				return
 			}
+			log.Printf("openkanban paneview: attachLoop err session=%s frames=%d outputBytes=%d: %v", p.sessionID, frameCount, outputBytes, err)
 			p.handleAttachExit(err, false)
 			return
 		}
+		frameCount++
 		switch typ {
 		case daemon.TypePTYOutput:
 			if len(payload) == 0 {
 				continue
+			}
+			outputBytes += len(payload)
+			if frameCount <= 5 {
+				log.Printf("openkanban paneview: attachLoop output frame #%d session=%s bytes=%d", frameCount, p.sessionID, len(payload))
 			}
 			p.applyOutput(payload)
 			p.emitTeaMsg(PaneOutputMsg{PaneID: p.id})
@@ -687,6 +697,7 @@ func (p *PaneView) attachLoop(conn net.Conn, r *bufio.Reader) {
 			// Daemon-initiated detach: the session may or may not
 			// still be running. We transition to Unattached and let
 			// the UI poll List to learn the truth.
+			log.Printf("openkanban paneview: attachLoop got TypeDetach session=%s frames=%d outputBytes=%d", p.sessionID, frameCount, outputBytes)
 			p.handleAttachExit(nil, true)
 			return
 		case daemon.TypeResize:
