@@ -325,6 +325,7 @@ func (s *Server) dispatchSessionEvent(ev SessionEvent) {
 	}
 	s.clientsMu.Unlock()
 
+	log.Printf("openkanbankd: dispatchSessionEvent event=%q session=%s subs=%d", ev.Event, ev.SessionID, len(subs))
 	for _, c := range subs {
 		c.writeMu.Lock()
 		werr := WriteFrame(c.conn, TypeJSONPush, payload)
@@ -791,6 +792,7 @@ func (s *Server) handleSubscribe(c *clientConn, req SubscribeReq) SubscribeResp 
 	s.clientsMu.Lock()
 	c.subscribed = true
 	s.clientsMu.Unlock()
+	log.Printf("openkanbankd: client %d subscribed", c.id)
 	return SubscribeResp{}
 }
 

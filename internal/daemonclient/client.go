@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"runtime"
 	"sync"
@@ -287,13 +288,16 @@ func (c *Client) deliverResp(payload []byte, env error) {
 func (c *Client) handlePush(payload []byte) {
 	typeName, raw, err := daemon.DecodeEnvelope(payload)
 	if err != nil {
+		log.Printf("openkanban client: handlePush decode err: %v", err)
 		return
 	}
 	if typeName != daemon.MsgSessionEvent {
+		log.Printf("openkanban client: handlePush unknown type %q", typeName)
 		return
 	}
 	var ev daemon.SessionEvent
 	if err := json.Unmarshal(raw, &ev); err != nil {
+		log.Printf("openkanban client: handlePush unmarshal err: %v", err)
 		return
 	}
 
@@ -304,13 +308,12 @@ func (c *Client) handlePush(payload []byte) {
 	}
 	c.subscribersMu.Unlock()
 
+	log.Printf("openkanban client: handlePush event=%q session=%s subs=%d", ev.Event, ev.SessionID, len(subs))
 	for _, ch := range subs {
 		select {
 		case ch <- ev:
 		default:
-			// Subscriber's buffer is full. We drop rather than block
-			// the read loop — a slow consumer must not back up the
-			// control conn.
+			log.Printf("openkanban client: handlePush dropped event %q (subscriber buffer full)", ev.Event)
 		}
 	}
 }
