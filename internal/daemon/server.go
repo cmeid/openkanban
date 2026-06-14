@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/techdufus/openkanban/internal/terminal"
 )
@@ -24,6 +25,13 @@ var BinaryVersion = "dev"
 // the daemon's defensive kill path tears down sessions that survived
 // past the last client disconnect.
 const shutdownGraceSeconds = 3
+
+// postSpawnInputDelay is how long handleSpawn waits before writing
+// SpawnReq.PostSpawnInput to the freshly-spawned PTY. 500ms gives
+// Claude / opencode enough time to finish booting their interactive
+// input loop so a slash command like "/color red\r" isn't dropped
+// before the agent's TTY reader is wired up.
+const postSpawnInputDelay = 500 * time.Millisecond
 
 // Server is the openkanbankd RPC server. It listens on a Unix socket,
 // accepts client connections, multiplexes JSON-mode RPCs, and owns the
@@ -495,6 +503,15 @@ func (s *Server) handleSpawn(c *clientConn, req SpawnReq) (SpawnResp, error) {
 	// gate. The watcher emits an "exited" SessionEvent when the pane
 	// publishes its final ExitEvent.
 	s.watchSessionExit(sess)
+
+	// Schedule the optional one-shot PostSpawnInput AFTER registry +
+	// watcher are wired, so a teardown racing the timer (handleKill /
+	// handleTicketDone deleting the session) propagates through the
+	// pane's cancelPostSpawnTimerLocked path and the write doesn't
+	// fire against a closed PTY.
+	if req.PostSpawnInput != "" && sess.pane != nil {
+		sess.pane.SchedulePostSpawnInput([]byte(req.PostSpawnInput), postSpawnInputDelay)
+	}
 
 	s.emitEvent(SessionEvent{Event: "started", SessionID: sess.ID(), TicketID: sess.TicketID(), Status: "working"})
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	xvt "github.com/charmbracelet/x/vt"
@@ -411,5 +412,86 @@ func TestBuildCleanEnv_StripsInheritedOpenkanban(t *testing.T) {
 	}
 	if anyWithPrefix("OPENKANBAN_PTY_DEBUG_LOG") {
 		t.Errorf("OPENKANBAN_PTY_DEBUG_LOG should have been stripped; env=%v", env)
+	}
+}
+
+// TestSchedulePostSpawnInput_FiresAndEchoes asserts the timer-driven
+// PTY write actually lands on the child. We spawn `cat`, which echoes
+// stdin back to stdout. After SchedulePostSpawnInput with a short
+// delay, the bytes written into the PTY master come back through the
+// pane's subscriber as an OutputEvent. The cat process is killed via
+// p.Stop() before the test returns; that also cancels the timer (no-
+// op here since it already fired).
+func TestSchedulePostSpawnInput_FiresAndEchoes(t *testing.T) {
+	p := startTestPane(t, "cat")
+	t.Cleanup(func() { _ = p.Stop() })
+
+	sub, unsub := p.Subscribe()
+	defer unsub()
+
+	const payload = "hello-post-spawn\n"
+	p.SchedulePostSpawnInput([]byte(payload), 50*time.Millisecond)
+
+	// Read events until we see the payload echoed back, or 2s passes.
+	deadline := time.After(2 * time.Second)
+	var collected []byte
+	for {
+		select {
+		case ev, ok := <-sub:
+			if !ok {
+				t.Fatalf("subscriber channel closed before seeing %q (got %q)", payload, collected)
+			}
+			if oe, ok := ev.(OutputEvent); ok {
+				collected = append(collected, oe.Data...)
+				if strings.Contains(string(collected), "hello-post-spawn") {
+					return
+				}
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for cat to echo %q; got %q", payload, collected)
+		}
+	}
+}
+
+// TestSchedulePostSpawnInput_EmptyIsNoOp asserts the zero-length
+// guard: no timer is created (so nothing can later fire) when the
+// caller passes an empty slice. We assert p.postSpawnTimer remains
+// nil after the call.
+func TestSchedulePostSpawnInput_EmptyIsNoOp(t *testing.T) {
+	p := New("test", 80, 24, 100)
+	p.SchedulePostSpawnInput(nil, 10*time.Millisecond)
+	p.SchedulePostSpawnInput([]byte{}, 10*time.Millisecond)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.postSpawnTimer != nil {
+		t.Errorf("postSpawnTimer should be nil for empty input; got %v", p.postSpawnTimer)
+	}
+}
+
+// TestSchedulePostSpawnInput_StopCancels asserts Stop() cancels the
+// pending timer so the callback can't fire after teardown. We use a
+// long delay (2s) plus a short test window (200ms); without the
+// cancel in Stop, the callback would race the test exit and try to
+// write to a closed PTY.
+func TestSchedulePostSpawnInput_StopCancels(t *testing.T) {
+	p := startTestPane(t, "cat")
+	p.SchedulePostSpawnInput([]byte("late\n"), 2*time.Second)
+
+	// Snapshot timer pointer under the lock.
+	p.mu.Lock()
+	had := p.postSpawnTimer != nil
+	p.mu.Unlock()
+	if !had {
+		t.Fatalf("expected postSpawnTimer to be set before Stop")
+	}
+
+	if err := p.Stop(); err != nil {
+		t.Fatalf("Stop returned %v", err)
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.postSpawnTimer != nil {
+		t.Errorf("postSpawnTimer should be cleared after Stop; got %v", p.postSpawnTimer)
 	}
 }

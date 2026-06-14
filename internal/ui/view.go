@@ -11,6 +11,7 @@ import (
 
 	"github.com/techdufus/openkanban/internal/board"
 	"github.com/techdufus/openkanban/internal/config"
+	"github.com/techdufus/openkanban/internal/project"
 )
 
 func (m *Model) View() string {
@@ -323,6 +324,17 @@ func (m *Model) renderColumn(col board.Column, tickets []*board.Ticket, isActive
 
 	border := columnBorder
 	borderColor := m.colors.surface
+	// When the board is filtered to a single project, tint the otherwise
+	// neutral column border with that project's color so the whole board
+	// reads as belonging to one project.
+	if len(m.filterProjectIDs) == 1 {
+		for id := range m.filterProjectIDs {
+			if p := m.globalStore.GetProject(id); p != nil {
+				borderColor = project.ResolveLipglossColor(p.GetColor())
+			}
+			break
+		}
+	}
 	if isDragTarget {
 		border = dragTargetBorder
 		borderColor = m.colors.success
@@ -366,8 +378,9 @@ func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, w
 		if len(shortName) > 12 {
 			shortName = shortName[:10] + ".."
 		}
-		bracketStyle := lipgloss.NewStyle().Foreground(m.colors.info)
-		textStyle := lipgloss.NewStyle().Foreground(m.colors.info).Bold(true)
+		projColor := project.ResolveLipglossColor(proj.GetColor())
+		bracketStyle := lipgloss.NewStyle().Foreground(projColor)
+		textStyle := lipgloss.NewStyle().Foreground(projColor).Bold(true)
 		projectBadge = bracketStyle.Render("❨") + textStyle.Render(shortName) + bracketStyle.Render("❩")
 	}
 
@@ -1418,12 +1431,14 @@ func (m *Model) renderAgentView() string {
 	title := "Agent"
 	agentType := ""
 	projectName := ""
+	var projectColor lipgloss.Color
 	var sessionDuration string
 	if ticket != nil {
 		title = ticket.Title
 		agentType = ticket.AgentType
 		if proj := m.globalStore.GetProjectForTicket(ticket); proj != nil {
 			projectName = proj.Name
+			projectColor = project.ResolveLipglossColor(proj.GetColor())
 		}
 		if ticket.AgentSpawnedAt != nil {
 			duration := time.Since(*ticket.AgentSpawnedAt)
@@ -1441,7 +1456,7 @@ func (m *Model) renderAgentView() string {
 	if projectName != "" {
 		projBadge := lipgloss.NewStyle().
 			Foreground(m.colors.base).
-			Background(m.colors.info).
+			Background(projectColor).
 			Padding(0, 1).
 			Render(projectName)
 		header = header + "  " + projBadge
@@ -1571,12 +1586,16 @@ func (m *Model) renderActiveFilter() string {
 		Padding(0, 1)
 
 	filterText := m.filterQuery
+	var swatch string
 	if len(m.filterProjectIDs) > 0 && m.filterQuery == "" {
 		count := len(m.filterProjectIDs)
 		if count == 1 {
 			for id := range m.filterProjectIDs {
 				if p := m.globalStore.GetProject(id); p != nil {
 					filterText = "@" + p.Name
+					swatch = lipgloss.NewStyle().
+						Foreground(project.ResolveLipglossColor(p.GetColor())).
+						Render("● ")
 				}
 				break
 			}
@@ -1585,7 +1604,7 @@ func (m *Model) renderActiveFilter() string {
 		}
 	}
 
-	return filterStyle.Render("FILTERED: "+filterText) + " " + clearStyle.Render("× clear")
+	return swatch + filterStyle.Render("FILTERED: "+filterText) + " " + clearStyle.Render("× clear")
 }
 
 func (m *Model) renderFilterHint() string {
@@ -1623,6 +1642,9 @@ func (m *Model) renderProjectSelector() string {
 	for i, p := range projects {
 		name := p.Name
 		path := shortenPath(p.RepoPath)
+		swatch := lipgloss.NewStyle().
+			Foreground(project.ResolveLipglossColor(p.GetColor())).
+			Render("● ")
 
 		nameStyle := lipgloss.NewStyle().Foreground(m.colors.text)
 		pathStyle := lipgloss.NewStyle().Foreground(m.colors.muted)
@@ -1632,12 +1654,11 @@ func (m *Model) renderProjectSelector() string {
 		if i == m.projectListIndex {
 			nameStyle = nameStyle.Foreground(m.colors.info).Bold(true)
 			pathStyle = pathStyle.Foreground(m.colors.subtext)
-			prefix = lipgloss.NewStyle().Foreground(m.colors.info).Render("● ")
-			content := prefix + nameStyle.Render(name) + "  " + pathStyle.Render(path)
+			prefix = lipgloss.NewStyle().Foreground(m.colors.info).Render("▸ ")
+			content := prefix + swatch + nameStyle.Render(name) + "  " + pathStyle.Render(path)
 			line = lipgloss.NewStyle().Background(m.colors.surface).Padding(0, 1).Render(content)
 		} else {
-			prefix = "○ "
-			line = prefix + nameStyle.Render(name) + "  " + pathStyle.Render(path)
+			line = prefix + swatch + nameStyle.Render(name) + "  " + pathStyle.Render(path)
 		}
 		lines = append(lines, line)
 	}
@@ -1780,7 +1801,10 @@ func (m *Model) renderSidebar() string {
 		} else {
 			checkbox = "[ ] "
 		}
-		label := fmt.Sprintf("%s%s (%d)", checkbox, p.Name, count)
+		swatch := lipgloss.NewStyle().
+			Foreground(project.ResolveLipglossColor(p.GetColor())).
+			Render("●")
+		label := fmt.Sprintf("%s%s %s (%d)", checkbox, swatch, p.Name, count)
 
 		if m.sidebarIndex == idx && m.sidebarFocused {
 			lines = append(lines, selectedStyle.Render(label))

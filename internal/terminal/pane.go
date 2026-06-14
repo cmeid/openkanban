@@ -152,6 +152,14 @@ type Pane struct {
 	// Subscribe()s and so re-arming the Cmd doesn't churn subscriptions.
 	teaBridgeCh   <-chan Event
 	teaBridgeOnce sync.Once
+
+	// postSpawnTimer is the one-shot timer scheduled by
+	// SchedulePostSpawnInput. It writes a configured byte sequence
+	// (typically a slash command like "/color red\r") to the PTY
+	// master once the child's input loop has had time to come up.
+	// Guarded by p.mu; cleared by Stop / StopGraceful to prevent
+	// late writes against a closed PTY.
+	postSpawnTimer *time.Timer
 }
 
 func New(id string, width, height int, scrollbackSize int) *Pane {
@@ -784,6 +792,7 @@ func (p *Pane) stopDrainUnlocked() {
 func (p *Pane) Stop() error {
 	p.mu.Lock()
 
+	p.cancelPostSpawnTimerLocked()
 	if p.cmd != nil && p.cmd.Process != nil {
 		p.cmd.Process.Kill()
 	}
@@ -806,10 +815,15 @@ func (p *Pane) Stop() error {
 func (p *Pane) StopGraceful(timeout time.Duration) error {
 	p.mu.Lock()
 	if !p.running || p.cmd == nil || p.cmd.Process == nil {
+		// Even on no-op teardown, cancel any pending post-spawn
+		// timer so it can't fire after the caller's "session is
+		// gone" assumption.
+		p.cancelPostSpawnTimerLocked()
 		p.mu.Unlock()
 		return nil
 	}
 
+	p.cancelPostSpawnTimerLocked()
 	proc := p.cmd.Process
 	p.mu.Unlock()
 
@@ -852,6 +866,56 @@ func (p *Pane) WriteInput(data []byte) (int, error) {
 		return 0, ErrPaneNotRunning
 	}
 	return p.pty.Write(data)
+}
+
+// SchedulePostSpawnInput arranges for data to be written to the PTY
+// master after delay elapses. Used by the daemon's spawn handler to
+// feed a freshly-spawned interactive agent a one-shot input (e.g. a
+// slash command) once its input loop is ready. The delay is the
+// "wait for the child's TTY input loop to come up" budget — see
+// daemon.postSpawnInputDelay.
+//
+// A zero-length data slice is a no-op. Calling this twice on the
+// same pane stops the previous timer and replaces it. The timer is
+// stopped automatically by Stop / StopGraceful, so a late callback
+// never races a closed PTY.
+//
+// The write itself goes through WriteInput, which takes p.mu and
+// returns ErrPaneNotRunning if the pane has been torn down between
+// scheduling and firing. Errors are logged to stderr (we have no
+// reasonable recovery and don't want a silent failure).
+func (p *Pane) SchedulePostSpawnInput(data []byte, delay time.Duration) {
+	if len(data) == 0 {
+		return
+	}
+	p.mu.Lock()
+	if p.postSpawnTimer != nil {
+		p.postSpawnTimer.Stop()
+		p.postSpawnTimer = nil
+	}
+	// Copy data so a caller mutation after we return doesn't change
+	// what the timer ultimately writes.
+	payload := make([]byte, len(data))
+	copy(payload, data)
+	p.postSpawnTimer = time.AfterFunc(delay, func() {
+		if _, err := p.WriteInput(payload); err != nil {
+			fmt.Fprintf(os.Stderr, "pane %s: post-spawn input write failed: %v\n", p.id, err)
+		}
+	})
+	p.mu.Unlock()
+}
+
+// cancelPostSpawnTimerLocked stops the pending post-spawn-input
+// timer if any. Must be called with p.mu held. Safe to call when no
+// timer is pending. The timer's callback is a Go runtime detail —
+// AfterFunc's Stop() returns false if the timer has already fired
+// or been stopped; either way the pointer is cleared so a double
+// teardown is a no-op.
+func (p *Pane) cancelPostSpawnTimerLocked() {
+	if p.postSpawnTimer != nil {
+		p.postSpawnTimer.Stop()
+		p.postSpawnTimer = nil
+	}
 }
 
 // readOutput returns a Cmd that reads from the PTY
@@ -941,6 +1005,7 @@ func (p *Pane) Update(msg tea.Msg) tea.Cmd {
 			return nil
 		}
 		p.mu.Lock()
+		p.cancelPostSpawnTimerLocked()
 		p.running = false
 		p.exitErr = msg.Err
 		if p.pty != nil {

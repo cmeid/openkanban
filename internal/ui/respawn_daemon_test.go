@@ -9,6 +9,7 @@ import (
 
 	"github.com/techdufus/openkanban/internal/agent"
 	"github.com/techdufus/openkanban/internal/board"
+	"github.com/techdufus/openkanban/internal/project"
 )
 
 // envHas reports whether the SpawnReq env carries an exact KEY=VALUE
@@ -222,6 +223,127 @@ func TestBuildSpawnReq_ForceFresh_AgentSpawnedAtNilAtConstruction(t *testing.T) 
 	// argv shape should reflect "new session", not resume.
 	if argsContain(req.Args, "--continue") || argsContain(req.Args, "-c") {
 		t.Errorf("ForceFresh argv reflects resume despite AgentSpawnedAt=nil: %v", req.Args)
+	}
+}
+
+// TestBuildSpawnReq_Claude_ProjectColor_ExplicitColor pins the
+// PostSpawnInput contract for a claude spawn whose project has an
+// explicit, valid Color: the daemon must receive `/color <color>\r`
+// so it can write the slash command to the PTY ~500ms after spawn.
+func TestBuildSpawnReq_Claude_ProjectColor_ExplicitColor(t *testing.T) {
+	in := baseClaudeInputs(t, "TICK-COLOR-1", "task/explicit")
+	in.project = &project.Project{
+		ID:    "proj-explicit",
+		Name:  "Explicit",
+		Color: "brightblue",
+	}
+
+	req := buildSpawnReq(in)
+
+	want := "/color brightblue\r"
+	if req.PostSpawnInput != want {
+		t.Errorf("PostSpawnInput = %q, want %q", req.PostSpawnInput, want)
+	}
+}
+
+// TestBuildSpawnReq_Claude_ProjectColor_AutoDerived covers the
+// no-explicit-color path: GetColor() falls back to a deterministic
+// palette entry derived from the project ID. The /color command must
+// still fire and carry a valid palette name.
+func TestBuildSpawnReq_Claude_ProjectColor_AutoDerived(t *testing.T) {
+	in := baseClaudeInputs(t, "TICK-COLOR-2", "task/auto")
+	in.project = &project.Project{
+		ID:   "proj-auto",
+		Name: "Auto",
+		// Color intentionally empty → GetColor() derives from ID.
+	}
+
+	req := buildSpawnReq(in)
+
+	if !strings.HasPrefix(req.PostSpawnInput, "/color ") {
+		t.Fatalf("PostSpawnInput = %q, want prefix %q", req.PostSpawnInput, "/color ")
+	}
+	if !strings.HasSuffix(req.PostSpawnInput, "\r") {
+		t.Fatalf("PostSpawnInput = %q, want trailing \\r", req.PostSpawnInput)
+	}
+	color := strings.TrimSuffix(strings.TrimPrefix(req.PostSpawnInput, "/color "), "\r")
+	if !project.IsValidColor(color) {
+		t.Errorf("PostSpawnInput color %q is not a member of project.ColorPalette (%v)",
+			color, project.ColorPalette)
+	}
+}
+
+// TestBuildSpawnReq_Claude_NilProject_NoPostSpawnInput: claude spawns
+// without a resolvable project (legacy / pre-daemon tickets) must NOT
+// crash and must NOT set PostSpawnInput — the empty string keeps the
+// daemon's post-spawn writer path dormant.
+func TestBuildSpawnReq_Claude_NilProject_NoPostSpawnInput(t *testing.T) {
+	in := baseClaudeInputs(t, "TICK-COLOR-3", "task/nilproj")
+	in.project = nil
+
+	req := buildSpawnReq(in)
+
+	if req.PostSpawnInput != "" {
+		t.Errorf("PostSpawnInput = %q, want empty for nil project", req.PostSpawnInput)
+	}
+}
+
+// TestBuildSpawnReq_NonClaude_ProjectColor_NoPostSpawnInput: the
+// /color slash command is a Claude Code feature; other agents must
+// not receive it even when a project is in scope.
+func TestBuildSpawnReq_NonClaude_ProjectColor_NoPostSpawnInput(t *testing.T) {
+	cases := []struct {
+		name      string
+		agentType string
+		command   string
+	}{
+		{"opencode", "opencode", "opencode"},
+		{"gemini", "gemini", "gemini"},
+		{"codex", "codex", "codex"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := baseClaudeInputs(t, "TICK-COLOR-NC", "task/nc")
+			in.agentType = tc.agentType
+			in.command = tc.command
+			in.project = &project.Project{
+				ID:    "proj-nc",
+				Name:  "NC",
+				Color: "red",
+			}
+
+			req := buildSpawnReq(in)
+
+			if req.PostSpawnInput != "" {
+				t.Errorf("%s: PostSpawnInput = %q, want empty (only claude gets /color)",
+					tc.agentType, req.PostSpawnInput)
+			}
+		})
+	}
+}
+
+// TestBuildSpawnReq_Claude_Resume_ProjectColor pins that resumed
+// claude sessions ALSO get the /color command. Claude Code does not
+// persist the chosen color across sessions, so without this the
+// resumed UI reverts to the default tag color regardless of project.
+func TestBuildSpawnReq_Claude_Resume_ProjectColor(t *testing.T) {
+	in := baseClaudeInputs(t, "TICK-COLOR-RESUME", "task/resume")
+	// baseClaudeInputs already sets isNewSession=false / AgentSpawnedAt set.
+	in.project = &project.Project{
+		ID:    "proj-resume",
+		Name:  "Resume",
+		Color: "cyan",
+	}
+
+	req := buildSpawnReq(in)
+
+	want := "/color cyan\r"
+	if req.PostSpawnInput != want {
+		t.Errorf("resumed claude PostSpawnInput = %q, want %q", req.PostSpawnInput, want)
+	}
+	// Sanity: this is the resume branch — argv should carry --continue.
+	if !argsContain(req.Args, "--continue") {
+		t.Errorf("resume claude argv expected --continue, got %v", req.Args)
 	}
 }
 

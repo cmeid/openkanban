@@ -257,6 +257,12 @@ type SpawnReq struct {
 	Rows             int      `json:"rows"`
 	Scrollback       int      `json:"scrollback"`
 	AgentSessionUUID string   `json:"agent_session_uuid,omitempty"`
+	// PostSpawnInput, when non-empty, is written to the PTY master
+	// after a short delay so a freshly-spawned interactive agent
+	// (e.g. Claude) can receive a slash command like "/color red\r"
+	// once its input loop is ready. Appended at the end so the
+	// pinned field order from PR 494745b is preserved.
+	PostSpawnInput string `json:"post_spawn_input,omitempty"`
 }
 
 // SpawnResp acknowledges a successful spawn.

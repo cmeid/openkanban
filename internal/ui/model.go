@@ -3257,6 +3257,11 @@ type spawnReqInputs struct {
 	opencodeSessionID string
 	geminiSessionID   string
 	codexSessionID    string
+	// project is the resolved project for the ticket. Used by the claude
+	// branch to inject a `/color <palette>\r` PostSpawnInput so the
+	// Claude UI's tag color matches the project's color in the
+	// openkanban TUI. Nil-safe: when nil, no PostSpawnInput is set.
+	project *project.Project
 }
 
 // buildSpawnReq constructs the daemon.SpawnReq for a ticket given the
@@ -3274,6 +3279,13 @@ type spawnReqInputs struct {
 func buildSpawnReq(in spawnReqInputs) daemon.SpawnReq {
 	args := make([]string, len(in.cleanArgs))
 	copy(args, in.cleanArgs)
+
+	// postSpawnInput, if non-empty, is sent to the PTY ~500ms after spawn
+	// by the daemon. Used for claude's `/color <palette>` slash command:
+	// Claude Code doesn't persist the color across sessions, so both new
+	// and resumed claude spawns get the input. Other agents leave this
+	// empty.
+	var postSpawnInput string
 
 	switch in.agentType {
 	case "claude":
@@ -3313,6 +3325,14 @@ func buildSpawnReq(in spawnReqInputs) daemon.SpawnReq {
 					}
 				}
 			}
+		}
+		// Set the project color via `/color <palette>` once the Claude UI
+		// is up. Applies to both new and resumed sessions because Claude
+		// Code does not persist the chosen color across sessions. The
+		// daemon writes this to the PTY ~500ms after spawn (see
+		// terminal.Pane.SchedulePostSpawnInput).
+		if in.project != nil {
+			postSpawnInput = "/color " + in.project.GetColor() + "\r"
 		}
 	case "opencode":
 		args = []string{in.workdir, "--port", fmt.Sprintf("%d", in.agentPort)}
@@ -3383,6 +3403,7 @@ func buildSpawnReq(in spawnReqInputs) daemon.SpawnReq {
 		Rows:             in.rows,
 		Scrollback:       0,
 		AgentSessionUUID: in.ticket.AgentSessionID,
+		PostSpawnInput:   postSpawnInput,
 	}
 }
 
@@ -3555,6 +3576,7 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 			opencodeSessionID: opencodeSessionID,
 			geminiSessionID:   geminiSessionID,
 			codexSessionID:    codexSessionID,
+			project:           proj,
 		})
 		spawnCtx, spawnCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		resp, err := daemonClient.Spawn(spawnCtx, req)
