@@ -170,6 +170,11 @@ type PaneView struct {
 	// signals, not data.
 	teaMsgs   chan tea.Msg
 	teaClosed atomic.Bool
+
+	// One-shot diagnostic logging flags so we don't spam stderr on
+	// every render. Will be removed once Bug A is closed.
+	viewLoggedSize bool
+	viewLoggedNil  bool
 }
 
 // NewPaneView constructs a fresh PaneView for the daemon-owned session
@@ -1125,13 +1130,23 @@ func (p *PaneView) View() string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.vt == nil {
+		if !p.viewLoggedNil {
+			log.Printf("openkanban paneview: View() vt is nil session=%s", p.sessionID)
+			p.viewLoggedNil = true
+		}
 		return ""
 	}
 	if !p.dirty && p.cachedView != "" {
 		return p.cachedView
 	}
 	cursorVisible := !p.cursorHidden.Load()
+	w := p.vt.Width()
+	h := p.vt.Height()
 	p.cachedView = terminal.RenderVT(p.vt, p.scrollback, p.viewportOffset, cursorVisible, p.selection)
+	if !p.viewLoggedSize {
+		log.Printf("openkanban paneview: View() session=%s vt_w=%d vt_h=%d viewportOffset=%d cursorVisible=%v rendered_len=%d", p.sessionID, w, h, p.viewportOffset, cursorVisible, len(p.cachedView))
+		p.viewLoggedSize = true
+	}
 	p.dirty = false
 	return p.cachedView
 }
