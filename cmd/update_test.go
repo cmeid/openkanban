@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -238,6 +239,105 @@ func TestUpdateCheckForUpdates_NoOriginRemote(t *testing.T) {
 	}
 	if status.Reason != "remote unreachable" {
 		t.Fatalf("expected Reason=%q, got %q", "remote unreachable", status.Reason)
+	}
+}
+
+// revParseHead returns the full SHA at the named ref in dir.
+func revParseRef(t *testing.T, dir, ref string) string {
+	t.Helper()
+	return strings.TrimSpace(runGit(t, dir, "rev-parse", ref))
+}
+
+func TestSyncLocalMain_FeatureBranchAdvances(t *testing.T) {
+	remote, local := setupRepos(t)
+
+	// Remote is ahead of local main by one commit.
+	makeCommit(t, remote, "new.txt", "new\n", "second commit on remote")
+
+	// Switch to a feature branch so HEAD's symbolic-ref is not main.
+	runGit(t, local, "checkout", "-b", "feat/x")
+
+	preMain := revParseRef(t, local, "refs/heads/main")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	syncLocalMain(ctx, local)
+
+	postMain := revParseRef(t, local, "refs/heads/main")
+	remoteMain := revParseRef(t, remote, "refs/heads/main")
+
+	if postMain == preMain {
+		t.Fatalf("expected local main to advance; stayed at %s", preMain)
+	}
+	if postMain != remoteMain {
+		t.Fatalf("expected local main to match remote (%s); got %s", remoteMain, postMain)
+	}
+}
+
+func TestSyncLocalMain_OnMainSkips(t *testing.T) {
+	remote, local := setupRepos(t)
+
+	// Remote is ahead, but we stay on main so the helper should skip
+	// (the existing pull in ApplyUpdate handles main).
+	makeCommit(t, remote, "new.txt", "new\n", "second commit on remote")
+
+	preMain := revParseRef(t, local, "refs/heads/main")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	syncLocalMain(ctx, local)
+
+	postMain := revParseRef(t, local, "refs/heads/main")
+
+	if postMain != preMain {
+		t.Fatalf("expected no-op on main; local main moved from %s to %s", preMain, postMain)
+	}
+}
+
+func TestSyncLocalMain_DivergedNoClobber(t *testing.T) {
+	remote, local := setupRepos(t)
+
+	// Diverge: remote gets one commit, local main gets a different commit,
+	// then we switch off main so the helper actually runs.
+	makeCommit(t, remote, "remote-only.txt", "remote\n", "remote-only commit")
+	makeCommit(t, local, "local-only.txt", "local\n", "local-only on main")
+	runGit(t, local, "checkout", "-b", "feat/x")
+
+	preMain := revParseRef(t, local, "refs/heads/main")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	syncLocalMain(ctx, local)
+
+	postMain := revParseRef(t, local, "refs/heads/main")
+
+	if postMain != preMain {
+		t.Fatalf("expected diverged local main to be untouched; moved from %s to %s", preMain, postMain)
+	}
+}
+
+func TestSyncLocalMain_DetachedHEAD(t *testing.T) {
+	remote, local := setupRepos(t)
+
+	// Remote is ahead. Detach HEAD so symbolic-ref returns an error —
+	// the helper must still advance local main.
+	makeCommit(t, remote, "new.txt", "new\n", "second commit on remote")
+	runGit(t, local, "checkout", "--detach", "HEAD")
+
+	preMain := revParseRef(t, local, "refs/heads/main")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	syncLocalMain(ctx, local)
+
+	postMain := revParseRef(t, local, "refs/heads/main")
+	remoteMain := revParseRef(t, remote, "refs/heads/main")
+
+	if postMain == preMain {
+		t.Fatalf("expected detached-HEAD path to advance local main; stayed at %s", preMain)
+	}
+	if postMain != remoteMain {
+		t.Fatalf("expected local main to match remote (%s); got %s", remoteMain, postMain)
 	}
 }
 

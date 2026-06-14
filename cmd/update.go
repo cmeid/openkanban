@@ -101,6 +101,15 @@ func runUpdate(ctx context.Context, out io.Writer, status UpdateStatus) error {
 func ApplyUpdate(ctx context.Context, status UpdateStatus, out io.Writer) error {
 	fmt.Fprintf(out, "updating %s: %s -> %s\n", SourcePath, status.LocalSHA, status.RemoteSHA)
 
+	// Best-effort: fast-forward the local main ref toward origin/main
+	// before pulling on the current branch. Without this, running update
+	// from a feature-branch worktree advances the feature branch but
+	// leaves local main behind — the next branch cut from a stale base.
+	// Errors are intentionally swallowed; the real update is the pull.
+	syncCtx, cancelSync := context.WithTimeout(ctx, 60*time.Second)
+	syncLocalMain(syncCtx, SourcePath)
+	cancelSync()
+
 	pullCtx, cancelPull := context.WithTimeout(ctx, 60*time.Second)
 	defer cancelPull()
 	pull := exec.CommandContext(pullCtx, "git", "-C", SourcePath, "pull", "--ff-only", "origin", "main")
@@ -133,6 +142,30 @@ func ApplyUpdate(ctx context.Context, status UpdateStatus, out io.Writer) error 
 		fmt.Fprintln(out, "installed")
 	}
 	return nil
+}
+
+// syncLocalMain best-effort fast-forwards the local `main` ref toward
+// `origin/main` in the source clone, regardless of which branch is
+// currently checked out. Uses `git fetch origin main:main`, which
+// refuses non-fast-forwards by construction — a diverged local main
+// (has commits not on origin/main) is naturally left untouched.
+//
+// Skipped when the current branch IS main: the existing
+// `git pull --ff-only origin main` in ApplyUpdate already moves it.
+// Detached HEAD is NOT main (symbolic-ref fails) so the helper still
+// runs, which is what we want — refs/heads/main otherwise stays stale.
+//
+// All errors are swallowed by design: the helper is additive hygiene
+// before the real pull. A failure here must not prevent the update.
+func syncLocalMain(ctx context.Context, sourcePath string) {
+	if sourcePath == "" {
+		return
+	}
+	out, err := exec.CommandContext(ctx, "git", "-C", sourcePath, "symbolic-ref", "--short", "HEAD").Output()
+	if err == nil && strings.TrimSpace(string(out)) == "main" {
+		return
+	}
+	_ = exec.CommandContext(ctx, "git", "-C", sourcePath, "fetch", "origin", "main:main").Run()
 }
 
 // resolveGoBin returns the directory where `go install` placed the
