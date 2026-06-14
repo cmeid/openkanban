@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,6 +34,7 @@ const launchCheckTimeout = 1500 * time.Millisecond
 // go install). In that case we return (false, err) and let the caller
 // decide whether to surface it and continue to the TUI.
 func MaybePromptForUpdate(cfg *config.Config, isTTY bool, disableFlag bool) (handled bool, err error) {
+	warnSourcePathMissingIfNeeded(cfg, SourcePath, isTTY, disableFlag, os.Stderr)
 	if !shouldPromptForUpdate(cfg, SourcePath, isTTY, disableFlag) {
 		return false, nil
 	}
@@ -82,6 +84,28 @@ func MaybePromptForUpdate(cfg *config.Config, isTTY bool, disableFlag bool) (han
 		// Esc / unknown — fall through to the TUI.
 		return false, nil
 	}
+}
+
+// warnSourcePathMissingIfNeeded emits a one-line notice to w when the
+// user is on a release build (SourcePath=="") but otherwise expects
+// auto-update to run (TTY, --no-update-check not set, config flag
+// enabled). The intent is to break the silent-no-op: a Homebrew or
+// plain-`go install` binary that won't auto-update should at least
+// say so on launch, instead of leaving the user to wonder why their
+// shipped changes never land.
+//
+// Strictly a warning — never a blocker. Startup proceeds regardless.
+func warnSourcePathMissingIfNeeded(cfg *config.Config, sourcePath string, isTTY bool, disableFlag bool, w io.Writer) {
+	if sourcePath != "" {
+		return
+	}
+	if !isTTY || disableFlag {
+		return
+	}
+	if cfg == nil || !cfg.Behavior.CheckForUpdatesOnLaunch {
+		return
+	}
+	fmt.Fprintln(w, "openkanban: auto-update disabled (release build / no source clone). Run ./scripts/install.sh from a clone to enable.")
 }
 
 // shouldPromptForUpdate is the pure gating predicate. It does NOT
