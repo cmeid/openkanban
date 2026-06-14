@@ -394,6 +394,13 @@ func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, w
 			Render("✗")
 	}
 
+	var attachedBadge string
+	if m.daemonAttached[ticket.ID] > 0 {
+		attachedBadge = lipgloss.NewStyle().
+			Foreground(m.colors.info).
+			Render("◉")
+	}
+
 	priorityBadge := m.renderPriorityBadge(ticket.Priority)
 
 	var depBadge string
@@ -422,6 +429,9 @@ func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, w
 	}
 	if sessionBadge != "" {
 		headerParts = append(headerParts, sessionBadge)
+	}
+	if attachedBadge != "" {
+		headerParts = append(headerParts, attachedBadge)
 	}
 	headerLine := strings.Join(headerParts, "  ")
 

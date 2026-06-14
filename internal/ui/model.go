@@ -240,6 +240,15 @@ type Model struct {
 	// daemon-pushed "working" with the file's stale "idle".
 	daemonOwned map[board.TicketID]struct{}
 
+	// daemonAttached counts pending attaches for each ticket's daemon
+	// session — a ticket renders as "attached to a TUI" when its count
+	// is >0. Maintained as a counter (not a bool) so takeover races
+	// remain correct: the new "attached" and the old "detached" events
+	// may arrive in either order from separate daemon goroutines, but
+	// +1/-1 gives the same net for both orderings. Populated at startup
+	// from SessionInfo.AttachedClient and reset on daemon disconnect.
+	daemonAttached map[board.TicketID]int
+
 	// guardAPI is the subset of daemonclient.Client used by the exit
 	// guard (PrepareExit / Kill / ClientID). Held as an interface so
 	// tests can substitute a fake without standing up a real daemon. Set
@@ -384,6 +393,7 @@ func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projec
 		spinner:            sp,
 		panes:              make(map[board.TicketID]*daemonclient.PaneView),
 		daemonOwned:        make(map[board.TicketID]struct{}),
+		daemonAttached:     make(map[board.TicketID]int),
 		statusDetector:     agent.NewStatusDetector(),
 		selectedProject:    selectedProject,
 		sidebarVisible:     cfg.UI.SidebarVisible,
@@ -423,6 +433,9 @@ func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projec
 			for _, s := range resp.Sessions {
 				ownedByDaemon[board.TicketID(s.TicketID)] = s
 				m.daemonOwned[board.TicketID(s.TicketID)] = struct{}{}
+				if s.AttachedClient != 0 {
+					m.daemonAttached[board.TicketID(s.TicketID)] = 1
+				}
 			}
 		} else {
 			log.Printf("openkanban: daemon list failed at startup: %v", err)
@@ -829,6 +842,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.daemonEvents = nil
 		for id := range m.daemonOwned {
 			delete(m.daemonOwned, id)
+		}
+		for id := range m.daemonAttached {
+			delete(m.daemonAttached, id)
 		}
 		if msg.Err != nil {
 			m.notify("Daemon disconnected: " + msg.Err.Error())

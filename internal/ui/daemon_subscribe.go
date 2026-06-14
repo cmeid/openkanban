@@ -101,10 +101,14 @@ func (e daemonSubscribeErr) Error() string { return string(e) }
 //                   AgentNone. PaneView (if held) is closed; the
 //                   focused-pane mode unwinds to ModeNormal when the
 //                   event lands on the focused ticket.
-//   - "attached"  → informational; no AgentStatus change.
-//   - "detached"  → informational; no AgentStatus change. The local
-//                   PaneView may already have transitioned to
-//                   PaneViewDetached via its own DetachMsg path.
+//   - "attached"  → no AgentStatus change; increments
+//                   daemonAttached[ticketID] so the board card renders
+//                   the "attached to a TUI" indicator.
+//   - "detached"  → no AgentStatus change; decrements
+//                   daemonAttached[ticketID] (guarded against
+//                   underflow). The local PaneView may already have
+//                   transitioned to PaneViewDetached via its own
+//                   DetachMsg path.
 //
 // Precedence rule: this handler is unconditional — push events
 // authoritatively trump the status-file poll while the daemon
@@ -129,6 +133,7 @@ func (m *Model) handleDaemonSessionEvent(msg daemonSessionEventMsg) (tea.Model, 
 				}
 			case "exited":
 				delete(m.daemonOwned, ticketID)
+				delete(m.daemonAttached, ticketID)
 				// Expected=true means the daemon initiated the kill via
 				// handleTicketDone (i.e. the agent invoked `openkanban
 				// ticket done`). Preserve AgentCompleted so the card
@@ -154,10 +159,19 @@ func (m *Model) handleDaemonSessionEvent(msg daemonSessionEventMsg) (tea.Model, 
 					m.mode = ModeNormal
 					m.focusedPane = ""
 				}
-			case "attached", "detached":
-				// Informational only — no AgentStatus change. The
-				// per-pane attached/detached UI is driven by the local
-				// PaneView's own PaneAttachedMsg / PaneDetachedMsg.
+			case "attached":
+				// Counter rather than bool so a takeover's
+				// attached(new)+detached(old) pair leaves us at 1
+				// regardless of arrival order (the daemon emits the
+				// two from separate goroutines).
+				m.daemonAttached[ticketID]++
+			case "detached":
+				if m.daemonAttached[ticketID] > 0 {
+					m.daemonAttached[ticketID]--
+					if m.daemonAttached[ticketID] == 0 {
+						delete(m.daemonAttached, ticketID)
+					}
+				}
 			}
 		}
 	}

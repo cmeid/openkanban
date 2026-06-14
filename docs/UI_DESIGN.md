@@ -196,6 +196,23 @@ App
 | Completed | ✓ | Green | Agent finished |
 | Error | ✗ | Red | Agent crashed |
 
+### Daemon Attach Indicator
+
+Orthogonal to agent status — signals whether the ticket's daemon
+session currently has a TUI client attached to its PTY (this TUI or
+a sibling viewing the same session).
+
+| State      | Icon   | Color | Description                                      |
+|------------|--------|-------|--------------------------------------------------|
+| Unattached | (none) | —     | Session alive but no TUI is in agent-view mode   |
+| Attached   | ◉      | info  | Some TUI is attached to the daemon session's PTY |
+
+Rendered in the card's header badge row, after the agent-status badge.
+Driven by daemon-pushed `attached` / `detached` SessionEvent
+broadcasts — see [AGENT_INTEGRATION.md → One attacher per session](AGENT_INTEGRATION.md#one-attacher-per-session-with-takeover)
+for the event flow and the receiver-side counter that makes it
+race-correct.
+
 ### Card Variations
 
 ```
