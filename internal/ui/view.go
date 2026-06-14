@@ -1525,10 +1525,12 @@ func (m *Model) renderAgentView() string {
 		spacing = 1
 	}
 
-	// Surface-tinted background spans the full width to mark the chrome
-	// as a distinct band over the embedded PTY. Inner badges keep their
-	// own backgrounds; spacing cells inherit the bar's tint.
-	barStyle := lipgloss.NewStyle().Background(m.colors.surface).Width(m.width)
+	// Overlay-tinted background spans the full width to mark the chrome
+	// as a distinct band over the embedded PTY. Using `overlay` rather
+	// than `surface` because surface alone is too subtle — at a glance
+	// it's not obvious the session is encapsulated. Inner badges keep
+	// their own backgrounds; spacing cells inherit the bar's tint.
+	barStyle := lipgloss.NewStyle().Background(m.colors.overlay).Width(m.width)
 	bar := barStyle.Render(header + strings.Repeat(" ", spacing) + hints)
 	b.WriteString(bar)
 	b.WriteString("\n")
@@ -1537,6 +1539,14 @@ func (m *Model) renderAgentView() string {
 		b.WriteString(barStyle.Render(depsLine))
 		b.WriteString("\n")
 	}
+
+	// Heavy primary-colored rule across the full width nails the boundary
+	// between openkanban chrome and the embedded PTY. Without it the
+	// surface-tinted band reads as "maybe a status line" — with it, the
+	// "this session is wrapped" affordance is unambiguous.
+	separatorStyle := lipgloss.NewStyle().Foreground(m.colors.primary)
+	b.WriteString(separatorStyle.Render(strings.Repeat("━", m.width)))
+	b.WriteString("\n")
 
 	b.WriteString(pane.View())
 

@@ -1609,11 +1609,16 @@ func ticketHasDeps(g *project.GlobalTicketStore, t *board.Ticket) bool {
 // agentChromeHeight is the pure mapping from "does the deps line
 // render?" to chrome height. Kept separate from the Model so it can
 // be unit-tested without constructing a store.
+//
+// Layout: 1 row header + (0 or 1) deps row + 1 row heavy rule. The
+// rule is the visual boundary between openkanban chrome and the
+// embedded PTY, so mouse coords must account for it when translating
+// host-terminal Y into pane-relative Y.
 func agentChromeHeight(hasDeps bool) int {
 	if hasDeps {
-		return 2
+		return 3
 	}
-	return 1
+	return 2
 }
 
 func (m *Model) handleTicketFormMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {

@@ -12,8 +12,10 @@ func TestAgentChromeHeight(t *testing.T) {
 		hasDeps bool
 		want    int
 	}{
-		{"no deps line, header only", false, 1},
-		{"deps line present", true, 2},
+		// Header row + heavy rule row.
+		{"no deps line, header + rule", false, 2},
+		// Header row + deps row + heavy rule row.
+		{"deps line present, header + deps + rule", true, 3},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
