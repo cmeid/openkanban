@@ -646,7 +646,24 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case daemonclient.PaneOutputMsg, daemonclient.PaneRenderTickMsg, daemonclient.PaneAttachedMsg, daemonclient.PaneDetachedMsg:
+	case daemonclient.PaneOutputMsg, daemonclient.PaneRenderTickMsg, daemonclient.PaneAttachedMsg:
+		return m.handleTerminalMsg(msg)
+
+	case daemonclient.PaneDetachedMsg:
+		// Detach is the signal we get when the binary attach conn
+		// closes — either the agent exited (claude /q), the daemon
+		// killed the session, or another TUI took over. In all three
+		// cases, the local PaneView's vt has been torn down and View()
+		// returns "" (blank pane). Surface that by returning the user
+		// to the board if they're currently focused on this pane.
+		// They can re-enter via Enter if the session is still alive in
+		// the daemon (e.g. takeover case).
+		ticketID := board.TicketID(msg.PaneID)
+		if m.focusedPane == ticketID {
+			m.mode = ModeNormal
+			m.focusedPane = ""
+			m.selectTicketByID(ticketID)
+		}
 		return m.handleTerminalMsg(msg)
 
 	case daemonclient.PaneExitMsg:
