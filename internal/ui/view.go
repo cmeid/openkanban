@@ -729,7 +729,8 @@ func (m *Model) renderHelp() string {
 		"  " + keyStyle.Render("j/k") + descStyle.Render("   Move between tickets  ") + keyStyle.Render("e") + descStyle.Render("       Edit ticket") + "\n" +
 		"  " + keyStyle.Render("g") + descStyle.Render("     Go to first ticket    ") + keyStyle.Render("d") + descStyle.Render("       Delete ticket") + "\n" +
 		"  " + keyStyle.Render("G") + descStyle.Render("     Go to last ticket     ") + keyStyle.Render("Space") + descStyle.Render("   Move forward") + "\n" +
-		"  " + keyStyle.Render(" ") + descStyle.Render("                            ") + keyStyle.Render("-") + descStyle.Render("       Move backward") + "\n\n" +
+		"  " + keyStyle.Render(" ") + descStyle.Render("                            ") + keyStyle.Render("-") + descStyle.Render("       Move backward") + "\n" +
+		"  " + keyStyle.Render(" ") + descStyle.Render("                            ") + keyStyle.Render("K/J") + descStyle.Render("     Raise/lower priority") + "\n\n" +
 		sep + "\n" +
 		sectionStyle.Render("  📂 Sidebar") + "                    " + sectionStyle.Render("🤖 Agent") + "\n" +
 		sep + "\n" +
@@ -741,7 +742,8 @@ func (m *Model) renderHelp() string {
 		sectionStyle.Render("  👁 View") + "\n" +
 		sep + "\n" +
 		"  " + keyStyle.Render("/") + descStyle.Render("     Search/filter         ") + keyStyle.Render("O") + descStyle.Render("       Settings") + "\n" +
-		"  " + keyStyle.Render("?") + descStyle.Render("     Toggle help           ") + keyStyle.Render("q") + descStyle.Render("       Quit") + "\n\n" +
+		"  " + keyStyle.Render("o") + descStyle.Render("     Cycle sort order      ") + keyStyle.Render("?") + descStyle.Render("       Toggle help") + "\n" +
+		"  " + keyStyle.Render(" ") + descStyle.Render("                            ") + keyStyle.Render("q") + descStyle.Render("       Quit") + "\n\n" +
 		sep + "\n" +
 		"  " + lipgloss.NewStyle().Foreground(m.colors.warning).Render("💡") + m.dimStyle().Render(" Tip: Hold Shift to select text in agent view") + "\n\n" +
 		"  " + m.dimStyle().Render("Press any key to close")

@@ -49,6 +49,44 @@ const (
 	ModeCreateProject Mode = "NEW_PROJECT"
 )
 
+// SortMode controls the order tickets appear within each column.
+// SortDefault preserves the store's natural (map-iteration) order so
+// existing behavior is unchanged until the user opts in with `o`.
+type SortMode string
+
+const (
+	SortDefault  SortMode = ""
+	SortName     SortMode = "name"
+	SortAge      SortMode = "age"
+	SortPriority SortMode = "priority"
+)
+
+// sortModes is the cycle order the `o` keybinding walks. Kept here so
+// the cycle and the label/help text stay in sync.
+var sortModes = []SortMode{SortDefault, SortName, SortAge, SortPriority}
+
+func nextSortMode(s SortMode) SortMode {
+	for i, m := range sortModes {
+		if m == s {
+			return sortModes[(i+1)%len(sortModes)]
+		}
+	}
+	return SortDefault
+}
+
+func sortModeLabel(s SortMode) string {
+	switch s {
+	case SortName:
+		return "name (A→Z)"
+	case SortAge:
+		return "age (newest first)"
+	case SortPriority:
+		return "priority (highest first)"
+	default:
+		return "default"
+	}
+}
+
 const (
 	minColumnWidth = 20
 	columnOverhead = 5
@@ -127,6 +165,11 @@ type Model struct {
 	lastClickTicket int
 
 	columnTickets [][]*board.Ticket
+
+	// sortMode is the user-selected sort applied to each column in
+	// refreshColumnTickets. Session-only (not persisted); SortDefault
+	// preserves the store's natural order.
+	sortMode SortMode
 
 	showHelp    bool
 	showConfirm bool
@@ -1036,6 +1079,13 @@ func (m *Model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.quickMoveTicketBackward()
 	case "S":
 		return m.stopAgent()
+
+	case "K":
+		return m.adjustPriority(-1)
+	case "J":
+		return m.adjustPriority(1)
+	case "o":
+		return m.cycleSortMode()
 
 	case ":":
 		m.mode = ModeCommand
@@ -3020,6 +3070,57 @@ func (m *Model) quickMoveTicket() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// adjustPriority shifts the active ticket's priority by delta (negative
+// = raise, positive = lower) within the valid 1..5 range. Priority 1 is
+// the highest, so "raise" maps to a smaller number. The selected ticket
+// stays selected after the column rebuilds even when a priority sort
+// would otherwise drift it under the cursor.
+func (m *Model) adjustPriority(delta int) (tea.Model, tea.Cmd) {
+	ticket := m.selectedTicket()
+	if ticket == nil {
+		m.notify("No ticket selected")
+		return m, nil
+	}
+
+	current := effectivePriority(ticket.Priority)
+	next := current + delta
+	if next < 1 {
+		m.notify("Already at highest priority")
+		return m, nil
+	}
+	if next > 5 {
+		m.notify("Already at lowest priority")
+		return m, nil
+	}
+
+	ticket.Priority = next
+	ticket.Touch()
+	m.saveTicket(ticket)
+	m.refreshColumnTickets()
+	m.selectTicketByID(ticket.ID)
+
+	if delta < 0 {
+		m.notify(fmt.Sprintf("Priority raised to %d", next))
+	} else {
+		m.notify(fmt.Sprintf("Priority lowered to %d", next))
+	}
+	return m, nil
+}
+
+// cycleSortMode advances to the next sort mode and re-renders the board.
+// The currently-selected ticket stays selected so the cursor doesn't
+// jump to whatever happens to land at its old index after sorting.
+func (m *Model) cycleSortMode() (tea.Model, tea.Cmd) {
+	ticket := m.selectedTicket()
+	m.sortMode = nextSortMode(m.sortMode)
+	m.refreshColumnTickets()
+	if ticket != nil {
+		m.selectTicketByID(ticket.ID)
+	}
+	m.notify("Sort: " + sortModeLabel(m.sortMode))
+	return m, nil
+}
+
 func (m *Model) quickMoveTicketBackward() (tea.Model, tea.Cmd) {
 	ticket := m.selectedTicket()
 	if ticket == nil {
@@ -3786,12 +3887,45 @@ func (m *Model) refreshColumnTickets() {
 			}
 			filtered = append(filtered, t)
 		}
+		sortTickets(filtered, m.sortMode)
 		m.columnTickets[i] = filtered
 	}
 
 	if len(m.columnOffsets) != len(m.columns) {
 		m.columnOffsets = make([]int, len(m.columns))
 	}
+}
+
+// sortTickets reorders the slice in place per the given mode. Priority 0
+// (unset) is treated as the default value 3 so cards predating the
+// priority field don't all clump at one end of the sort.
+func sortTickets(tickets []*board.Ticket, mode SortMode) {
+	switch mode {
+	case SortName:
+		sort.SliceStable(tickets, func(i, j int) bool {
+			return strings.ToLower(tickets[i].Title) < strings.ToLower(tickets[j].Title)
+		})
+	case SortAge:
+		sort.SliceStable(tickets, func(i, j int) bool {
+			return tickets[i].CreatedAt.After(tickets[j].CreatedAt)
+		})
+	case SortPriority:
+		sort.SliceStable(tickets, func(i, j int) bool {
+			a := effectivePriority(tickets[i].Priority)
+			b := effectivePriority(tickets[j].Priority)
+			if a != b {
+				return a < b
+			}
+			return tickets[i].CreatedAt.After(tickets[j].CreatedAt)
+		})
+	}
+}
+
+func effectivePriority(p int) int {
+	if p < 1 || p > 5 {
+		return 3
+	}
+	return p
 }
 
 func (m *Model) ticketMatchesFilter(t *board.Ticket) bool {
