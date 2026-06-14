@@ -4091,19 +4091,21 @@ func (m *Model) getAgentIndex(agentName string) int {
 	return 0
 }
 
-const gracefulShutdownTimeout = 3 * time.Second
-
 // T2 of the integration plan removed maybeAutoStopCompletedPane.
 // Ticket-done now flows CLI → daemon (TicketDoneReq) → SessionEvent
 // broadcast; subscribed TUIs react via handleDaemonSessionEvent with
 // the authoritative Expected=true signal. No per-TUI poll-driven kill
 // path remains.
 
+// Cleanup detaches every pane this TUI holds from its daemon-side
+// session. It does NOT kill the underlying agents: daemon sessions
+// outlive any single TUI, and other TUIs may still be attached. The
+// daemon's last-client-disconnect handler (server.go) is the only
+// place sessions die on TUI exit, and it only fires when the actual
+// last connection drops.
 func (m *Model) Cleanup() {
 	for _, pane := range m.panes {
-		if pane.Running() {
-			pane.StopGraceful(gracefulShutdownTimeout)
-		}
+		_ = pane.Close()
 	}
 }
 
