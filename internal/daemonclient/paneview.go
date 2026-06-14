@@ -859,8 +859,8 @@ func (p *PaneView) Close() error {
 // or terminal.ExitFocusMsg in the attached case, AttachFirstMsg in the
 // unattached case, nil in the detached case.
 func (p *PaneView) HandleKey(msg tea.KeyMsg) tea.Msg {
-	log.Printf("openkanban paneview: HandleKey msg=%q", msg.String())
 	if msg.String() == "ctrl+g" {
+		log.Printf("openkanban paneview: HandleKey ctrl+g -> ExitFocusMsg")
 		return terminal.ExitFocusMsg{}
 	}
 
