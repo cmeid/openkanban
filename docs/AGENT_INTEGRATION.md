@@ -55,8 +55,8 @@ The daemon is autostarted on the first TUI invocation that needs it — `daemonc
 
 This is **not** a tmux-style long-running service. The daemon's contract is "be alive while there's a TUI that needs me." Concretely:
 
-- Last-client-disconnect triggers shutdown. When the connected-clients count drops to zero, the daemon waits a short grace period; if it stays at zero, it kills any still-live sessions (defensively — the TUI's exit-guard should have caught this) and exits. See `internal/daemon/server.go:handleLastClientDisconnect`.
-- The TUI's exit-guard (see `internal/ui/exit_guard.go`) prompts the user before quitting if doing so would leave the daemon as the last client with live sessions.
+- Last-client-disconnect triggers shutdown. When the connected-clients count drops to zero, the daemon kills any still-live sessions (defensively — the TUI's exit-guard should have caught this) and exits immediately. See `internal/daemon/server.go:handleLastClientDisconnect`.
+- The TUI's exit-guard (see `internal/ui/exit_guard.go`) prompts the user before quitting whenever live daemon sessions exist, regardless of client count — so simultaneous-close races across multiple TUIs can't bypass the prompt and tip the daemon into the defensive-kill path.
 
 This means a daemon process never outlives its useful work. It also means `openkanban daemon` from a fresh shell with no TUI running will start and immediately exit — that's expected; pair it with a TUI or a long-lived `openkanban daemon list` to keep it up for debugging.
 

@@ -268,6 +268,14 @@ func (p *PaneView) SetSessionName(name string) {
 	p.sessionName = name
 }
 
+// SessionName returns the cached OPENKANBAN_SESSION value (set at
+// construction from the daemon's SessionInfo, or via SetSessionName).
+func (p *PaneView) SessionName() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.sessionName
+}
+
 // Title returns the most recent OSC 0/2 window title.
 //
 // State matrix:
