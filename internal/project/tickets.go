@@ -86,6 +86,15 @@ func LoadTicketStore(project *Project) (*TicketStore, error) {
 			}
 			return fs.SkipDir
 		}
+		// Sweep stale per-writer tmp files left by crashed saves
+		// (os.CreateTemp(dir, "<final>.tmp-*") names). Best-effort —
+		// a remove failure is just logged.
+		if strings.Contains(d.Name(), ".tmp-") || strings.HasSuffix(d.Name(), ".tmp") {
+			if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
+				log.Printf("openkanban: failed to sweep stale tmp %s: %v", path, rmErr)
+			}
+			return nil
+		}
 		if !strings.HasSuffix(d.Name(), ".md") {
 			return nil
 		}
@@ -170,12 +179,28 @@ func (s *TicketStore) SaveTicket(t *board.Ticket) error {
 	}
 
 	newPath := filepath.Join(dir, TicketFilename(t))
-	tmpPath := newPath + ".tmp"
 
-	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
+	// os.CreateTemp gives each writer a unique tmp name
+	// (<final>.tmp-<rand>) so concurrent writers — including
+	// other openkanban processes subscribed to the same daemon —
+	// don't race on a shared "<final>.tmp" path and have one
+	// rename consume the tmp file from under another.
+	tmp, err := os.CreateTemp(dir, TicketFilename(t)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create tmp: %w", err)
+	}
+	tmpPath := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
 		return fmt.Errorf("write tmp: %w", err)
 	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("close tmp: %w", err)
+	}
 	if err := os.Rename(tmpPath, newPath); err != nil {
+		os.Remove(tmpPath)
 		return fmt.Errorf("rename tmp to dest: %w", err)
 	}
 

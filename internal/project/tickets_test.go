@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -258,10 +259,107 @@ func TestTicketStore_AtomicSaveNoTmpLeftover(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read project dir: %v", err)
 	}
+	// Both the original "<final>.tmp" pattern and the per-writer
+	// unique "<final>.tmp-<rand>" pattern (used to avoid the multi-process
+	// rename race) must be cleaned up after a successful save.
 	for _, ent := range entries {
-		if strings.HasSuffix(ent.Name(), ".tmp") {
-			t.Errorf("leftover .tmp file: %s", ent.Name())
+		if strings.Contains(ent.Name(), ".tmp") {
+			t.Errorf("leftover tmp file: %s", ent.Name())
 		}
+	}
+}
+
+// TestSaveTicket_ConcurrentSavesAllSucceed is the regression test for the
+// multi-PROCESS rename race observed in the wild: every openkanban TUI
+// subscribes to the daemon and saves the ticket on each push event, so
+// multiple TicketStore instances (one per process) converge on the same
+// destination file. If they also converge on the same "<dest>.tmp" path,
+// one writer's Rename consumes the tmp file from under another, and the
+// loser fails with "no such file or directory". Per-writer unique tmp
+// filenames (os.CreateTemp) eliminate the collision.
+//
+// We simulate this with N independent TicketStore instances sharing the
+// same config dir, each in its own goroutine. Each store holds its own
+// in-memory ticket struct, mirroring how separate processes never share
+// the in-memory map (so this is NOT testing intra-process safety of the
+// store's maps — that's a separate concern).
+func TestSaveTicket_ConcurrentSavesAllSucceed(t *testing.T) {
+	configDir := setupTmpConfigDir(t)
+	repoPath := t.TempDir()
+	ticket := board.NewTicket("ConcurrentSave", "project-1")
+
+	// Prime once so the destination exists — mirrors the in-the-wild
+	// state where the ticket was saved before the burst of session
+	// events arrives.
+	priming := NewTicketStore("project-1", repoPath)
+	priming.Add(ticket)
+	if err := priming.SaveTicket(ticket); err != nil {
+		t.Fatalf("initial SaveTicket: %v", err)
+	}
+
+	const writers = 16
+	const rounds = 8
+	errs := make(chan error, writers*rounds)
+	var wg sync.WaitGroup
+	wg.Add(writers)
+	for w := 0; w < writers; w++ {
+		go func() {
+			defer wg.Done()
+			// Each "process" gets its own store + its own copy of the
+			// ticket. They all target the same on-disk path.
+			store := NewTicketStore("project-1", repoPath)
+			local := *ticket
+			store.Add(&local)
+			for r := 0; r < rounds; r++ {
+				if err := store.SaveTicket(&local); err != nil {
+					errs <- err
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+
+	var got []error
+	for err := range errs {
+		got = append(got, err)
+	}
+	if len(got) > 0 {
+		t.Fatalf("%d concurrent SaveTicket failures; first: %v", len(got), got[0])
+	}
+
+	// The final on-disk file must parse back to the same ticket id and
+	// no .tmp / .tmp-* orphans must remain.
+	projectDir := filepath.Join(configDir, "tickets", "project-1")
+	entries, err := os.ReadDir(projectDir)
+	if err != nil {
+		t.Fatalf("read project dir: %v", err)
+	}
+	var mdFiles, tmpFiles []string
+	for _, ent := range entries {
+		if strings.HasSuffix(ent.Name(), ".md") {
+			mdFiles = append(mdFiles, ent.Name())
+		}
+		if strings.Contains(ent.Name(), ".tmp") {
+			tmpFiles = append(tmpFiles, ent.Name())
+		}
+	}
+	if len(mdFiles) != 1 {
+		t.Fatalf("expected exactly 1 .md file; got %d: %v", len(mdFiles), mdFiles)
+	}
+	if len(tmpFiles) != 0 {
+		t.Errorf("leftover tmp files after concurrent saves: %v", tmpFiles)
+	}
+	data, err := os.ReadFile(filepath.Join(projectDir, mdFiles[0]))
+	if err != nil {
+		t.Fatalf("read final file: %v", err)
+	}
+	got2, err := UnmarshalTicket(data)
+	if err != nil {
+		t.Fatalf("unmarshal final file: %v", err)
+	}
+	if got2.ID != ticket.ID {
+		t.Errorf("final file ticket ID = %q; want %q", got2.ID, ticket.ID)
 	}
 }
 
