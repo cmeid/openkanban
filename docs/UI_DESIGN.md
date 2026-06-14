@@ -83,6 +83,66 @@ This document defines the visual design, component hierarchy, and styling for Ag
 └─────────────────────────────────────────────────────┘
 ```
 
+## Embedded Session View
+
+When the user attaches into a running agent (Enter on an in-progress
+ticket), the TUI enters `ModeAgentView` and the inner PTY takes over
+the full window. A title bar at the top names the session and surfaces
+state at a glance; the rest of the screen is the agent's terminal.
+
+### Wireframe: Embedded Session
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│⎯⎯ Implement auth │ openkanban │ claude │ ● working │ ⏱ 2h15m   [1/3] Ctrl+g│  ← surface-tinted band
+│⛓↑ Schema design                                                              │  ← optional deps row
+│                                                                              │
+│  $ claude --resume … --fork-session                                          │
+│  ⏵ Adding JWT signing helper to internal/auth/token.go                       │
+│  ...                                                                         │
+│  (live PTY content)                                                          │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Title Bar Segments (left to right)
+
+| Segment              | Source                       | Notes                                                              |
+|----------------------|------------------------------|--------------------------------------------------------------------|
+| Priority glyph       | `ticket.Priority` (1–5)      | Same convention as the card view (P1=err, P5=muted).               |
+| Bold title           | `ticket.Title`               | The lead element — no breadcrumb.                                  |
+| Project badge        | `project.Name`               | Suppressed when the project is single.                             |
+| Agent type badge     | `ticket.AgentType`           | "claude", etc.                                                     |
+| Status pill          | `ticket.AgentStatus`         | `● working` / `◐ waiting` / `◆ idle` / `✓ done` / `✗ error`.       |
+| ⏱ Duration           | `time.Since(AgentSpawnedAt)` | Session age. Suppressed when status is `done` (pill carries it).   |
+| `[n/m]` pane indicator | `Running()` panes          | Position of the focused pane among all running panes.              |
+| Scroll indicator     | `pane.ViewportOffset()`      | `↑offset/total` in warning color when scrolled back.               |
+| `Ctrl+g Board`       | Static                       | The only key intercepted by `handleAgentViewMode` — exits the view.|
+
+### Time Semantics
+
+The `⏱` duration is **elapsed time since the agent was first spawned**
+for this ticket. `AgentSpawnedAt` is set once on first spawn and
+persists on the ticket's YAML frontmatter, so the counter survives TUI
+and daemon restarts — it only resets on a force-fresh kill. There is
+no agent last-activity timestamp; building an "idle for X" display
+would require a new field written from the daemon's `started` /
+`attached` push handlers.
+
+### Status Pill Colors
+
+| Status      | Glyph | Color     |
+|-------------|-------|-----------|
+| `working`   | ●     | success   |
+| `waiting`   | ◐     | warning   |
+| `idle`      | ◆     | muted     |
+| `completed` | ✓     | success   |
+| `error`     | ✗     | err       |
+| `none`      | —     | (no pill) |
+
+The whole header row (plus the optional deps row) renders with
+`m.colors.surface` as background so the chrome reads as a distinct
+band over the embedded PTY content.
+
 ## Component Hierarchy
 
 ```
