@@ -43,7 +43,7 @@ Stay scoped to this ticket's worktree; don't change ticket status — OpenKanban
 
 Your full brief lives at ` + "`{{.BriefPath}}`" + ` in this worktree. Read it before you start — that file is your primary specification. The "## Notes (from openkanban card)" block is auto-synced from the openkanban card by OpenKanban; treat it as the latest user-supplied additions. User-authored sections (## Brief, ## Acceptance, etc.) above the block are yours to read and refine if appropriate.{{end}}
 
-OpenKanban moved this ticket to in_progress on spawn. Leave the status as-is when you finish; the user will move it to done after reviewing. Work only inside this worktree; do not modify other tickets' briefs or worktrees.
+OpenKanban moved this ticket to in_progress on spawn. Leave the status as-is when you finish; the user will move it to in_review and then to done after reviewing. Work only inside this worktree; do not modify other tickets' briefs or worktrees.
 
 Focus on completing this ticket. Ask clarifying questions if anything is unclear.{{end}}`
 

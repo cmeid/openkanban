@@ -219,7 +219,7 @@ Available color fields:
 
 **Semantic accents:**
 - `primary` - Main accent (focus, selection, backlog column)
-- `secondary` - Secondary accent (special highlights)
+- `secondary` - Secondary accent (in-review column, special highlights)
 - `success` - Positive states (done column, confirmations)
 - `warning` - Caution states (in-progress column)
 - `error` - Errors and destructive actions

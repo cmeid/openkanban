@@ -368,7 +368,7 @@ type ThemeColors struct {
 
     // Semantic accents
     Primary   string // Main accent (focus, selection, backlog column)
-    Secondary string // Secondary accent (special highlights)
+    Secondary string // Secondary accent (in-review column, special highlights)
     Success   string // Positive states (done column, confirmations)
     Warning   string // Caution states (in-progress column)
     Error     string // Errors, destructive actions
@@ -382,6 +382,7 @@ type ThemeColors struct {
 |---------|-------|-------|
 | Backlog column | `Primary` | Column header, selected ticket border |
 | In Progress column | `Warning` | Column header, working agent indicator |
+| In Review column | `Secondary` | Column header, awaiting-human-review state |
 | Done column | `Success` | Column header, completed status |
 | Agent idle | `Primary` | Idle session indicator |
 | Agent working | `Warning` | Active processing (animated) |

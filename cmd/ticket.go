@@ -506,7 +506,7 @@ func init() {
 	ticketNewCmd.Flags().StringVar(&ticketNewDescriptionFile, "description-file", "",
 		"Read description from this file path instead of --description")
 	ticketNewCmd.Flags().StringVar(&ticketNewStatus, "status", "",
-		"Initial status: backlog (default), in_progress, done, archived")
+		"Initial status: backlog (default), in_progress, in_review, done, archived")
 	ticketNewCmd.Flags().StringVar(&ticketNewLabels, "labels", "",
 		"Comma-separated labels")
 	ticketNewCmd.Flags().IntVar(&ticketNewPriority, "priority", 0,
