@@ -140,7 +140,12 @@ type PaneView struct {
 	cursorHidden    atomic.Bool
 	mouseEnabled    bool
 	altScreenActive bool
-	cachedTitle     string
+	// cachedTitle is touched from BOTH applyOutput's OSC handler (which
+	// runs INSIDE p.vt.Write while applyOutput holds p.mu) AND from the
+	// Title() accessor. If it were a plain string guarded by p.mu, the
+	// OSC handler would re-acquire p.mu reentrantly and deadlock. Stored
+	// as atomic.Value so the OSC handler's write is lock-free.
+	cachedTitle atomic.Value // string
 
 	// Last successful List snapshot — populated by NewPaneView (when
 	// the caller passes one) and refreshed by Refresh(). Read in
@@ -197,7 +202,7 @@ func NewPaneView(client *Client, ticketID, sessionID string, info *daemon.Sessio
 	if info != nil {
 		copy := *info
 		pv.lastInfo = &copy
-		pv.cachedTitle = info.Title
+		pv.cachedTitle.Store(info.Title)
 		pv.width = info.Cols
 		pv.height = info.Rows
 		pv.workdir = info.Workdir
@@ -271,14 +276,21 @@ func (p *PaneView) Title() string {
 	defer p.mu.Unlock()
 	switch p.state {
 	case PaneViewAttached:
-		return p.cachedTitle
+		return cachedTitleValue(&p.cachedTitle)
 	case PaneViewUnattached:
 		if p.lastInfo != nil {
 			return p.lastInfo.Title
 		}
-		return p.cachedTitle
+		return cachedTitleValue(&p.cachedTitle)
 	}
 	return ""
+}
+
+// cachedTitleValue reads the atomic title slot, returning "" when it's
+// never been set. Used so callers don't have to repeat the type assertion.
+func cachedTitleValue(v *atomic.Value) string {
+	t, _ := v.Load().(string)
+	return t
 }
 
 // Running reports whether the underlying session is alive.
@@ -402,10 +414,13 @@ func (p *PaneView) initEmulatorLocked() {
 	p.scrollback = terminal.NewScrollbackBuffer(10000)
 	p.selection = terminal.NewSelectionState()
 	titleHandler := func(data []byte) bool {
+		// IMPORTANT: this callback runs SYNCHRONOUSLY inside vt.Write,
+		// which is itself called from applyOutput while applyOutput
+		// holds p.mu. Taking p.mu here would deadlock the calling
+		// goroutine. cachedTitle is an atomic.Value precisely so this
+		// path is lock-free.
 		title := parseOscTitlePayload(data)
-		p.mu.Lock()
-		p.cachedTitle = title
-		p.mu.Unlock()
+		p.cachedTitle.Store(title)
 		return true
 	}
 	p.vt.RegisterOscHandler(0, titleHandler)
@@ -1291,7 +1306,7 @@ func (p *PaneView) Refresh(info daemon.SessionInfo) {
 	cp := info
 	p.lastInfo = &cp
 	if info.Title != "" {
-		p.cachedTitle = info.Title
+		p.cachedTitle.Store(info.Title)
 	}
 	if info.Workdir != "" && p.workdir == "" {
 		p.workdir = info.Workdir
