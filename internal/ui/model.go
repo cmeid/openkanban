@@ -1457,31 +1457,56 @@ func (m *Model) handleAgentViewMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	if !ok {
 		return m, nil
 	}
+	adjusted, action := routeAgentViewMouse(msg, m.width, m.agentViewChromeHeight())
+	switch action {
+	case agentViewMouseCloseModal:
+		m.mode = ModeNormal
+		return m, m.maybeSetWindowTitle()
+	case agentViewMouseForward:
+		pane.HandleMouse(adjusted)
+	}
+	return m, nil
+}
 
+// agentViewMouseAction is the routing decision for an incoming mouse
+// event in the agent view modal.
+type agentViewMouseAction int
+
+const (
+	agentViewMouseDrop agentViewMouseAction = iota
+	agentViewMouseForward
+	agentViewMouseCloseModal
+)
+
+// routeAgentViewMouse decides what handleAgentViewMouse should do
+// with a mouse event: close the modal (close-button hit), forward
+// to the pane with pane-relative coordinates, or drop it.
+//
+// BubbleTea reports mouse Y relative to the host terminal (row 0
+// = top of TUI). The pane's content sits below the agent view's
+// chrome (1-row header, plus optional 1-row deps line). We subtract
+// chrome height so the pane sees pane-relative coordinates;
+// otherwise selection lands one (or two) rows below the cursor.
+//
+// Position-sensitive events (click/drag) landing on the chrome
+// rows are dropped. Wheel events are position-insensitive — the
+// user expects scroll to work regardless of which row the cursor
+// happens to sit on — so they are clamped to row 0 and forwarded.
+func routeAgentViewMouse(msg tea.MouseMsg, width, chrome int) (tea.MouseMsg, agentViewMouseAction) {
 	if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
-		if msg.Y == 0 && msg.X >= m.width-25 {
-			m.mode = ModeNormal
-			return m, m.maybeSetWindowTitle()
+		if msg.Y == 0 && msg.X >= width-25 {
+			return msg, agentViewMouseCloseModal
 		}
 	}
-
-	// BubbleTea reports mouse Y relative to the host terminal (row 0
-	// = top of TUI). The pane's content sits below the agent view's
-	// chrome (1-row header, plus optional 1-row deps line). Subtract
-	// the chrome height so the pane sees pane-relative coordinates;
-	// otherwise selection lands one (or two) rows below the cursor.
-	chrome := m.agentViewChromeHeight()
 	adjusted := msg
 	adjusted.Y = msg.Y - chrome
 	if adjusted.Y < 0 {
-		// Click landed on the chrome itself (header or deps line).
-		// Row 0 / close-button case is handled above; other chrome
-		// clicks are no-ops.
-		return m, nil
+		if !tea.MouseEvent(msg).IsWheel() {
+			return msg, agentViewMouseDrop
+		}
+		adjusted.Y = 0
 	}
-
-	pane.HandleMouse(adjusted)
-	return m, nil
+	return adjusted, agentViewMouseForward
 }
 
 // agentViewChromeHeight returns the height in rows of the non-pane
