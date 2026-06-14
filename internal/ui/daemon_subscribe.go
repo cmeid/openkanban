@@ -65,13 +65,17 @@ func subscribeDaemonEvents(client *daemonclient.Client) (<-chan daemon.SessionEv
 // daemonSessionEventMsg so events keep flowing.
 func readNextDaemonEvent(ch <-chan daemon.SessionEvent) tea.Cmd {
 	if ch == nil {
+		log.Printf("openkanban model: readNextDaemonEvent invoked with nil channel")
 		return func() tea.Msg { return daemonSubscribeEndedMsg{} }
 	}
 	return func() tea.Msg {
+		log.Printf("openkanban model: readNextDaemonEvent waiting on channel")
 		ev, ok := <-ch
 		if !ok {
+			log.Printf("openkanban model: readNextDaemonEvent channel closed")
 			return daemonSubscribeEndedMsg{}
 		}
+		log.Printf("openkanban model: readNextDaemonEvent got event=%q session=%s", ev.Event, ev.SessionID)
 		return daemonSessionEventMsg{Event: ev}
 	}
 }

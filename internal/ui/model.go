@@ -483,6 +483,22 @@ func (m *Model) checkForUpdates() tea.Cmd {
 }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Daemon push events must be handled regardless of mode so the
+	// readNextDaemonEvent listener is always re-armed. If we let these
+	// fall through to a mode-specific switch (ModeSpawning, ModeShuttingDown)
+	// that doesn't list them as a case, the msg is silently dropped and
+	// handleDaemonSessionEvent never fires — which means the re-arm cmd
+	// is never returned and every subsequent push event piles up in the
+	// subscriber channel buffer with no reader.
+	switch msg := msg.(type) {
+	case daemonSessionEventMsg:
+		return m.handleDaemonSessionEvent(msg)
+	case daemonSubscribeFailedMsg:
+		return m.handleDaemonSubscribeFailed(msg)
+	case daemonSubscribeEndedMsg:
+		return m.handleDaemonSubscribeEnded(msg)
+	}
+
 	if m.mode == ModeShuttingDown {
 		switch msg := msg.(type) {
 		case shutdownCompleteMsg:
@@ -782,15 +798,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// to refreshing AgentStatus for visibility — it no longer
 			// kills panes.
 		}
-
-	case daemonSessionEventMsg:
-		return m.handleDaemonSessionEvent(msg)
-
-	case daemonSubscribeFailedMsg:
-		return m.handleDaemonSubscribeFailed(msg)
-
-	case daemonSubscribeEndedMsg:
-		return m.handleDaemonSubscribeEnded(msg)
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd
