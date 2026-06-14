@@ -110,6 +110,9 @@ func (m *Model) handleDaemonSessionEvent(msg daemonSessionEventMsg) (tea.Model, 
 	ev := msg.Event
 	ticketID := board.TicketID(ev.TicketID)
 
+	log.Printf("openkanban model: handleDaemonSessionEvent event=%q session=%s ticket=%s expected=%v",
+		ev.Event, ev.SessionID, ev.TicketID, ev.Expected)
+
 	if ticketID != "" {
 		ticket, _ := m.globalStore.Get(ticketID)
 		if ticket != nil {
