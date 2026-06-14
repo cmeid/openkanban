@@ -141,6 +141,10 @@ type PaneView struct {
 	cursorHidden    atomic.Bool
 	mouseEnabled    bool
 	altScreenActive bool
+	// lastTopRow is the row-0 snapshot taken inside applyOutput just
+	// before vt.Write; PushScrolledLine compares against it after the
+	// write and pushes to scrollback if the row scrolled off.
+	lastTopRow []terminal.Glyph
 	// cachedTitle is touched from BOTH applyOutput's OSC handler (which
 	// runs INSIDE p.vt.Write while applyOutput holds p.mu) AND from the
 	// Title() accessor. If it were a plain string guarded by p.mu, the
@@ -792,7 +796,14 @@ func (p *PaneView) applyOutput(data []byte) {
 	if hasSeq(data, mouseDisableSeqs) {
 		p.mouseEnabled = false
 	}
+	// Capture scrollback: snapshot row 0 before vt.Write, push it
+	// after if it scrolled off. Without this, the local scrollback
+	// ring stays empty and wheel scroll silently no-ops because
+	// scrollUpLocked clamps to scrollback.Len() == 0.
+	p.lastTopRow = terminal.CaptureTopRow(p.vt, p.altScreenActive)
 	p.vt.Write(data)
+	terminal.PushScrolledLine(p.vt, p.altScreenActive, p.lastTopRow, p.scrollback)
+	p.lastTopRow = nil
 	p.dirty = true
 	p.cachedView = ""
 }

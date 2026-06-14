@@ -973,10 +973,14 @@ func (p *Pane) handleOutput(data []byte) {
 	p.detectMouseModeChanges(data)
 	p.detectAltScreenChanges(data)
 
-	// Capture scrollback: snapshot before, compare after
-	p.captureScrollbackBeforeWrite()
+	// Capture scrollback: snapshot row 0 before vt.Write, push it to
+	// the ring after if it scrolled off. Shared with PaneView via
+	// scrollback_capture.go so the daemon-side pane and the client-side
+	// mirror produce identical scrollback content.
+	p.lastTopRow = CaptureTopRow(p.vt, p.altScreenActive)
 	p.vt.Write(data)
-	p.captureScrollbackAfterWrite()
+	PushScrolledLine(p.vt, p.altScreenActive, p.lastTopRow, p.scrollback)
+	p.lastTopRow = nil
 
 	p.dirty = true
 }
@@ -1075,82 +1079,6 @@ func (p *Pane) detectAltScreenChanges(data []byte) {
 	}
 }
 
-// captureScrollbackBeforeWrite takes a snapshot of row 0 before vt.Write.
-// Called with mutex held. SafeEmulator's own internal mutex serializes
-// emulator access; we additionally rely on p.mu to keep this pair
-// atomic with respect to other pane operations.
-func (p *Pane) captureScrollbackBeforeWrite() {
-	if p.vt == nil || p.altScreenActive {
-		p.lastTopRow = nil
-		return
-	}
-
-	cols := p.vt.Width()
-	if cols <= 0 {
-		p.lastTopRow = nil
-		return
-	}
-
-	// Snapshot row 0
-	p.lastTopRow = make([]Glyph, cols)
-	for col := 0; col < cols; col++ {
-		p.lastTopRow[col] = cellToGlyph(p.vt.CellAt(col, 0))
-	}
-}
-
-// captureScrollbackAfterWrite checks if row 0 changed and captures scrolled line.
-// Called with mutex held.
-func (p *Pane) captureScrollbackAfterWrite() {
-	if p.vt == nil || p.altScreenActive || p.lastTopRow == nil {
-		return
-	}
-
-	cols := p.vt.Width()
-	if cols <= 0 || cols != len(p.lastTopRow) {
-		return
-	}
-
-	// Compare current row 0 with snapshot
-	changed := false
-	for col := 0; col < cols; col++ {
-		if cellToGlyph(p.vt.CellAt(col, 0)) != p.lastTopRow[col] {
-			changed = true
-			break
-		}
-	}
-
-	// If row 0 changed and the old content isn't visible anywhere,
-	// the old top row has scrolled off - add to scrollback
-	if changed && !p.isLineVisible(p.lastTopRow) {
-		p.scrollback.Push(p.lastTopRow)
-	}
-
-	p.lastTopRow = nil
-}
-
-// isLineVisible checks if a line is still visible on screen.
-// Called with mutex held.
-func (p *Pane) isLineVisible(line []Glyph) bool {
-	cols := p.vt.Width()
-	rows := p.vt.Height()
-	if len(line) != cols {
-		return false
-	}
-
-	for row := 0; row < rows; row++ {
-		match := true
-		for col := 0; col < cols; col++ {
-			if cellToGlyph(p.vt.CellAt(col, row)) != line[col] {
-				match = false
-				break
-			}
-		}
-		if match {
-			return true
-		}
-	}
-	return false
-}
 
 // scheduleRenderTick returns a Cmd to trigger render after throttle interval
 func (p *Pane) scheduleRenderTick() tea.Cmd {
