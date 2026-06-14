@@ -626,6 +626,21 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Bubbletea v1 silently drops CSI sequences it doesn't have in its
+	// hardcoded table — notably xterm modifyOtherKeys
+	// (\x1b[27;<mod>;<key>~), which Ghostty emits for shift+enter,
+	// ctrl+enter, etc. When the user is attached to a pane, forward
+	// the raw bytes so the inner agent (Claude Code, etc.) can
+	// interpret the sequence natively.
+	if m.mode == ModeAgentView {
+		if raw := daemonclient.ExtractRawCSIBytes(msg); raw != nil {
+			if pane, ok := m.panes[m.focusedPane]; ok {
+				pane.WriteRaw(raw)
+			}
+			return m, m.maybeSetWindowTitle()
+		}
+	}
+
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)

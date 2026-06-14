@@ -3,6 +3,7 @@ package daemonclient
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -293,6 +294,59 @@ func TestPaneView_GetSetWorkdirAndSession(t *testing.T) {
 		t.Errorf("GetWorkdir: got %q want /tmp/x", got)
 	}
 }
+
+// fakeUnknownCSI mimics bubbletea v1's internal unknownCSISequenceMsg:
+// a named []byte whose String() begins with "?CSI". ExtractRawCSIBytes
+// must recover the underlying bytes via reflection because the real
+// type is unexported.
+type fakeUnknownCSI []byte
+
+func (u fakeUnknownCSI) String() string {
+	return fmt.Sprintf("?CSI%+v?", []byte(u)[2:])
+}
+
+func TestExtractRawCSIBytes(t *testing.T) {
+	shiftEnter := fakeUnknownCSI{0x1b, '[', '2', '7', ';', '2', ';', '1', '3', '~'}
+
+	tests := []struct {
+		name string
+		msg  tea.Msg
+		want []byte
+	}{
+		{
+			name: "Ghostty shift+enter (CSI 27;2;13~) returns full sequence",
+			msg:  shiftEnter,
+			want: []byte{0x1b, '[', '2', '7', ';', '2', ';', '1', '3', '~'},
+		},
+		{
+			name: "plain KeyMsg returns nil",
+			msg:  tea.KeyMsg{Type: tea.KeyEnter},
+			want: nil,
+		},
+		{
+			name: "tea.MouseMsg returns nil",
+			msg:  tea.MouseMsg{},
+			want: nil,
+		},
+		{
+			name: "arbitrary stringer without ?CSI prefix returns nil",
+			msg:  notACSIStringer{},
+			want: nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ExtractRawCSIBytes(tt.msg)
+			if !bytes.Equal(got, tt.want) {
+				t.Errorf("ExtractRawCSIBytes(%v) = %v, want %v", tt.msg, got, tt.want)
+			}
+		})
+	}
+}
+
+type notACSIStringer struct{}
+
+func (notACSIStringer) String() string { return "some other tea msg" }
 
 func TestTranslateKey_EnterAndShiftEnter(t *testing.T) {
 	tests := []struct {

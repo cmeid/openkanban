@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -979,6 +980,62 @@ func (p *PaneView) HandleKey(msg tea.KeyMsg) tea.Msg {
 	_ = daemon.WriteFrame(conn, daemon.TypePTYInput, input)
 	p.attachWriteM.Unlock()
 	return nil
+}
+
+// WriteRaw forwards raw bytes to the attached daemon-side PTY without
+// any key translation. Used for input sequences bubbletea v1 doesn't
+// decode into a KeyMsg — most notably xterm modifyOtherKeys (e.g.
+// shift+enter as \x1b[27;2;13~ from Ghostty), which the model layer
+// recovers via ExtractRawCSIBytes and hands here verbatim so the inner
+// agent (Claude Code, etc.) can interpret the sequence natively.
+//
+// No-op if the view is not in PaneViewAttached.
+func (p *PaneView) WriteRaw(b []byte) {
+	if len(b) == 0 {
+		return
+	}
+	p.mu.Lock()
+	if p.state != PaneViewAttached {
+		p.mu.Unlock()
+		return
+	}
+	conn := p.attachConn
+	p.mu.Unlock()
+	if conn == nil {
+		return
+	}
+	p.attachWriteM.Lock()
+	_ = daemon.WriteFrame(conn, daemon.TypePTYInput, b)
+	p.attachWriteM.Unlock()
+}
+
+// ExtractRawCSIBytes returns the raw byte sequence carried by a
+// bubbletea v1 unknownCSISequenceMsg, or nil if msg is not one.
+//
+// Bubbletea v1's input parser silently drops CSI sequences that aren't
+// in its hardcoded `sequences` table — most notably xterm
+// modifyOtherKeys (CSI 27;<mod>;<key>~) which Ghostty emits for
+// shift+enter, ctrl+enter, etc. The dropped sequence is converted to
+// an internal, unexported type whose String() starts with "?CSI"; the
+// underlying value is a named []byte holding the full sequence
+// including the leading ESC '['. We detect by string prefix and pull
+// the bytes via reflection so we don't depend on the unexported name.
+func ExtractRawCSIBytes(msg tea.Msg) []byte {
+	s, ok := msg.(fmt.Stringer)
+	if !ok || !strings.HasPrefix(s.String(), "?CSI") {
+		return nil
+	}
+	v := reflect.ValueOf(msg)
+	if v.Kind() != reflect.Slice || v.Type().Elem().Kind() != reflect.Uint8 {
+		return nil
+	}
+	raw := v.Bytes()
+	if len(raw) == 0 {
+		return nil
+	}
+	out := make([]byte, len(raw))
+	copy(out, raw)
+	return out
 }
 
 // HandleMouse mirrors terminal.Pane.HandleMouse: no return value,
