@@ -736,7 +736,7 @@ func (m *Model) renderHelp() string {
 		sep + "\n" +
 		"  " + keyStyle.Render("/") + descStyle.Render("     Search/filter         ") + keyStyle.Render("O") + descStyle.Render("       Settings") + "\n" +
 		"  " + keyStyle.Render("o") + descStyle.Render("     Cycle sort order      ") + keyStyle.Render("?") + descStyle.Render("       Toggle help") + "\n" +
-		"  " + keyStyle.Render(" ") + descStyle.Render("                            ") + keyStyle.Render("q") + descStyle.Render("       Quit") + "\n\n" +
+		"  " + keyStyle.Render("w") + descStyle.Render("     Cycle session filter  ") + keyStyle.Render("q") + descStyle.Render("       Quit") + "\n\n" +
 		sep + "\n" +
 		"  " + lipgloss.NewStyle().Foreground(m.colors.warning).Render("💡") + m.dimStyle().Render(" Tip: Hold Shift to select text in agent view") + "\n\n" +
 		"  " + m.dimStyle().Render("Press any key to close")

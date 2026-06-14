@@ -87,6 +87,41 @@ func sortModeLabel(s SortMode) string {
 	}
 }
 
+// SessionFilter narrows the board to tickets matching a session-state
+// predicate. "Open" means the ticket has a live daemon session
+// (daemonOwned); "Waiting" tightens that to sessions where the agent is
+// blocked on user input (AgentStatus == AgentWaiting). Session-only
+// (not persisted) — same lifetime convention as sortMode.
+type SessionFilter string
+
+const (
+	SessionFilterAll     SessionFilter = ""
+	SessionFilterOpen    SessionFilter = "open"
+	SessionFilterWaiting SessionFilter = "waiting"
+)
+
+var sessionFilters = []SessionFilter{SessionFilterAll, SessionFilterOpen, SessionFilterWaiting}
+
+func nextSessionFilter(f SessionFilter) SessionFilter {
+	for i, sf := range sessionFilters {
+		if sf == f {
+			return sessionFilters[(i+1)%len(sessionFilters)]
+		}
+	}
+	return SessionFilterAll
+}
+
+func sessionFilterLabel(f SessionFilter) string {
+	switch f {
+	case SessionFilterOpen:
+		return "open sessions"
+	case SessionFilterWaiting:
+		return "waiting sessions"
+	default:
+		return "all"
+	}
+}
+
 const (
 	minColumnWidth = 20
 	columnOverhead = 5
@@ -170,6 +205,11 @@ type Model struct {
 	// refreshColumnTickets. Session-only (not persisted); SortDefault
 	// preserves the store's natural order.
 	sortMode SortMode
+
+	// sessionFilter narrows the board to tickets with a live daemon
+	// session ("open") or waiting-for-input sessions ("waiting"). Same
+	// session-only lifetime as sortMode; cycled with 'w'.
+	sessionFilter SessionFilter
 
 	showHelp    bool
 	showConfirm bool
@@ -1102,6 +1142,8 @@ func (m *Model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.adjustPriority(1)
 	case "o":
 		return m.cycleSortMode()
+	case "w":
+		return m.cycleSessionFilter()
 
 	case ":":
 		m.mode = ModeCommand
@@ -3142,6 +3184,22 @@ func (m *Model) cycleSortMode() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// cycleSessionFilter advances to the next session filter (all → open →
+// waiting → all) and re-renders the board. Preserves selection like
+// cycleSortMode; the selected ticket may scroll off-screen if it no
+// longer matches the active filter, but its identity is retained so a
+// subsequent cycle back to "all" restores the cursor where it was.
+func (m *Model) cycleSessionFilter() (tea.Model, tea.Cmd) {
+	ticket := m.selectedTicket()
+	m.sessionFilter = nextSessionFilter(m.sessionFilter)
+	m.refreshColumnTickets()
+	if ticket != nil {
+		m.selectTicketByID(ticket.ID)
+	}
+	m.notify("Filter: " + sessionFilterLabel(m.sessionFilter))
+	return m, nil
+}
+
 func (m *Model) quickMoveTicketBackward() (tea.Model, tea.Cmd) {
 	ticket := m.selectedTicket()
 	if ticket == nil {
@@ -3960,6 +4018,19 @@ func effectivePriority(p int) int {
 func (m *Model) ticketMatchesFilter(t *board.Ticket) bool {
 	if len(m.filterProjectIDs) > 0 && !m.filterProjectIDs[t.ProjectID] {
 		return false
+	}
+	switch m.sessionFilter {
+	case SessionFilterOpen:
+		if _, ok := m.daemonOwned[t.ID]; !ok {
+			return false
+		}
+	case SessionFilterWaiting:
+		if _, ok := m.daemonOwned[t.ID]; !ok {
+			return false
+		}
+		if t.AgentStatus != board.AgentWaiting {
+			return false
+		}
 	}
 	if m.filterQuery == "" {
 		return true
