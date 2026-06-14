@@ -225,6 +225,89 @@ func TestBuildSpawnReq_ForceFresh_AgentSpawnedAtNilAtConstruction(t *testing.T) 
 	}
 }
 
+// argsHavePair reports whether args contains `flag` immediately
+// followed by `value` (space-separated CLI pair).
+func argsHavePair(args []string, flag, value string) bool {
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == flag && args[i+1] == value {
+			return true
+		}
+	}
+	return false
+}
+
+// TestBuildSpawnReq_NewClaude_StartsInPlanMode pins the ticket: every
+// new claude session must be launched with --permission-mode plan so
+// the agent reviews the work before touching the tree. The default
+// agent config carries --dangerously-skip-permissions; that flag
+// conflicts with plan mode and must be filtered out on new sessions.
+func TestBuildSpawnReq_NewClaude_StartsInPlanMode(t *testing.T) {
+	in := baseClaudeInputs(t, "TICK-PLAN", "task/plan")
+	in.ticket.AgentSpawnedAt = nil
+	in.isNewSession = true
+	in.cleanArgs = []string{"--dangerously-skip-permissions"}
+
+	req := buildSpawnReq(in)
+
+	if !argsHavePair(req.Args, "--permission-mode", "plan") {
+		t.Errorf("new claude argv missing --permission-mode plan, got %v", req.Args)
+	}
+	if argsContain(req.Args, "--dangerously-skip-permissions") {
+		t.Errorf("new claude argv must NOT contain --dangerously-skip-permissions (conflicts with plan mode), got %v", req.Args)
+	}
+}
+
+// TestBuildSpawnReq_NewClaude_StripsExistingPermissionMode asserts the
+// user's pre-existing --permission-mode <X> pair (e.g. acceptEdits) is
+// replaced by --permission-mode plan on new sessions. The ticket
+// guarantees plan mode unconditionally on new spawn.
+func TestBuildSpawnReq_NewClaude_StripsExistingPermissionMode(t *testing.T) {
+	in := baseClaudeInputs(t, "TICK-PLAN-OVERRIDE", "task/override")
+	in.ticket.AgentSpawnedAt = nil
+	in.isNewSession = true
+	in.cleanArgs = []string{"--permission-mode", "acceptEdits"}
+
+	req := buildSpawnReq(in)
+
+	if argsHavePair(req.Args, "--permission-mode", "acceptEdits") {
+		t.Errorf("user-configured permission-mode acceptEdits must be stripped on new session, got %v", req.Args)
+	}
+	if !argsHavePair(req.Args, "--permission-mode", "plan") {
+		t.Errorf("new claude argv missing --permission-mode plan after stripping override, got %v", req.Args)
+	}
+	// Only one --permission-mode flag should remain.
+	count := 0
+	for _, a := range req.Args {
+		if a == "--permission-mode" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("expected exactly one --permission-mode flag, got %d in %v", count, req.Args)
+	}
+}
+
+// TestBuildSpawnReq_ResumeClaude_NoPlanMode pins that resumed claude
+// sessions are not forced into plan mode — only new sessions get the
+// flag. Resumes pick up wherever the user left off (the ticket title
+// is "start all NEW sessions in plan mode", explicit on new).
+func TestBuildSpawnReq_ResumeClaude_NoPlanMode(t *testing.T) {
+	in := baseClaudeInputs(t, "TICK-RESUME", "task/resume")
+	// baseClaudeInputs already sets AgentSpawnedAt != nil and isNewSession=false.
+	in.cleanArgs = []string{"--dangerously-skip-permissions"}
+
+	req := buildSpawnReq(in)
+
+	if argsHavePair(req.Args, "--permission-mode", "plan") {
+		t.Errorf("resumed claude argv must NOT carry --permission-mode plan, got %v", req.Args)
+	}
+	// And the user's resume-time args (incl. --dangerously-skip-permissions)
+	// pass through untouched — only new-session argv is rewritten.
+	if !argsContain(req.Args, "--dangerously-skip-permissions") {
+		t.Errorf("resumed argv must preserve user's --dangerously-skip-permissions, got %v", req.Args)
+	}
+}
+
 // TestResolveBrief_SkipMergePreservesBytes pins the SkipMerge brief
 // contract: the file's bytes (and mtime) on disk are not touched by
 // the spawn flow when the user picks option 'n'. The agent then sees

@@ -3513,6 +3513,14 @@ func buildSpawnReq(in spawnReqInputs) daemon.SpawnReq {
 	switch in.agentType {
 	case "claude":
 		if in.isNewSession {
+			// New claude sessions always start in plan mode so the user
+			// reviews the proposed approach before any tree mutation.
+			// Strip anything that would conflict — --dangerously-skip-permissions
+			// (alias for bypassPermissions) and any pre-existing
+			// --permission-mode pair from the user's config — then
+			// append --permission-mode plan as the single authority.
+			args = stripPermissionFlags(args)
+			args = append(args, "--permission-mode", "plan")
 			if !hasClaudeNameFlag(args) && strings.TrimSpace(in.ticket.Title) != "" {
 				args = append(args, "-n", in.ticket.Title)
 			}
@@ -4008,6 +4016,32 @@ func hasClaudeNameFlag(args []string) bool {
 		}
 	}
 	return false
+}
+
+// stripPermissionFlags removes any claude permission-related flags the
+// user may have configured (--dangerously-skip-permissions, any form
+// of --permission-mode) so the caller can install its own authoritative
+// permission mode without ambiguity.
+func stripPermissionFlags(args []string) []string {
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--dangerously-skip-permissions" {
+			continue
+		}
+		if a == "--permission-mode" {
+			// Skip the flag and its value (if present).
+			if i+1 < len(args) {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(a, "--permission-mode=") {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
 }
 
 func (m *Model) resetSpawnState(ticketID board.TicketID) {
