@@ -90,6 +90,18 @@ var redrawFixtures = []redrawFixture{
 		},
 	},
 	{
+		// Wide (CJK / emoji) glyphs occupy two terminal cells. The
+		// snapshot must skip the continuation cell — ultraviolet stores
+		// it as a zero-value Cell (Width=0) following each wide cell.
+		// Emitting a space for the continuation in writeRow shifts every
+		// glyph after the wide char one column right in the destination
+		// emulator, surfacing as "garbled initial render on session
+		// attach".
+		name:          "wide_chars_round_trip",
+		stream:        []byte("hello 中文 X 🙂 Y\r\n壱弐参\r\n"),
+		cursorVisible: true,
+	},
+	{
 		// Synthetic "claude-like" stream: enter alt screen, draw a
 		// header line in bold, draw a status line, hide cursor, then
 		// re-position the cursor mid-screen.

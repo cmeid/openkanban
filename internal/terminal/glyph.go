@@ -55,6 +55,15 @@ func (g Glyph) styleEqual(o Glyph) bool {
 // Combining marks and ZWJ sequences will not round-trip — known
 // limitation, called out at the boundary.
 //
+// Width semantics:
+//   - 1: normal single-cell glyph.
+//   - 2: leading half of a wide (CJK / emoji) glyph; the cell to its
+//     right is the continuation (Width == 0).
+//   - 0: continuation cell of a preceding wide glyph. Callers iterating
+//     columns and writing one rune per cell MUST skip these — emitting a
+//     space for the continuation shifts everything after the wide glyph
+//     one column right (see TestSerializeRedraw_RoundTrip/wide_chars_round_trip).
+//
 // Exported (PR5) so the daemon's redraw serializer can read cells
 // from a SafeEmulator without duplicating the boundary translation.
 func CellToGlyph(c *uv.Cell) Glyph {
@@ -66,8 +75,11 @@ func CellToGlyph(c *uv.Cell) Glyph {
 		ch = r
 		break
 	}
+	// Preserve Width == 0 for the continuation half of a wide glyph;
+	// only defend against negative (which ultraviolet does not produce
+	// today).
 	width := c.Width
-	if width <= 0 {
+	if width < 0 {
 		width = 1
 	}
 	return Glyph{

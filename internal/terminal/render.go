@@ -116,6 +116,12 @@ func renderGlyphLine(line []Glyph, cols int, logicalRow int, selection *Selectio
 		if col < len(line) {
 			glyph = line[col]
 		}
+		// Skip continuation cells of wide glyphs. Emitting a space
+		// here would visually shift everything after a wide char by
+		// one column on the host terminal.
+		if glyph.Width == 0 && col < len(line) {
+			continue
+		}
 		ch := glyph.Char
 		if ch == 0 {
 			ch = ' '
@@ -168,12 +174,20 @@ func renderLiveRow(vt *xvt.SafeEmulator, cursorVisible bool, selection *Selectio
 
 	for col := 0; col < cols; col++ {
 		glyph := cellToGlyph(vt.CellAt(col, row))
+		// Skip continuation cells of wide glyphs. Emitting a space
+		// here would visually shift everything after a wide char by
+		// one column on the host terminal. The cursor case is handled
+		// separately so the cursor cell is still rendered if it
+		// happens to land on a continuation column.
+		isCursor := cursorVisible && col == cursor.X && row == cursor.Y
+		if glyph.Width == 0 && !isCursor {
+			continue
+		}
 		ch := glyph.Char
 		if ch == 0 {
 			ch = ' '
 		}
 
-		isCursor := cursorVisible && col == cursor.X && row == cursor.Y
 		cellSelected := selection != nil && selection.Contains(Position{Row: logicalRow, Col: col})
 
 		if !firstCell && (!glyph.styleEqual(currentStyle) || isCursor || cellSelected != inSelection) {

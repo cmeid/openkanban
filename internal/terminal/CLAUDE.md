@@ -39,6 +39,16 @@ See [docs/AGENT_INTEGRATION.md#architecture-terminal-emulator](../../docs/AGENT_
 
 This is intentional: it decouples scrollback/selection/render code from the emulator choice, so a future swap doesn't ripple through every file.
 
+### Glyph.Width semantics
+
+`Glyph.Width` carries the cell's monospaced display width and is load-bearing for any code that iterates columns and emits one rune per cell:
+
+- **1** — normal single-cell glyph.
+- **2** — leading half of a wide (CJK / emoji) glyph; the cell to its right is the continuation.
+- **0** — continuation cell of a preceding wide glyph. ultraviolet stores these as zero-value `Cell{}`; `CellToGlyph` preserves the 0 so writers can recognize them.
+
+**Any cell-iterating writer MUST skip Width=0 cells.** Emitting a space for the continuation shifts every glyph after the wide one one column right in the destination — the bug that surfaced as "garbled initial render on session attach" across `daemon/redraw.go:writeRow`, `terminal/render.go:renderLiveRow`, and `terminal/render.go:renderGlyphLine`. The regression guard is `TestSerializeRedraw_RoundTrip/wide_chars_round_trip` in `internal/daemon/redraw_test.go`.
+
 ## Message Types
 
 BubbleTea integration:

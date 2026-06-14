@@ -275,6 +275,82 @@ func TestPaneView_SetSize_Cached_WhenUnattached(t *testing.T) {
 	}
 }
 
+// TestPaneView_View_UnattachedReturnsBlankGrid asserts the vt-nil
+// View() returns a full-size grid of spaces (not "") so bubbletea's
+// diff renderer overwrites the entire pane region during the brief
+// window between mode=ModeAgentView and Attach completion. Returning
+// "" leaves the previous mode's content visible underneath the chrome
+// bar — the symptom of "garbled initial render on session attach".
+func TestPaneView_View_UnattachedReturnsBlankGrid(t *testing.T) {
+	_ = startTestDaemon(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	c, err := New(ctx)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer c.Close()
+
+	pv := NewPaneView(c, "T-PV-VIEW-BLANK", "", nil)
+	defer pv.Close()
+	pv.SetSize(80, 24)
+
+	got := pv.View()
+	if got == "" {
+		t.Fatalf("View() with vt=nil returned empty string; want full-size blank grid")
+	}
+	lines := strings.Split(got, "\n")
+	if len(lines) != 24 {
+		t.Errorf("View() row count: got %d want 24", len(lines))
+	}
+	for i, line := range lines {
+		if len(line) != 80 {
+			t.Errorf("row %d: visible width got %d want 80 (line=%q)", i, len(line), line)
+		}
+		if strings.TrimSpace(line) != "" {
+			t.Errorf("row %d: expected all spaces, got %q", i, line)
+		}
+	}
+}
+
+// TestBlankPaneView_Dimensions covers the degenerate inputs.
+func TestBlankPaneView_Dimensions(t *testing.T) {
+	tests := []struct {
+		name        string
+		cols, rows  int
+		wantNewline int
+		wantLineLen int
+		wantEmpty   bool
+	}{
+		{name: "80x24", cols: 80, rows: 24, wantNewline: 23, wantLineLen: 80},
+		{name: "1x1", cols: 1, rows: 1, wantNewline: 0, wantLineLen: 1},
+		{name: "zero_cols", cols: 0, rows: 24, wantEmpty: true},
+		{name: "zero_rows", cols: 80, rows: 0, wantEmpty: true},
+		{name: "negative", cols: -1, rows: -1, wantEmpty: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := blankPaneView(tt.cols, tt.rows)
+			if tt.wantEmpty {
+				if got != "" {
+					t.Errorf("blankPaneView(%d, %d): got %q want \"\"", tt.cols, tt.rows, got)
+				}
+				return
+			}
+			gotNewlines := strings.Count(got, "\n")
+			if gotNewlines != tt.wantNewline {
+				t.Errorf("newline count: got %d want %d", gotNewlines, tt.wantNewline)
+			}
+			for i, line := range strings.Split(got, "\n") {
+				if len(line) != tt.wantLineLen {
+					t.Errorf("row %d: got width %d want %d", i, len(line), tt.wantLineLen)
+				}
+			}
+		})
+	}
+}
+
 func TestPaneView_GetSetWorkdirAndSession(t *testing.T) {
 	_ = startTestDaemon(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

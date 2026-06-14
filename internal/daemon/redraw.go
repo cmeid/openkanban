@@ -153,6 +153,13 @@ func writeRow(b *strings.Builder, vt *xvt.SafeEmulator, cols, row int) {
 
 	for col := 0; col < cols; col++ {
 		g := terminal.CellToGlyph(vt.CellAt(col, row))
+		// Skip continuation cells of wide glyphs — the destination
+		// emulator will allocate them when it consumes the leading
+		// rune. Emitting a space here instead would shift every
+		// glyph after the wide one one column right.
+		if g.Width == 0 {
+			continue
+		}
 		ch := g.Char
 		if ch == 0 {
 			ch = ' '

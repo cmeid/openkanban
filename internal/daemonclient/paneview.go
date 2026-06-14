@@ -1215,7 +1215,18 @@ func (p *PaneView) View() string {
 			log.Printf("openkanban paneview: View() vt is nil session=%s", p.sessionID)
 			p.viewLoggedNil = true
 		}
-		return ""
+		// Return a properly-sized blank rather than "". The model
+		// flips to ModeAgentView synchronously on the PaneViewUnattached
+		// re-attach branch (see Model.spawnAgent), so renderAgentView
+		// composes chrome + pane.View() while Attach is still in
+		// flight. If we returned "" here, bubbletea's diff renderer
+		// would only repaint the chrome line, leaving the previous
+		// mode's content visible underneath — the symptom Chris filed
+		// as "garbled initial render on session attach". A full-size
+		// blank ensures the entire pane region is overwritten with
+		// spaces; the real snapshot lands on the next View() call,
+		// triggered by the PaneAttachedMsg or first PaneOutputMsg.
+		return blankPaneView(p.width, p.height)
 	}
 	if !p.dirty && p.cachedView != "" {
 		return p.cachedView
@@ -1224,6 +1235,28 @@ func (p *PaneView) View() string {
 	p.cachedView = terminal.RenderVT(p.vt, p.scrollback, p.viewportOffset, cursorVisible, p.selection)
 	p.dirty = false
 	return p.cachedView
+}
+
+// blankPaneView returns a width × height grid of spaces, used by View()
+// when the local emulator isn't yet populated (Attach in flight, or
+// post-detach window before re-attach). Each row is exactly `cols`
+// visible cells wide so bubbletea's standardRenderer treats it as a
+// full-width line and the line skip logic in renderAgentView's chrome
+// composition is uniform across attached / unattached states.
+func blankPaneView(cols, rows int) string {
+	if cols <= 0 || rows <= 0 {
+		return ""
+	}
+	line := strings.Repeat(" ", cols)
+	var b strings.Builder
+	b.Grow((cols + 1) * rows)
+	for i := 0; i < rows; i++ {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(line)
+	}
+	return b.String()
 }
 
 // GetContent returns the live screen as plain text. In PaneViewDetached
