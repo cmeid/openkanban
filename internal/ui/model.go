@@ -187,6 +187,16 @@ type Model struct {
 	daemonUnsub     func()
 	daemonConnected atomic.Bool
 
+	// daemonOwned tracks tickets that currently have a live daemon
+	// session — populated from the startup List() and maintained by
+	// handleDaemonSessionEvent on "started" / "exited". Used by the
+	// file-poll precedence rule so daemon-pushed AgentStatus wins
+	// regardless of whether THIS TUI is the one with an attached
+	// PaneView. Without this, a second TUI watching a session spawned
+	// elsewhere falls back to the on-disk status file and clobbers the
+	// daemon-pushed "working" with the file's stale "idle".
+	daemonOwned map[board.TicketID]struct{}
+
 	// guardAPI is the subset of daemonclient.Client used by the exit
 	// guard (PrepareExit / Kill / ClientID). Held as an interface so
 	// tests can substitute a fake without standing up a real daemon. Set
@@ -330,6 +340,7 @@ func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projec
 		formFieldLines:     make(map[int]int),
 		spinner:            sp,
 		panes:              make(map[board.TicketID]*daemonclient.PaneView),
+		daemonOwned:        make(map[board.TicketID]struct{}),
 		statusDetector:     agent.NewStatusDetector(),
 		selectedProject:    selectedProject,
 		sidebarVisible:     cfg.UI.SidebarVisible,
@@ -368,6 +379,7 @@ func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projec
 		if err == nil {
 			for _, s := range resp.Sessions {
 				ownedByDaemon[board.TicketID(s.TicketID)] = s
+				m.daemonOwned[board.TicketID(s.TicketID)] = struct{}{}
 			}
 		} else {
 			log.Printf("openkanban: daemon list failed at startup: %v", err)
@@ -526,7 +538,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			ticket, _ := m.globalStore.Get(msg.ticketID)
 			if ticket != nil {
 				ticket.AgentType = m.spawningAgent
-				ticket.AgentStatus = board.AgentNone
+				// Don't clobber AgentStatus here. The daemon's "started"
+				// SessionEvent (which handleDaemonSessionEvent sets to
+				// AgentWorking) can race with spawnReadyMsg and arrive
+				// first; a blind reset here would replace the correct
+				// "working" with AgentNone and leave the card blank.
+				// The daemon push is authoritative for AgentStatus.
 				if ticket.AgentSpawnedAt == nil {
 					now := time.Now()
 					ticket.AgentSpawnedAt = &now
@@ -744,13 +761,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Daemon push channel is gone; the file-poll takes over as the
 		// AgentStatus source. Clear the subscribe handles so we don't
-		// keep dangling references.
+		// keep dangling references, and drop daemonOwned so the poll
+		// can reassert authority on the next tick.
 		m.daemonConnected.Store(false)
 		if m.daemonUnsub != nil {
 			m.daemonUnsub()
 			m.daemonUnsub = nil
 		}
 		m.daemonEvents = nil
+		for id := range m.daemonOwned {
+			delete(m.daemonOwned, id)
+		}
 		if msg.Err != nil {
 			m.notify("Daemon disconnected: " + msg.Err.Error())
 		} else {
@@ -772,14 +793,21 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case agentStatusResultMsg:
 		// Precedence rule (PR9): when the daemon push channel is live,
 		// daemon-pushed SessionEvents are the authoritative source of
-		// AgentStatus for daemon-owned panes. The local file-poll only
-		// fills in for panes the daemon doesn't own (and as graceful
+		// AgentStatus for daemon-owned tickets. The local file-poll only
+		// fills in for tickets the daemon doesn't own (and as graceful
 		// degradation when the push channel is down).
+		//
+		// We key on m.daemonOwned (maintained by handleDaemonSessionEvent)
+		// rather than m.panes — a sibling TUI that did NOT spawn the
+		// session still receives push events and tracks ownership, but
+		// has no local PaneView until the user attaches. Using m.panes
+		// here lets the poll clobber AgentWorking with the file's stale
+		// "idle" on every TUI but the one that spawned.
 		daemonLive := m.daemonConnected.Load()
 		for ticketID, status := range msg {
 			if daemonLive {
-				if _, owned := m.panes[ticketID]; owned {
-					// Daemon-owned pane; let push events drive its
+				if _, owned := m.daemonOwned[ticketID]; owned {
+					// Daemon-owned ticket; let push events drive its
 					// status and ignore the file-poll value.
 					continue
 				}

@@ -122,11 +122,13 @@ func (m *Model) handleDaemonSessionEvent(msg daemonSessionEventMsg) (tea.Model, 
 		if ticket != nil {
 			switch ev.Event {
 			case "started":
+				m.daemonOwned[ticketID] = struct{}{}
 				if ticket.AgentStatus != board.AgentWorking {
 					ticket.AgentStatus = board.AgentWorking
 					m.saveTicket(ticket)
 				}
 			case "exited":
+				delete(m.daemonOwned, ticketID)
 				// Expected=true means the daemon initiated the kill via
 				// handleTicketDone (i.e. the agent invoked `openkanban
 				// ticket done`). Preserve AgentCompleted so the card
