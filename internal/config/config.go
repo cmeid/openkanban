@@ -1,6 +1,7 @@
 package config
 
 import (
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,32 +21,15 @@ const defaultGlobalPrompt = `You have been spawned by OpenKanban to work on a ti
 
 Focus on completing this ticket. Ask clarifying questions if the description is unclear.`
 
-const defaultAgentPrompt = `{{if .IsExternalResume}}OpenKanban has scoped this session to ticket "{{.Title}}". Continue with your prior context; what follows is the ticket metadata.
-
-**Title:** {{.Title}}{{if .Description}}
-
-**Description:**
-{{.Description}}{{end}}
-
-**Branch:** {{.BranchName}} (from {{.BaseBranch}}){{if .HasBrief}}
-
-Full brief: ` + "`{{.BriefPath}}`" + ` in your worktree.{{end}}
-
-Stay scoped to this ticket's worktree; don't change ticket status — OpenKanban owns that.
-{{else}}You have been spawned by OpenKanban to work on one ticket.
-
-**Title:** {{.Title}}{{if .Description}}
-
-**Description:**
-{{.Description}}{{end}}
-
-**Branch:** {{.BranchName}} (from {{.BaseBranch}}){{if .HasBrief}}
-
-Your full brief lives at ` + "`{{.BriefPath}}`" + ` in this worktree. Read it before you start — that file is your primary specification. The "## Notes (from openkanban card)" block is auto-synced from the openkanban card by OpenKanban; treat it as the latest user-supplied additions. User-authored sections (## Brief, ## Acceptance, etc.) above the block are yours to read and refine if appropriate.{{end}}
-
-OpenKanban moved this ticket to in_progress on spawn. Leave the status as-is when you finish; the user will move it to in_review and then to done after reviewing. Work only inside this worktree; do not modify other tickets' briefs or worktrees.
-
-Focus on completing this ticket. Ask clarifying questions if anything is unclear.{{end}}`
+// defaultAgentPrompt is the canonical priming prompt OpenKanban sends to
+// every spawned Claude-class agent. It is embedded from
+// agent_prompt.tmpl so the source is editable markdown rather than
+// backtick-escaped Go string literals. The binary ships with this
+// content baked in; per-user customization still flows through
+// config.json's `agents.<name>.init_prompt` override.
+//
+//go:embed agent_prompt.tmpl
+var defaultAgentPrompt string
 
 const defaultAiderPrompt = `OpenKanban Ticket: {{.Title}}
 
@@ -309,6 +293,9 @@ func (c *Config) mergeAgentDefaults() {
 			}
 			if userCfg.Env == nil {
 				userCfg.Env = defaultCfg.Env
+			}
+			if userCfg.InitPrompt == "" {
+				userCfg.InitPrompt = defaultCfg.InitPrompt
 			}
 			c.Agents[name] = userCfg
 		}

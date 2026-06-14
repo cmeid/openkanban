@@ -414,6 +414,10 @@ func TestMergeAgentDefaults(t *testing.T) {
 	if cfg.Agents["claude"].Command != "custom-claude" {
 		t.Errorf("claude.Command = %q; want %q", cfg.Agents["claude"].Command, "custom-claude")
 	}
+
+	if cfg.Agents["claude"].InitPrompt != defaultAgentPrompt {
+		t.Error("claude.InitPrompt should inherit defaultAgentPrompt when user config omits it")
+	}
 }
 
 func TestConfigStructure(t *testing.T) {
@@ -634,6 +638,8 @@ func TestDefaultAgentPrompt_FreshSpawn(t *testing.T) {
 		"Work only inside this worktree",
 		"tickets/test.md",
 		"## Notes (from openkanban card)",
+		"finishing-an-openkanban-ticket",
+		"superpowers:finishing-a-development-branch",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("want substring %q in:\n%s", want, got)
@@ -665,6 +671,7 @@ func TestDefaultAgentPrompt_ExternalResume(t *testing.T) {
 		"has scoped this session",
 		"scoped to this ticket's worktree",
 		"Test ticket",
+		"finishing-an-openkanban-ticket",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("want substring %q in:\n%s", want, got)
