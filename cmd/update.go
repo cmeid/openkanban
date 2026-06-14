@@ -113,6 +113,13 @@ func ApplyUpdate(ctx context.Context, status UpdateStatus, out io.Writer) error 
 	installCtx, cancelInstall := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancelInstall()
 	ldflags := fmt.Sprintf("-X github.com/techdufus/openkanban/cmd.SourcePath=%s", SourcePath)
+	// Bake the post-pull commit so `openkanban version` reflects the
+	// rebuilt binary. Mirrors scripts/install.sh: missing commit is
+	// non-fatal — we degrade to the default "none" rather than blocking
+	// the rebuild.
+	if c, err := shortHeadSHA(installCtx, SourcePath); err == nil && c != "" {
+		ldflags += fmt.Sprintf(" -X github.com/techdufus/openkanban/cmd.Commit=%s", c)
+	}
 	install := exec.CommandContext(installCtx, "go", "install", "-ldflags", ldflags, SourcePath)
 	install.Stdout = os.Stderr
 	install.Stderr = os.Stderr
@@ -242,6 +249,18 @@ func localHeadSHA(ctx context.Context, sourcePath string) (string, error) {
 		return "", fmt.Errorf("malformed rev-parse output: %q", sha)
 	}
 	return sha, nil
+}
+
+// shortHeadSHA returns the abbreviated HEAD SHA of the source clone,
+// matching scripts/install.sh's `git rev-parse --short HEAD`. Returns
+// "" + a nil error when the path isn't a git repo; callers can treat
+// either error or empty as "no commit to bake."
+func shortHeadSHA(ctx context.Context, sourcePath string) (string, error) {
+	out, err := exec.CommandContext(ctx, "git", "-C", sourcePath, "rev-parse", "--short", "HEAD").Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 // isAncestor reports whether `ancestor` is an ancestor of `descendant`

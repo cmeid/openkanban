@@ -256,3 +256,40 @@ func TestUpdateCheckForUpdates_ContextCancelled(t *testing.T) {
 		t.Fatalf("expected context.Canceled, got %v", err)
 	}
 }
+
+func TestShortHeadSHA_ReturnsAbbrev(t *testing.T) {
+	_, local := setupRepos(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	short, err := shortHeadSHA(ctx, local)
+	if err != nil {
+		t.Fatalf("shortHeadSHA: %v", err)
+	}
+	if short == "" {
+		t.Fatal("expected non-empty short SHA")
+	}
+	if len(short) >= 40 {
+		t.Errorf("expected abbreviated SHA, got full-length %q", short)
+	}
+
+	full, err := localHeadSHA(ctx, local)
+	if err != nil {
+		t.Fatalf("localHeadSHA: %v", err)
+	}
+	// The abbreviated SHA must be a prefix of the full SHA; this catches
+	// any future drift where we accidentally call a different ref.
+	if len(full) < len(short) || full[:len(short)] != short {
+		t.Errorf("short %q is not a prefix of full %q", short, full)
+	}
+}
+
+func TestShortHeadSHA_NonRepo(t *testing.T) {
+	dir := t.TempDir() // empty, not a git repo
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if _, err := shortHeadSHA(ctx, dir); err == nil {
+		t.Fatal("expected error for non-repo path, got nil")
+	}
+}
