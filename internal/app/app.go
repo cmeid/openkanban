@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -14,6 +15,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/techdufus/openkanban/internal/agent"
 	"github.com/techdufus/openkanban/internal/config"
+	"github.com/techdufus/openkanban/internal/daemon"
 	"github.com/techdufus/openkanban/internal/daemonclient"
 	"github.com/techdufus/openkanban/internal/git"
 	"github.com/techdufus/openkanban/internal/project"
@@ -23,6 +25,15 @@ import (
 )
 
 func Run(cfg *config.Config, filterPath, version string) error {
+	// MUST be the first statement: project.LoadGlobalTicketStore below
+	// fans out to ~11 log.Printf sites in internal/project/{tickets,
+	// migration}.go that fire on migrations and duplicate-removal. Any
+	// later insertion point silently corrupts Bubble Tea's alt-screen
+	// rendering on first launch.
+	if logCloser := redirectTUILog(); logCloser != nil {
+		defer logCloser.Close()
+	}
+
 	registry, err := project.LoadRegistry()
 	if err != nil {
 		return fmt.Errorf("failed to load project registry: %w", err)
@@ -76,7 +87,7 @@ func Run(cfg *config.Config, filterPath, version string) error {
 		if errors.Is(daemonErr, daemonclient.ErrProtocolVersionSkew) {
 			fmt.Fprintln(os.Stderr, "openkanban: daemon version skew detected — run `openkanban daemon restart` to refresh; running in degraded mode without the daemon.")
 		} else {
-			log.Printf("openkanban: daemon unavailable, agents cannot be spawned (%v)", daemonErr)
+			fmt.Fprintf(os.Stderr, "openkanban: daemon unavailable, agents cannot be spawned: %v (see `openkanban daemon status`)\n", daemonErr)
 		}
 		daemonClient = nil
 	}
@@ -233,4 +244,34 @@ func DeleteProject(nameOrID string) error {
 
 	fmt.Printf("Deleted project '%s' (%s)\n", target.Name, target.RepoPath)
 	return nil
+}
+
+// redirectTUILog points the default log package at a file under
+// ~/.cache/openkanban/tui.log (honoring OPENKANBAN_TUI_LOG). Without
+// this, the TUI process's many log.Printf calls (daemonclient,
+// ui/daemon_subscribe, project migration) write to stderr and corrupt
+// Bubble Tea's alt-screen rendering.
+//
+// Returns the open file so Run can defer Close. Returns nil if logs
+// were discarded (failure path) — Close is a no-op in that case.
+func redirectTUILog() io.Closer {
+	_ = daemon.EnsureRuntimeDir()
+
+	path, err := TUILogPath()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "openkanban: could not resolve TUI log path: %v (logs disabled)\n", err)
+		log.SetOutput(io.Discard)
+		return nil
+	}
+
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "openkanban: could not open TUI log %s: %v (logs disabled)\n", path, err)
+		log.SetOutput(io.Discard)
+		return nil
+	}
+
+	log.SetOutput(f)
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	return f
 }
