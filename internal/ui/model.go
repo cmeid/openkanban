@@ -1341,6 +1341,7 @@ func (m *Model) handleAgentViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if result := pane.HandleKey(msg); result != nil {
 		switch r := result.(type) {
 		case terminal.ExitFocusMsg:
+			log.Printf("openkanban model: ExitFocusMsg received, mode -> ModeNormal")
 			m.mode = ModeNormal
 			m.focusedPane = ""
 		case daemonclient.AttachFirstMsg:
@@ -3572,6 +3573,7 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 		attachErr := pv.Attach(attachCtx)
 		attachCancel()
 		if attachErr != nil {
+			log.Printf("openkanban model: attach failed after spawn ticket=%s session=%s err=%v", ticketID, resp.SessionID, attachErr)
 			// Spawn succeeded but we couldn't get a binary channel.
 			// Keep the PaneView so the user can retry attach; surface
 			// the error.

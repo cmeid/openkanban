@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"strings"
 	"sync"
@@ -516,6 +517,7 @@ func (p *PaneView) attach(ctx context.Context, takeover bool) error {
 
 	conn, err := DialOrStart(ctx)
 	if err != nil {
+		log.Printf("openkanban paneview: attach dial failed session=%s: %v", sessionID, err)
 		return err
 	}
 	r := bufio.NewReader(conn)
@@ -528,10 +530,12 @@ func (p *PaneView) attach(ctx context.Context, takeover bool) error {
 		BinaryVersion:   daemon.BinaryVersion,
 		ClientName:      clientNameForHello + "/attach",
 	}); err != nil {
+		log.Printf("openkanban paneview: attach hello write failed session=%s: %v", sessionID, err)
 		conn.Close()
 		return fmt.Errorf("daemonclient: attach hello: %w", err)
 	}
 	if _, err := readJSONResp(r, daemon.MsgHelloResp, nil); err != nil {
+		log.Printf("openkanban paneview: attach hello resp failed session=%s: %v", sessionID, err)
 		conn.Close()
 		return fmt.Errorf("daemonclient: attach hello resp: %w", err)
 	}
@@ -542,11 +546,13 @@ func (p *PaneView) attach(ctx context.Context, takeover bool) error {
 		Rows:      uint16(h),
 		Takeover:  takeover,
 	}); err != nil {
+		log.Printf("openkanban paneview: attach req write failed session=%s: %v", sessionID, err)
 		conn.Close()
 		return fmt.Errorf("daemonclient: attach req: %w", err)
 	}
 	var aresp daemon.AttachResp
 	if _, err := readJSONResp(r, daemon.MsgAttachResp, &aresp); err != nil {
+		log.Printf("openkanban paneview: attach resp read failed session=%s: %v", sessionID, err)
 		conn.Close()
 		return fmt.Errorf("daemonclient: attach resp: %w", err)
 	}
@@ -564,6 +570,7 @@ func (p *PaneView) attach(ctx context.Context, takeover bool) error {
 	for remaining > 0 {
 		typ, payload, err := daemon.ReadFrame(r)
 		if err != nil {
+			log.Printf("openkanban paneview: snapshot frame read failed session=%s remaining=%d: %v", sessionID, remaining, err)
 			conn.Close()
 			p.mu.Lock()
 			p.teardownEmulatorLocked()
@@ -571,6 +578,7 @@ func (p *PaneView) attach(ctx context.Context, takeover bool) error {
 			return fmt.Errorf("daemonclient: read snapshot frame: %w", err)
 		}
 		if typ != daemon.TypePTYOutput {
+			log.Printf("openkanban paneview: snapshot got unexpected frame type session=%s type=0x%02x", sessionID, typ)
 			conn.Close()
 			p.mu.Lock()
 			p.teardownEmulatorLocked()
@@ -605,6 +613,8 @@ func (p *PaneView) attach(ctx context.Context, takeover bool) error {
 	default:
 	}
 	p.mu.Unlock()
+
+	log.Printf("openkanban paneview: attach OK session=%s vt=%p snapshot=%d", sessionID, p.vt, aresp.SnapshotSize)
 
 	// Spawn the binary read loop.
 	p.attachLoopWG.Add(1)
@@ -849,6 +859,7 @@ func (p *PaneView) Close() error {
 // or terminal.ExitFocusMsg in the attached case, AttachFirstMsg in the
 // unattached case, nil in the detached case.
 func (p *PaneView) HandleKey(msg tea.KeyMsg) tea.Msg {
+	log.Printf("openkanban paneview: HandleKey msg=%q", msg.String())
 	if msg.String() == "ctrl+g" {
 		return terminal.ExitFocusMsg{}
 	}

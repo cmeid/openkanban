@@ -46,6 +46,8 @@ func (s *Server) handleAttach(c *clientConn, req AttachReq) {
 		return
 	}
 
+	log.Printf("openkanbankd: client %d handleAttach session=%s cols=%d rows=%d takeover=%v", c.id, req.SessionID, req.Cols, req.Rows, req.Takeover)
+
 	s.sessionsMu.RLock()
 	sess := s.sessions[req.SessionID]
 	s.sessionsMu.RUnlock()
@@ -64,6 +66,8 @@ func (s *Server) handleAttach(c *clientConn, req AttachReq) {
 		s.writeError(c, "attach_failed", err.Error())
 		return
 	}
+
+	log.Printf("openkanbankd: client %d attach approved session=%s snapshot_bytes=%d", c.id, req.SessionID, len(snapshot))
 
 	// AttachResp BEFORE the binary frames so the client can switch
 	// its read loop based on the JSON envelope.
@@ -147,6 +151,7 @@ func writeSnapshotChunks(conn net.Conn, writeMu lockable, data []byte, clientID 
 			return fmt.Errorf("snapshot chunk %d-%d (client %d): %w", off, end, clientID, err)
 		}
 	}
+	log.Printf("openkanbankd: client %d snapshot sent session=%s bytes=%d", clientID, "n/a", len(data))
 	return nil
 }
 
