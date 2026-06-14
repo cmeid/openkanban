@@ -176,11 +176,10 @@ type PaneView struct {
 	teaMsgs   chan tea.Msg
 	teaClosed atomic.Bool
 
-	// One-shot diagnostic logging flags so we don't spam stderr on
-	// every render. Will be removed once Bug A is closed.
-	viewLoggedSize   bool
-	viewLoggedNil    bool
-	applyOutputCount int
+	// One-shot diagnostic flag: keep the "View() vt is nil" warning
+	// gated to fire once per PaneView so a teardown bug never gets
+	// silently rendered as a blank pane.
+	viewLoggedNil bool
 }
 
 // NewPaneView constructs a fresh PaneView for the daemon-owned session
@@ -709,13 +708,6 @@ func (p *PaneView) attachLoop(conn net.Conn, r *bufio.Reader) {
 				continue
 			}
 			outputBytes += len(payload)
-			// Log every frame's metadata (count, bytes) at INFO; cap
-			// the cumulative log lines so a high-output agent doesn't
-			// spam stderr. The 50-frame budget is enough to see the
-			// initial UI render plus a few seconds of activity.
-			if frameCount <= 50 {
-				log.Printf("openkanban paneview: attachLoop frame #%d session=%s bytes=%d total=%d", frameCount, p.sessionID, len(payload), outputBytes)
-			}
 			p.applyOutput(payload)
 			p.emitTeaMsg(PaneOutputMsg{PaneID: p.id})
 		case daemon.TypeDetach:
@@ -802,10 +794,6 @@ func (p *PaneView) applyOutput(data []byte) {
 	p.vt.Write(data)
 	p.dirty = true
 	p.cachedView = ""
-	p.applyOutputCount++
-	if p.applyOutputCount <= 20 {
-		log.Printf("openkanban paneview: applyOutput #%d session=%s bytes=%d vt_w=%d vt_h=%d altScreen=%v cursorHidden=%v", p.applyOutputCount, p.sessionID, len(data), p.vt.Width(), p.vt.Height(), p.altScreenActive, p.cursorHidden.Load())
-	}
 }
 
 var (
@@ -1164,13 +1152,7 @@ func (p *PaneView) View() string {
 		return p.cachedView
 	}
 	cursorVisible := !p.cursorHidden.Load()
-	w := p.vt.Width()
-	h := p.vt.Height()
 	p.cachedView = terminal.RenderVT(p.vt, p.scrollback, p.viewportOffset, cursorVisible, p.selection)
-	if !p.viewLoggedSize {
-		log.Printf("openkanban paneview: View() session=%s vt_w=%d vt_h=%d viewportOffset=%d cursorVisible=%v rendered_len=%d", p.sessionID, w, h, p.viewportOffset, cursorVisible, len(p.cachedView))
-		p.viewLoggedSize = true
-	}
 	p.dirty = false
 	return p.cachedView
 }
