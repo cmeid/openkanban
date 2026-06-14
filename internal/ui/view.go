@@ -8,9 +8,11 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/techdufus/openkanban/internal/board"
 	"github.com/techdufus/openkanban/internal/config"
+	"github.com/techdufus/openkanban/internal/daemonclient"
 )
 
 func (m *Model) View() string {
@@ -1411,10 +1413,53 @@ func (m *Model) renderAgentView() string {
 	if !ok {
 		return "No pane focused"
 	}
+	return m.renderAgentChrome(pane) + pane.View()
+}
+
+// renderAgentChrome builds the chrome block rendered above the embedded
+// session pane: a 1-row header and (when the focused ticket has any
+// dep relationships) a 1-row deps summary. Each row is clipped to
+// m.width so neither can wrap to a second host row — that's the
+// invariant agentChromeHeight relies on for pane sizing.
+//
+// The returned string includes a trailing "\n" after each chrome row
+// (matching what renderAgentView used to emit inline), so the caller
+// can concatenate pane.View() directly. The number of "\n" characters
+// in the result equals agentChromeHeight(hasDeps).
+func (m *Model) renderAgentChrome(pane *daemonclient.PaneView) string {
+	ticket, _ := m.globalStore.Get(m.focusedPane)
 
 	var b strings.Builder
+	b.WriteString(clipRow(m.renderAgentHeaderLine(ticket, pane), m.width))
+	b.WriteString("\n")
+	if deps := m.renderAgentDepsLine(ticket); deps != "" {
+		b.WriteString(clipRow(deps, m.width))
+		b.WriteString("\n")
+	}
+	return b.String()
+}
 
-	ticket, _ := m.globalStore.Get(m.focusedPane)
+// clipRow trims a styled row to at most `width` display columns and
+// strips any embedded newlines so the row stays on a single host
+// terminal line. ansi.Truncate preserves the surrounding ANSI escapes
+// so styles don't bleed into the rest of the screen.
+func clipRow(s string, width int) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = strings.ReplaceAll(s, "\n", "")
+	}
+	if width <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) > width {
+		return ansi.Truncate(s, width, "")
+	}
+	return s
+}
+
+// renderAgentHeaderLine builds the title/badge header followed by
+// right-aligned scroll/pane/hint indicators. Returns the row before
+// clipping — caller is responsible for clipping to m.width.
+func (m *Model) renderAgentHeaderLine(ticket *board.Ticket, pane *daemonclient.PaneView) string {
 	title := "Agent"
 	agentType := ""
 	projectName := ""
@@ -1463,31 +1508,6 @@ func (m *Model) renderAgentView() string {
 		header = header + "  " + durationBadge
 	}
 
-	var depsLine string
-	if ticket != nil {
-		blockedBy := m.globalStore.GetBlockedBy(ticket.ID)
-		blocks := m.globalStore.GetBlocks(ticket.ID)
-		if len(blockedBy) > 0 || len(blocks) > 0 {
-			depStyle := lipgloss.NewStyle().Foreground(m.colors.muted)
-			var depParts []string
-			if len(blockedBy) > 0 {
-				var names []string
-				for _, t := range blockedBy {
-					names = append(names, t.Title)
-				}
-				depParts = append(depParts, "⛓↑ "+strings.Join(names, ", "))
-			}
-			if len(blocks) > 0 {
-				var names []string
-				for _, t := range blocks {
-					names = append(names, t.Title)
-				}
-				depParts = append(depParts, "⛓↓ "+strings.Join(names, ", "))
-			}
-			depsLine = depStyle.Render(strings.Join(depParts, "  "))
-		}
-	}
-
 	activePaneCount := 0
 	paneIndex := 0
 	for id, p := range m.panes {
@@ -1503,36 +1523,69 @@ func (m *Model) renderAgentView() string {
 		Foreground(m.colors.muted).
 		Render(fmt.Sprintf("[%d/%d]", paneIndex, activePaneCount))
 
-	// Scroll indicator when viewport is scrolled back
 	scrollIndicator := ""
-	if offset := pane.ViewportOffset(); offset > 0 {
-		scrollbackLen := pane.ScrollbackLen()
-		scrollStyle := lipgloss.NewStyle().
-			Foreground(m.colors.warning).
-			Bold(true)
-		scrollIndicator = scrollStyle.Render(fmt.Sprintf("↑%d/%d", offset, scrollbackLen)) + "  "
+	if pane != nil {
+		if offset := pane.ViewportOffset(); offset > 0 {
+			scrollbackLen := pane.ScrollbackLen()
+			scrollStyle := lipgloss.NewStyle().
+				Foreground(m.colors.warning).
+				Bold(true)
+			scrollIndicator = scrollStyle.Render(fmt.Sprintf("↑%d/%d", offset, scrollbackLen)) + "  "
+		}
 	}
 
 	keyStyle := lipgloss.NewStyle().Foreground(m.colors.info)
 	hints := scrollIndicator + paneIndicator + "  " +
 		keyStyle.Render("Ctrl+g") + m.dimStyle().Render(" Board")
 
-	spacing := m.width - lipgloss.Width(header) - lipgloss.Width(hints)
-	spacing = max(spacing, 0)
-
-	b.WriteString(header)
-	b.WriteString(strings.Repeat(" ", spacing))
-	b.WriteString(hints)
-	b.WriteString("\n")
-
-	if depsLine != "" {
-		b.WriteString(depsLine)
-		b.WriteString("\n")
+	// If header + hints would overflow m.width, clip the header so the
+	// hints stay readable on the right. clipRow will absorb any
+	// remaining overflow on the combined string as a final safety net.
+	maxHeader := m.width - lipgloss.Width(hints) - 1
+	if maxHeader < 0 {
+		maxHeader = 0
+	}
+	if lipgloss.Width(header) > maxHeader {
+		header = ansi.Truncate(header, maxHeader, "…")
 	}
 
-	b.WriteString(pane.View())
+	spacing := m.width - lipgloss.Width(header) - lipgloss.Width(hints)
+	if spacing < 1 {
+		spacing = 1
+	}
 
-	return b.String()
+	return header + strings.Repeat(" ", spacing) + hints
+}
+
+// renderAgentDepsLine returns the styled deps-summary row for the
+// focused ticket, or "" when the ticket has no incoming/outgoing
+// blockers. Caller is responsible for clipping to m.width.
+func (m *Model) renderAgentDepsLine(ticket *board.Ticket) string {
+	if ticket == nil {
+		return ""
+	}
+	blockedBy := m.globalStore.GetBlockedBy(ticket.ID)
+	blocks := m.globalStore.GetBlocks(ticket.ID)
+	if len(blockedBy) == 0 && len(blocks) == 0 {
+		return ""
+	}
+	depStyle := lipgloss.NewStyle().Foreground(m.colors.muted)
+	var depParts []string
+	if len(blockedBy) > 0 {
+		var names []string
+		for _, t := range blockedBy {
+			names = append(names, t.Title)
+		}
+		depParts = append(depParts, "⛓↑ "+strings.Join(names, ", "))
+	}
+	if len(blocks) > 0 {
+		var names []string
+		for _, t := range blocks {
+			names = append(names, t.Title)
+		}
+		depParts = append(depParts, "⛓↓ "+strings.Join(names, ", "))
+	}
+	return depStyle.Render(strings.Join(depParts, "  "))
 }
 
 func formatDuration(d time.Duration) string {

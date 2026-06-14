@@ -603,7 +603,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		if m.focusedPane != "" {
 			if pane, ok := m.panes[m.focusedPane]; ok {
-				pane.SetSize(m.width, m.height-2)
+				focused, _ := m.globalStore.Get(m.focusedPane)
+				pane.SetSize(m.width, agentPaneRows(m.height, ticketHasDeps(m.globalStore, focused)))
 			}
 		}
 		return m, nil
@@ -1416,6 +1417,19 @@ func agentChromeHeight(hasDeps bool) int {
 		return 2
 	}
 	return 1
+}
+
+// agentPaneRows is the height-harmonization contract: the embedded
+// session pane gets every host row that the chrome above it doesn't
+// claim. Floored to 1 so claude always has at least one row to draw
+// into — when the host is too short for chrome plus pane, the chrome
+// is what gets clipped, not the pane.
+func agentPaneRows(termHeight int, hasDeps bool) int {
+	rows := termHeight - agentChromeHeight(hasDeps)
+	if rows < 1 {
+		return 1
+	}
+	return rows
 }
 
 func (m *Model) handleTicketFormMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
@@ -2661,8 +2675,7 @@ func (m *Model) attachToAgent() (tea.Model, tea.Cmd) {
 
 	m.mode = ModeAgentView
 	m.focusedPane = ticket.ID
-	paneHeight := m.height - 2
-	pane.SetSize(m.width, paneHeight)
+	pane.SetSize(m.width, agentPaneRows(m.height, ticketHasDeps(m.globalStore, ticket)))
 
 	// If we have a daemon-owned but unattached pane, do the binary
 	// upgrade now so the user sees a live screen.
@@ -3077,7 +3090,7 @@ func (m *Model) spawnAgent() (tea.Model, tea.Cmd) {
 			// instance). Re-attach instead of spawning a duplicate.
 			m.mode = ModeAgentView
 			m.focusedPane = ticket.ID
-			existing.SetSize(m.width, m.height-2)
+			existing.SetSize(m.width, agentPaneRows(m.height, ticketHasDeps(m.globalStore, ticket)))
 			cmd := m.attachExisting(ticket.ID, existing)
 			return m, tea.Batch(cmd, m.maybeSetWindowTitle())
 		}
@@ -3396,7 +3409,7 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 	branchName := ticket.BranchName
 	baseBranch := ticket.BaseBranch
 	useWorktree := ticket.UseWorktree
-	width, height := m.width, m.height-2
+	width, height := m.width, agentPaneRows(m.height, ticketHasDeps(m.globalStore, ticket))
 
 	agentType := agentCfg.Command
 	if strings.Contains(agentType, "/") {
