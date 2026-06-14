@@ -413,6 +413,9 @@ func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projec
 			m.daemonEvents = events
 			m.daemonUnsub = unsub
 			m.daemonConnected.Store(true)
+			log.Printf("openkanban model: daemon Subscribe ok; push channel armed")
+		} else {
+			log.Printf("openkanban model: daemon Subscribe returned nil channel; push events disabled")
 		}
 	}
 
