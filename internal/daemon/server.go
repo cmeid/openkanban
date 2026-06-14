@@ -10,7 +10,10 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/signal"
+	"runtime"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/techdufus/openkanban/internal/terminal"
@@ -180,6 +183,21 @@ func (s *Server) Serve(ctx context.Context) error {
 	// if no sessions are attached — the next TUI launch will autostart
 	// a fresh daemon from the new binary. Exits with the daemon.
 	go s.watchBinaryStaleness()
+
+	// Diagnostic: dump every goroutine's stack on SIGUSR1 so we can
+	// inspect the daemon's runtime state without restarting it. The
+	// handler never exits the process — only the existing shutdown
+	// paths can do that.
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGUSR1)
+	go func() {
+		for range sigChan {
+			buf := make([]byte, 1<<20) // 1 MB; plenty for dozens of goroutines
+			n := runtime.Stack(buf, true)
+			log.Printf("openkanbankd: SIGUSR1 received, goroutine dump:\n%s", buf[:n])
+		}
+	}()
+	log.Printf("openkanbankd: SIGUSR1 goroutine-dump handler ready")
 
 	for {
 		conn, err := s.ln.Accept()

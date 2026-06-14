@@ -173,8 +173,9 @@ type PaneView struct {
 
 	// One-shot diagnostic logging flags so we don't spam stderr on
 	// every render. Will be removed once Bug A is closed.
-	viewLoggedSize bool
-	viewLoggedNil  bool
+	viewLoggedSize   bool
+	viewLoggedNil    bool
+	applyOutputCount int
 }
 
 // NewPaneView constructs a fresh PaneView for the daemon-owned session
@@ -786,6 +787,10 @@ func (p *PaneView) applyOutput(data []byte) {
 	p.vt.Write(data)
 	p.dirty = true
 	p.cachedView = ""
+	p.applyOutputCount++
+	if p.applyOutputCount <= 20 {
+		log.Printf("openkanban paneview: applyOutput #%d session=%s bytes=%d vt_w=%d vt_h=%d altScreen=%v cursorHidden=%v", p.applyOutputCount, p.sessionID, len(data), p.vt.Width(), p.vt.Height(), p.altScreenActive, p.cursorHidden.Load())
+	}
 }
 
 var (
