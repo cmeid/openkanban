@@ -1,6 +1,7 @@
 package daemonclient
 
 import (
+	"bytes"
 	"context"
 	"strings"
 	"testing"
@@ -290,5 +291,37 @@ func TestPaneView_GetSetWorkdirAndSession(t *testing.T) {
 	pv.SetSessionName("named")
 	if got := pv.GetWorkdir(); got != "/tmp/x" {
 		t.Errorf("GetWorkdir: got %q want /tmp/x", got)
+	}
+}
+
+func TestTranslateKey_EnterAndShiftEnter(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  tea.KeyMsg
+		want []byte
+	}{
+		{
+			name: "plain Enter emits CR",
+			msg:  tea.KeyMsg{Type: tea.KeyEnter},
+			want: []byte("\r"),
+		},
+		{
+			// Bubbletea v1 has no Shift field; terminals configured
+			// for shift+enter emit ESC+CR, which lands here as
+			// Alt+Enter. The PTY must see ESC+CR so the inner agent
+			// (Claude Code, etc.) inserts a newline instead of
+			// submitting.
+			name: "Alt+Enter (shift+enter) emits ESC+CR",
+			msg:  tea.KeyMsg{Type: tea.KeyEnter, Alt: true},
+			want: []byte{27, '\r'},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := translateKey(tt.msg)
+			if !bytes.Equal(got, tt.want) {
+				t.Errorf("translateKey(%v) = %q, want %q", tt.msg, got, tt.want)
+			}
+		})
 	}
 }

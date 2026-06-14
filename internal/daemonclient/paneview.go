@@ -1318,6 +1318,14 @@ func translateKey(msg tea.KeyMsg) []byte {
 
 	switch msg.Type {
 	case tea.KeyEnter:
+		// Bubbletea v1 has no Shift field; terminals configured to
+		// send shift+enter emit ESC+CR, which bubbletea reports as
+		// Alt+Enter. Pass that through verbatim so the inner agent
+		// (Claude Code, etc.) sees the meta-Enter and inserts a
+		// newline instead of submitting.
+		if msg.Alt {
+			return []byte{27, '\r'}
+		}
 		return []byte("\r")
 	case tea.KeyBackspace:
 		return []byte{127}

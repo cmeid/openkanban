@@ -267,6 +267,15 @@ func TestTranslateKey(t *testing.T) {
 			want: []byte("\r"),
 		},
 		{
+			// Terminals configured for shift+enter (iTerm2/Ghostty/etc.)
+			// emit ESC+CR; bubbletea v1 reports that as Alt+Enter since
+			// it has no Shift field. Pass it through so the inner agent
+			// (e.g. Claude Code) sees a real meta-Enter, not bare CR.
+			name: "Alt+Enter (shift+enter from terminal) emits ESC+CR",
+			msg:  tea.KeyMsg{Type: tea.KeyEnter, Alt: true},
+			want: []byte{27, '\r'},
+		},
+		{
 			name: "Up arrow",
 			msg:  tea.KeyMsg{Type: tea.KeyUp},
 			want: []byte("\x1b[A"),
