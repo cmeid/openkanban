@@ -675,13 +675,13 @@ func (m *Model) contextualHints(hintStyle lipgloss.Style, sep string) string {
 		ticket := m.selectedTicket()
 		if ticket != nil {
 			if _, hasPane := m.panes[ticket.ID]; hasPane {
-				return hintStyle.Render("Enter") + m.dimStyle().Render(" attach") + sep +
+				return hintStyle.Render("Enter/s") + m.dimStyle().Render(" open agent") + sep +
 					hintStyle.Render("S") + m.dimStyle().Render(" stop agent") + sep +
 					hintStyle.Render("Space") + m.dimStyle().Render(" move") + sep +
 					hintStyle.Render("?") + m.dimStyle().Render(" help")
 			}
 			if ticket.Status == board.StatusInProgress {
-				return hintStyle.Render("s") + m.dimStyle().Render(" spawn agent") + sep +
+				return hintStyle.Render("Enter/s") + m.dimStyle().Render(" spawn agent") + sep +
 					hintStyle.Render("Space") + m.dimStyle().Render(" move") + sep +
 					hintStyle.Render("e") + m.dimStyle().Render(" edit") + sep +
 					hintStyle.Render("?") + m.dimStyle().Render(" help")
@@ -733,10 +733,10 @@ func (m *Model) renderHelp() string {
 		sep + "\n" +
 		sectionStyle.Render("  📂 Sidebar") + "                    " + sectionStyle.Render("🤖 Agent") + "\n" +
 		sep + "\n" +
-		"  " + keyStyle.Render("[") + descStyle.Render("     Toggle sidebar        ") + keyStyle.Render("s") + descStyle.Render("       Spawn agent") + "\n" +
+		"  " + keyStyle.Render("[") + descStyle.Render("     Toggle sidebar        ") + keyStyle.Render("s/Enter") + descStyle.Render(" Open agent") + "\n" +
 		"  " + keyStyle.Render("h") + descStyle.Render("     Enter sidebar         ") + keyStyle.Render("S") + descStyle.Render("       Stop agent") + "\n" +
-		"  " + keyStyle.Render("l") + descStyle.Render("     Exit sidebar          ") + keyStyle.Render("Enter") + descStyle.Render("   Attach to agent") + "\n" +
-		"  " + keyStyle.Render("j/k") + descStyle.Render("   Navigate projects     ") + keyStyle.Render("Ctrl+g") + descStyle.Render("  Exit agent view") + "\n\n" +
+		"  " + keyStyle.Render("l") + descStyle.Render("     Exit sidebar          ") + keyStyle.Render("Ctrl+g") + descStyle.Render("  Exit agent view") + "\n" +
+		"  " + keyStyle.Render("j/k") + descStyle.Render("   Navigate projects") + "\n\n" +
 		sep + "\n" +
 		sectionStyle.Render("  👁 View") + "\n" +
 		sep + "\n" +

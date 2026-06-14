@@ -1021,16 +1021,19 @@ func (m *Model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.createNewTicket()
 	case "e":
 		return m.editTicket()
-	case "enter":
-		return m.attachToAgent()
+	case "enter", "s":
+		// Single entry point: spawnAgent dispatches to spawn or
+		// re-attach based on the current pane state. Pre-consolidation,
+		// Enter only attached and 's' only spawned, which produced
+		// cross-key bounces ("press Enter to attach" / "press 's' to
+		// spawn") for the user.
+		return m.spawnAgent()
 	case "d":
 		return m.confirmDeleteTicket()
 	case " ":
 		return m.quickMoveTicket()
 	case "-", "backspace":
 		return m.quickMoveTicketBackward()
-	case "s":
-		return m.spawnAgent()
 	case "S":
 		return m.stopAgent()
 
@@ -2791,40 +2794,13 @@ func (m *Model) editTicket() (tea.Model, tea.Cmd) {
 	return m, m.titleInput.Cursor.BlinkCmd()
 }
 
-func (m *Model) attachToAgent() (tea.Model, tea.Cmd) {
-	ticket := m.selectedTicket()
-	if ticket == nil {
-		m.notify("No ticket selected")
-		return m, nil
-	}
-
-	pane, ok := m.panes[ticket.ID]
-	if !ok || !pane.Running() {
-		m.notify("No agent running — press 's' to spawn")
-		return m, nil
-	}
-
-	m.mode = ModeAgentView
-	m.focusedPane = ticket.ID
-	paneHeight := m.height - 2
-	pane.SetSize(m.width, paneHeight)
-
-	// If we have a daemon-owned but unattached pane, do the binary
-	// upgrade now so the user sees a live screen.
-	var attachCmd tea.Cmd
-	if pane.State() == daemonclient.PaneViewUnattached {
-		attachCmd = m.attachExisting(ticket.ID, pane)
-	}
-	return m, tea.Batch(attachCmd, m.maybeSetWindowTitle())
-}
-
 // attachExisting performs the daemon attach (or takeover, if another
 // client owns the binary stream) for a PaneView the model already
 // holds. Returns a tea.Cmd that runs the attach in the background and
 // then arms the pane's tea message reader.
 //
 // Used by:
-//   - attachToAgent (Enter on a daemon-owned ticket from board view)
+//   - spawnAgent (Enter/s on a daemon-owned ticket from board view)
 //   - handleAgentViewMode (AttachFirstMsg fallback when the user types
 //     into an unattached pane)
 //   - Update's AttachFirstMsg routing.
@@ -2886,16 +2862,9 @@ func (m *Model) attachExisting(ticketID board.TicketID, pv *daemonclient.PaneVie
 }
 
 func (m *Model) handleDoubleClick() (tea.Model, tea.Cmd) {
-	ticket := m.selectedTicket()
-	if ticket == nil {
-		return m, nil
-	}
-
-	pane, ok := m.panes[ticket.ID]
-	if ok && pane.Running() {
-		return m.attachToAgent()
-	}
-
+	// spawnAgent now dispatches to spawn vs attach based on the pane
+	// state itself, so the double-click handler doesn't need to
+	// pre-decide. Same behavior as 's' / Enter on the board view.
 	return m.spawnAgent()
 }
 
@@ -3201,22 +3170,33 @@ func (m *Model) shouldCleanupDeadSession(ticket *board.Ticket) (bool, string) {
 	return dead, deadPath
 }
 
+// spawnAgent is the single entry point for the "open this ticket's
+// agent" action: both 's' and Enter on the board view route here, as
+// does double-click. It dispatches based on the current pane state:
+//
+//   - no pane / PaneViewDetached  → spawn a fresh session
+//   - PaneViewUnattached          → attach to the daemon-owned session
+//   - PaneViewAttached            → just switch to the agent view
+//
+// The pre-consolidation behavior split this between spawnAgent and
+// attachToAgent and produced "press the OTHER key" bounce
+// notifications when the user pressed the wrong one for the current
+// state.
 func (m *Model) spawnAgent() (tea.Model, tea.Cmd) {
 	ticket := m.selectedTicket()
 	if ticket == nil {
-		return m, nil
-	}
-
-	if ticket.Status != board.StatusInProgress {
-		m.notify("Press Space to move to In Progress first")
+		m.notify("No ticket selected")
 		return m, nil
 	}
 
 	if existing, exists := m.panes[ticket.ID]; exists {
 		switch existing.State() {
 		case daemonclient.PaneViewAttached:
-			m.notify("Agent already running — press Enter to attach")
-			return m, nil
+			// Already attached in this TUI — just switch to its view.
+			m.mode = ModeAgentView
+			m.focusedPane = ticket.ID
+			existing.SetSize(m.width, m.height-2)
+			return m, m.maybeSetWindowTitle()
 		case daemonclient.PaneViewUnattached:
 			// Daemon owns it (likely from a prior TUI run or sibling
 			// instance). Re-attach instead of spawning a duplicate.
@@ -3228,6 +3208,15 @@ func (m *Model) spawnAgent() (tea.Model, tea.Cmd) {
 		}
 		// PaneViewDetached falls through to the spawn path so a stale
 		// view (daemon vanished, etc.) gets refreshed.
+	}
+
+	// From here on we are spawning fresh, which requires the ticket to
+	// actually be ready to work on. Putting the in-progress check after
+	// the attach branches lets Enter/s on an already-running session
+	// reach the view without the user first having to clear this gate.
+	if ticket.Status != board.StatusInProgress {
+		m.notify("Press Space to move to In Progress first")
+		return m, nil
 	}
 
 	proj := m.globalStore.GetProjectForTicket(ticket)
