@@ -393,25 +393,7 @@ func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, w
 			Render("✗")
 	}
 
-	var priorityBadge string
-	if ticket.Priority >= 1 && ticket.Priority <= 5 {
-		priorityColors := map[int]lipgloss.Color{
-			1: m.colors.err,
-			2: lipgloss.Color("#fab387"),
-			3: m.colors.warning,
-			4: m.colors.primary,
-			5: m.colors.muted,
-		}
-		priorityLabels := map[int]string{
-			1: "⌃⌃",
-			2: "⌃⎯",
-			3: "⎯⎯",
-			4: "⎯⌄",
-			5: "⌄⌄",
-		}
-		pColor := priorityColors[ticket.Priority]
-		priorityBadge = lipgloss.NewStyle().Foreground(pColor).Bold(true).Render(priorityLabels[ticket.Priority])
-	}
+	priorityBadge := m.renderPriorityBadge(ticket.Priority)
 
 	var depBadge string
 	blockedByCount := len(m.globalStore.GetBlockedBy(ticket.ID))
@@ -1420,10 +1402,14 @@ func (m *Model) renderAgentView() string {
 	title := "Agent"
 	agentType := ""
 	projectName := ""
+	priority := 0
+	var agentStatus board.AgentStatus
 	var sessionDuration string
 	if ticket != nil {
 		title = ticket.Title
 		agentType = ticket.AgentType
+		priority = ticket.Priority
+		agentStatus = ticket.AgentStatus
 		if proj := m.globalStore.GetProjectForTicket(ticket); proj != nil {
 			projectName = proj.Name
 		}
@@ -1433,12 +1419,15 @@ func (m *Model) renderAgentView() string {
 		}
 	}
 
-	breadcrumbStyle := lipgloss.NewStyle().Foreground(m.colors.muted)
 	titleStyle := lipgloss.NewStyle().
 		Foreground(m.colors.primary).
 		Bold(true)
 
-	header := breadcrumbStyle.Render("Board → ") + titleStyle.Render(title)
+	var headerParts []string
+	if pri := m.renderPriorityBadge(priority); pri != "" {
+		headerParts = append(headerParts, pri)
+	}
+	headerParts = append(headerParts, titleStyle.Render(title))
 
 	if projectName != "" {
 		projBadge := lipgloss.NewStyle().
@@ -1446,7 +1435,7 @@ func (m *Model) renderAgentView() string {
 			Background(m.colors.info).
 			Padding(0, 1).
 			Render(projectName)
-		header = header + "  " + projBadge
+		headerParts = append(headerParts, projBadge)
 	}
 
 	if agentType != "" {
@@ -1455,15 +1444,24 @@ func (m *Model) renderAgentView() string {
 			Background(m.colors.primary).
 			Padding(0, 1).
 			Render(agentType)
-		header = header + "  " + agentBadge
+		headerParts = append(headerParts, agentBadge)
 	}
 
-	if sessionDuration != "" {
+	if pill := m.renderAgentStatusPill(agentStatus); pill != "" {
+		headerParts = append(headerParts, pill)
+	}
+
+	// Session duration ticks since AgentSpawnedAt. Suppress it when the
+	// agent has reported completion — the "✓ done" pill carries the
+	// state, and a still-ticking counter would read as "still running".
+	if sessionDuration != "" && agentStatus != board.AgentCompleted {
 		durationBadge := lipgloss.NewStyle().
 			Foreground(m.colors.muted).
 			Render("⏱ " + sessionDuration)
-		header = header + "  " + durationBadge
+		headerParts = append(headerParts, durationBadge)
 	}
+
+	header := strings.Join(headerParts, "  ")
 
 	var depsLine string
 	if ticket != nil {
@@ -1520,15 +1518,22 @@ func (m *Model) renderAgentView() string {
 		keyStyle.Render("Ctrl+g") + m.dimStyle().Render(" Board")
 
 	spacing := m.width - lipgloss.Width(header) - lipgloss.Width(hints)
-	spacing = max(spacing, 0)
+	// At least one cell of separation keeps the bar legible when content
+	// is wide enough to butt the right-hand hints against the header.
+	if spacing < 1 {
+		spacing = 1
+	}
 
-	b.WriteString(header)
-	b.WriteString(strings.Repeat(" ", spacing))
-	b.WriteString(hints)
+	// Surface-tinted background spans the full width to mark the chrome
+	// as a distinct band over the embedded PTY. Inner badges keep their
+	// own backgrounds; spacing cells inherit the bar's tint.
+	barStyle := lipgloss.NewStyle().Background(m.colors.surface).Width(m.width)
+	bar := barStyle.Render(header + strings.Repeat(" ", spacing) + hints)
+	b.WriteString(bar)
 	b.WriteString("\n")
 
 	if depsLine != "" {
-		b.WriteString(depsLine)
+		b.WriteString(barStyle.Render(depsLine))
 		b.WriteString("\n")
 	}
 
@@ -1550,6 +1555,96 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%dh", hours)
 	}
 	return fmt.Sprintf("%dh%dm", hours, mins)
+}
+
+// agentStatusGlyph maps an AgentStatus to the (icon, label) pair used
+// in the embedded-session title bar. Returns empty strings for
+// AgentNone (no badge). The icons match renderTicket's sessionBadge
+// where they overlap; AgentWorking adds a solid dot since the card
+// view doesn't render a badge for working agents.
+func agentStatusGlyph(s board.AgentStatus) (icon, label string) {
+	switch s {
+	case board.AgentWorking:
+		return "●", "working"
+	case board.AgentWaiting:
+		return "◐", "waiting"
+	case board.AgentIdle:
+		return "◆", "idle"
+	case board.AgentCompleted:
+		return "✓", "done"
+	case board.AgentError:
+		return "✗", "error"
+	}
+	return "", ""
+}
+
+// renderAgentStatusPill returns a styled "<icon> <label>" pill for the
+// embedded-session title bar, or "" for AgentNone. Color tracks status
+// severity (working=success, waiting=warning, completed=success-dim,
+// error=err, idle=muted).
+func (m *Model) renderAgentStatusPill(s board.AgentStatus) string {
+	icon, label := agentStatusGlyph(s)
+	if icon == "" {
+		return ""
+	}
+	var color lipgloss.Color
+	switch s {
+	case board.AgentWorking:
+		color = m.colors.success
+	case board.AgentWaiting:
+		color = m.colors.warning
+	case board.AgentIdle:
+		color = m.colors.muted
+	case board.AgentCompleted:
+		color = m.colors.success
+	case board.AgentError:
+		color = m.colors.err
+	default:
+		color = m.colors.muted
+	}
+	return lipgloss.NewStyle().Foreground(color).Render(icon + " " + label)
+}
+
+// priorityGlyph returns the two-cell glyph used for a ticket priority,
+// or "" if the priority is out of the 1..5 range. The convention is
+// shared between the card view and the agent-view title bar.
+func priorityGlyph(p int) string {
+	switch p {
+	case 1:
+		return "⌃⌃"
+	case 2:
+		return "⌃⎯"
+	case 3:
+		return "⎯⎯"
+	case 4:
+		return "⎯⌄"
+	case 5:
+		return "⌄⌄"
+	}
+	return ""
+}
+
+// renderPriorityBadge returns a styled priority glyph. Empty string
+// for out-of-range priorities.
+func (m *Model) renderPriorityBadge(p int) string {
+	glyph := priorityGlyph(p)
+	if glyph == "" {
+		return ""
+	}
+	var color lipgloss.Color
+	switch p {
+	case 1:
+		color = m.colors.err
+	case 2:
+		color = lipgloss.Color("#fab387")
+	case 3:
+		color = m.colors.warning
+	case 4:
+		color = m.colors.primary
+	case 5:
+		color = m.colors.muted
+	}
+	return lipgloss.NewStyle().Foreground(color).Bold(true).Render(glyph)
 }
 
 func (m *Model) renderFilterInput() string {
