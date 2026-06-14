@@ -693,8 +693,12 @@ func (p *PaneView) attachLoop(conn net.Conn, r *bufio.Reader) {
 				continue
 			}
 			outputBytes += len(payload)
-			if frameCount <= 5 {
-				log.Printf("openkanban paneview: attachLoop output frame #%d session=%s bytes=%d", frameCount, p.sessionID, len(payload))
+			// Log every frame's metadata (count, bytes) at INFO; cap
+			// the cumulative log lines so a high-output agent doesn't
+			// spam stderr. The 50-frame budget is enough to see the
+			// initial UI render plus a few seconds of activity.
+			if frameCount <= 50 {
+				log.Printf("openkanban paneview: attachLoop frame #%d session=%s bytes=%d total=%d", frameCount, p.sessionID, len(payload), outputBytes)
 			}
 			p.applyOutput(payload)
 			p.emitTeaMsg(PaneOutputMsg{PaneID: p.id})
