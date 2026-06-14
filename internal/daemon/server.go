@@ -640,8 +640,23 @@ func (s *Server) watchSessionExit(sess *Session) {
 				Reason:    reason,
 			})
 		}
+		// removeSession deletes sess from the registry if (and only if)
+		// it's still the entry under sessID. handleKill / handleTicketDone
+		// may have already removed it via the explicit path; both paths
+		// must be safe to run concurrently. We do this BEFORE the emit
+		// so subscribers that List() in response to "exited" don't see
+		// the stale session.
+		removeSession := func() {
+			s.sessionsMu.Lock()
+			if cur, ok := s.sessions[sessID]; ok && cur == sess {
+				delete(s.sessions, sessID)
+				log.Printf("openkanbankd: session %s (ticket=%s) exited; removed from registry", sessID, ticketID)
+			}
+			s.sessionsMu.Unlock()
+		}
 		for ev := range ch {
 			if _, ok := ev.(terminal.ExitEvent); ok {
+				removeSession()
 				emit()
 				return
 			}
@@ -649,6 +664,7 @@ func (s *Server) watchSessionExit(sess *Session) {
 		// Channel closed without ExitEvent (e.g. Stop tore the loop
 		// down before the read returned). Emit anyway so subscribers
 		// learn the session is gone.
+		removeSession()
 		emit()
 	}()
 }
