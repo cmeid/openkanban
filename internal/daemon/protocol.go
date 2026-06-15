@@ -219,6 +219,16 @@ func DecodeEnvelope(data []byte) (typeName string, payload json.RawMessage, err 
 	return env.Type, env.Payload, nil
 }
 
+// Well-known ClientName values used in HelloReq. The daemon
+// distinguishes TUI clients (interactive, attach long-lived sessions)
+// from CLI clients (one-shot subcommands like `daemon list` / `stop`)
+// so the warn-on-orphan logic in handlePrepareExit knows which
+// connections matter for "is a user still watching this work?"
+const (
+	ClientNameTUI = "openkanban-tui"
+	ClientNameCLI = "openkanban-cli"
+)
+
 // HelloReq is the first message a client sends after connecting. It
 // announces the client's protocol version and identity.
 type HelloReq struct {
@@ -395,9 +405,13 @@ type SessionEvent struct {
 type PrepareExitReq struct{}
 
 // PrepareExitResp tells the exiting client what state is at stake.
+// OtherTUIClients counts TUI clients OTHER than the asking client;
+// used by `daemon stop` / `daemon restart` to decide whether a
+// shutdown would orphan live sessions with no TUI watching.
 type PrepareExitResp struct {
-	ClientCount int           `json:"client_count"`
-	Sessions    []SessionInfo `json:"sessions"`
+	ClientCount     int           `json:"client_count"`
+	OtherTUIClients int           `json:"other_tui_clients"`
+	Sessions        []SessionInfo `json:"sessions"`
 }
 
 // ShutdownReq asks the daemon to exit. With Force=false the daemon

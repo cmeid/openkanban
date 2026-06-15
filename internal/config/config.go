@@ -66,6 +66,7 @@ type Config struct {
 	UI       UIConfig               `json:"ui"`
 	Cleanup  CleanupSettings        `json:"cleanup"`
 	Behavior BehaviorSettings       `json:"behavior"`
+	Daemon   DaemonSettings         `json:"daemon"`
 	Opencode OpencodeSettings       `json:"opencode"`
 	Keys     map[string]string      `json:"keys,omitempty"`
 }
@@ -124,6 +125,15 @@ type BehaviorSettings struct {
 	ConfirmQuitWithAgents     bool `json:"confirm_quit_with_agents"`      // Prompt before quitting with running agents
 	CheckForUpdatesOnLaunch   bool `json:"check_for_updates_on_launch"`   // Quick update check before entering the TUI
 	ForwardAgentNotifications bool `json:"forward_agent_notifications"`   // Re-emit OSC 9 notifications from wrapped agents to the host terminal
+}
+
+// DaemonSettings controls how the TUI interacts with openkanbankd at
+// launch. Defaults preserve historical behavior — the TUI forks a
+// daemon on demand. Set Autostart=false (or pass --no-launch-daemon)
+// when openkanbankd is managed externally (e.g. by launchd) so the
+// TUI does not race the service for the pidlock.
+type DaemonSettings struct {
+	Autostart bool `json:"autostart"` // TUI autostarts the daemon if not already running
 }
 
 func defaultAgents() map[string]AgentConfig {
@@ -200,6 +210,9 @@ func DefaultConfig() *Config {
 			ConfirmQuitWithAgents:     true,
 			CheckForUpdatesOnLaunch:   true,
 			ForwardAgentNotifications: true,
+		},
+		Daemon: DaemonSettings{
+			Autostart: true,
 		},
 		Opencode: OpencodeSettings{
 			ServerEnabled:  true,

@@ -242,6 +242,47 @@ func TestLoad_ValidFile(t *testing.T) {
 	}
 }
 
+// TestLoad_LegacyConfigInheritsDaemonDefault verifies the
+// backward-compat contract: a config.json written before DaemonSettings
+// existed (no "daemon" key) MUST still load with Autostart=true.
+// Without this, every user upgrading from an older binary would
+// silently lose TUI-spawned daemon autostart on first launch.
+//
+// The mechanism: Load() / LoadWithValidation() start from
+// DefaultConfig() then json.Unmarshal user JSON over it. Go's
+// json.Unmarshal only overwrites fields PRESENT in the JSON; absent
+// keys keep the destination struct's existing value. This test
+// pins that behavior so a future refactor can't regress it.
+func TestLoad_LegacyConfigInheritsDaemonDefault(t *testing.T) {
+	tmp := filepath.Join(t.TempDir(), "config.json")
+	// Deliberately omit the "daemon" key — simulating a config
+	// written by an older openkanban binary.
+	legacy := `{"defaults":{"default_agent":"claude"},"ui":{"theme":"catppuccin-mocha"}}`
+	if err := os.WriteFile(tmp, []byte(legacy), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	t.Run("Load", func(t *testing.T) {
+		cfg, err := Load(tmp)
+		if err != nil {
+			t.Fatalf("Load() error: %v", err)
+		}
+		if !cfg.Daemon.Autostart {
+			t.Errorf("legacy config missing 'daemon' key: Autostart got %v want true", cfg.Daemon.Autostart)
+		}
+	})
+
+	t.Run("LoadWithValidation", func(t *testing.T) {
+		cfg, _, err := LoadWithValidation(tmp)
+		if err != nil {
+			t.Fatalf("LoadWithValidation() error: %v", err)
+		}
+		if !cfg.Daemon.Autostart {
+			t.Errorf("legacy config missing 'daemon' key (validation path): Autostart got %v want true", cfg.Daemon.Autostart)
+		}
+	})
+}
+
 func TestLoad_EmptyArgs(t *testing.T) {
 	tests := []struct {
 		name string

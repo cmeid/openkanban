@@ -76,8 +76,10 @@ type rawResp struct {
 
 // clientNameForHello is the identifier the daemon sees in HelloReq.
 // Kept distinct from BinaryVersion so the daemon's logs can tell apart
-// e.g. concurrent TUI clients on the same host.
-const clientNameForHello = "openkanban-tui"
+// e.g. concurrent TUI clients on the same host. Sourced from
+// internal/daemon's ClientNameTUI constant so server-side TUI counting
+// (handlePrepareExit) and client-side naming agree.
+const clientNameForHello = daemon.ClientNameTUI
 
 // New dials the daemon (autostarting if needed), performs the Hello
 // handshake, and spawns the read loop. Returns the connected Client on
@@ -85,6 +87,20 @@ const clientNameForHello = "openkanban-tui"
 // can't be reached.
 func New(ctx context.Context) (*Client, error) {
 	conn, err := DialOrStart(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return newClient(ctx, conn)
+}
+
+// NewNoAutostart is New without the on-demand fork: it dials the
+// existing daemon and never tries to start one. Used by the TUI when
+// the user passes --no-launch-daemon or sets daemon.autostart=false
+// in config, indicating openkanbankd is managed externally (e.g. by
+// launchd). Returns ErrDaemonUnavailable wrapping the dial cause if
+// the daemon isn't already listening.
+func NewNoAutostart(ctx context.Context) (*Client, error) {
+	conn, err := Dial(ctx)
 	if err != nil {
 		return nil, err
 	}

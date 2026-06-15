@@ -49,16 +49,22 @@ Per-user, single instance, locked by `flock(LOCK_EX|LOCK_NB)` on a pidfile.
 - Pidfile: `~/.cache/openkanban/daemon.pid` (override via `OPENKANBAN_DAEMON_PID`)
 - Log: `~/.cache/openkanban/daemon.log` (override via `OPENKANBAN_DAEMON_LOG`; tail with `openkanban daemon log`)
 
-The daemon is autostarted on the first TUI invocation that needs it — `daemonclient.DialOrStart` (see `internal/daemonclient/dial.go`) forks `<self> daemon` with `Setsid` and stdio redirected to the log file, then polls the socket until it binds. No systemd unit, no launchd plist; the user-facing model is "openkanban runs it for you, you mostly don't need to know."
+The daemon has two supported lifecycle modes:
 
-### Lifecycle: bound to ≥1 live TUI
+1. **Default (TUI-managed).** The TUI autostarts the daemon on first invocation via `daemonclient.DialOrStart` (`internal/daemonclient/dial.go`), which forks `<self> daemon` with `Setsid` and stdio redirected to the log file, then polls the socket until it binds. The daemon's lifetime is bound to a connected TUI — see below. The user-facing model is "openkanban runs it for you, you mostly don't need to know."
 
-This is **not** a tmux-style long-running service. The daemon's contract is "be alive while there's a TUI that needs me." Concretely:
+2. **System-managed (macOS launchd).** Run `openkanban daemon install-service` to register openkanbankd as a LaunchAgent under `gui/<uid>`. The plist invokes `openkanban daemon --persistent`, which keeps the daemon alive across TUI restarts. Useful when iterating on TUI code or expecting agent sessions to outlive any one TUI process. `daemon uninstall-service` reverses it. Set `daemon.autostart: false` in `~/.config/openkanban/config.json` (or pass `--no-launch-daemon` at launch) so the TUI doesn't race the service for the pidlock. No Linux systemd backend yet; on Linux you can run `openkanban daemon --persistent` under your own supervisor (systemd user unit, tmux, etc.).
+
+### Lifecycle: default vs persistent
+
+**Default mode** is not a tmux-style long-running service. The daemon's contract is "be alive while there's a TUI that needs me." Concretely:
 
 - Last-client-disconnect triggers shutdown. When the connected-clients count drops to zero, the daemon kills any still-live sessions (defensively — the TUI's exit-guard should have caught this) and exits immediately. See `internal/daemon/server.go:handleLastClientDisconnect`.
 - The TUI's exit-guard (see `internal/ui/exit_guard.go`) prompts the user before quitting whenever live daemon sessions exist, regardless of client count — so simultaneous-close races across multiple TUIs can't bypass the prompt and tip the daemon into the defensive-kill path.
 
-This means a daemon process never outlives its useful work. It also means `openkanban daemon` from a fresh shell with no TUI running will start and immediately exit — that's expected; pair it with a TUI or a long-lived `openkanban daemon list` to keep it up for debugging.
+This means a default-mode daemon process never outlives its useful work. It also means `openkanban daemon` from a fresh shell with no TUI running will start and immediately exit — that's expected; pair it with a TUI or a long-lived `openkanban daemon list` to keep it up for debugging.
+
+**Persistent mode** (`--persistent`, used by `daemon install-service`) inverts the last-client gate: the daemon stays alive when all clients disconnect, and only exits via explicit `openkanban daemon stop`, SIGTERM, or its own staleness watcher (after a binary upgrade with no sessions attached — see below). To avoid silently orphaning live sessions, `daemon stop` prompts before shutting down if sessions are alive AND no TUI is currently watching (pass `--force` to skip).
 
 ### One attacher per session, with Takeover
 
@@ -88,10 +94,27 @@ This is why a TUI reattach "just shows the current screen" — there is no scrol
 
 Migrating an openkanban-owned session is the case the daemon makes safer: the daemon knows it holds the JSONL open, so the CLI does not need to lsof the world and SIGTERM strangers.
 
+### Architectural decisions (do not regress without consulting this section)
+
+The persistent-mode / launchd integration shipped 2026-06-15 has a small set of load-bearing design choices. Future contributors editing this area should preserve each unless the original constraint genuinely no longer applies.
+
+1. **Two modes only: default (TUI-bound) and persistent (`--persistent`).** No auto-detection of "am I under launchd?" via PPID or env. The flag is explicit. Why: PPID-based detection is fragile across re-execs and process supervisors, and hides intent.
+2. **Last-client-disconnect = exit ONLY in default mode.** `handleLastClientDisconnect` (`internal/daemon/server.go`) gates `initiateShutdown` on `!s.persistent`. Don't conditionally re-introduce shutdown in persistent mode without addressing the "rapid TUI iteration loses sessions" use case that motivated this whole refactor.
+3. **Persistent + stale binary + 0 sessions = STILL exit.** `watchBinaryStaleness` deliberately ignores the `persistent` flag at the zero-sessions branch. Why: under launchd the exit triggers a clean respawn with the new binary; without launchd, exit beats "stale forever." Adding a `persistent` gate here would create a stale-binary footgun.
+4. **No `service.Backend` interface — launchd is inline, build-tagged.** `internal/service/launchd_darwin.go` + `launchd_other.go` (stub returning `ErrUnsupported`). Why: with one concrete backend, an abstraction is guessing at the seam. When systemd lands as `systemd_linux.go`, *that's* the moment to extract a contract from the actual diff between the two implementations. Don't pre-abstract.
+5. **`launchctl bootstrap` / `bootout`, NOT `load` / `unload`.** The deprecated verbs work but are noisy on Sonoma+ and break `launchctl print` scrapes. If you "fix" this back to `load`, you're undoing a deliberate Sonoma-era choice — read the man pages first.
+6. **`KeepAlive = {SuccessfulExit: false}`** in the plist. A clean `openkanban daemon stop` (exit 0) leaves the service down. Only crashes / signals / `launchctl bootout` trigger respawn. This is the user's escape hatch from "the service refuses to stop."
+7. **`install-service` REFUSES if a daemon is currently running.** Liveness check via `daemonclient.Dial(2s-timeout)`. No "auto-stop the existing one" magic. Why: transactional stop-then-install can fail mid-way (sessions live, user not prompted); two clear user steps beats one magical action.
+8. **`install-service` does NOT modify `~/.config/openkanban/config.json`.** Only the interactive `scripts/install.sh` prompt path is allowed to flip `daemon.autostart=false`. The bare subcommand prints a hint and lets the user choose. Why: separation of concerns; re-running install-service shouldn't silently reconfigure the user.
+9. **`install-service` rejects `os.TempDir()` / `/go-build` binary paths.** `sanityCheckBinPath` catches the "I ran from `go run`" footgun where the plist points at a path the OS will GC in minutes.
+10. **`--no-launch-daemon` is ONE-WAY.** `=true` suppresses autostart; `=false` does NOT force autostart on (config controls). There's a code comment at `cmd/root.go` enforcing this so a future contributor doesn't refactor it into a tri-state.
+11. **TUI clients identify themselves as `"openkanban-tui"`; CLI subcommands as `"openkanban-cli"`.** Constants live in `internal/daemon/protocol.go` (`ClientNameTUI` / `ClientNameCLI`). `daemon stop` uses `PrepareExitResp.OtherTUIClients` to decide whether shutting down would orphan live agent work — the warning prompt only fires when no TUI is watching. Don't drop the ClientName tracking; don't reuse those string values for non-TUI/non-CLI clients.
+12. **Existing default-mode integration tests stay default-mode.** Persistent-mode behavior has its own siblings (`TestServerLifecycle_PersistentSurvivesLastDisconnect`, `TestPrepareExit_OtherTUIClients`). Don't add a `persistent` knob to `startServer()`; copy-paste a new test fixture instead — keeps the test harness from accidentally coupling the two modes.
+
 ### What is *not* supported
 
 - **Concurrent shared attach.** One attacher; status subscribers do not see keystrokes.
-- **Daemon survives its own upgrade.** Replacing the `openkanban` binary requires `openkanban daemon restart`. The protocol-version check in the client fails loudly with that exact hint if the user forgets. "Upgrade in place" was considered and rejected — every reasonable implementation requires either ABI freezing or an in-band handshake migration, both of which cost more than the user does by re-killing N sessions once a release.
+- **Daemon survives its own upgrade.** Replacing the `openkanban` binary requires the daemon to restart. In default mode, that's `openkanban daemon restart` (or just quit and re-launch the TUI — the next invocation autostarts a fresh daemon from the new binary). In persistent / launchd-managed mode, run `openkanban daemon stop`; launchd's `KeepAlive = {SuccessfulExit: false}` keeps a clean stop down rather than respawning, so the user can re-launch the TUI (or `launchctl bootstrap` the service again) when ready. Either way the protocol-version check in the client fails loudly with an actionable hint if the user attaches a new-binary client to an old-binary daemon. "Upgrade in place" was considered and rejected — every reasonable implementation requires either ABI freezing or an in-band handshake migration, both of which cost more than the user does by re-killing N sessions once a release.
 - **Persistent scrollback across restarts.** Scrollback lives in the per-session ring buffer in the daemon process. Daemon restart loses it. (The agent's own conversation history is in its session JSONL, which is independent.)
 - **Networking.** The socket is `AF_UNIX`, mode 0600, in the user's `~/.cache`. There is no TCP listener and no auth layer; the security model is "you trust everything else under your uid."
 

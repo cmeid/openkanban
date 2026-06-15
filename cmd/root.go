@@ -15,9 +15,10 @@ import (
 )
 
 var (
-	cfgFile        string
-	projectPath    string
-	noUpdateCheck  bool
+	cfgFile         string
+	projectPath     string
+	noUpdateCheck   bool
+	noLaunchDaemon  bool
 )
 
 var rootCmd = &cobra.Command{
@@ -64,7 +65,12 @@ for safe parallel development.`,
 			// not block the user from working on tickets.
 		}
 
-		return app.Run(cfg, projectPath, Version)
+		// Effective autostart = config default (DaemonSettings.Autostart,
+		// defaults to true in DefaultConfig) AND NOT --no-launch-daemon.
+		// The CLI flag is one-way: it can only suppress autostart, never
+		// force it on. See the flag registration comment below.
+		autostartDaemon := cfg.Daemon.Autostart && !noLaunchDaemon
+		return app.Run(cfg, projectPath, Version, autostartDaemon)
 	},
 }
 
@@ -76,6 +82,11 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.config/openkanban/config.json)")
 	rootCmd.PersistentFlags().StringVarP(&projectPath, "project", "p", "", "project or repository path")
 	rootCmd.PersistentFlags().BoolVar(&noUpdateCheck, "no-update-check", false, "Skip the launch-time check for openkanban updates")
+	// --no-launch-daemon is intentionally one-way: passing =true disables
+	// the TUI's on-demand daemon fork; passing =false does NOT force
+	// autostart (config.daemon.autostart controls the default). Don't
+	// refactor this into a tri-state without consulting the design.
+	rootCmd.PersistentFlags().BoolVar(&noLaunchDaemon, "no-launch-daemon", false, "Don't autostart openkanbankd; dial existing one or run in degraded mode")
 
 	rootCmd.AddCommand(newCmd)
 	rootCmd.AddCommand(listCmd)

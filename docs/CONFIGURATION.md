@@ -56,6 +56,9 @@ OpenKanban configuration lives in `~/.config/openkanban/config.json`.
   "behavior": {
     "confirm_quit_with_agents": true
   },
+  "daemon": {
+    "autostart": true
+  },
   "opencode": {
     "server_enabled": true,
     "server_port": 4096,
@@ -224,6 +227,24 @@ Available color fields:
 - `warning` - Caution states (in-progress column)
 - `error` - Errors and destructive actions
 - `info` - Informational elements
+
+## Daemon
+
+Controls how the TUI interacts with `openkanbankd`, the per-user daemon that owns long-lived agent PTYs:
+
+```json
+{
+  "daemon": {
+    "autostart": true
+  }
+}
+```
+
+- `autostart` - When `true` (default), the TUI forks `openkanban daemon` on launch if no daemon is currently running. When `false`, the TUI dials the existing daemon and degrades to "no agent spawn" mode if none is found. Set this to `false` after running `openkanban daemon install-service` so the launchd-managed daemon owns the lifecycle without the TUI racing it for the pidlock.
+
+The CLI flag `--no-launch-daemon` overrides `autostart=true` for a single invocation. It is intentionally one-way: passing `=false` does NOT force autostart on. To re-enable autostart permanently, set `daemon.autostart` back to `true` in this file.
+
+See [AGENT_INTEGRATION.md → Identity, mutex, paths](AGENT_INTEGRATION.md#identity-mutex-paths) for the two supported lifecycle modes (default TUI-managed vs system-managed via `openkanban daemon install-service`).
 
 ## OpenCode Integration
 
