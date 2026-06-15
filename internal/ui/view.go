@@ -1903,8 +1903,13 @@ func (m *Model) renderSidebar() string {
 	}
 
 	projects := m.globalStore.Projects()
-	statusHeight := 1
-	availableHeight := m.height - m.headerHeight() - statusHeight
+	// Match the board area exactly so JoinHorizontal(Top, sidebar, board)
+	// produces a row that fits within m.height. Previously this used
+	// m.height - headerHeight() - 1 (only the statusBar), which left the
+	// sidebar 2 rows taller than boardAreaHeight() and pushed View()
+	// output past m.height. See model.go:boardAreaHeight for the
+	// canonical formula.
+	availableHeight := m.boardAreaHeight()
 
 	titleStyle := lipgloss.NewStyle().
 		Foreground(m.colors.primary).

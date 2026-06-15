@@ -148,6 +148,36 @@ func TestBoardAreaHeightMatchesColumnContentHeight(t *testing.T) {
 	}
 }
 
+// TestSidebarMatchesBoardArea verifies that when the sidebar is visible,
+// the composed View() output fits within m.height. Previously, the
+// sidebar sized itself to m.height - headerHeight() - 1 (statusBar
+// only), while boardAreaHeight() reserves an additional 2 rows for the
+// newlines bracketing the status bar. JoinHorizontal(Top, sidebar,
+// board) then produced a row 2 lines taller than the board area,
+// pushing total View() output past m.height.
+//
+// Asserts on the composed View() height rather than the sidebar string
+// in isolation: lipgloss.Style.Height(n) is a *minimum*, not an exact
+// target (see lipgloss/align.go:62-83), so the in-isolation height of
+// the sidebar after Height() is not a reliable invariant. The actual
+// invariant we care about is that the full View() fits the terminal.
+func TestSidebarMatchesBoardArea(t *testing.T) {
+	m, proj := newHeightTestModel(t, 120, 30)
+	m.sidebarVisible = true
+
+	// Populate at least one ticket so View() renders the board content
+	// rather than the empty-state placeholder.
+	if err := m.globalStore.Add(makeTicket(proj, "a ticket", "desc", []string{"bug"})); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	m.refreshColumnTickets()
+
+	view := m.View()
+	if got := lipgloss.Height(view); got > m.height {
+		t.Errorf("View() height = %d, want <= m.height=%d\n---\n%s\n---", got, m.height, view)
+	}
+}
+
 // TestCardLineClampStaysSingleLine pins the rendering pattern used by
 // renderTicket to clamp every non-title card line (description, badge
 // rows) to exactly one row. Without this, long descriptions wrap and
