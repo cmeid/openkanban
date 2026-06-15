@@ -69,9 +69,11 @@ Upstream's CLI was effectively project-management only (`new` / `list` / `delete
 | `openkanban ticket delete` | Daemon-aware. If the daemon owns the session, sends a `KillReq` first, then unlinks the `.md`. |
 | `openkanban daemon {list,stop,restart,log}` | Daemon lifecycle. |
 | `openkanban hooks install` | Wires Claude Code `SessionStart` / `UserPromptSubmit` / `Stop` / `Notification` hooks into `~/.claude/settings.json`. Atomic write, timestamped backup, preserves foreign keys, dedupes by command prefix. |
+| `openkanban hooks uninstall` | Inverse of `hooks install`. Strips entries recognized by the `openkanban status set ` command prefix; foreign hooks on the same events are preserved. No-op (no rewrite, no backup) when no openkanban entries are present. |
 | `openkanban status set <state>` | Used by the installed hooks to drive ticket `agent_status` from inside a session. |
 | `openkanban config {validate,generate,path}` | Config tooling, including a validator that warns when an agent's `init_prompt` restates rules already in `~/.claude/CLAUDE.md`. |
 | `openkanban update` | Self-update from the source clone; `origin/main` check, `ff-only` pull, `go install` with `SourcePath` preserved. Also ff-fast-forwards local `main` toward `origin/main` even when run from a feature-branch worktree, so the next branch you cut doesn't start from a stale base. Diverged local `main` (has commits not on `origin/main`) is left untouched. Refuses with an actionable message when the source clone is on a non-`main` branch, detached HEAD, a linked git worktree, or not a git repo at all — and on a non-`main` branch offers an opt-in "switch to main & update" prompt rather than silently building from the wrong tree. |
+| `openkanban uninstall` | Removes install artifacts only: the running binary, the openkanban Claude Code hook entries, and the legacy `~/.local/bin/update-openkanban` script if present. Data dirs (`~/.config/openkanban`, `~/.cache/openkanban`, `~/.cache/openkanban-status`) are listed in the summary but never touched, so a reinstall finds projects and config where they were. `--dry-run` previews; `-y` skips the confirmation. |
 
 See [`cmd/`](cmd/).
 
@@ -144,7 +146,7 @@ Every launch checks `origin/main` for newer commits and prompts before applying:
 
 You can also update on demand: `openkanban update --check` to print status, `openkanban update` to pull + rebuild + reinstall.
 
-See [`docs/INSTALL.md`](docs/INSTALL.md) for prerequisites, troubleshooting, and removal.
+To remove openkanban, run `openkanban uninstall`. It removes the binary, the Claude Code hook entries, and the legacy `~/.local/bin/update-openkanban` script if present. Data directories (`~/.config/openkanban`, `~/.cache/openkanban*`) are listed in the closing summary but never touched — a reinstall finds projects and config exactly where they were. Pass `--dry-run` to preview or `-y` to skip the prompt. See [`docs/INSTALL.md`](docs/INSTALL.md) for prerequisites, troubleshooting, and manual data cleanup.
 
 ### `go install` (upstream binary)
 
