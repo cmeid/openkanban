@@ -277,3 +277,186 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+// makeGlyphLine builds a row of plain (single-width, default-styled)
+// glyphs from a string, padded to `cols` with blank Width=1 glyphs.
+func makeGlyphLine(s string, cols int) []terminal.Glyph {
+	row := make([]terminal.Glyph, cols)
+	i := 0
+	for _, r := range s {
+		if i >= cols {
+			break
+		}
+		row[i] = terminal.Glyph{Char: r, Width: 1}
+		i++
+	}
+	for ; i < cols; i++ {
+		row[i] = terminal.Glyph{Char: ' ', Width: 1}
+	}
+	return row
+}
+
+// TestSerializeScrollback_Empty: nil and empty rows return nil.
+func TestSerializeScrollback_Empty(t *testing.T) {
+	if out := SerializeScrollback(nil); out != nil {
+		t.Errorf("nil rows: want nil, got %d bytes", len(out))
+	}
+	if out := SerializeScrollback([][]terminal.Glyph{}); out != nil {
+		t.Errorf("empty rows: want nil, got %d bytes", len(out))
+	}
+}
+
+// TestSerializeScrollback_RoundTrip: serialize a known set of rows,
+// feed the bytes through a fresh emulator + scrollback driver that
+// mirrors the live-mode producer (CaptureTopRow → vt.Write →
+// PushScrolledLine), and assert the destination scrollback ring
+// contains the same rows in the same order.
+func TestSerializeScrollback_RoundTrip(t *testing.T) {
+	const cols, rows = 20, 4
+	src := make([][]terminal.Glyph, 10)
+	for i := 0; i < 10; i++ {
+		src[i] = makeGlyphLine(fmt.Sprintf("line %d", i), cols)
+	}
+
+	bytes := SerializeScrollback(src)
+	if len(bytes) == 0 {
+		t.Fatalf("SerializeScrollback returned empty for non-empty rows")
+	}
+
+	em := xvt.NewSafeEmulator(cols, rows)
+	sb := terminal.NewScrollbackBuffer(100)
+	// Apply byte-by-byte chunks so the scrollback capture loop runs
+	// after each emulator write — same as applyOutput on the client.
+	// Feeding everything in one Write is also valid because each row
+	// in the byte stream ends in \r\n, which the emulator interprets
+	// as a scroll on the bottom row.
+	lastTop := terminal.CaptureTopRow(em, false)
+	if _, err := em.Write(bytes); err != nil {
+		t.Fatalf("emulator write: %v", err)
+	}
+	terminal.PushScrolledLine(em, false, lastTop, sb)
+
+	// The above single-write path only captures ONE scroll. The
+	// real client loop calls CaptureTopRow + PushScrolledLine around
+	// each write. Reset and redo: split bytes into per-row chunks via
+	// "\r\n" so the producer sees each scroll.
+	em = xvt.NewSafeEmulator(cols, rows)
+	sb = terminal.NewScrollbackBuffer(100)
+	for _, chunk := range splitAfter(bytes, []byte("\r\n")) {
+		top := terminal.CaptureTopRow(em, false)
+		if _, err := em.Write(chunk); err != nil {
+			t.Fatalf("emulator chunk write: %v", err)
+		}
+		terminal.PushScrolledLine(em, false, top, sb)
+	}
+
+	// We pushed 10 rows of content onto a 4-row screen, so we expect
+	// at least 10 - 4 = 6 lines in scrollback (the first 6 lines must
+	// have scrolled off; the last 4 sit on the live grid).
+	if got := sb.Len(); got < 6 {
+		t.Fatalf("scrollback.Len() = %d, want >= 6 (rows=10, grid=%d)", got, rows)
+	}
+
+	// Verify the first scrollback row matches src[0] textually.
+	first := sb.Get(0)
+	if first == nil {
+		t.Fatalf("sb.Get(0) returned nil")
+	}
+	if got, want := glyphRowToString(first), glyphRowToString(src[0]); got != want {
+		t.Errorf("first scrollback row: got %q, want %q", got, want)
+	}
+}
+
+// TestSerializeScrollback_WideCharRoundTrip: include a wide CJK glyph
+// (Width=2) followed by its continuation cell (Width=0). The
+// continuation must be skipped during serialization; the destination
+// emulator re-allocates the wide cell from the leading rune.
+func TestSerializeScrollback_WideCharRoundTrip(t *testing.T) {
+	const cols, rows = 20, 4
+	// Build a single row: "中" is wide; the row layout is
+	//   [中(W2)] [_(W0)] [X(W1)] [pad...]
+	row := make([]terminal.Glyph, cols)
+	row[0] = terminal.Glyph{Char: '中', Width: 2}
+	row[1] = terminal.Glyph{Char: 0, Width: 0} // continuation
+	row[2] = terminal.Glyph{Char: 'X', Width: 1}
+	for i := 3; i < cols; i++ {
+		row[i] = terminal.Glyph{Char: ' ', Width: 1}
+	}
+
+	// Surround with enough filler rows to force a scroll-off.
+	src := [][]terminal.Glyph{row}
+	for i := 0; i < 10; i++ {
+		src = append(src, makeGlyphLine(fmt.Sprintf("pad %d", i), cols))
+	}
+
+	bytes := SerializeScrollback(src)
+	if len(bytes) == 0 {
+		t.Fatalf("SerializeScrollback returned empty")
+	}
+
+	em := xvt.NewSafeEmulator(cols, rows)
+	sb := terminal.NewScrollbackBuffer(100)
+	for _, chunk := range splitAfter(bytes, []byte("\r\n")) {
+		top := terminal.CaptureTopRow(em, false)
+		if _, err := em.Write(chunk); err != nil {
+			t.Fatalf("emulator chunk write: %v", err)
+		}
+		terminal.PushScrolledLine(em, false, top, sb)
+	}
+
+	// First scrollback row should be the wide-char row. Verify cells.
+	first := sb.Get(0)
+	if first == nil {
+		t.Fatalf("first scrollback row nil")
+	}
+	if len(first) != cols {
+		t.Fatalf("first row len = %d, want %d", len(first), cols)
+	}
+	if first[0].Char != '中' || first[0].Width != 2 {
+		t.Errorf("col 0: got char=%q width=%d, want char=%q width=2",
+			first[0].Char, first[0].Width, '中')
+	}
+	if first[1].Width != 0 {
+		t.Errorf("col 1 (continuation): got width=%d, want 0", first[1].Width)
+	}
+	if first[2].Char != 'X' || first[2].Width != 1 {
+		t.Errorf("col 2: got char=%q width=%d, want char=%q width=1",
+			first[2].Char, first[2].Width, 'X')
+	}
+}
+
+// splitAfter splits data so each segment ends with sep (last segment
+// may not). Used by the round-trip tests to chunk byte streams
+// row-by-row so the scrollback capture loop runs per row.
+func splitAfter(data, sep []byte) [][]byte {
+	var out [][]byte
+	for {
+		idx := bytes.Index(data, sep)
+		if idx < 0 {
+			if len(data) > 0 {
+				out = append(out, data)
+			}
+			return out
+		}
+		end := idx + len(sep)
+		out = append(out, data[:end])
+		data = data[end:]
+	}
+}
+
+// glyphRowToString turns a row of glyphs into a trimmed string for
+// diagnostics. Width=0 cells contribute nothing.
+func glyphRowToString(row []terminal.Glyph) string {
+	var sb strings.Builder
+	for _, g := range row {
+		if g.Width == 0 {
+			continue
+		}
+		ch := g.Char
+		if ch == 0 {
+			ch = ' '
+		}
+		sb.WriteRune(ch)
+	}
+	return strings.TrimRight(sb.String(), " ")
+}

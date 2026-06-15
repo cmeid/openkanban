@@ -78,9 +78,9 @@ The attached/detached state is broadcast to every subscribed client via `Session
 
 ### Snapshot redraw on attach
 
-When a client attaches, the daemon serializes the current screen state — emulator cell grid, cursor position, alt-screen flag, mouse-mode flag, cursor visibility, title — into a synthetic ANSI redraw blob and sends it before any new live bytes. The client's local `xvt.SafeEmulator` consumes it and ends up in a state cell-grid-equivalent to the daemon's. See `internal/daemon/redraw.go` and its tests for fixture-driven round-trip verification.
+When a client attaches, the daemon ships a synthetic ANSI byte stream over the binary connection before any new live bytes: first the serialized scrollback history (SGR-batched per row, terminated by `\r\n`), then a `SerializeRedraw` of the current screen state — emulator cell grid, cursor position, alt-screen flag, mouse-mode flag, cursor visibility, title. The client's local `xvt.SafeEmulator` consumes it and ends up cell-grid-equivalent to the daemon's; the client's snapshot-apply path also drives `CaptureTopRow`/`PushScrolledLine` per `\r\n`-segment so the history rows land in its own scrollback ring as they scroll off the top. See `internal/daemon/redraw.go` (`SerializeRedraw`, `SerializeScrollback`) and `internal/daemonclient/paneview.go::applySnapshotChunk`.
 
-This is why a TUI reattach "just shows the current screen" — there is no scrollback replay, no cold start. Scrollback bytes prior to the snapshot are not transmitted across a detach/reattach.
+The redraw portion uses CUP positioning rather than `\n` scrolling, so it does not push extra rows into client-side scrollback. If the redraw flips alt-screen on, the client's alt-screen detector keeps subsequent rows out of the primary-screen ring (matching the live-mode contract).
 
 ### `--migrate` and the 3×3 matrix
 

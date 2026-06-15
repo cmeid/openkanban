@@ -159,3 +159,32 @@ func TestScrollbackBuffer_DefaultCapacity(t *testing.T) {
 		t.Errorf("expected default capacity 10000 for negative, got %d", sb2.Capacity())
 	}
 }
+
+func TestPane_SnapshotScrollback_Empty(t *testing.T) {
+	// Fresh pane with no started PTY: scrollback is nil.
+	p := New("snap-empty", 80, 24, 1000)
+	if got := p.SnapshotScrollback(); got != nil {
+		t.Fatalf("fresh pane SnapshotScrollback: got %d rows, want nil", len(got))
+	}
+}
+
+func TestPane_SnapshotScrollback_AfterScrollOff(t *testing.T) {
+	// Simulate scrollback population by directly constructing the
+	// buffer; this exercises SnapshotScrollback without depending on
+	// the full PTY/vt write path.
+	p := New("snap-filled", 80, 24, 1000)
+	p.scrollback = NewScrollbackBuffer(1000)
+	for i := 0; i < 5; i++ {
+		p.scrollback.Push(makeTestLine("line" + string(rune('0'+i))))
+	}
+
+	rows := p.SnapshotScrollback()
+	if len(rows) != 5 {
+		t.Fatalf("SnapshotScrollback: got %d rows, want 5", len(rows))
+	}
+	for i, want := range []string{"line0", "line1", "line2", "line3", "line4"} {
+		if got := lineToString(rows[i]); got != want {
+			t.Errorf("row %d: got %q, want %q", i, got, want)
+		}
+	}
+}

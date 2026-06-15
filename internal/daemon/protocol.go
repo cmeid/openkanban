@@ -366,8 +366,11 @@ type AttachReq struct {
 
 // AttachResp acknowledges a successful Attach. The daemon immediately
 // follows the AttachResp frame with SnapshotSize bytes' worth of
-// TypePTYOutput frames (the scrollback snapshot) before the connection
-// is fully in binary mode.
+// TypePTYOutput frames before the connection is fully in binary mode.
+// The snapshot byte stream is laid out as: serialized scrollback
+// history (each row terminated by \r\n so a client driving local
+// scrollback capture during snapshot apply lands the rows in its own
+// ring) followed by a SerializeRedraw of the live grid.
 type AttachResp struct {
 	ClientID     uint16 `json:"client_id"`
 	SnapshotSize int    `json:"snapshot_size"`

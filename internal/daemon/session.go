@@ -406,24 +406,35 @@ func (s *Session) Detach(ac *attachedClient) {
 }
 
 // buildSnapshotForPane reaches into the pane's emulator + modal state
-// to produce a SerializeRedraw-shaped byte stream. It is the only
+// to produce a snapshot byte stream containing scrollback history
+// followed by a SerializeRedraw of the live grid. It is the only
 // place the daemon couples to the pane's internals; PR7 will replace
 // this with a cleaner Pane.Snapshot() accessor.
+//
+// The byte stream is layered so a client driving its local scrollback
+// capture during snapshot apply will land each history line in its
+// own ring as the row scrolls off the top of the live grid. The
+// redraw portion uses CUP cursor positioning rather than \n scrolling,
+// so it does not push additional rows into scrollback.
 //
 // Returns nil when the pane isn't ready (no emulator). Safe to call
 // concurrently — SerializeRedraw only reads via SafeEmulator's locked
 // methods, and the modal getters on Pane take their own locks.
 func buildSnapshotForPane(p *terminal.Pane) []byte {
-	// SafeEmulatorForSnapshot + the three modal getters are exported
-	// on Pane in this PR. The cursor-visibility / mouse / altScreen
-	// booleans are tracked exclusively on Pane (the emulator's own
-	// state machine doesn't expose them), so we have to query the
-	// pane rather than the emulator directly.
 	vt, cursorVisible, mouseEnabled, altScreen, title := p.SnapshotState()
 	if vt == nil {
 		return nil
 	}
-	return SerializeRedraw(vt, cursorVisible, mouseEnabled, altScreen, title)
+	scrollbackRows := p.SnapshotScrollback()
+	sb := SerializeScrollback(scrollbackRows)
+	redraw := SerializeRedraw(vt, cursorVisible, mouseEnabled, altScreen, title)
+	if len(sb) == 0 {
+		return redraw
+	}
+	out := make([]byte, 0, len(sb)+len(redraw))
+	out = append(out, sb...)
+	out = append(out, redraw...)
+	return out
 }
 
 // logWriteFailure logs and returns errors uniformly so the binary I/O
