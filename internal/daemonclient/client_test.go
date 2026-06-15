@@ -154,8 +154,66 @@ func TestClient_PrepareExit(t *testing.T) {
 	if resp.ClientCount != 1 {
 		t.Errorf("PrepareExit ClientCount: got %d want 1", resp.ClientCount)
 	}
+	if resp.OtherActiveClients != 0 {
+		t.Errorf("PrepareExit OtherActiveClients (sole client): got %d want 0", resp.OtherActiveClients)
+	}
 	if c.ClientCount() != 1 {
 		t.Errorf("post-PrepareExit ClientCount: got %d want 1", c.ClientCount())
+	}
+}
+
+// TestClient_CancelExit_ReversesPrepare verifies that calling CancelExit
+// on a client that previously called PrepareExit causes a peer client's
+// next PrepareExit to see the original as active again (i.e. counted in
+// OtherActiveClients). This also doubles as the round-trip test that
+// gates Task 3 — a missing dispatch case in the server would surface
+// here as an "unknown message type" error, not at build time.
+func TestClient_CancelExit_ReversesPrepare(t *testing.T) {
+	_ = startTestDaemon(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	a, err := New(ctx)
+	if err != nil {
+		t.Fatalf("New A: %v", err)
+	}
+	defer a.Close()
+
+	b, err := New(ctx)
+	if err != nil {
+		t.Fatalf("New B: %v", err)
+	}
+	defer b.Close()
+
+	// A prepares to exit: from A's perspective B is still active (1).
+	respA, err := a.PrepareExit(ctx)
+	if err != nil {
+		t.Fatalf("A PrepareExit: %v", err)
+	}
+	if respA.OtherActiveClients != 1 {
+		t.Errorf("A PrepareExit OtherActiveClients: got %d want 1", respA.OtherActiveClients)
+	}
+
+	// B prepares to exit: from B's perspective A is exiting, so 0.
+	respB, err := b.PrepareExit(ctx)
+	if err != nil {
+		t.Fatalf("B PrepareExit: %v", err)
+	}
+	if respB.OtherActiveClients != 0 {
+		t.Errorf("B PrepareExit OtherActiveClients (peer exiting): got %d want 0", respB.OtherActiveClients)
+	}
+
+	// A cancels its exit: B's next PrepareExit should now see A active.
+	if err := a.CancelExit(ctx); err != nil {
+		t.Fatalf("A CancelExit: %v", err)
+	}
+	respB2, err := b.PrepareExit(ctx)
+	if err != nil {
+		t.Fatalf("B PrepareExit (post-CancelExit): %v", err)
+	}
+	if respB2.OtherActiveClients != 1 {
+		t.Errorf("B PrepareExit after A CancelExit: got OtherActiveClients=%d want 1", respB2.OtherActiveClients)
 	}
 }
 
