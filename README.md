@@ -142,6 +142,8 @@ cd openkanban
 
 `scripts/install.sh` checks prerequisites, builds and `go install`s the binary into `$GOBIN`, and — if Claude Code is detected — offers to wire session-status hooks into `~/.claude/settings.json`. Idempotent; safe to re-run. (`scripts/install.sh` is fork-only; upstream doesn't ship one.)
 
+> ℹ️ **Use the script, not bare `go install .`.** The install script injects three ldflags (`SourcePath`, `Commit`, `BuildMarker`) that the binary depends on at runtime. A bare `go install .` skips them; the resulting binary refuses to run anything except `openkanban version` and prints a hint pointing back at the script. See [`docs/INSTALL.md`](docs/INSTALL.md#why-scriptsinstallsh-and-not-bare-go-install) for the rationale.
+
 Every launch checks `origin/main` for newer commits and prompts before applying: **Enter** to update + relaunch, **Esc** to skip, **Q** to quit. Disable with `--no-update-check` or `behavior.check_for_updates_on_launch: false` in `~/.config/openkanban/config.json`. The launch-time check also surfaces every status on stderr ("up to date", "ahead", "diverged", refusals) so it's never silent. When the source clone is parked on a non-`main` branch, the prompt instead offers to switch back to `main` first; detached HEAD / linked-worktree / non-git-repo source clones refuse with an actionable message rather than building from the wrong tree.
 
 You can also update on demand: `openkanban update --check` to print status, `openkanban update` to pull + rebuild + reinstall.

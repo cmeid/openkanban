@@ -18,6 +18,45 @@ Optional:
 - **Claude Code** — if `~/.claude/` exists and `claude` is on `$PATH`,
   the installer offers to wire session-status hooks (see below).
 
+## Why `./scripts/install.sh` (and not bare `go install .`)
+
+`scripts/install.sh` injects three ldflags the binary depends on at
+runtime:
+
+| ldflag | What it does |
+|---|---|
+| `cmd.SourcePath=<repo>` | tells `openkanban update` where to `git pull` and `go install` from |
+| `cmd.Commit=<short SHA>` | populates `openkanban version` so update / drift detection can compare against source HEAD |
+| `cmd.BuildMarker=official` | marks the binary as "built via the canonical install flow" |
+
+A bare `go install .` skips all three. To make the resulting failure
+mode loud instead of silent, the binary refuses to run any command
+except `openkanban version` when `BuildMarker` is unset, and prints an
+actionable hint pointing back here:
+
+```text
+openkanban: this binary is a STUB.
+
+It was built via bare `go install .` (or `go build`) without the
+ldflags that inject install-time metadata (SourcePath, Commit,
+BuildMarker). Without those, `openkanban update`, version
+reporting, and the autostart fork all degrade silently — so
+the binary refuses to run anything except `openkanban version`.
+
+Re-install via the canonical script:
+
+    cd <source-clone> && ./scripts/install.sh
+```
+
+If you see this, just re-run `./scripts/install.sh` from a clone and
+the next invocation works. `openkanban version` still runs on a stub
+and shows `build: STUB` in its output, so you can confirm the rebuild
+fixed it.
+
+`openkanban update` re-applies the same ldflags after pulling, so
+updates from inside `openkanban` (launch-time prompt, `openkanban
+update`, etc.) always produce non-stub binaries.
+
 ## What `scripts/install.sh` does
 
 1. **Self-locates** the repo root from its own path. You can invoke it as
@@ -124,6 +163,33 @@ Make sure the freshly-installed binary is the one on `$PATH`. Run
 `openkanban version` — the `source:` line shows which clone it was built
 from. If you have multiple clones, install from the one you want
 `update` to track.
+
+### `openkanban update` says "binary behind source — needs reinstall"
+
+You (or some automation) ran `git pull` in the source clone without
+re-running `./scripts/install.sh`. The source is at `origin/main` but
+the binary on `$PATH` is older. `openkanban update` will skip the
+no-op pull and just rebuild — accept the prompt, or run it directly:
+
+```bash
+openkanban update
+```
+
+This is the same code path used when a real upstream update is
+available; just no `git pull` happens because there's nothing to pull.
+
+### `openkanban version` shows `build: STUB`
+
+Your binary was built without the canonical install ldflags (most
+commonly a bare `go install .`). The binary refuses to run anything
+except `version`. Recovery is the same as a normal install:
+
+```bash
+cd <source-clone> && ./scripts/install.sh
+```
+
+See the "Why `./scripts/install.sh` (and not bare `go install .`)"
+section at the top of this page for the full rationale.
 
 ## Removal
 
