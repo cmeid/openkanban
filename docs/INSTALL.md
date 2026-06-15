@@ -88,13 +88,35 @@ this fast), re-checks PATH, and re-prompts the Claude Code question.
 | Path | Contents |
 |---|---|
 | `$GOBIN/openkanban` | the binary |
+| `~/Applications/OpenKanban.app` | macOS-only — daemon binary inside an `.app` bundle (see "macOS notifications" below) |
 | `~/.claude/settings.json` | four hook entries (only if you opted in) |
 | `~/.config/openkanban/` | created lazily by the binary on first run |
 | `~/.cache/openkanban-status/` | created lazily by status hooks |
 
-The installer itself touches only the binary and (with consent) the
-Claude Code settings file. It does not write to your shell config, your
-filesystem outside `$GOBIN`, or any system-level paths.
+The installer itself touches the binary, the macOS bundle, and (with
+consent) the Claude Code settings file. It does not write to your
+shell config, your filesystem outside `$GOBIN` and `~/Applications`,
+or any system-level paths.
+
+### macOS notifications
+
+On macOS, `scripts/install.sh` also assembles `OpenKanban.app` under
+`~/Applications/` and registers it with Launch Services. This bundle
+holds the daemon binary at `Contents/MacOS/openkanbankd` so the
+daemon process inherits the bundle's identity
+(`CFBundleIdentifier=dev.cmeid.openkanban`). With that identity,
+desktop notifications from wrapped Claude sessions surface as native
+macOS notifications with the OpenKanban icon — rather than being lost
+to alt-screen / stderr-redirect details.
+
+First-run notification will trigger a macOS permission prompt; accept
+it to enable notifications going forward. The app then appears under
+**System Settings → Notifications** for ongoing management. Disable
+the feature in `config.json` via `behavior.forward_agent_notifications:
+false`.
+
+`scripts/install.sh` skips this step silently on non-macOS hosts.
+`openkanban uninstall` removes the bundle along with the binary.
 
 ## Updating
 
