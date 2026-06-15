@@ -269,7 +269,14 @@ func (m *Model) renderColumn(colIdx int, col board.Column, tickets []*board.Tick
 
 	count := countStyle.Render(" " + countText)
 
-	headerLine := header + count
+	// Clamp the column header to a single row. width-2 matches the column's
+	// effective content width after Padding(0,1) on the column style block
+	// below (see the lipgloss.NewStyle().Border(border)...Width(width).Padding(0,1)
+	// chain near the end of this function); keep these widths in lockstep if
+	// the column padding ever changes. Without this clamp, a long column name
+	// at small widths wraps to 2 rows and breaks the columnHeaderHeight = 3
+	// invariant (top border + header + blank separator).
+	headerLine := lipgloss.NewStyle().MaxHeight(1).Width(width - 2).Render(header + count)
 
 	// Render and measure every ticket so we can both (1) cache per-ticket
 	// heights for hitTestTicket / ensureTicketVisible (which need the FULL

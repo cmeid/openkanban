@@ -178,6 +178,43 @@ func TestSidebarMatchesBoardArea(t *testing.T) {
 	}
 }
 
+// TestColumnHeaderLineSingleRow verifies that a deliberately long column
+// name does not wrap the column's header line to 2 rows at narrow widths.
+// Without the headerLine clamp in renderColumn, "▸ 📋 In Progress Tickets
+// Awaiting Review (1)" wraps at minColumnWidth (effective content width
+// = width - 2 = 18) and breaks the columnHeaderHeight = 3 invariant
+// (top border + header + blank separator).
+//
+// The assertion compares the long-name column's rendered height to a
+// short-name baseline rendered with the same number of tickets at the
+// same width; if the long header wraps, the long-name column is exactly
+// one row taller. With the clamp applied they match.
+func TestColumnHeaderLineSingleRow(t *testing.T) {
+	m, proj := newHeightTestModel(t, 120, 40)
+
+	// One ticket per column so we exercise the normal (non-empty-state)
+	// rendering path that places headerLine above the joined tickets.
+	tk := makeTicket(proj, "short", "d", []string{"x"})
+	if err := m.globalStore.Add(tk); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	m.refreshColumnTickets()
+
+	shortCol := m.columns[0]
+	shortCol.Name = "Todo"
+	longCol := m.columns[0]
+	longCol.Name = "In Progress Tickets Awaiting Review"
+
+	short := m.renderColumn(0, shortCol, m.columnTickets[0], false, false, false, minColumnWidth, true, 0)
+	long := m.renderColumn(0, longCol, m.columnTickets[0], false, false, false, minColumnWidth, true, 0)
+
+	if got, want := lipgloss.Height(long), lipgloss.Height(short); got != want {
+		t.Errorf("long-name column height = %d, short-name column height = %d; "+
+			"headers should both occupy 1 row\n---long---\n%s\n---short---\n%s\n---",
+			got, want, long, short)
+	}
+}
+
 // TestCardLineClampStaysSingleLine pins the rendering pattern used by
 // renderTicket to clamp every non-title card line (description, badge
 // rows) to exactly one row. Without this, long descriptions wrap and
