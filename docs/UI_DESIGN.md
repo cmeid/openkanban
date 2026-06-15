@@ -238,6 +238,25 @@ broadcasts — see [AGENT_INTEGRATION.md → One attacher per session](AGENT_INT
 for the event flow and the receiver-side counter that makes it
 race-correct.
 
+### Column Position Badge
+
+A muted `N/total` prefix sits at the head of each card's header row,
+where `N` is the card's 1-indexed position in its column and `total`
+is the column's card count. Makes the cursor's location — and how
+many cards sit above and below — visible at a glance without having
+to scroll.
+
+| Element | Value         | Foreground |
+|---------|---------------|------------|
+| Format  | `%d/%d`       | `muted`    |
+| Index   | `i+1` (1-based) | —        |
+| Total   | `len(tickets)` (per column) | — |
+
+Rendered first in `renderTicket`'s `headerParts` so priority, project,
+deps, and session badges follow it. Muted styling keeps it from
+competing with the indicators that change state — it's a static
+position cue, not a status signal.
+
 ### Card Variations
 
 ```
