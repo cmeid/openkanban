@@ -24,7 +24,16 @@ import (
 	"github.com/techdufus/openkanban/internal/watch"
 )
 
-func Run(cfg *config.Config, filterPath, version string) error {
+// Run launches the TUI. autostartDaemon controls whether the TUI
+// tries to fork openkanbankd if it's not already running:
+//   - true (default): old behavior — call daemonclient.New, which
+//     forks the daemon on dial failure.
+//   - false: call daemonclient.NewNoAutostart, which dials only.
+//     Used when openkanbankd is managed by launchd / systemd, or
+//     when the user passed --no-launch-daemon. Either way the
+//     daemon-connect failure path is the same: TUI degrades to
+//     "no spawn, no daemon-owned panes" rather than aborting.
+func Run(cfg *config.Config, filterPath, version string, autostartDaemon bool) error {
 	// MUST be the first statement: project.LoadGlobalTicketStore below
 	// fans out to ~11 log.Printf sites in internal/project/{tickets,
 	// migration}.go that fire on migrations and duplicate-removal. Any
@@ -81,7 +90,13 @@ func Run(cfg *config.Config, filterPath, version string) error {
 	// but app.Run is reached from the foreground TUI command, so stderr
 	// goes to the user's terminal) and then continue in degraded mode.
 	daemonCtx, daemonCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	daemonClient, daemonErr := daemonclient.New(daemonCtx)
+	var daemonClient *daemonclient.Client
+	var daemonErr error
+	if autostartDaemon {
+		daemonClient, daemonErr = daemonclient.New(daemonCtx)
+	} else {
+		daemonClient, daemonErr = daemonclient.NewNoAutostart(daemonCtx)
+	}
 	daemonCancel()
 	if daemonErr != nil {
 		if errors.Is(daemonErr, daemonclient.ErrProtocolVersionSkew) {

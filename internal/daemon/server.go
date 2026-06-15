@@ -34,14 +34,22 @@ const shutdownGraceSeconds = 3
 // accepts client connections, multiplexes JSON-mode RPCs, and owns the
 // set of live terminal.Pane-backed Sessions.
 //
-// The server enforces last-client-shutdown semantics: when the final
+// Default mode enforces last-client-shutdown semantics: when the final
 // client disconnects (the connection count under clientsMu drops to
 // zero), it tears down any remaining sessions defensively and exits.
-// This is deliberate — the daemon must NOT outlive the last TUI.
+// This is deliberate — by default the daemon must NOT outlive the
+// last TUI.
+//
+// Persistent mode (Options.Persistent, set by `openkanban daemon
+// --persistent`) inverts that: the daemon stays alive when the last
+// client disconnects and only exits via explicit ShutdownReq, SIGTERM,
+// or a stale-binary self-restart. This is the mode used by launchd /
+// systemd to own the daemon's lifecycle independently of any TUI.
 type Server struct {
-	sock    string
-	pidlock *PidLock
-	ln      net.Listener
+	sock       string
+	pidlock    *PidLock
+	ln         net.Listener
+	persistent bool
 
 	sessionsMu sync.RWMutex
 	sessions   map[string]*Session
@@ -90,6 +98,12 @@ type clientConn struct {
 	conn       net.Conn
 	r          *bufio.Reader
 	subscribed bool
+	// name is the ClientName the client announced in HelloReq
+	// ("openkanban-tui", "openkanban-cli", etc.). Used by
+	// handlePrepareExit to answer "is another TUI watching?" Reads
+	// and writes are serialized via s.clientsMu, matching the
+	// subscribed-field precedent above.
+	name string
 
 	// writeMu serializes WriteFrame calls so the JSON response,
 	// push, and (PR5) PTY-output frames produced by separate
@@ -104,14 +118,29 @@ type clientConn struct {
 // Exported so the (eventual) PR9 fan-out code can live in a separate
 // file in this package without poking at private fields.
 
+// Options configures non-default Server behavior. Zero-value is the
+// default (TUI-managed, last-client-shutdown semantics). Persistent
+// flips the lifecycle to "stay alive across disconnects" — used by
+// launchd / systemd integration.
+type Options struct {
+	Persistent bool
+}
+
 // NewServer acquires the pidlock, listens on the socket, and returns a
-// ready-but-not-yet-running Server. Call Serve to begin accepting
-// connections.
+// ready-but-not-yet-running Server with default options. Call Serve to
+// begin accepting connections.
 //
 // If another daemon already holds the pidlock the function returns the
 // underlying *ErrAlreadyLocked so the caller can format a clean
 // "already running with pid N" message.
 func NewServer(sock, pidpath string) (*Server, error) {
+	return NewServerWithOptions(sock, pidpath, Options{})
+}
+
+// NewServerWithOptions is NewServer with non-default Options. Kept as
+// a sibling rather than expanding NewServer's signature so the (sock,
+// pidpath) 2-arg shape stays stable for the many existing call sites.
+func NewServerWithOptions(sock, pidpath string, opts Options) (*Server, error) {
 	lock, err := AcquirePidLock(pidpath)
 	if err != nil {
 		return nil, err
@@ -139,13 +168,14 @@ func NewServer(sock, pidpath string) (*Server, error) {
 	}
 
 	return &Server{
-		sock:     sock,
-		pidlock:  lock,
-		ln:       ln,
-		sessions: make(map[string]*Session),
-		clients:  make(map[uint16]*clientConn),
-		shutdown: make(chan struct{}),
-		events:   make(chan SessionEvent, 64),
+		sock:       sock,
+		pidlock:    lock,
+		ln:         ln,
+		persistent: opts.Persistent,
+		sessions:   make(map[string]*Session),
+		clients:    make(map[uint16]*clientConn),
+		shutdown:   make(chan struct{}),
+		events:     make(chan SessionEvent, 64),
 	}, nil
 }
 
@@ -241,10 +271,17 @@ func (s *Server) Serve(ctx context.Context) error {
 // When the binary first goes stale, we set pendingRestart and decide
 // what to do based on the live session count:
 //   - zero sessions: initiate immediate shutdown so the next TUI
-//     launch will autostart a fresh daemon from the new binary;
-//   - >0 sessions: log a loud warning and keep running. The
-//     handleLastClientDisconnect path will exit cleanly when the last
-//     client drops, and the next launch picks up the new binary.
+//     launch (default mode) — or launchd / systemd respawn (persistent
+//     mode) — picks up the new binary.
+//   - >0 sessions: log a loud warning and keep running.
+//     - Default mode: handleLastClientDisconnect will exit cleanly
+//       when the last client drops, and the next launch picks up the
+//       new binary.
+//     - Persistent mode: handleLastClientDisconnect no longer exits,
+//       so the daemon stays on the stale binary until sessions drain
+//       naturally and the user explicitly runs `openkanban daemon
+//       stop` (after which launchd respawns it on the new binary,
+//       given KeepAlive={SuccessfulExit:false}).
 //
 // We deliberately don't kill live sessions to "force" a restart —
 // that would surprise the user and orphan in-progress agent work.
@@ -564,6 +601,7 @@ func (s *Server) dispatch(c *clientConn, typeName string, raw json.RawMessage) {
 
 func (s *Server) handleHello(c *clientConn, req HelloReq) HelloResp {
 	s.clientsMu.Lock()
+	c.name = req.ClientName
 	count := len(s.clients)
 	s.clientsMu.Unlock()
 
@@ -799,6 +837,18 @@ func (s *Server) handleSubscribe(c *clientConn, req SubscribeReq) SubscribeResp 
 func (s *Server) handlePrepareExit(c *clientConn, req PrepareExitReq) PrepareExitResp {
 	s.clientsMu.Lock()
 	count := len(s.clients)
+	// Count TUI clients OTHER than the asking client. Used by the
+	// CLI subcommands (daemon stop / daemon restart) to decide
+	// whether shutting down would orphan a TUI's live sessions.
+	otherTUIs := 0
+	for _, other := range s.clients {
+		if other.id == c.id {
+			continue
+		}
+		if other.name == ClientNameTUI {
+			otherTUIs++
+		}
+	}
 	s.clientsMu.Unlock()
 
 	s.sessionsMu.RLock()
@@ -808,7 +858,7 @@ func (s *Server) handlePrepareExit(c *clientConn, req PrepareExitReq) PrepareExi
 	}
 	s.sessionsMu.RUnlock()
 
-	return PrepareExitResp{ClientCount: count, Sessions: infos}
+	return PrepareExitResp{ClientCount: count, OtherTUIClients: otherTUIs, Sessions: infos}
 }
 
 func (s *Server) handleShutdown(c *clientConn, req ShutdownReq) ShutdownResp {
@@ -839,13 +889,24 @@ func (s *Server) handleShutdown(c *clientConn, req ShutdownReq) ShutdownResp {
 }
 
 // handleLastClientDisconnect is invoked when the clients map drops to
-// zero. If sessions are still alive at that moment the exit-guard in
-// the TUI failed; we log loudly and kill them defensively before
-// shutting the daemon down.
+// zero. In default mode, this triggers a shutdown (the daemon is not
+// supposed to outlive the last TUI). In persistent mode (launchd /
+// systemd integration), the daemon stays up and only logs; explicit
+// ShutdownReq or signals are the exit paths.
+//
+// If sessions are still alive at that moment the exit-guard in the
+// TUI failed; we log loudly. In default mode we then kill them
+// defensively via initiateShutdown's cleanup; in persistent mode the
+// sessions stay attached to the daemon and a future TUI can re-attach.
 func (s *Server) handleLastClientDisconnect() {
 	s.sessionsMu.RLock()
 	live := len(s.sessions)
 	s.sessionsMu.RUnlock()
+
+	if s.persistent {
+		log.Printf("openkanbankd: last client disconnected; staying up (persistent mode); %d live session(s)", live)
+		return
+	}
 
 	if live > 0 {
 		log.Printf("WARN: last client disconnected with %d live sessions; exit-guard was bypassed; terminating sessions", live)
