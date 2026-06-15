@@ -46,43 +46,67 @@ still react.`,
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		ticket, store, err := loadSessionTicket()
-		if err != nil {
-			return err
-		}
-
-		// Idempotency: don't re-stamp CompletedAt on a second invocation.
-		// SetStatus unconditionally overwrites CompletedAt = now, so we
-		// skip the mutation when already Done. The status-file write
-		// below still happens so the TUI's auto-stop transition is
-		// re-armed for any pane that's somehow still alive.
-		if ticket.Status != board.StatusDone {
-			ticket.SetStatus(board.StatusDone)
-			ticket.AgentStatus = board.AgentCompleted
-			if err := store.SaveTicket(ticket); err != nil {
-				return fmt.Errorf("save ticket %s: %w", ticket.ID, err)
-			}
-		}
-
-		// $OPENKANBAN_SESSION may be empty (e.g. legacy spawns that
-		// didn't set it). The status file is a fast hint to the TUI;
-		// the .md write above is the authoritative source.
-		if session := os.Getenv("OPENKANBAN_SESSION"); session != "" {
-			if err := agent.WriteStatusFile(session, board.AgentCompleted); err != nil {
-				return fmt.Errorf("write status file for session %q: %w", session, err)
-			}
-		}
-
-		// Tell openkanbankd that this ticket is done so it can terminate
-		// the live PTY and broadcast the expected-exit signal to other
-		// TUIs. Strictly best-effort: a scripted CLI invocation must
-		// NEVER autostart a daemon, and any failure here is downgraded
-		// to a stderr warning — the .md + status-file writes above are
-		// the authoritative ticket-done signal.
-		notifyDaemonTicketDone(string(ticket.ID))
-
-		return nil
+		return wrapUpSessionTicketAt(board.StatusDone)
 	},
+}
+
+// wrapUpSessionTicketAt promotes the env-bound ticket to target and
+// terminates the live PTY, mirroring the agent-side "/quit equivalent"
+// motion. Used by both `ticket done` (target=StatusDone) and `ticket
+// in-review` (target=StatusInReview) — both are "the agent is handing
+// off, kill the session" transitions and the side effects (AgentStatus
+// flip, status-file write, daemon notification) match exactly.
+//
+// Idempotent on a ticket already at target: SetStatus is skipped (so
+// SetStatus's CompletedAt re-stamp for done, and the UpdatedAt drift
+// for in-review, don't fire on repeats), but the status-file and
+// daemon notification still run so a re-armed TUI can react.
+//
+// Caller-visible behavior contract:
+//   - $OPENKANBAN_TICKET_ID must be set; loadSessionTicket returns an
+//     error otherwise.
+//   - .md write is authoritative. Status-file write is best-effort
+//     (skipped when $OPENKANBAN_SESSION is empty).
+//   - notifyDaemonTicketDone is best-effort and never fails the
+//     command — daemon outages downgrade to a stderr warning.
+func wrapUpSessionTicketAt(target board.TicketStatus) error {
+	ticket, store, err := loadSessionTicket()
+	if err != nil {
+		return err
+	}
+
+	// Idempotency: don't re-stamp timestamps on a repeat invocation.
+	// SetStatus unconditionally overwrites CompletedAt (for done) /
+	// UpdatedAt (for both), so skip the mutation when already at
+	// target. The status-file write below still happens so the TUI's
+	// auto-stop transition is re-armed for any pane that's somehow
+	// still alive.
+	if ticket.Status != target {
+		ticket.SetStatus(target)
+		ticket.AgentStatus = board.AgentCompleted
+		if err := store.SaveTicket(ticket); err != nil {
+			return fmt.Errorf("save ticket %s: %w", ticket.ID, err)
+		}
+	}
+
+	// $OPENKANBAN_SESSION may be empty (e.g. legacy spawns that
+	// didn't set it). The status file is a fast hint to the TUI;
+	// the .md write above is the authoritative source.
+	if session := os.Getenv("OPENKANBAN_SESSION"); session != "" {
+		if err := agent.WriteStatusFile(session, board.AgentCompleted); err != nil {
+			return fmt.Errorf("write status file for session %q: %w", session, err)
+		}
+	}
+
+	// Tell openkanbankd that this ticket is wrapping up so it can
+	// terminate the live PTY and broadcast the expected-exit signal
+	// to other TUIs. Strictly best-effort: a scripted CLI invocation
+	// must NEVER autostart a daemon, and any failure here is
+	// downgraded to a stderr warning — the .md + status-file writes
+	// above are the authoritative wrap-up signal.
+	notifyDaemonTicketDone(string(ticket.ID))
+
+	return nil
 }
 
 // notifyDaemonTicketDone makes a best-effort daemon RPC announcing the

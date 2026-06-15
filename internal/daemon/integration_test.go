@@ -74,6 +74,28 @@ func startServer(t *testing.T) (*Server, chan error) {
 	return srv, errCh
 }
 
+// startServerWithOptions is startServer with custom Options (e.g.
+// Persistent: true). Returns the server and a channel that Serve's
+// error (if any) is sent on.
+func startServerWithOptions(t *testing.T, opts Options) (*Server, chan error) {
+	t.Helper()
+	sock, pid := testEnv(t)
+
+	srv, err := NewServerWithOptions(sock, pid, opts)
+	if err != nil {
+		t.Fatalf("NewServerWithOptions: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.Serve(ctx)
+	}()
+	return srv, errCh
+}
+
 // dialTestClient opens a fresh connection to sock.
 func dialTestClient(t *testing.T, sock string) net.Conn {
 	t.Helper()
@@ -494,4 +516,132 @@ func TestServer_ConcurrentClients(t *testing.T) {
 
 	holder.Close()
 	waitServerDone(t, errCh, 5*time.Second)
+}
+
+// TestPrepareExit_OtherTUIClients verifies that PrepareExitResp's
+// OtherTUIClients counts TUI-named connections excluding the asker
+// and excluding CLI clients. The `daemon stop` / `daemon restart`
+// warning UX depends on this.
+func TestPrepareExit_OtherTUIClients(t *testing.T) {
+	srv, errCh := startServer(t)
+
+	tui1 := dialTestClient(t, srv.SocketPath())
+	rTui1 := bufio.NewReader(tui1)
+	helloWithName(t, tui1, rTui1, ClientNameTUI)
+
+	tui2 := dialTestClient(t, srv.SocketPath())
+	rTui2 := bufio.NewReader(tui2)
+	helloWithName(t, tui2, rTui2, ClientNameTUI)
+
+	cli := dialTestClient(t, srv.SocketPath())
+	rCli := bufio.NewReader(cli)
+	helloWithName(t, cli, rCli, ClientNameCLI)
+
+	// From tui1's PrepareExit, the other TUI count is 1 (tui2 only —
+	// self excluded, CLI excluded).
+	resp := prepareExit(t, tui1, rTui1)
+	if resp.ClientCount != 3 {
+		t.Errorf("ClientCount from tui1: got %d want 3", resp.ClientCount)
+	}
+	if resp.OtherTUIClients != 1 {
+		t.Errorf("OtherTUIClients from tui1: got %d want 1 (tui2 only)", resp.OtherTUIClients)
+	}
+
+	// From cli's PrepareExit, both TUIs count.
+	resp = prepareExit(t, cli, rCli)
+	if resp.OtherTUIClients != 2 {
+		t.Errorf("OtherTUIClients from cli: got %d want 2 (both TUIs)", resp.OtherTUIClients)
+	}
+
+	// Disconnect tui2; tui1's view should then show 0 other TUIs.
+	tui2.Close()
+	// Brief settle so the daemon updates its clients map.
+	time.Sleep(50 * time.Millisecond)
+	resp = prepareExit(t, tui1, rTui1)
+	if resp.OtherTUIClients != 0 {
+		t.Errorf("OtherTUIClients from tui1 after tui2 disconnect: got %d want 0", resp.OtherTUIClients)
+	}
+
+	tui1.Close()
+	cli.Close()
+	waitServerDone(t, errCh, 3*time.Second)
+	_ = rTui2 // silence unused if loop short-circuits
+}
+
+// TestServerLifecycle_PersistentSurvivesLastDisconnect verifies that
+// a daemon running with Options.Persistent stays accepting connections
+// after the last client disconnects (the default-mode tests above
+// assert the inverse).
+func TestServerLifecycle_PersistentSurvivesLastDisconnect(t *testing.T) {
+	srv, errCh := startServerWithOptions(t, Options{Persistent: true})
+
+	c1 := dialTestClient(t, srv.SocketPath())
+	r1 := bufio.NewReader(c1)
+	helloWithName(t, c1, r1, ClientNameTUI)
+
+	// Disconnect; in default mode the daemon would exit here. In
+	// persistent mode it must stay up.
+	c1.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	// Confirm: dial a fresh connection. If the daemon exited, this
+	// will fail with ECONNREFUSED / file-not-found.
+	c2, err := net.Dial("unix", srv.SocketPath())
+	if err != nil {
+		t.Fatalf("post-disconnect dial: persistent daemon should still be listening but got: %v", err)
+	}
+	r2 := bufio.NewReader(c2)
+	helloWithName(t, c2, r2, ClientNameTUI)
+
+	// Ensure errCh has not received anything — daemon is still running.
+	select {
+	case err := <-errCh:
+		t.Fatalf("persistent daemon exited unexpectedly: %v", err)
+	default:
+	}
+
+	// Disconnect c2 and explicitly cancel via Shutdown so the test
+	// can wind down (the test's cancel is hooked in t.Cleanup but
+	// signaling cleanly is faster than waiting for timeout).
+	c2.Close()
+
+	// Trigger shutdown via the listener's accept loop catching the
+	// context cancel from t.Cleanup; waitServerDone has its own
+	// timeout to bound this.
+	srv.initiateShutdown("test cleanup")
+	waitServerDone(t, errCh, 3*time.Second)
+}
+
+// helloWithName issues a Hello with the given ClientName and validates
+// the response is a HelloResp envelope.
+func helloWithName(t *testing.T, conn net.Conn, r *bufio.Reader, name string) {
+	t.Helper()
+	writeReq(t, conn, MsgHelloReq, HelloReq{
+		ProtocolVersion: ProtocolVersion,
+		BinaryVersion:   "test",
+		ClientName:      name,
+	})
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	defer conn.SetReadDeadline(time.Time{})
+	typ, _ := readResp(t, r)
+	if typ != MsgHelloResp {
+		t.Fatalf("hello: got msg %q want %q", typ, MsgHelloResp)
+	}
+}
+
+// prepareExit issues a PrepareExitReq and returns the decoded response.
+func prepareExit(t *testing.T, conn net.Conn, r *bufio.Reader) PrepareExitResp {
+	t.Helper()
+	writeReq(t, conn, MsgPrepareExitReq, PrepareExitReq{})
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	defer conn.SetReadDeadline(time.Time{})
+	name, raw := readResp(t, r)
+	if name != MsgPrepareExitResp {
+		t.Fatalf("prepare_exit: got msg %q want %q", name, MsgPrepareExitResp)
+	}
+	var resp PrepareExitResp
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("decode PrepareExitResp: %v", err)
+	}
+	return resp
 }

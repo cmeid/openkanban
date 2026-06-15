@@ -174,6 +174,50 @@ else
   say "  (Run \`openkanban hooks install\` later if you set up Claude Code.)"
 fi
 
+# -- optional: launchd background service (macOS) -------------------------
+step "Background service (launchd)"
+
+# Linux / other Unixes: no systemd backend yet, so we silently skip.
+# Windows isn't reached by this script in the first place.
+if [ "$(uname -s)" = "Darwin" ]; then
+  if [ "$have_tty" = "1" ] && [ -t 0 ]; then
+    say "  openkanbankd can run as a launchd LaunchAgent under your user account,"
+    say "  independent of any TUI. Benefit: you can quit and restart the TUI as much"
+    say "  as you want (e.g. while iterating on openkanban itself) and your in-flight"
+    say "  agent sessions keep running. The service starts at login and exits only"
+    say "  when you run \`openkanban daemon stop\`."
+    say  ""
+    printf '  Install openkanbankd as a launchd service now? [y/N] '
+    read -r reply
+    case "${reply:-n}" in
+      y|Y|yes|YES)
+        if "$INSTALLED_BIN" daemon install-service; then
+          say  ""
+          say  "  To prevent the TUI from also forking its own daemon, add the following"
+          say  "  to ~/.config/openkanban/config.json (top-level key):"
+          say  ""
+          say  '      "daemon": { "autostart": false }'
+          say  ""
+          say  "  Or pass --no-launch-daemon when invoking openkanban."
+        else
+          warn "openkanban daemon install-service failed. You can re-run it later with:"
+          say  "      openkanban daemon install-service"
+        fi
+        ;;
+      *)
+        say "  skipped. You can install later with:"
+        say  "      openkanban daemon install-service"
+        ;;
+    esac
+  else
+    say "  macOS detected but stdin is not a TTY — skipping launchd prompt."
+    say "  Run \`openkanban daemon install-service\` interactively to set it up."
+  fi
+else
+  say "  launchd-based service install is macOS-only. On Linux, run \`openkanban daemon --persistent\`"
+  say "  under your own process supervisor (systemd user unit, tmux, etc.)."
+fi
+
 # -- closing banner -------------------------------------------------------
 step "Done"
 

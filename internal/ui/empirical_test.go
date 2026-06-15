@@ -58,23 +58,23 @@ func TestEmpiricalRenderHeights(t *testing.T) {
 	long := mk(strings.Repeat("verylongword ", 12), "a brief description", []string{"bug"})
 	huge := mk(strings.Repeat("x", 100), "a brief description", []string{"bug"})
 
-	shortView := m.renderTicket(short, false, false, cardWidth, m.colors.primary)
-	longView := m.renderTicket(long, false, false, cardWidth, m.colors.primary)
-	hugeView := m.renderTicket(huge, false, false, cardWidth, m.colors.primary)
+	shortView := m.renderTicket(short, false, false, cardWidth, m.colors.primary, 1, 1)
+	longView := m.renderTicket(long, false, false, cardWidth, m.colors.primary, 1, 1)
+	hugeView := m.renderTicket(huge, false, false, cardWidth, m.colors.primary, 1, 1)
 
 	t.Logf("(a) short-title card height = %d", lipgloss.Height(shortView))
 	t.Logf("(b) long-title card height  = %d", lipgloss.Height(longView))
 	t.Logf("(b') 100-rune card height   = %d", lipgloss.Height(hugeView))
 
-	c1 := m.renderTicket(mk("c1", "d", nil), false, false, cardWidth, m.colors.primary)
-	c2 := m.renderTicket(mk("c2", "d", nil), false, false, cardWidth, m.colors.primary)
-	c3 := m.renderTicket(mk("c3", "d", nil), false, false, cardWidth, m.colors.primary)
+	c1 := m.renderTicket(mk("c1", "d", nil), false, false, cardWidth, m.colors.primary, 1, 3)
+	c2 := m.renderTicket(mk("c2", "d", nil), false, false, cardWidth, m.colors.primary, 2, 3)
+	c3 := m.renderTicket(mk("c3", "d", nil), false, false, cardWidth, m.colors.primary, 3, 3)
 	sum := lipgloss.Height(c1) + lipgloss.Height(c2) + lipgloss.Height(c3)
 	joined := strings.Join([]string{c1, c2, c3}, "\n")
 	t.Logf("(c) sum=%d  joined=%d  delta=%d", sum, lipgloss.Height(joined), lipgloss.Height(joined)-sum)
 
 	// Mixed: 2 short + 1 long
-	lc := m.renderTicket(mk(strings.Repeat("y", 80), "d", nil), false, false, cardWidth, m.colors.primary)
+	lc := m.renderTicket(mk(strings.Repeat("y", 80), "d", nil), false, false, cardWidth, m.colors.primary, 2, 3)
 	mixedSum := lipgloss.Height(c1) + lipgloss.Height(lc) + lipgloss.Height(c2)
 	mixedJoined := strings.Join([]string{c1, lc, c2}, "\n")
 	t.Logf("(d) mixed: short=%d long=%d short=%d sum=%d joined=%d",

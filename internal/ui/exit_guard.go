@@ -125,19 +125,18 @@ func (m *Model) handleQuitRequested() (tea.Model, tea.Cmd) {
 	}
 }
 
-// handlePrepareExitResult applies the three-way decision tree from the
-// daemon's response:
-//
-//   - ClientCount > 1 → another TUI is still connected, the daemon
-//     stays up for them, we may exit freely.
-//   - Sessions empty → we're the last TUI but there's nothing live;
-//     exit and let the daemon shut itself down (PR4 last-client logic).
-//   - Otherwise → enter ModeConfirmExit and let the user terminate.
+// handlePrepareExitResult decides whether to exit immediately or warn
+// the user. We previously skipped the modal when ClientCount > 1, on
+// the theory that other TUIs would keep the daemon (and its sessions)
+// alive. That shortcut races: when multiple TUIs close near-
+// simultaneously, each sees ClientCount > 1 and silent-quits, and the
+// last one out trips the daemon's defensive "exit-guard was bypassed"
+// kill (see internal/daemon/server.go handleLastClientDisconnect). So
+// whenever the daemon reports live sessions, we now show the modal
+// unconditionally — the user explicitly chose to quit, they get to see
+// what's at stake.
 func (m *Model) handlePrepareExitResult(msg prepareExitResultMsg) (tea.Model, tea.Cmd) {
 	resp := msg.Resp
-	if resp.ClientCount > 1 {
-		return m, tea.Quit
-	}
 	if len(resp.Sessions) == 0 {
 		return m, tea.Quit
 	}
@@ -154,14 +153,59 @@ func (m *Model) handlePrepareExitResult(msg prepareExitResultMsg) (tea.Model, te
 	return m, nil
 }
 
-// handlePrepareExitFailed logs the error and exits anyway. Trapping the
-// user inside the TUI when the daemon is unreachable is worse than the
-// outside chance that the daemon has live sessions we don't know about.
+// handlePrepareExitFailed runs when the PrepareExit RPC errored or
+// timed out. Without an authoritative session list from the daemon we
+// must not silently tea.Quit if our local pane state shows running
+// agents — that's the same silent-destruction path the modal exists to
+// prevent. Fall back to the local pane snapshot: if any pane is
+// Running(), synthesize a SessionInfo list and show the modal. The
+// synthesized PID is 0 (we don't track it client-side); SessionID is
+// the daemon-internal handle the kill RPC needs.
+//
+// Only when the local snapshot is also empty do we exit anyway —
+// trapping the user when there's genuinely nothing live is worse than
+// the residual chance of a daemon-side ghost session.
 func (m *Model) handlePrepareExitFailed(msg prepareExitFailedMsg) (tea.Model, tea.Cmd) {
 	if msg.Err != nil {
 		log.Printf("openkanban: exit guard PrepareExit failed: %v", msg.Err)
 	}
-	return m, tea.Quit
+
+	sessions := m.localRunningSessions()
+	if len(sessions) == 0 {
+		return m, tea.Quit
+	}
+
+	m.confirmExit.reset()
+	m.confirmExit.sessions = sessions
+	m.confirmExit.killing = map[string]bool{}
+	m.mode = ModeConfirmExit
+	m.notify("Daemon RPC failed; showing locally-known sessions. Kill or cancel.")
+	return m, nil
+}
+
+// localRunningSessions builds a SessionInfo list from m.panes where
+// the pane reports Running(). Used as a fallback when the daemon's
+// PrepareExit RPC is unavailable. PID is omitted (the client doesn't
+// track it); the SessionID is the daemon-internal handle so a Kill
+// RPC from the modal can still target the right session.
+func (m *Model) localRunningSessions() []daemon.SessionInfo {
+	if len(m.panes) == 0 {
+		return nil
+	}
+	out := make([]daemon.SessionInfo, 0, len(m.panes))
+	for ticketID, pane := range m.panes {
+		if pane == nil || !pane.Running() {
+			continue
+		}
+		out = append(out, daemon.SessionInfo{
+			SessionID:   pane.SessionID(),
+			TicketID:    string(ticketID),
+			SessionName: pane.SessionName(),
+			Title:       pane.Title(),
+			Running:     true,
+		})
+	}
+	return out
 }
 
 // handleSessionKilled removes the named session from the modal's list.

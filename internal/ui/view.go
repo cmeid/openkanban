@@ -125,42 +125,39 @@ func (m *Model) renderHeader() string {
 		}
 	}
 
-	var activity string
-	totalActive := workingCount + waitingCount + idleCount
-	if totalActive > 0 {
-		var statusText string
-		var bgColor lipgloss.Color
+	var statusText string
+	var bgColor, fgColor lipgloss.Color
+	fgColor = m.colors.base
 
-		if waitingCount > 0 {
-			bgColor = m.colors.secondary
-			statusText = fmt.Sprintf("◐ %d waiting", waitingCount)
-			if workingCount > 0 {
-				statusText = fmt.Sprintf("◐ %d waiting, %d working", waitingCount, workingCount)
-			}
-		} else if workingCount > 0 {
-			bgColor = m.colors.warning
-			statusText = fmt.Sprintf("%s %d working", m.spinner.View(), workingCount)
-		} else {
-			bgColor = m.colors.primary
-			statusText = fmt.Sprintf("◆ %d idle", idleCount)
+	if waitingCount > 0 {
+		bgColor = m.colors.secondary
+		statusText = fmt.Sprintf("◐ %d waiting", waitingCount)
+		if workingCount > 0 {
+			statusText = fmt.Sprintf("◐ %d waiting, %d working", waitingCount, workingCount)
 		}
-
-		activityBadge := lipgloss.NewStyle().
-			Foreground(m.colors.base).
-			Background(bgColor).
-			Bold(true).
-			Padding(0, 1).
-			Render(statusText)
-		activity = activityBadge
+	} else if workingCount > 0 {
+		bgColor = m.colors.warning
+		statusText = fmt.Sprintf("%s %d working", m.spinner.View(), workingCount)
+	} else if idleCount > 0 {
+		bgColor = m.colors.primary
+		statusText = fmt.Sprintf("◆ %d idle", idleCount)
+	} else {
+		bgColor = m.colors.surface
+		fgColor = m.colors.muted
+		statusText = "○ 0 sessions"
 	}
+
+	activity := lipgloss.NewStyle().
+		Foreground(fgColor).
+		Background(bgColor).
+		Bold(true).
+		Padding(0, 1).
+		Render(statusText)
 
 	helpStyle := lipgloss.NewStyle().Foreground(m.colors.muted)
 	help := helpStyle.Render("? help  q quit")
 
-	right := help
-	if activity != "" {
-		right = lipgloss.JoinHorizontal(lipgloss.Center, activity, "  ", help)
-	}
+	right := lipgloss.JoinHorizontal(lipgloss.Center, activity, "  ", help)
 
 	spacing := m.width - lipgloss.Width(left) - lipgloss.Width(right)
 	spacing = max(spacing, 0)
@@ -295,7 +292,7 @@ func (m *Model) renderColumn(colIdx int, col board.Column, tickets []*board.Tick
 	for i, ticket := range tickets {
 		isSelected := isActive && i == m.activeTicket
 		isTicketHovered := isHovered && i == m.hoverTicket
-		v := m.renderTicket(ticket, isSelected, isTicketHovered, width-4, headerColor)
+		v := m.renderTicket(ticket, isSelected, isTicketHovered, width-4, headerColor, i+1, len(tickets))
 		rendered[i] = v
 		heights[i] = lipgloss.Height(v)
 	}
@@ -408,7 +405,7 @@ func (m *Model) renderColumn(colIdx int, col board.Column, tickets []*board.Tick
 	return style.Render(content)
 }
 
-func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, width int, columnColor lipgloss.Color) string {
+func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, width int, columnColor lipgloss.Color, index, total int) string {
 	pane, hasPane := m.panes[ticket.ID]
 	isRunning := hasPane && pane.Running()
 
@@ -470,7 +467,11 @@ func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, w
 		}
 	}
 
-	var headerParts []string
+	positionBadge := lipgloss.NewStyle().
+		Foreground(m.colors.muted).
+		Render(fmt.Sprintf("%d/%d", index, total))
+
+	headerParts := []string{positionBadge}
 	if priorityBadge != "" {
 		headerParts = append(headerParts, priorityBadge)
 	}

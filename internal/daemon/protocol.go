@@ -219,6 +219,16 @@ func DecodeEnvelope(data []byte) (typeName string, payload json.RawMessage, err 
 	return env.Type, env.Payload, nil
 }
 
+// Well-known ClientName values used in HelloReq. The daemon
+// distinguishes TUI clients (interactive, attach long-lived sessions)
+// from CLI clients (one-shot subcommands like `daemon list` / `stop`)
+// so the warn-on-orphan logic in handlePrepareExit knows which
+// connections matter for "is a user still watching this work?"
+const (
+	ClientNameTUI = "openkanban-tui"
+	ClientNameCLI = "openkanban-cli"
+)
+
 // HelloReq is the first message a client sends after connecting. It
 // announces the client's protocol version and identity.
 type HelloReq struct {
@@ -284,6 +294,12 @@ type KillResp struct{}
 // Reason:"ticket_done"} to all subscribers. The CLI is expected to
 // have already written the ticket .md and status file before sending
 // this; the daemon does NOT touch the worktree.
+//
+// The name is historical: both `openkanban ticket done` and `openkanban
+// ticket in-review` send this RPC. From the daemon's perspective the
+// motion is identical — terminate the live PTY for this ticket as an
+// expected wrap-up. The CLI side decides which status the ticket lands
+// in; the daemon does not care.
 type TicketDoneReq struct {
 	TicketID string `json:"ticket_id"`
 }
@@ -367,14 +383,16 @@ type SubscribeResp struct{}
 //
 // Expected is only meaningful when Event == "exited". It is true when
 // the daemon initiated the kill via handleTicketDone (i.e. the agent
-// invoked `openkanban ticket done`), and false for natural process
-// exits and plain Kill RPCs. Subscribers use this to decide whether to
-// preserve AgentCompleted (Expected=true) or reset to AgentNone
-// (Expected=false).
+// invoked `openkanban ticket done` or `openkanban ticket in-review`),
+// and false for natural process exits and plain Kill RPCs. Subscribers
+// use this to decide whether to preserve AgentCompleted (Expected=true)
+// or reset to AgentNone (Expected=false).
 //
 // Reason is a diagnostic hint paired with Expected. Possible values:
 //
-//	"ticket_done"   - kill initiated by handleTicketDone
+//	"ticket_done"   - kill initiated by handleTicketDone (covers both
+//	                  `ticket done` and `ticket in-review` — the daemon
+//	                  doesn't distinguish since the motion is identical)
 //	"natural_exit"  - the child closed its PTY on its own
 //	"kill"          - a Kill RPC initiated the termination
 //
@@ -395,9 +413,13 @@ type SessionEvent struct {
 type PrepareExitReq struct{}
 
 // PrepareExitResp tells the exiting client what state is at stake.
+// OtherTUIClients counts TUI clients OTHER than the asking client;
+// used by `daemon stop` / `daemon restart` to decide whether a
+// shutdown would orphan live sessions with no TUI watching.
 type PrepareExitResp struct {
-	ClientCount int           `json:"client_count"`
-	Sessions    []SessionInfo `json:"sessions"`
+	ClientCount     int           `json:"client_count"`
+	OtherTUIClients int           `json:"other_tui_clients"`
+	Sessions        []SessionInfo `json:"sessions"`
 }
 
 // ShutdownReq asks the daemon to exit. With Force=false the daemon

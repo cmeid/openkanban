@@ -83,6 +83,31 @@ This document defines the visual design, component hierarchy, and styling for Ag
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
+### Header Activity Chip
+
+A persistent badge in the top-right of the header reports the live
+session count, grouped by `AgentStatus` over panes whose
+`PaneView.Running()` is true. The chip is **always rendered** — even
+with zero sessions — so the header footprint doesn't shift as work
+starts and ends.
+
+| Condition (priority order) | Text                                | Background  | Foreground |
+|----------------------------|-------------------------------------|-------------|------------|
+| `waiting > 0`              | `◐ N waiting` (+ `, M working`)     | `secondary` | `base`     |
+| `working > 0`              | `<spinner> N working`               | `warning`   | `base`     |
+| `idle > 0`                 | `◆ N idle`                          | `primary`   | `base`     |
+| all zero                   | `○ 0 sessions`                      | `surface`   | `muted`    |
+
+The zero-state pairing (`bg=surface`, `fg=muted`) is the same subdued
+treatment used by the column scroll-overflow indicators — it reads as
+"inactive" rather than "alarming" and keeps the chip from competing
+with active-state colors for attention.
+
+Rendered by `renderHeader()` in `internal/ui/view.go`. The
+`waiting` branch wins when both waiting and working are non-zero
+because the user-attention semantics of "an agent is waiting on you"
+outrank "an agent is making progress."
+
 ## Embedded Session View
 
 When the user attaches into a running agent (Enter on an in-progress
@@ -212,6 +237,25 @@ Driven by daemon-pushed `attached` / `detached` SessionEvent
 broadcasts — see [AGENT_INTEGRATION.md → One attacher per session](AGENT_INTEGRATION.md#one-attacher-per-session-with-takeover)
 for the event flow and the receiver-side counter that makes it
 race-correct.
+
+### Column Position Badge
+
+A muted `N/total` prefix sits at the head of each card's header row,
+where `N` is the card's 1-indexed position in its column and `total`
+is the column's card count. Makes the cursor's location — and how
+many cards sit above and below — visible at a glance without having
+to scroll.
+
+| Element | Value         | Foreground |
+|---------|---------------|------------|
+| Format  | `%d/%d`       | `muted`    |
+| Index   | `i+1` (1-based) | —        |
+| Total   | `len(tickets)` (per column) | — |
+
+Rendered first in `renderTicket`'s `headerParts` so priority, project,
+deps, and session badges follow it. Muted styling keeps it from
+competing with the indicators that change state — it's a static
+position cue, not a status signal.
 
 ### Card Variations
 

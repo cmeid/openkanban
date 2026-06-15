@@ -9,7 +9,9 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/techdufus/openkanban/internal/board"
 	"github.com/techdufus/openkanban/internal/daemon"
+	"github.com/techdufus/openkanban/internal/daemonclient"
 )
 
 // fakeGuardAPI is a tiny in-memory stand-in for *daemonclient.Client
@@ -152,22 +154,35 @@ func containsQuitMsg(msgs []tea.Msg) bool {
 	return false
 }
 
-func TestExitGuard_ClientCountGreaterThanOne_ExitsImmediately(t *testing.T) {
-	api := newFakeGuardAPI([]daemon.SessionInfo{
+// When sessions exist, the modal must appear regardless of how many
+// other TUIs are currently attached. The previous "ClientCount > 1 →
+// silent quit" shortcut raced when multiple TUIs closed near-
+// simultaneously and the daemon ended up defensively killing all
+// sessions (see daemon.log "exit-guard was bypassed" path).
+func TestExitGuard_ClientCountGreaterThanOne_StillShowsModalWhenSessionsLive(t *testing.T) {
+	sessions := []daemon.SessionInfo{
 		{SessionID: "s1", TicketID: "t1", PID: 100, Running: true},
-	}, /*clientCount=*/ 2)
+	}
+	api := newFakeGuardAPI(sessions, /*clientCount=*/ 5)
 	m := minimalModel(api)
 
 	_, cmd := m.handleQuitRequested()
-	finalModel, msgs := runCmds(t, m, cmd)
-	if !containsQuitMsg(msgs) {
-		t.Fatalf("expected tea.Quit; got msgs=%v", msgs)
+	msg := cmd()
+	resMsg, ok := msg.(prepareExitResultMsg)
+	if !ok {
+		t.Fatalf("expected prepareExitResultMsg; got %T", msg)
 	}
-	if finalModel.mode == ModeConfirmExit {
-		t.Errorf("expected NOT to enter ModeConfirmExit; got mode=%v", finalModel.mode)
+	newModel, followup := m.Update(resMsg)
+	mm := newModel.(*Model)
+	if mm.mode != ModeConfirmExit {
+		t.Fatalf("expected ModeConfirmExit even with ClientCount=%d; got %v",
+			api.prepareExitResp.ClientCount, mm.mode)
 	}
-	if api.prepareCalls != 1 {
-		t.Errorf("expected 1 PrepareExit call, got %d", api.prepareCalls)
+	if isQuitCmd(followup) {
+		t.Errorf("expected NOT to quit; got tea.Quit")
+	}
+	if len(mm.confirmExit.sessions) != 1 {
+		t.Errorf("expected 1 session in modal; got %d", len(mm.confirmExit.sessions))
 	}
 }
 
@@ -324,7 +339,10 @@ func TestExitGuard_EscCancels(t *testing.T) {
 	}
 }
 
-func TestExitGuard_PrepareExitFails_ExitsAnyway(t *testing.T) {
+// PrepareExit RPC failure with NO known local sessions: we have
+// nothing to warn about, so falling through to tea.Quit is the right
+// move (trapping the user would be worse).
+func TestExitGuard_PrepareExitFails_NoLocalSessions_ExitsAnyway(t *testing.T) {
 	api := newFakeGuardAPI(nil, 1)
 	api.prepareExitErr = errors.New("daemon broke")
 	m := minimalModel(api)
@@ -335,7 +353,46 @@ func TestExitGuard_PrepareExitFails_ExitsAnyway(t *testing.T) {
 		t.Fatalf("expected tea.Quit despite RPC error; got msgs=%v", msgs)
 	}
 	if finalModel.mode == ModeConfirmExit {
-		t.Errorf("expected NOT to enter ModeConfirmExit when PrepareExit failed; mode=%v", finalModel.mode)
+		t.Errorf("expected NOT to enter ModeConfirmExit when PrepareExit failed and no local sessions; mode=%v", finalModel.mode)
+	}
+}
+
+// PrepareExit RPC failure WITH known local sessions: fall back to the
+// local pane snapshot and surface the modal so the user can decide,
+// rather than silently exiting and letting the daemon kill them on
+// disconnect.
+func TestExitGuard_PrepareExitFails_LocalSessions_ShowsModal(t *testing.T) {
+	api := newFakeGuardAPI(nil, 1)
+	api.prepareExitErr = errors.New("daemon broke")
+
+	// PaneView with info.Running=true sits in PaneViewUnattached and
+	// reports Running()=true even with a nil daemon client.
+	info := &daemon.SessionInfo{
+		SessionID:   "s-alive",
+		TicketID:    "t-alive",
+		SessionName: "task/foo",
+		Running:     true,
+	}
+	pv := daemonclient.NewPaneView(nil, "t-alive", "s-alive", info)
+
+	m := minimalModel(api)
+	m.panes = map[board.TicketID]*daemonclient.PaneView{
+		board.TicketID("t-alive"): pv,
+	}
+
+	_, cmd := m.handleQuitRequested()
+	finalModel, msgs := runCmds(t, m, cmd)
+	if containsQuitMsg(msgs) {
+		t.Fatalf("expected NOT to exit when local sessions exist; got tea.Quit")
+	}
+	if finalModel.mode != ModeConfirmExit {
+		t.Fatalf("expected ModeConfirmExit on RPC failure with local sessions; got %v", finalModel.mode)
+	}
+	if got := len(finalModel.confirmExit.sessions); got != 1 {
+		t.Errorf("expected 1 synthesized session; got %d", got)
+	}
+	if got := finalModel.confirmExit.sessions[0].SessionID; got != "s-alive" {
+		t.Errorf("expected SessionID=s-alive in fallback; got %q", got)
 	}
 }
 

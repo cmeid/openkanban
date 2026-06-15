@@ -21,6 +21,12 @@ import (
 	"github.com/techdufus/openkanban/internal/daemon"
 )
 
+// daemonFlagPersistent controls whether the daemon stays alive when
+// the last client disconnects. Default (false) preserves the original
+// TUI-managed lifecycle; --persistent is set in the launchd plist so
+// the system-managed daemon outlives any one TUI session.
+var daemonFlagPersistent bool
+
 // daemonCmd is the parent command for openkanbankd-related operations.
 // `openkanban daemon` itself runs the daemon in the foreground; the
 // list/stop/log subcommands are client-side helpers that dial into a
@@ -55,7 +61,7 @@ func runDaemonForeground(cmd *cobra.Command, args []string) error {
 	log.SetOutput(os.Stderr)
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
-	srv, err := daemon.NewServer(sock, pidpath)
+	srv, err := daemon.NewServerWithOptions(sock, pidpath, daemon.Options{Persistent: daemonFlagPersistent})
 	if err != nil {
 		var already *daemon.ErrAlreadyLocked
 		if errors.As(err, &already) {
@@ -89,7 +95,7 @@ var daemonListCmd = &cobra.Command{
 		if _, err := exchange(conn, r, daemon.MsgHelloReq, daemon.HelloReq{
 			ProtocolVersion: daemon.ProtocolVersion,
 			BinaryVersion:   Version,
-			ClientName:      "openkanban-cli",
+			ClientName:      daemon.ClientNameCLI,
 		}); err != nil {
 			return fmt.Errorf("hello: %w", err)
 		}
@@ -119,9 +125,22 @@ var daemonListCmd = &cobra.Command{
 	},
 }
 
+// daemonStopFlagForce is the --force flag on `daemon stop` — when
+// set, skip the interactive prompt even if sessions are alive and no
+// TUI is watching.
+var daemonStopFlagForce bool
+
 // daemonStopCmd asks the running daemon to shut itself down. With
 // Force=false the daemon kills any live sessions defensively (and
 // reports how many it killed) before exiting.
+//
+// Safety (matches daemon restart's pattern): if live sessions exist
+// AND no other TUI is currently connected (so no human would notice
+// the orphan) AND stderr is a TTY AND --force is NOT set, prompt
+// interactively before tearing them down. This is most useful in
+// persistent / launchd-managed mode where the daemon outlives any
+// single TUI — a casual `daemon stop` from a script would otherwise
+// silently kill in-flight agent work.
 var daemonStopCmd = &cobra.Command{
 	Use:           "stop",
 	Short:         "Ask the running daemon to shut down",
@@ -138,12 +157,38 @@ var daemonStopCmd = &cobra.Command{
 		if _, err := exchange(conn, r, daemon.MsgHelloReq, daemon.HelloReq{
 			ProtocolVersion: daemon.ProtocolVersion,
 			BinaryVersion:   Version,
-			ClientName:      "openkanban-cli",
+			ClientName:      daemon.ClientNameCLI,
 		}); err != nil {
 			return fmt.Errorf("hello: %w", err)
 		}
 
-		raw, err := exchange(conn, r, daemon.MsgShutdownReq, daemon.ShutdownReq{Force: false})
+		// Learn the live-session count and whether any other TUI is
+		// watching before pulling the trigger.
+		raw, err := exchange(conn, r, daemon.MsgPrepareExitReq, daemon.PrepareExitReq{})
+		if err != nil {
+			return fmt.Errorf("prepare_exit: %w", err)
+		}
+		var prep daemon.PrepareExitResp
+		if err := json.Unmarshal(raw, &prep); err != nil {
+			return fmt.Errorf("decode PrepareExitResp: %w", err)
+		}
+
+		liveSessions := len(prep.Sessions)
+		// Prompt only when sessions would orphan: live sessions AND
+		// no other TUI is connected to watch them. If a TUI IS
+		// watching, the user already knows the state and can react
+		// (e.g. exit-guard in the TUI itself).
+		if liveSessions > 0 && prep.OtherTUIClients == 0 && !daemonStopFlagForce && stderrIsTTY() {
+			fmt.Fprintf(os.Stderr, "daemon stop will terminate %d live agent session(s) with no TUI watching. Continue? [y/N] ", liveSessions)
+			line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+			ans := strings.TrimSpace(line)
+			if ans != "y" && ans != "Y" {
+				fmt.Fprintln(os.Stderr, "aborted")
+				os.Exit(1)
+			}
+		}
+
+		raw, err = exchange(conn, r, daemon.MsgShutdownReq, daemon.ShutdownReq{Force: false})
 		if err != nil {
 			return fmt.Errorf("shutdown: %w", err)
 		}
@@ -187,7 +232,7 @@ var daemonRestartCmd = &cobra.Command{
 		if _, err := exchange(conn, r, daemon.MsgHelloReq, daemon.HelloReq{
 			ProtocolVersion: daemon.ProtocolVersion,
 			BinaryVersion:   Version,
-			ClientName:      "openkanban-cli",
+			ClientName:      daemon.ClientNameCLI,
 		}); err != nil {
 			return fmt.Errorf("hello: %w", err)
 		}
@@ -336,6 +381,8 @@ func exchange(conn net.Conn, r *bufio.Reader, msgType string, payload any) (json
 }
 
 func init() {
+	daemonCmd.Flags().BoolVar(&daemonFlagPersistent, "persistent", false, "Stay alive when the last client disconnects (used by launchd / systemd integration)")
+	daemonStopCmd.Flags().BoolVar(&daemonStopFlagForce, "force", false, "skip the interactive 'continue?' prompt even if live sessions exist")
 	daemonRestartCmd.Flags().BoolVar(&daemonRestartFlagForce, "force", false, "skip the interactive 'continue?' prompt even if live sessions exist")
 
 	daemonCmd.AddCommand(daemonListCmd)

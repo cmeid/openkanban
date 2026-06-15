@@ -43,10 +43,51 @@ func MaybePromptForUpdate(cfg *config.Config, isTTY bool, disableFlag bool) (han
 	defer cancel()
 
 	status, checkErr := CheckForUpdates(ctx)
-	if checkErr != nil || !status.Available {
-		// Timeout, network failure, no source clone, up to date,
-		// ahead, diverged — all fall through silently.
+	if checkErr != nil {
+		// Genuine errors (context cancel, malformed git output) stay
+		// silent — startup should not spam the user with internal noise.
 		return false, nil
+	}
+	if !status.Available {
+		// Surface every non-empty Reason. This deliberately includes the
+		// boring "up to date" case so the user can see why auto-update
+		// is or isn't doing anything on each launch.
+		if status.Reason != "" {
+			fmt.Fprintln(os.Stderr, "openkanban: "+status.Reason)
+		}
+		if !status.OfferBranchSwitch {
+			return false, nil
+		}
+		// Re-derive the branch name for the prompt.
+		branch, _, _ := currentBranch(ctx, SourcePath)
+		choice, runErr := runBranchSwitchPrompt(branch)
+		if runErr != nil {
+			return false, nil
+		}
+		switch choice {
+		case promptQuit:
+			return true, nil
+		case promptApply:
+			// fall through to the switch + re-check
+		default:
+			return false, nil
+		}
+		newStatus, switchErr := branchSwitchAndRecheck(context.Background(), os.Stderr)
+		if switchErr != nil {
+			fmt.Fprintln(os.Stderr, "openkanban: switch failed —", switchErr,
+				"\nfix the source clone manually or reinstall via ./scripts/install.sh")
+			return false, nil
+		}
+		if !newStatus.Available {
+			// Often the re-check returns "up to date" — surface that
+			// too so the user knows the switch worked.
+			if newStatus.Reason != "" {
+				fmt.Fprintln(os.Stderr, "openkanban: "+newStatus.Reason)
+			}
+			return false, nil
+		}
+		status = newStatus
+		// Fall through into the existing runUpdatePrompt path below.
 	}
 
 	choice, runErr := runUpdatePrompt(status)
@@ -189,6 +230,61 @@ func runUpdatePrompt(status UpdateStatus) (promptChoice, error) {
 		return promptDismiss, err
 	}
 	finalModel, ok := final.(updatePromptModel)
+	if !ok {
+		return promptDismiss, nil
+	}
+	return finalModel.choice, nil
+}
+
+// branchSwitchPromptModel backs the one-line prompt offering to switch
+// the source clone from its current branch to main. Sibling of
+// updatePromptModel; same three choices, different View.
+type branchSwitchPromptModel struct {
+	branch string
+	choice promptChoice
+}
+
+func (m branchSwitchPromptModel) Init() tea.Cmd { return nil }
+
+func (m branchSwitchPromptModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	keyMsg, ok := msg.(tea.KeyMsg)
+	if !ok {
+		return m, nil
+	}
+	switch keyMsg.String() {
+	case "enter":
+		m.choice = promptApply
+		return m, tea.Quit
+	case "esc":
+		m.choice = promptDismiss
+		return m, tea.Quit
+	case "q", "Q", "ctrl+c":
+		m.choice = promptQuit
+		return m, tea.Quit
+	}
+	return m, nil
+}
+
+func (m branchSwitchPromptModel) View() string {
+	prefix := lipgloss.NewStyle().Bold(true).Render(
+		fmt.Sprintf("Source on %q.", m.branch),
+	)
+	return prefix + " [Enter] switch to main & update · [Esc] skip · [Q] quit\n"
+}
+
+// runBranchSwitchPrompt drives the branch-switch tea program on stderr.
+// Mirrors runUpdatePrompt.
+func runBranchSwitchPrompt(branch string) (promptChoice, error) {
+	model := branchSwitchPromptModel{branch: branch, choice: promptDismiss}
+	prog := tea.NewProgram(model,
+		tea.WithInput(os.Stdin),
+		tea.WithOutput(os.Stderr),
+	)
+	final, err := prog.Run()
+	if err != nil {
+		return promptDismiss, err
+	}
+	finalModel, ok := final.(branchSwitchPromptModel)
 	if !ok {
 		return promptDismiss, nil
 	}

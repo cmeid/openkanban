@@ -64,7 +64,7 @@ func TestRenderTicketShortTitleHeight(t *testing.T) {
 	m, proj := newHeightTestModel(t, 120, 40)
 	tk := makeTicket(proj, "short title", "a brief description", []string{"bug"})
 
-	view := m.renderTicket(tk, false, false, 36, m.colors.primary)
+	view := m.renderTicket(tk, false, false, 36, m.colors.primary, 1, 1)
 
 	if got := lipgloss.Height(view); got != 8 {
 		t.Errorf("short-title card height = %d, want 8\n---\n%s\n---", got, view)
@@ -81,7 +81,7 @@ func TestRenderTicketLongTitleHeight(t *testing.T) {
 	m, proj := newHeightTestModel(t, 120, 40)
 	tk := makeTicket(proj, strings.Repeat("verylongword ", 12), "a brief description", []string{"bug"})
 
-	view := m.renderTicket(tk, false, false, 36, m.colors.primary)
+	view := m.renderTicket(tk, false, false, 36, m.colors.primary, 1, 1)
 
 	if got := lipgloss.Height(view); got != 9 {
 		t.Errorf("long-title card height = %d, want 9\n---\n%s\n---", got, view)

@@ -70,6 +70,22 @@ Three options:
   `behavior.check_for_updates_on_launch: false` in
   `~/.config/openkanban/config.json`.
 
+The update flow **refuses** when the source clone would silently build
+the wrong tree: source on a non-`main` named branch, detached HEAD, not
+a git repo (unreadable / wiped), or a linked git worktree. Each refusal
+exits cleanly with an actionable message that names the offending state
+and the manual `git checkout main && git pull --ff-only origin main`
+recipe to fix it. The non-`main` named-branch case additionally offers a
+one-keystroke "switch to main & update" prompt (**Enter** to apply,
+**Esc** to skip, **Q** to quit). The linked-worktree case has no offer
+— `git checkout main` would refuse because `main` is already checked
+out in the original clone; the refusal points you at that clone
+instead.
+
+The launch-time check also surfaces every non-empty status on stderr
+("up to date", "ahead", "diverged", refusal messages) so it's never
+silent about why auto-update is or isn't doing anything on a given run.
+
 For binaries installed via Homebrew or `go install …@latest`, the update
 flow prints upgrade instructions instead of attempting an in-place pull
 (`SourcePath` is empty in release builds). On TTY launches, the binary
