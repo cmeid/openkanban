@@ -29,6 +29,14 @@ multiple AI coding agents across different tasks and git worktrees.
 
 Each ticket spawns an embedded terminal pane with its own git worktree
 for safe parallel development.`,
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		// Refuse to run if this is a stub binary (bare `go install .`
+		// produced it, missing the install-time metadata that update,
+		// version reporting, and source-clone awareness all depend on).
+		// `version` is allowed through so users can see WHY their
+		// binary is broken; everything else is gated.
+		return guardStubBuild(cmd)
+	},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cmd.SilenceUsage = true
 		cfg, result, err := config.LoadWithValidation(cfgFile)

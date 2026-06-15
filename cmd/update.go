@@ -15,9 +15,11 @@ import (
 
 // UpdateStatus is the result of a CheckForUpdates call.
 type UpdateStatus struct {
-	// Available is true only when the local HEAD is strictly behind
-	// origin/main (i.e., a fast-forward is possible). False when up
-	// to date, ahead, diverged, or unable to check.
+	// Available is true when an update action is possible: either the
+	// local HEAD is strictly behind origin/main (a fast-forward exists)
+	// OR the installed binary's commit is older than the source HEAD
+	// (a rebuild fixes things even with no pull). False when up to
+	// date, ahead, diverged, or unable to check.
 	Available bool
 
 	// LocalSHA and RemoteSHA are the short-form (10-char) SHAs.
@@ -36,6 +38,13 @@ type UpdateStatus struct {
 	// linked git worktree (which would refuse the checkout). Callers MAY
 	// prompt the user; CheckForUpdates does not switch on its own.
 	OfferBranchSwitch bool
+
+	// BinaryStale signals "source is at the right commit but the
+	// installed binary is older" — i.e., the user pulled (or the source
+	// clone was already up-to-date) but didn't reinstall. The update
+	// path still runs `go install` in this case; no `git pull` happens
+	// because the source is already correct.
+	BinaryStale bool
 }
 
 // updateCheckOnly is bound to --check on the update subcommand.
@@ -126,29 +135,37 @@ func runUpdate(ctx context.Context, out io.Writer, status UpdateStatus) error {
 // We give the whole flow a generous timeout — pull + go install can be
 // slow on a cold cache.
 func ApplyUpdate(ctx context.Context, status UpdateStatus, out io.Writer) error {
-	fmt.Fprintf(out, "updating %s: %s -> %s\n", SourcePath, status.LocalSHA, status.RemoteSHA)
+	if status.BinaryStale && status.LocalSHA == status.RemoteSHA {
+		fmt.Fprintf(out, "rebuilding %s (source at %s; installed binary is older)\n", SourcePath, status.LocalSHA)
+	} else {
+		fmt.Fprintf(out, "updating %s: %s -> %s\n", SourcePath, status.LocalSHA, status.RemoteSHA)
 
-	// Best-effort: fast-forward the local main ref toward origin/main
-	// before pulling on the current branch. Without this, running update
-	// from a feature-branch worktree advances the feature branch but
-	// leaves local main behind — the next branch cut from a stale base.
-	// Errors are intentionally swallowed; the real update is the pull.
-	syncCtx, cancelSync := context.WithTimeout(ctx, 60*time.Second)
-	syncLocalMain(syncCtx, SourcePath)
-	cancelSync()
+		// Best-effort: fast-forward the local main ref toward origin/main
+		// before pulling on the current branch. Without this, running update
+		// from a feature-branch worktree advances the feature branch but
+		// leaves local main behind — the next branch cut from a stale base.
+		// Errors are intentionally swallowed; the real update is the pull.
+		syncCtx, cancelSync := context.WithTimeout(ctx, 60*time.Second)
+		syncLocalMain(syncCtx, SourcePath)
+		cancelSync()
 
-	pullCtx, cancelPull := context.WithTimeout(ctx, 60*time.Second)
-	defer cancelPull()
-	pull := exec.CommandContext(pullCtx, "git", "-C", SourcePath, "pull", "--ff-only", "origin", "main")
-	pull.Stdout = os.Stderr
-	pull.Stderr = os.Stderr
-	if err := pull.Run(); err != nil {
-		return fmt.Errorf("git pull: %w", err)
+		pullCtx, cancelPull := context.WithTimeout(ctx, 60*time.Second)
+		defer cancelPull()
+		pull := exec.CommandContext(pullCtx, "git", "-C", SourcePath, "pull", "--ff-only", "origin", "main")
+		pull.Stdout = os.Stderr
+		pull.Stderr = os.Stderr
+		if err := pull.Run(); err != nil {
+			return fmt.Errorf("git pull: %w", err)
+		}
 	}
 
 	installCtx, cancelInstall := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancelInstall()
 	ldflags := fmt.Sprintf("-X github.com/techdufus/openkanban/cmd.SourcePath=%s", SourcePath)
+	// Mark the resulting binary as built via the canonical install
+	// path so its PersistentPreRunE guard lets it run. Bare
+	// `go install .` skips this flag → stub binary.
+	ldflags += " -X github.com/techdufus/openkanban/cmd.BuildMarker=official"
 	// Bake the post-pull commit so `openkanban version` reflects the
 	// rebuilt binary. Mirrors scripts/install.sh: missing commit is
 	// non-fatal — we degrade to the default "none" rather than blocking
@@ -292,7 +309,34 @@ func CheckForUpdates(ctx context.Context) (UpdateStatus, error) {
 		return UpdateStatus{}, fmt.Errorf("rev-parse HEAD: %w", err)
 	}
 
+	// Compute the installed binary's commit so we can detect "source is
+	// at the right HEAD but the binary on disk is older" — the classic
+	// "I `git pull`-ed but forgot to reinstall" case. installedShort is
+	// the short SHA the version-time ldflags / BuildInfo provide (or ""
+	// when neither is available, in which case we can't say either way
+	// and conservatively don't claim binary-stale).
+	//
+	// Comparison: prefix-match against the FULL local SHA, because the
+	// ldflags-injected Commit (`git rev-parse --short HEAD`, ~7 chars)
+	// is shorter than short(localSHA) (10 chars), so a string-equality
+	// check would mis-classify identical commits as stale. The prefix
+	// match is correct for any short-SHA length (including a fully-
+	// expanded 40-char ldflags value, hypothetically).
+	installedShort := resolvedCommit()
+	binaryStale := installedShort != "" && !strings.HasPrefix(localSHA, installedShort)
+
 	if localSHA == remoteSHA {
+		if binaryStale {
+			// Source is at origin/main but the binary lags. ApplyUpdate
+			// will skip the (no-op) pull and just rebuild.
+			return UpdateStatus{
+				Available:   true,
+				LocalSHA:    short(localSHA),
+				RemoteSHA:   short(remoteSHA),
+				BinaryStale: true,
+				Reason:      "binary behind source — needs reinstall",
+			}, nil
+		}
 		return UpdateStatus{Available: false, Reason: "up to date"}, nil
 	}
 
@@ -307,9 +351,10 @@ func CheckForUpdates(ctx context.Context) (UpdateStatus, error) {
 	switch {
 	case behind && !ahead:
 		return UpdateStatus{
-			Available: true,
-			LocalSHA:  short(localSHA),
-			RemoteSHA: short(remoteSHA),
+			Available:   true,
+			LocalSHA:    short(localSHA),
+			RemoteSHA:   short(remoteSHA),
+			BinaryStale: binaryStale,
 		}, nil
 	case ahead && !behind:
 		return UpdateStatus{Available: false, Reason: "ahead"}, nil

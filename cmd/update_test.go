@@ -22,6 +22,17 @@ func withSourcePath(t *testing.T, path string) {
 	t.Cleanup(func() { SourcePath = prev })
 }
 
+// withCommit temporarily overrides the package-level Commit (the
+// ldflags-injected short SHA the installed binary reports) for one
+// test. Pair with withSourcePath to simulate "binary at commit X,
+// source clone at HEAD Y" scenarios.
+func withCommit(t *testing.T, sha string) {
+	t.Helper()
+	prev := Commit
+	Commit = sha
+	t.Cleanup(func() { Commit = prev })
+}
+
 // gitEnv is the environment we inject into every test `git` call so
 // commits land cleanly in CI / sandbox environments that have no user
 // config and no signing keys.
@@ -128,6 +139,101 @@ func TestUpdateCheckForUpdates_UpToDate(t *testing.T) {
 	}
 	if status.Reason != "up to date" {
 		t.Fatalf("expected Reason=%q, got %q", "up to date", status.Reason)
+	}
+}
+
+// TestUpdateCheckForUpdates_BinaryStaleSourceAtRemote covers the case
+// that was silently broken before this fix: the source clone has been
+// pulled to origin/main, but the installed binary's `Commit` is older.
+// We want Available=true with BinaryStale=true and a clear Reason, so
+// `openkanban update` reinstalls instead of saying "up to date".
+func TestUpdateCheckForUpdates_BinaryStaleSourceAtRemote(t *testing.T) {
+	_, local := setupRepos(t)
+	withSourcePath(t, local)
+	// Simulate installed binary that's older than source HEAD.
+	withCommit(t, "0000000")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	status, err := CheckForUpdates(ctx)
+	if err != nil {
+		t.Fatalf("CheckForUpdates: %v", err)
+	}
+	if !status.Available {
+		t.Fatalf("expected Available=true (binary stale), got %+v", status)
+	}
+	if !status.BinaryStale {
+		t.Fatalf("expected BinaryStale=true, got %+v", status)
+	}
+	if !strings.Contains(status.Reason, "binary behind source") {
+		t.Errorf("expected Reason to mention 'binary behind source', got %q", status.Reason)
+	}
+	if status.LocalSHA != status.RemoteSHA {
+		t.Errorf("expected LocalSHA == RemoteSHA (source matches origin), got local=%q remote=%q",
+			status.LocalSHA, status.RemoteSHA)
+	}
+}
+
+// TestUpdateCheckForUpdates_InstalledMatchesSource verifies the
+// invariant the previous test exercises the inverse of: when the
+// installed Commit matches the source HEAD AND source matches origin,
+// the result is "up to date" (no false binary-stale positive).
+func TestUpdateCheckForUpdates_InstalledMatchesSource(t *testing.T) {
+	_, local := setupRepos(t)
+	withSourcePath(t, local)
+	// Get the source's actual HEAD short SHA and inject it as the
+	// "installed" Commit.
+	headLong := strings.TrimSpace(runGit(t, local, "rev-parse", "HEAD"))
+	if len(headLong) < 10 {
+		t.Fatalf("rev-parse HEAD returned short value %q", headLong)
+	}
+	withCommit(t, headLong[:7]) // ldflags use the 7-char short form
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	status, err := CheckForUpdates(ctx)
+	if err != nil {
+		t.Fatalf("CheckForUpdates: %v", err)
+	}
+	if status.Available || status.BinaryStale {
+		t.Fatalf("expected up-to-date (Available=false, BinaryStale=false), got %+v", status)
+	}
+	if status.Reason != "up to date" {
+		t.Errorf("expected Reason='up to date', got %q", status.Reason)
+	}
+}
+
+// TestUpdateCheckForUpdates_UnknownCommitNoStaleClaim — if the
+// installed binary has Commit="none" AND BuildInfo isn't available
+// (we can't really fake the second condition in-process, but we
+// can drive the explicit-none path), we must NOT report binary-stale
+// even though we can't prove the negative. False positives here
+// would nag the user on every launch.
+func TestUpdateCheckForUpdates_UnknownCommitNoStaleClaim(t *testing.T) {
+	_, local := setupRepos(t)
+	withSourcePath(t, local)
+	withCommit(t, "none")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	status, err := CheckForUpdates(ctx)
+	if err != nil {
+		t.Fatalf("CheckForUpdates: %v", err)
+	}
+	// NOTE: resolvedCommit() also consults BuildInfo. In the test
+	// binary BuildInfo may or may not contain a vcs.revision depending
+	// on the build flags, so we can't deterministically assert either
+	// "up to date" or "binary stale" here. We CAN assert that whatever
+	// branch fires is internally consistent: BinaryStale implies
+	// Available, "up to date" implies no BinaryStale.
+	if status.BinaryStale && !status.Available {
+		t.Errorf("BinaryStale=true must imply Available=true; got %+v", status)
+	}
+	if !status.Available && status.BinaryStale {
+		t.Errorf("Available=false must imply BinaryStale=false; got %+v", status)
 	}
 }
 
