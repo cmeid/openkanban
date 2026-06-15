@@ -294,6 +294,12 @@ type KillResp struct{}
 // Reason:"ticket_done"} to all subscribers. The CLI is expected to
 // have already written the ticket .md and status file before sending
 // this; the daemon does NOT touch the worktree.
+//
+// The name is historical: both `openkanban ticket done` and `openkanban
+// ticket in-review` send this RPC. From the daemon's perspective the
+// motion is identical — terminate the live PTY for this ticket as an
+// expected wrap-up. The CLI side decides which status the ticket lands
+// in; the daemon does not care.
 type TicketDoneReq struct {
 	TicketID string `json:"ticket_id"`
 }
@@ -377,14 +383,16 @@ type SubscribeResp struct{}
 //
 // Expected is only meaningful when Event == "exited". It is true when
 // the daemon initiated the kill via handleTicketDone (i.e. the agent
-// invoked `openkanban ticket done`), and false for natural process
-// exits and plain Kill RPCs. Subscribers use this to decide whether to
-// preserve AgentCompleted (Expected=true) or reset to AgentNone
-// (Expected=false).
+// invoked `openkanban ticket done` or `openkanban ticket in-review`),
+// and false for natural process exits and plain Kill RPCs. Subscribers
+// use this to decide whether to preserve AgentCompleted (Expected=true)
+// or reset to AgentNone (Expected=false).
 //
 // Reason is a diagnostic hint paired with Expected. Possible values:
 //
-//	"ticket_done"   - kill initiated by handleTicketDone
+//	"ticket_done"   - kill initiated by handleTicketDone (covers both
+//	                  `ticket done` and `ticket in-review` — the daemon
+//	                  doesn't distinguish since the motion is identical)
 //	"natural_exit"  - the child closed its PTY on its own
 //	"kill"          - a Kill RPC initiated the termination
 //

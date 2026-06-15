@@ -448,11 +448,12 @@ func (c *Client) Owns(ctx context.Context, sessionUUID string) (daemon.OwnsResp,
 }
 
 // TicketDone informs the daemon that the agent invoked `openkanban
-// ticket done` for ticketID. The daemon scans its live sessions for
-// one bound to that ticket, flips its expected-completion flag, and
-// kills the pane — the resulting SessionEvent broadcast carries
-// Expected=true / Reason="ticket_done" so subscribed TUIs preserve
-// AgentCompleted instead of resetting to AgentNone.
+// ticket done` or `openkanban ticket in-review` for ticketID — both
+// wrap-up motions take the same daemon path. The daemon scans its live
+// sessions for one bound to that ticket, flips its expected-completion
+// flag, and kills the pane — the resulting SessionEvent broadcast
+// carries Expected=true / Reason="ticket_done" so subscribed TUIs
+// preserve AgentCompleted instead of resetting to AgentNone.
 //
 // On miss (no live session for ticketID), the response carries
 // Killed=false with no error. The caller is expected to treat the .md

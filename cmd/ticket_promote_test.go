@@ -1,11 +1,15 @@
 package cmd
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/techdufus/openkanban/internal/board"
+	"github.com/techdufus/openkanban/internal/daemonclient"
 	"github.com/techdufus/openkanban/internal/project"
 )
 
@@ -66,6 +70,7 @@ func TestTicketInProgress_IdempotentNoRestartStamp(t *testing.T) {
 func TestTicketInReview_FromInProgress(t *testing.T) {
 	proj, tk, _ := scaffoldTicketDoneEnv(t)
 	t.Setenv("OPENKANBAN_TICKET_ID", string(tk.ID))
+	t.Setenv("OPENKANBAN_SESSION", "test-session")
 
 	if err := ticketInReviewCmd.RunE(ticketInReviewCmd, nil); err != nil {
 		t.Fatalf("ticketInReviewCmd.RunE: %v", err)
@@ -75,14 +80,26 @@ func TestTicketInReview_FromInProgress(t *testing.T) {
 	if got.Status != board.StatusInReview {
 		t.Errorf("Status = %q; want %q", got.Status, board.StatusInReview)
 	}
-	// AgentStatus must be untouched — review-promotion leaves the
-	// live PTY alive and reflecting its current activity.
-	if got.AgentStatus == board.AgentCompleted {
-		t.Error("AgentStatus = completed; in-review must not flip agent_status")
+	// AgentStatus must flip to completed — in-review now mirrors done's
+	// "/quit equivalent" motion, so the badge marks the agent as having
+	// wrapped up its work even though the column says In Review.
+	if got.AgentStatus != board.AgentCompleted {
+		t.Errorf("AgentStatus = %q; want %q", got.AgentStatus, board.AgentCompleted)
 	}
 	// CompletedAt must NOT be set — we're not done.
 	if got.CompletedAt != nil {
 		t.Errorf("CompletedAt = %v; want nil on in_review", got.CompletedAt)
+	}
+
+	// Status file must be written so TUIs that aren't subscribed to
+	// the daemon push channel still see the completion via the poll.
+	home := os.Getenv("HOME")
+	body, err := os.ReadFile(filepath.Join(home, ".cache", "openkanban-status", "test-session.status"))
+	if err != nil {
+		t.Fatalf("status file missing: %v", err)
+	}
+	if string(body) != "completed\n" {
+		t.Errorf("status file body = %q; want %q", body, "completed\n")
 	}
 }
 
@@ -107,6 +124,67 @@ func TestTicketInReview_IdempotentOnSecondInvocation(t *testing.T) {
 		t.Errorf("UpdatedAt drifted on idempotent invocation: %v -> %v",
 			firstUpdate, secondUpdate)
 	}
+}
+
+// TestTicketInReview_DaemonUp_OwnsTicket_SendsTicketDoneReq verifies
+// the daemon-side termination path: when a live session is bound to
+// the ticket, `ticket in-review` delivers the TicketDoneReq RPC and
+// the daemon kills the session. Mirrors the equivalent done test.
+func TestTicketInReview_DaemonUp_OwnsTicket_SendsTicketDoneReq(t *testing.T) {
+	sock, _ := daemonTestEnv(t)
+	startDaemonServer(t, sock)
+
+	proj, tk, _ := scaffoldTicketDoneEnv(t)
+	t.Setenv("OPENKANBAN_TICKET_ID", string(tk.ID))
+	t.Setenv("OPENKANBAN_SESSION", "test-session")
+
+	daemonSessionID := spawnDaemonSessionForTicket(t, string(tk.ID))
+
+	stderr := captureStderr(t, func() {
+		if err := ticketInReviewCmd.RunE(ticketInReviewCmd, nil); err != nil {
+			t.Fatalf("ticketInReviewCmd.RunE: %v", err)
+		}
+	})
+
+	if strings.Contains(stderr, "openkanbankd:") {
+		t.Errorf("unexpected openkanbankd warning on happy path: %q", stderr)
+	}
+
+	got := loadTicket(t, proj, tk.ID)
+	if got.Status != board.StatusInReview {
+		t.Errorf("Status = %q; want %q", got.Status, board.StatusInReview)
+	}
+	if got.AgentStatus != board.AgentCompleted {
+		t.Errorf("AgentStatus = %q; want %q", got.AgentStatus, board.AgentCompleted)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	c, err := daemonclient.New(ctx)
+	if err != nil {
+		t.Fatalf("daemonclient.New (post-check): %v", err)
+	}
+	defer c.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		list, err := c.List(ctx)
+		if err != nil {
+			t.Fatalf("List: %v", err)
+		}
+		stillThere := false
+		for _, s := range list.Sessions {
+			if s.SessionID == daemonSessionID {
+				stillThere = true
+				break
+			}
+		}
+		if !stillThere {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Errorf("daemon still holds session %s after ticket-in-review", daemonSessionID)
 }
 
 func TestPromoteSessionTicket_MissingEnvVar(t *testing.T) {

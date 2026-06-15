@@ -753,13 +753,16 @@ func (s *Server) handleKill(c *clientConn, req KillReq) (KillResp, error) {
 }
 
 // handleTicketDone is the load-bearing handler for `openkanban ticket
-// done`. It scans the live sessions for one bound to req.TicketID; if
-// found, it flips that session's expected-completion flag, removes it
-// from the registry, and kicks off the kill in a goroutine. The
-// resulting "exited" SessionEvent (emitted by watchSessionExit when the
-// pane publishes ExitEvent) carries Expected=true / Reason="ticket_done"
-// so subscribers preserve AgentCompleted instead of resetting to
-// AgentNone.
+// done` and `openkanban ticket in-review` — both CLIs send the same
+// TicketDoneReq because the daemon-side motion is identical (terminate
+// the live PTY as an expected wrap-up; the CLI is responsible for the
+// status the ticket lands in). It scans the live sessions for one
+// bound to req.TicketID; if found, it flips that session's
+// expected-completion flag, removes it from the registry, and kicks
+// off the kill in a goroutine. The resulting "exited" SessionEvent
+// (emitted by watchSessionExit when the pane publishes ExitEvent)
+// carries Expected=true / Reason="ticket_done" so subscribers preserve
+// AgentCompleted instead of resetting to AgentNone.
 //
 // Returns synchronously: Killed:true plus the daemon-internal SessionID
 // on hit; Killed:false (no error) on miss. The CLI treats the miss as

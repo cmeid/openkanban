@@ -43,10 +43,10 @@ func loadSessionTicket() (*board.Ticket, *project.TicketStore, error) {
 // status-specific side effects (e.g. agent_status writes, daemon
 // notifications) on top.
 //
-// Used by `ticket in-progress` and `ticket in-review`. `ticket done`
-// has additional invariants (AgentStatus=completed, status-file write,
-// daemon-side PTY shutdown) and so reuses loadSessionTicket directly
-// rather than going through this helper.
+// Used by `ticket in-progress`. `ticket done` and `ticket in-review`
+// have additional invariants (AgentStatus=completed, status-file write,
+// daemon-side PTY shutdown) and so go through wrapUpSessionTicketAt
+// rather than this helper.
 func promoteSessionTicketTo(target board.TicketStatus) error {
 	ticket, store, err := loadSessionTicket()
 	if err != nil {
@@ -87,23 +87,27 @@ daemon — the live PTY keeps running.`,
 
 var ticketInReviewCmd = &cobra.Command{
 	Use:   "in-review",
-	Short: "Move this session's ticket to in-review",
+	Short: "Mark this session's ticket as in-review and signal openkanban to wrap up",
 	Long: `Flip the ticket bound to the current openkanban session to
-Status=in_review. Reads $OPENKANBAN_TICKET_ID (set by openkanban
-when spawning the session); exits non-zero if unset.
+Status=in_review + AgentStatus=completed. Reads $OPENKANBAN_TICKET_ID
+(set by openkanban when spawning the session); exits non-zero if unset.
 
-Use this when a session has finished its work but is handing the
-ticket off for human review rather than marking it done. AgentStatus
-is left untouched; only the column position changes.
+Use this when a session has finished its work and is handing the
+ticket off for human review. Mirrors 'ticket done': writes the
+session's status file (if $OPENKANBAN_SESSION is set) and signals the
+daemon to terminate the live PTY — the agent-side "/quit equivalent."
+The ticket lands in the In Review column with the completed badge so
+the reviewer picks it up from the board, not from inside the dying
+agent session.
 
-Idempotent on a ticket already in_review. Unlike 'ticket done', this
-command does NOT signal the daemon — the live PTY keeps running so
-the reviewer can ask follow-up questions in the same session.`,
+Idempotent on a ticket already in_review — no second UpdatedAt
+restamp, but the status file is re-written and the daemon is
+re-notified so a re-armed TUI can still react.`,
 	Args:          cobra.NoArgs,
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return promoteSessionTicketTo(board.StatusInReview)
+		return wrapUpSessionTicketAt(board.StatusInReview)
 	},
 }
 
