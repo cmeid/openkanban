@@ -635,9 +635,10 @@ use to report back:
   hooks (see `openkanban hooks install`) to write working / idle /
   waiting status that the TUI polls.
 - `OPENKANBAN_TICKET_ID` — the ticket's frontmatter UUID. Used by
-  `openkanban ticket done` to resolve the .md file authoritatively.
+  `openkanban ticket done` / `in-review` / `in-progress` to resolve the
+  .md file authoritatively.
 
-Two CLI subcommands are designed to be invoked from inside a spawned
+Several CLI subcommands are designed to be invoked from inside a spawned
 session:
 
 ### `openkanban status set <state>`
@@ -670,6 +671,27 @@ after the previous completion) re-arms the auto-stop transition.
 
 Worktree, branch, and session-JSONL teardown remain reserved for
 ticket deletion — `ticket done` does not touch them.
+
+### `openkanban ticket in-review`
+
+Same motion as `ticket done`, but the ticket lands in
+`Status=in_review` instead of `Status=done`. Used when the agent has
+finished its implementation work and is handing the ticket off to a
+human reviewer — the reviewer picks it up from the board, not from
+inside the (now-dead) agent session. `AgentStatus=completed`, status
+file write, and daemon-side PTY termination all happen exactly as with
+`ticket done`; the daemon doesn't distinguish between the two.
+
+Idempotent on a ticket already `in_review` — no second `UpdatedAt`
+drift, but the status file and daemon RPC still fire.
+
+### `openkanban ticket in-progress`
+
+Flips `Status=in_progress`. Unlike `ticket done` / `in-review`, this
+command does NOT signal the daemon — `AgentStatus` is left untouched
+and the live PTY keeps running. Use it when a session needs to flag
+itself as actively working (e.g. an agent resuming from a paused
+state and wanting the board to reflect that).
 
 ## Adding New Agents
 
