@@ -72,7 +72,10 @@ Three options:
 
 For binaries installed via Homebrew or `go install …@latest`, the update
 flow prints upgrade instructions instead of attempting an in-place pull
-(`SourcePath` is empty in release builds).
+(`SourcePath` is empty in release builds). On TTY launches, the binary
+also prints a one-line stderr notice that auto-update is disabled and
+how to re-enable it (`./scripts/install.sh` from a clone). Strictly
+advisory — startup proceeds normally.
 
 ## Troubleshooting
 

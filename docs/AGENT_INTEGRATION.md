@@ -557,7 +557,7 @@ case agentStatusMsg:
 
 1. Agent-specific `init_prompt` in config
 2. Global `defaults.init_prompt` in config
-3. Built-in default prompt
+3. Built-in default prompt — embedded from [`internal/config/agent_prompt.tmpl`](../internal/config/agent_prompt.tmpl) via `//go:embed`. Edit the markdown file, not a Go string constant. On `Load`, `mergeAgentDefaults` restores the embedded default when a user's `init_prompt` field is empty or absent, so clearing the override falls through to the binary's shipped content (not to the much shorter generic `defaultGlobalPrompt`).
 
 ## Environment Isolation
 
