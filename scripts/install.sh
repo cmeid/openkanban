@@ -114,6 +114,11 @@ esac
 step "Building and installing openkanban"
 
 LDFLAGS="-X github.com/techdufus/openkanban/cmd.SourcePath=$REPO_ROOT"
+# Mark this binary as built via the canonical install path. The root
+# command's PersistentPreRunE refuses to run anything except `version`
+# on binaries missing this marker — that's what makes bare
+# `go install .` produce a stub.
+LDFLAGS="$LDFLAGS -X github.com/techdufus/openkanban/cmd.BuildMarker=official"
 # Pass current commit/version when available so `openkanban version` is informative.
 if git -C "$REPO_ROOT" rev-parse --short HEAD >/dev/null 2>&1; then
   COMMIT="$(git -C "$REPO_ROOT" rev-parse --short HEAD)"
