@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -644,4 +646,226 @@ func prepareExit(t *testing.T, conn net.Conn, r *bufio.Reader) PrepareExitResp {
 		t.Fatalf("decode PrepareExitResp: %v", err)
 	}
 	return resp
+}
+
+
+// cancelExitFor performs a CancelExit RPC. Helper for the exit-intent
+// tests.
+func cancelExit(t *testing.T, conn net.Conn, r *bufio.Reader) {
+	t.Helper()
+	writeReq(t, conn, MsgCancelExitReq, CancelExitReq{})
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	defer conn.SetReadDeadline(time.Time{})
+	name, _ := readResp(t, r)
+	if name != MsgCancelExitResp {
+		t.Fatalf("CancelExit: got msg %q want %q", name, MsgCancelExitResp)
+	}
+}
+
+// TestServer_PrepareExit_ConcurrentExits fires PrepareExit from N
+// clients simultaneously under a starting-gate WaitGroup. The atomic
+// exit-intent design guarantees exactly one caller observes
+// OtherActiveClients == 0, even when the calls land in the daemon at
+// near-identical instants — the clientsMu acquire-and-flip-and-count
+// step is serialized. We DON'T assert monotonic decrement across
+// callers: interleaving means a later-completing caller may legitimately
+// see more "others" than an earlier one (e.g. one caller's RPC finishes
+// before another's flip is observed). "Exactly one sees 0" is the
+// load-bearing invariant.
+func TestServer_PrepareExit_ConcurrentExits(t *testing.T) {
+	srv, errCh := startServer(t)
+
+	const n = 5
+	conns := make([]net.Conn, n)
+	readers := make([]*bufio.Reader, n)
+	for i := 0; i < n; i++ {
+		conns[i] = dialTestClient(t, srv.SocketPath())
+		readers[i] = bufio.NewReader(conns[i])
+		helloAndUnpack(t, conns[i], readers[i])
+	}
+
+	// Starting gate: all goroutines block on `start` until released.
+	var start sync.WaitGroup
+	start.Add(1)
+	resps := make([]PrepareExitResp, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			start.Wait()
+			resps[i] = prepareExit(t, conns[i], readers[i])
+		}(i)
+	}
+	start.Done()
+	wg.Wait()
+
+	zeroSeen := 0
+	for i, r := range resps {
+		if r.OtherActiveClients == 0 {
+			zeroSeen++
+		}
+		// Every response should also include the deprecated ClientCount
+		// (total), which is N here (no one has disconnected yet).
+		if r.ClientCount != n {
+			t.Errorf("client %d ClientCount: got %d want %d", i, r.ClientCount, n)
+		}
+	}
+	if zeroSeen != 1 {
+		t.Errorf("expected exactly one caller to see OtherActiveClients==0; got %d (resps=%+v)",
+			zeroSeen, resps)
+	}
+
+	// Tear down so the test cleanly completes.
+	for _, c := range conns {
+		c.Close()
+	}
+	waitServerDone(t, errCh, 5*time.Second)
+}
+
+// TestServer_CancelExit_ReversesFlag asserts that calling CancelExit
+// reverses the exiting flag set by an earlier PrepareExit — a peer's
+// next PrepareExit sees the original client as active again.
+func TestServer_CancelExit_ReversesFlag(t *testing.T) {
+	srv, errCh := startServer(t)
+
+	a := dialTestClient(t, srv.SocketPath())
+	rA := bufio.NewReader(a)
+	helloAndUnpack(t, a, rA)
+
+	b := dialTestClient(t, srv.SocketPath())
+	rB := bufio.NewReader(b)
+	helloAndUnpack(t, b, rB)
+
+	// A prepares to exit; from A's POV B is still active (1).
+	respA := prepareExit(t, a, rA)
+	if respA.OtherActiveClients != 1 {
+		t.Errorf("A PrepareExit OtherActiveClients: got %d want 1", respA.OtherActiveClients)
+	}
+
+	// B prepares to exit; from B's POV A has already flipped to exiting,
+	// so the count of *active* others is 0.
+	respB := prepareExit(t, b, rB)
+	if respB.OtherActiveClients != 0 {
+		t.Errorf("B PrepareExit OtherActiveClients (A exiting): got %d want 0", respB.OtherActiveClients)
+	}
+
+	// A cancels its exit; B's next PrepareExit should see A back to active.
+	cancelExit(t, a, rA)
+	respB2 := prepareExit(t, b, rB)
+	if respB2.OtherActiveClients != 1 {
+		t.Errorf("B PrepareExit after A CancelExit: got OtherActiveClients=%d want 1", respB2.OtherActiveClients)
+	}
+
+	a.Close()
+	b.Close()
+	waitServerDone(t, errCh, 3*time.Second)
+}
+
+// TestServerLifecycle_MultiTUI_NoDefensiveKill drives the multi-TUI
+// close path end-to-end: client A (with a live session) prepares to
+// exit while B is still attached, sees OtherActiveClients > 0,
+// silent-quits. B then kills the session and disconnects. When the
+// last-client-disconnect handler fires, sessions is empty, so the
+// clean shutdown log fires — NOT the "exit-guard was bypassed" warn.
+//
+// Captures the standard log output for the duration of the test so we
+// can assert the warning never appeared.
+func TestServerLifecycle_MultiTUI_NoDefensiveKill(t *testing.T) {
+	// Capture log output for the duration of this test.
+	var logBuf syncBuffer
+	prev := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	srv, errCh := startServer(t)
+
+	a := dialTestClient(t, srv.SocketPath())
+	rA := bufio.NewReader(a)
+	helloAndUnpack(t, a, rA)
+
+	b := dialTestClient(t, srv.SocketPath())
+	rB := bufio.NewReader(b)
+	helloAndUnpack(t, b, rB)
+
+	// A spawns a long-running session. After A leaves, B owns it.
+	writeReq(t, a, MsgSpawnReq, SpawnReq{
+		TicketID:    "TEST-MTUI",
+		SessionName: "mtui-session",
+		Command:     "/bin/sleep",
+		Args:        []string{"30"},
+		Cols:        80,
+		Rows:        24,
+		Scrollback:  1000,
+	})
+	a.SetReadDeadline(time.Now().Add(3 * time.Second))
+	name, raw := readResp(t, rA)
+	if name != MsgSpawnResp {
+		t.Fatalf("spawn: got %q want %q", name, MsgSpawnResp)
+	}
+	var spawn SpawnResp
+	if err := json.Unmarshal(raw, &spawn); err != nil {
+		t.Fatalf("decode SpawnResp: %v", err)
+	}
+	a.SetReadDeadline(time.Time{})
+
+	// A prepares to exit while B is still attached. OtherActiveClients
+	// should be 1 → the TUI silent-quits.
+	respA := prepareExit(t, a, rA)
+	if respA.OtherActiveClients != 1 {
+		t.Fatalf("A PrepareExit OtherActiveClients: got %d want 1", respA.OtherActiveClients)
+	}
+	a.Close()
+
+	// Give the daemon a moment to process A's disconnect bookkeeping
+	// (clients map shrinks under clientsMu).
+	time.Sleep(100 * time.Millisecond)
+
+	// B explicitly kills the session before exiting — the well-behaved
+	// last-out path.
+	writeReq(t, b, MsgKillReq, KillReq{
+		SessionID:    spawn.SessionID,
+		GraceSeconds: 1,
+	})
+	b.SetReadDeadline(time.Now().Add(5 * time.Second))
+	name, _ = readResp(t, rB)
+	if name != MsgKillResp {
+		t.Fatalf("kill: got %q want %q", name, MsgKillResp)
+	}
+	b.SetReadDeadline(time.Time{})
+
+	// B disconnects. Daemon should observe clients==0, sessions==0,
+	// and log the clean-shutdown line, NOT the bypassed warning.
+	b.Close()
+	waitServerDone(t, errCh, 5*time.Second)
+
+	out := logBuf.String()
+	if strings.Contains(out, "exit-guard was bypassed") {
+		t.Errorf("unexpected defensive-kill log in clean multi-TUI close:\n%s", out)
+	}
+	if !strings.Contains(out, "last client disconnected; shutting down") {
+		t.Errorf("expected clean-shutdown log line; got:\n%s", out)
+	}
+}
+
+// syncBuffer is a goroutine-safe in-memory buffer for capturing log
+// output during a test. The daemon writes to log.Default() from
+// multiple goroutines (read loops, shutdown, the spawned session's
+// exit callback), and a bare bytes.Buffer would race under -race.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf []byte
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.buf = append(s.buf, p...)
+	return len(p), nil
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return string(s.buf)
 }

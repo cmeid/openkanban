@@ -186,6 +186,8 @@ const (
 
 	MsgPrepareExitReq  = "prepare_exit.req"
 	MsgPrepareExitResp = "prepare_exit.resp"
+	MsgCancelExitReq   = "cancel_exit.req"
+	MsgCancelExitResp  = "cancel_exit.resp"
 	MsgShutdownReq     = "shutdown.req"
 	MsgShutdownResp    = "shutdown.resp"
 
@@ -407,20 +409,62 @@ type SessionEvent struct {
 	Reason    string `json:"reason,omitempty"`
 }
 
-// PrepareExitReq is sent by a TUI client that is about to quit; it
-// allows the daemon to report how many other clients remain and what
-// sessions are still owned, so the client can warn the user.
+// PrepareExitReq is sent by a TUI client that is about to quit. The
+// daemon atomically marks the calling connection as exiting and
+// reports how many peer clients remain active, so the TUI can decide
+// between silent-quit (peers will keep the daemon alive) and the
+// exit-confirm modal (we're the last one out and sessions are at
+// stake).
 type PrepareExitReq struct{}
 
 // PrepareExitResp tells the exiting client what state is at stake.
-// OtherTUIClients counts TUI clients OTHER than the asking client;
-// used by `daemon stop` / `daemon restart` to decide whether a
-// shutdown would orphan live sessions with no TUI watching.
+// Two peer-count fields answer different questions:
+//
+//   - OtherTUIClients counts TUI-named connections OTHER than the
+//     asking client, used by `daemon stop` / `daemon restart` to
+//     decide whether a shutdown would orphan live sessions with no
+//     TUI watching.
+//   - OtherActiveClients counts peer connections (any name) that
+//     have NOT also called PrepareExit, used by the TUI exit-guard
+//     to silent-quit when a peer will keep the daemon alive.
 type PrepareExitResp struct {
-	ClientCount     int           `json:"client_count"`
-	OtherTUIClients int           `json:"other_tui_clients"`
-	Sessions        []SessionInfo `json:"sessions"`
+	// ClientCount is the total live client count including the caller.
+	//
+	// Deprecated: this value includes self and any peer that has also
+	// called PrepareExit, so it's unsafe for "am I the last one out?"
+	// decisions — multiple TUIs closing simultaneously all see
+	// ClientCount > 1 and race. Use OtherActiveClients instead, which
+	// the daemon computes atomically under clientsMu.
+	ClientCount int `json:"client_count"`
+
+	// OtherTUIClients counts TUI-named connections OTHER than the
+	// asking client. Used by `daemon stop` / `daemon restart` to
+	// decide whether a shutdown would orphan live sessions with no
+	// TUI watching. Does NOT filter on the exiting flag (a TUI in
+	// the middle of dismissing its exit modal is still "watching"
+	// from the CLI's perspective).
+	OtherTUIClients int `json:"other_tui_clients"`
+
+	// OtherActiveClients is the count of peer clients that are still
+	// active (have NOT also called PrepareExit). Exactly one caller
+	// among a set of simultaneous closers sees this as 0, even when
+	// they all call PrepareExit at the same instant — the daemon
+	// flips the per-client exiting flag and counts under a single
+	// clientsMu acquisition.
+	OtherActiveClients int `json:"other_active_clients"`
+
+	Sessions []SessionInfo `json:"sessions"`
 }
+
+// CancelExitReq clears the exit-intent flag set by a prior PrepareExit
+// on this connection. The TUI sends this when the user dismisses the
+// exit-confirm modal (Esc/q), so subsequent PrepareExit RPCs from peer
+// TUIs see this client as active again.
+type CancelExitReq struct{}
+
+// CancelExitResp is intentionally empty — the operation has no return
+// payload, only a success/failure signal via the RPC layer.
+type CancelExitResp struct{}
 
 // ShutdownReq asks the daemon to exit. With Force=false the daemon
 // refuses if any sessions are still running.
