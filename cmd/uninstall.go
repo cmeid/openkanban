@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -96,6 +97,15 @@ type uninstallPlan struct {
 	// users here so we mop it up if they ever installed it.
 	LegacyUpdateScript string
 
+	// MacAppBundle is ~/Applications/OpenKanban.app when present (darwin
+	// only), "" otherwise. install.sh places it here so the daemon can
+	// run inside the bundle and inherit the CFBundleIdentifier required
+	// for macOS notifications to be attributed to OpenKanban. Uninstall
+	// removes it symmetrically. We intentionally never touch the
+	// system-wide /Applications/OpenKanban.app — that would require
+	// admin and we don't install it from this path either.
+	MacAppBundle string
+
 	// DataDirs are absolute paths that openkanban creates but uninstall
 	// MUST NOT touch — config, projects, ticket files, cache. Printed
 	// in the closing summary so the user knows where to find them if
@@ -149,6 +159,16 @@ func planUninstall() (uninstallPlan, error) {
 		plan.LegacyUpdateScript = legacy
 	}
 
+	// macOS .app bundle (only relevant when install.sh ran on this OS;
+	// safe to probe unconditionally — non-darwin hosts simply won't have
+	// it, and the directory check is cheap).
+	if runtime.GOOS == "darwin" {
+		bundle := filepath.Join(home, "Applications", "OpenKanban.app")
+		if st, err := os.Stat(bundle); err == nil && st.IsDir() {
+			plan.MacAppBundle = bundle
+		}
+	}
+
 	// Data dirs: config (XDG-aware via config.ConfigDir), runtime cache,
 	// and the per-session status cache. None of these are removed; the
 	// listing is purely informational.
@@ -194,6 +214,9 @@ func printPlan(out io.Writer, plan uninstallPlan) {
 	if plan.LegacyUpdateScript != "" {
 		fmt.Fprintf(out, "  legacy script:    %s\n", plan.LegacyUpdateScript)
 	}
+	if plan.MacAppBundle != "" {
+		fmt.Fprintf(out, "  macOS .app:       %s\n", plan.MacAppBundle)
+	}
 
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, "Will NOT remove (your data — delete by hand if you want a clean slate):")
@@ -232,6 +255,17 @@ func executePlan(out io.Writer, plan uninstallPlan) error {
 			errs = append(errs, fmt.Errorf("remove legacy script %s: %w", plan.LegacyUpdateScript, err))
 		} else {
 			fmt.Fprintf(out, "removed %s\n", plan.LegacyUpdateScript)
+		}
+	}
+
+	// RemoveAll is the right tool for a directory tree we own and just
+	// confirmed exists; the call is bounded to plan.MacAppBundle (the
+	// per-user bundle) and never touches the system-wide /Applications.
+	if plan.MacAppBundle != "" {
+		if err := os.RemoveAll(plan.MacAppBundle); err != nil {
+			errs = append(errs, fmt.Errorf("remove macOS bundle %s: %w", plan.MacAppBundle, err))
+		} else {
+			fmt.Fprintf(out, "removed %s\n", plan.MacAppBundle)
 		}
 	}
 

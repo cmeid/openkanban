@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -55,9 +54,15 @@ var daemonInstallServiceCmd = &cobra.Command{
 			return fmt.Errorf("a daemon may be running but isn't responsive within 2s; investigate with `openkanban daemon log` and either stop it or `kill` its pid before re-running install-service")
 		}
 
-		binPath, err := os.Executable()
+		// Resolve via the shared lookup so the launchd plist points at the
+		// OpenKanban.app bundle whenever it's installed — required for
+		// branded macOS notifications. Falls back to the CLI binary on
+		// dev machines without the bundle (notifications will lack the
+		// OpenKanban identity in that case; we surface that in the
+		// printed status below).
+		binPath, binSrc, err := daemon.ResolveBinary()
 		if err != nil {
-			return fmt.Errorf("resolve current executable: %w", err)
+			return fmt.Errorf("resolve daemon binary: %w", err)
 		}
 		logPath, err := daemon.LogPath()
 		if err != nil {
@@ -70,7 +75,7 @@ var daemonInstallServiceCmd = &cobra.Command{
 		}
 
 		fmt.Printf("installed: %s\n", plistPath)
-		fmt.Printf("binary:    %s\n", binPath)
+		fmt.Printf("binary:    %s %s\n", binPath, binarySourceAnnotation(binSrc))
 		fmt.Printf("log:       %s\n", logPath)
 		fmt.Println()
 		fmt.Println("Next steps:")
@@ -98,6 +103,23 @@ var daemonUninstallServiceCmd = &cobra.Command{
 		fmt.Println("uninstalled. If you want the TUI to start daemons on demand again, ensure `daemon.autostart: true` in ~/.config/openkanban/config.json (the default).")
 		return nil
 	},
+}
+
+// binarySourceAnnotation returns the parenthesized suffix printed after the
+// resolved daemon binary path, so the user can tell at a glance whether the
+// launchd service will get branded notifications (bundle) or unbranded ones
+// (CLI fallback / explicit override).
+func binarySourceAnnotation(src daemon.BinarySource) string {
+	switch src {
+	case daemon.BinarySourceBundle:
+		return "(bundle — notifications use OpenKanban identity)"
+	case daemon.BinarySourceEnv:
+		return "(from $OPENKANBAN_DAEMON_BINARY override)"
+	case daemon.BinarySourceFallback:
+		return "(CLI fallback — notifications will lack OpenKanban identity; install the bundle via `scripts/install.sh`)"
+	default:
+		return ""
+	}
 }
 
 func init() {

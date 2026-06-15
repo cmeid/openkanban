@@ -272,6 +272,14 @@ type SpawnReq struct {
 	Rows             int      `json:"rows"`
 	Scrollback       int      `json:"scrollback"`
 	AgentSessionUUID string   `json:"agent_session_uuid,omitempty"`
+	// ForwardNotifications enables OSC 9 → desktop notification
+	// forwarding for this session. The daemon plumbs the flag into
+	// terminal.Pane.SetForwardNotifications after the pane is built;
+	// from there, OSC 9 sequences emitted by the agent are dispatched
+	// via the notify package (NSUserNotification on darwin, no-op
+	// elsewhere). Defaults to false so an old client missing the field
+	// gets the conservative behavior.
+	ForwardNotifications bool `json:"forward_notifications,omitempty"`
 }
 
 // SpawnResp acknowledges a successful spawn.

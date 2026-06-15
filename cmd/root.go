@@ -11,7 +11,6 @@ import (
 
 	"github.com/techdufus/openkanban/internal/app"
 	"github.com/techdufus/openkanban/internal/config"
-	"github.com/techdufus/openkanban/internal/daemonclient"
 )
 
 var (
@@ -58,8 +57,6 @@ for safe parallel development.`,
 		if result != nil && result.HasWarnings() {
 			fmt.Fprintf(os.Stderr, "Config warnings:\n%s\n", result.FormatWarnings())
 		}
-
-		daemonclient.SetNotificationForwarding(cfg.Behavior.ForwardAgentNotifications)
 
 		isTTY := isatty.IsTerminal(os.Stdin.Fd()) && isatty.IsTerminal(os.Stderr.Fd())
 		if handled, err := MaybePromptForUpdate(cfg, isTTY, noUpdateCheck); handled {

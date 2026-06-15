@@ -16,6 +16,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	xvt "github.com/charmbracelet/x/vt"
 	"github.com/creack/pty"
+
+	"github.com/techdufus/openkanban/internal/notify"
 )
 
 const (
@@ -120,6 +122,15 @@ type Pane struct {
 	// via the Callbacks.CursorVisibility hook. Atomic so the goroutine
 	// that drives the callback can safely write while renderers read.
 	cursorHidden atomic.Bool
+
+	// forwardNotifications gates the OSC 9 handler. When true, an OSC 9
+	// sequence emitted by the agent is forwarded to notify.Send (which
+	// fires a desktop notification on darwin and is a no-op elsewhere).
+	// Atomic because the handler runs synchronously inside vt.Write
+	// under p.mu — taking p.mu in the handler would deadlock. The
+	// daemon flips this via SetForwardNotifications based on the spawn
+	// request's ForwardNotifications field.
+	forwardNotifications atomic.Bool
 
 	// drainStop stops the goroutine that pipes emulator-emitted responses
 	// (DA queries, etc.) back to the PTY. Without that drain charm/x/vt
@@ -549,9 +560,11 @@ func parseOscTitlePayload(data []byte) string {
 }
 
 // registerTitleHandlersUnlocked wires OSC 0/2 handlers on the emulator
-// to capture the child process's window title. OSC 0 sets both window
-// title and icon name; OSC 2 sets only the window title. Both feed the
-// same Pane field — we only care about the window title.
+// to capture the child process's window title, plus an OSC 9 handler
+// that forwards desktop notifications via the notify package when
+// forwardNotifications is set. OSC 0 sets both window title and icon
+// name; OSC 2 sets only the window title. Both feed the same Pane
+// field — we only care about the window title.
 //
 // Must be called with p.mu held and after p.vt has been constructed.
 func (p *Pane) registerTitleHandlersUnlocked() {
@@ -569,6 +582,50 @@ func (p *Pane) registerTitleHandlersUnlocked() {
 	}
 	p.vt.RegisterOscHandler(0, handler)
 	p.vt.RegisterOscHandler(2, handler)
+	p.vt.RegisterOscHandler(9, p.forwardNotificationHandler)
+}
+
+// forwardNotificationHandler is the OSC 9 callback registered on the
+// emulator. The agent (typically claude code) emits OSC 9 with a
+// payload of "9;<body>" to request the host terminal raise a desktop
+// notification. We strip the "9;" prefix using parseOscTitlePayload
+// (which handles any "<digits>;" prefix) and forward the body to
+// notify.Send.
+//
+// Lock discipline: this runs SYNCHRONOUSLY inside p.vt.Write which is
+// invoked under p.mu by handleOutput. Taking p.mu here would deadlock.
+// We only touch the forwardNotifications atomic.Bool, so the handler
+// is lock-free.
+//
+// Returns false when forwarding is disabled or the stripped payload is
+// empty (so an unhandled-OSC fallback in the emulator doesn't surface
+// the payload as a stray title); returns true when notify.Send was
+// invoked, regardless of any error notify.Send returned.
+func (p *Pane) forwardNotificationHandler(data []byte) bool {
+	if !p.forwardNotifications.Load() {
+		return false
+	}
+	body := parseOscTitlePayload(data)
+	if body == "" {
+		return false
+	}
+	// Errors from notify.Send are swallowed: there's no actionable
+	// recovery from the emulator callback, and a logging side-effect
+	// would surface inside vt.Write under p.mu. The notify package
+	// itself is responsible for any necessary observability.
+	_ = notify.Send(body)
+	return true
+}
+
+// SetForwardNotifications toggles OSC 9 → desktop notification
+// forwarding for this pane. Safe to call from any goroutine; the
+// underlying field is atomic.Bool. The daemon calls this once during
+// session construction based on SpawnReq.ForwardNotifications.
+func (p *Pane) SetForwardNotifications(enabled bool) {
+	if p == nil {
+		return
+	}
+	p.forwardNotifications.Store(enabled)
 }
 
 // startDrainUnlocked spawns the goroutine that forwards emulator
