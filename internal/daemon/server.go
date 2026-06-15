@@ -474,6 +474,11 @@ func (s *Server) unregisterClient(c *clientConn) int {
 func (s *Server) handleConn(c *clientConn) {
 	defer func() {
 		c.conn.Close()
+		// Scrub this client out of every session's viewers set BEFORE
+		// the last-client check — a TUI that vanishes without sending
+		// SetViewing(false) would otherwise leave sibling boards with
+		// a stuck "viewing" indicator until the session itself exits.
+		s.cleanupViewersForClient(c.id)
 		remaining := s.unregisterClient(c)
 		log.Printf("openkanbankd: client %d disconnected (remaining=%d)", c.id, remaining)
 		if remaining == 0 {
@@ -606,6 +611,14 @@ func (s *Server) dispatch(c *clientConn, typeName string, raw json.RawMessage) {
 		// outer handleConn loop will hit EOF on its next ReadFrame
 		// and exit through the usual disconnect path.
 		s.handleAttach(c, req)
+
+	case MsgSetViewingReq:
+		var req SetViewingReq
+		if err := json.Unmarshal(raw, &req); err != nil {
+			s.writeError(c, "bad_request", err.Error())
+			return
+		}
+		s.writeResp(c, MsgSetViewingResp, s.handleSetViewing(c, req))
 
 	default:
 		s.writeError(c, "unknown_message", fmt.Sprintf("unknown message type %q", typeName))
@@ -850,6 +863,49 @@ func (s *Server) handleSubscribe(c *clientConn, req SubscribeReq) SubscribeResp 
 	s.clientsMu.Unlock()
 	log.Printf("openkanbankd: client %d subscribed", c.id)
 	return SubscribeResp{}
+}
+
+// handleSetViewing toggles this client's membership in the session's
+// viewers set. Broadcasts a "viewing" or "unviewing" SessionEvent
+// only when the set actually changed (idempotent on duplicate calls).
+// Unknown session_id returns ViewerCount=0 with no event — the TUI
+// may race the daemon's "exited" event for a session it was viewing
+// and the right behavior is silent no-op, not error.
+func (s *Server) handleSetViewing(c *clientConn, req SetViewingReq) SetViewingResp {
+	s.sessionsMu.RLock()
+	sess, ok := s.sessions[req.SessionID]
+	s.sessionsMu.RUnlock()
+	if !ok {
+		return SetViewingResp{ViewerCount: 0}
+	}
+	count, changed := sess.SetViewing(c.id, req.Viewing)
+	if changed {
+		ev := "viewing"
+		if !req.Viewing {
+			ev = "unviewing"
+		}
+		s.emitEvent(SessionEvent{Event: ev, SessionID: sess.ID(), TicketID: sess.TicketID()})
+	}
+	return SetViewingResp{ViewerCount: count}
+}
+
+// cleanupViewersForClient removes clientID from every session's
+// viewers set and emits an "unviewing" SessionEvent for each session
+// where the client was actually a viewer. Called from the disconnect
+// path so a crashed or unceremoniously-closed TUI doesn't leave
+// zombie viewer counts on sibling boards.
+func (s *Server) cleanupViewersForClient(clientID uint16) {
+	s.sessionsMu.RLock()
+	sessions := make([]*Session, 0, len(s.sessions))
+	for _, sess := range s.sessions {
+		sessions = append(sessions, sess)
+	}
+	s.sessionsMu.RUnlock()
+	for _, sess := range sessions {
+		if sess.RemoveViewer(clientID) {
+			s.emitEvent(SessionEvent{Event: "unviewing", SessionID: sess.ID(), TicketID: sess.TicketID()})
+		}
+	}
 }
 
 // handlePrepareExit atomically marks the calling client as exiting and

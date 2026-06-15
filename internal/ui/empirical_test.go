@@ -28,7 +28,7 @@ func TestEmpiricalRenderHeights(t *testing.T) {
 	m := &Model{
 		globalStore:    globalStore,
 		panes:          map[board.TicketID]*daemonclient.PaneView{},
-		daemonAttached: map[board.TicketID]int{},
+		daemonViewing: map[board.TicketID]int{},
 		columns:        board.DefaultColumns(),
 		spinner:        sp,
 		width:          120,

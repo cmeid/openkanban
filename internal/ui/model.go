@@ -294,14 +294,23 @@ type Model struct {
 	// daemon-pushed "working" with the file's stale "idle".
 	daemonOwned map[board.TicketID]struct{}
 
-	// daemonAttached counts pending attaches for each ticket's daemon
-	// session — a ticket renders as "attached to a TUI" when its count
-	// is >0. Maintained as a counter (not a bool) so takeover races
-	// remain correct: the new "attached" and the old "detached" events
-	// may arrive in either order from separate daemon goroutines, but
-	// +1/-1 gives the same net for both orderings. Populated at startup
-	// from SessionInfo.AttachedClient and reset on daemon disconnect.
-	daemonAttached map[board.TicketID]int
+	// daemonViewing counts how many TUI clients are currently focused on
+	// each ticket's daemon session (in ModeAgentView) — a ticket renders
+	// the "viewing" indicator when its count is >0. Populated at startup
+	// from SessionInfo.ViewerCount and maintained by daemon-pushed
+	// "viewing" / "unviewing" SessionEvents (driven by SetViewing RPC
+	// calls from every connected TUI's mode transitions). Reset on
+	// daemon disconnect.
+	daemonViewing map[board.TicketID]int
+
+	// viewingSessionID is the daemon SessionID this TUI most recently
+	// told the daemon it was viewing (via SetViewing(true)). Used by
+	// reconcileViewing to emit SetViewing(prev,false) / SetViewing(new,
+	// true) only when the TUI's current view target actually changes —
+	// dispatched at the end of every Update so any mode/focusedPane
+	// transition gets caught without scattering RPC calls through every
+	// case branch.
+	viewingSessionID string
 
 	// guardAPI is the subset of daemonclient.Client used by the exit
 	// guard (PrepareExit / Kill / ClientID). Held as an interface so
@@ -447,7 +456,7 @@ func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projec
 		spinner:            sp,
 		panes:              make(map[board.TicketID]*daemonclient.PaneView),
 		daemonOwned:        make(map[board.TicketID]struct{}),
-		daemonAttached:     make(map[board.TicketID]int),
+		daemonViewing:      make(map[board.TicketID]int),
 		statusDetector:     agent.NewStatusDetector(),
 		selectedProject:    selectedProject,
 		sidebarVisible:     cfg.UI.SidebarVisible,
@@ -487,8 +496,8 @@ func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projec
 			for _, s := range resp.Sessions {
 				ownedByDaemon[board.TicketID(s.TicketID)] = s
 				m.daemonOwned[board.TicketID(s.TicketID)] = struct{}{}
-				if s.AttachedClient != 0 {
-					m.daemonAttached[board.TicketID(s.TicketID)] = 1
+				if s.ViewerCount > 0 {
+					m.daemonViewing[board.TicketID(s.TicketID)] = s.ViewerCount
 				}
 			}
 		} else {
@@ -604,7 +613,81 @@ func (m *Model) checkForUpdates() tea.Cmd {
 	}
 }
 
+// Update is the BubbleTea entry point. The actual case-dispatch lives
+// in dispatchUpdate; this wrapper reconciles the daemon's viewing
+// state (a single "what session is this TUI focused on right now"
+// signal) against whatever mode/focusedPane mutation the inner
+// dispatch may have performed. Centralizing the reconcile here means
+// no individual case branch has to remember to fire SetViewing —
+// the diff between viewingSessionID and the post-update truth covers
+// every transition path.
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	next, cmd := m.dispatchUpdate(msg)
+	nm, ok := next.(*Model)
+	if !ok {
+		return next, cmd
+	}
+	if viewingCmd := nm.reconcileViewing(); viewingCmd != nil {
+		return nm, tea.Batch(cmd, viewingCmd)
+	}
+	return nm, cmd
+}
+
+// reconcileViewing computes the session this TUI is currently focused
+// on (ModeAgentView + a pane for the focused ticket), compares it to
+// the last value we told the daemon, and returns the fire-and-forget
+// tea.Cmd that calls SetViewing(prev,false) and/or SetViewing(new,
+// true) for the diff. Returns nil when nothing changed.
+//
+// Two calls when both prev and new are non-empty (a focus change
+// between sessions); one call on enter-from-board and one on
+// leave-to-board; zero work in the steady state.
+func (m *Model) reconcileViewing() tea.Cmd {
+	target := ""
+	if m.mode == ModeAgentView && m.focusedPane != "" {
+		if pv, ok := m.panes[m.focusedPane]; ok && pv != nil {
+			target = pv.SessionID()
+		}
+	}
+	if target == m.viewingSessionID {
+		return nil
+	}
+	prev := m.viewingSessionID
+	m.viewingSessionID = target
+	var cmds []tea.Cmd
+	if prev != "" {
+		cmds = append(cmds, m.setViewingCmd(prev, false))
+	}
+	if target != "" {
+		cmds = append(cmds, m.setViewingCmd(target, true))
+	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	return tea.Batch(cmds...)
+}
+
+// setViewingCmd returns a fire-and-forget tea.Cmd that calls
+// daemonClient.SetViewing. The RPC is idempotent on the daemon side
+// (duplicate true / duplicate false is a silent no-op), so callers
+// don't need to gate. Returns nil when there's no daemon client or
+// the sessionID is empty.
+func (m *Model) setViewingCmd(sessionID string, viewing bool) tea.Cmd {
+	if m.daemonClient == nil || sessionID == "" {
+		return nil
+	}
+	client := m.daemonClient
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+		if _, err := client.SetViewing(ctx, sessionID, viewing); err != nil {
+			log.Printf("openkanban: SetViewing(%s, %v) failed: %v", sessionID, viewing, err)
+		}
+		return nil
+	}
+}
+
+func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// Daemon push events must be handled regardless of mode so the
 	// readNextDaemonEvent listener is always re-armed. If we let these
 	// fall through to a mode-specific switch (ModeSpawning, ModeShuttingDown)
@@ -897,9 +980,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		for id := range m.daemonOwned {
 			delete(m.daemonOwned, id)
 		}
-		for id := range m.daemonAttached {
-			delete(m.daemonAttached, id)
+		for id := range m.daemonViewing {
+			delete(m.daemonViewing, id)
 		}
+		m.viewingSessionID = ""
 		if msg.Err != nil {
 			m.notify("Daemon disconnected: " + msg.Err.Error())
 		} else {

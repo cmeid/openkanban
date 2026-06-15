@@ -444,9 +444,9 @@ func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, w
 			Render("✗")
 	}
 
-	var attachedBadge string
-	if m.daemonAttached[ticket.ID] > 0 {
-		attachedBadge = lipgloss.NewStyle().
+	var viewingBadge string
+	if m.daemonViewing[ticket.ID] > 0 {
+		viewingBadge = lipgloss.NewStyle().
 			Foreground(m.colors.info).
 			Render("◉")
 	}
@@ -484,8 +484,8 @@ func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, w
 	if sessionBadge != "" {
 		headerParts = append(headerParts, sessionBadge)
 	}
-	if attachedBadge != "" {
-		headerParts = append(headerParts, attachedBadge)
+	if viewingBadge != "" {
+		headerParts = append(headerParts, viewingBadge)
 	}
 	headerLine := strings.Join(headerParts, "  ")
 

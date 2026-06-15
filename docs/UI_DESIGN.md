@@ -221,22 +221,28 @@ App
 | Completed | ✓ | Green | Agent finished |
 | Error | ✗ | Red | Agent crashed |
 
-### Daemon Attach Indicator
+### TUI Viewing Indicator
 
-Orthogonal to agent status — signals whether the ticket's daemon
-session currently has a TUI client attached to its PTY (this TUI or
-a sibling viewing the same session).
+Orthogonal to agent status — signals whether any TUI client is
+currently in agent-view mode on this ticket. Distinct from the
+daemon's "attached" semantic (PTY-stream ownership, which typically
+spans the whole session lifetime): viewing is the narrower "user is
+focused on it right now" signal, flipping on Enter / off on Esc.
 
-| State      | Icon   | Color | Description                                      |
-|------------|--------|-------|--------------------------------------------------|
-| Unattached | (none) | —     | Session alive but no TUI is in agent-view mode   |
-| Attached   | ◉      | info  | Some TUI is attached to the daemon session's PTY |
+| State        | Icon   | Color | Description                                                |
+|--------------|--------|-------|------------------------------------------------------------|
+| Not viewed   | (none) | —     | No TUI has this session open in agent view                 |
+| Being viewed | ◉      | info  | One or more TUIs are in `ModeAgentView` on this session    |
 
 Rendered in the card's header badge row, after the agent-status badge.
-Driven by daemon-pushed `attached` / `detached` SessionEvent
-broadcasts — see [AGENT_INTEGRATION.md → One attacher per session](AGENT_INTEGRATION.md#one-attacher-per-session-with-takeover)
-for the event flow and the receiver-side counter that makes it
-race-correct.
+Driven by `SetViewing` RPC calls every TUI makes on agent-view
+enter/leave; the daemon broadcasts `viewing` / `unviewing`
+`SessionEvent`s and each subscribed TUI maintains its own counter. A
+TUI is most useful when looking at a sibling instance — your own
+window can't show its own viewing state while you're in agent view on
+that very session. See
+[AGENT_INTEGRATION.md → TUI viewing signal](AGENT_INTEGRATION.md#tui-viewing-signal-distinct-from-attach)
+for the full RPC flow.
 
 ### Column Position Badge
 

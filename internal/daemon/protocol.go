@@ -180,6 +180,9 @@ const (
 	MsgAttachReq  = "attach.req"
 	MsgAttachResp = "attach.resp"
 
+	MsgSetViewingReq  = "set_viewing.req"
+	MsgSetViewingResp = "set_viewing.resp"
+
 	MsgSubscribeReq  = "subscribe.req"
 	MsgSubscribeResp = "subscribe.resp"
 	MsgSessionEvent  = "session.event"
@@ -326,6 +329,14 @@ type ListResp struct {
 }
 
 // SessionInfo describes a single daemon-owned session.
+//
+// AttachedClient names the holder of the binary PTY stream (a session
+// is "attached" from spawn until the spawning client's PaneView is
+// closed); ViewerCount is the higher-level signal of "how many TUI
+// clients have called SetViewing(true) on this session" — i.e. how
+// many UIs are currently in ModeAgentView on it. The two are
+// orthogonal: a session is typically Attached for its whole lifetime
+// but Viewed only while someone is focused on it.
 type SessionInfo struct {
 	SessionID      string    `json:"session_id"`
 	TicketID       string    `json:"ticket_id"`
@@ -337,6 +348,7 @@ type SessionInfo struct {
 	Rows           int       `json:"rows"`
 	Running        bool      `json:"running"`
 	AttachedClient uint16    `json:"attached_client"`
+	ViewerCount    int       `json:"viewer_count"`
 	StartedAt      time.Time `json:"started_at"`
 }
 
@@ -376,6 +388,35 @@ type AttachResp struct {
 	SnapshotSize int    `json:"snapshot_size"`
 }
 
+// SetViewingReq tells the daemon that this client is now (or no longer)
+// focused on the named session in agent-view mode. The daemon keeps a
+// per-session set of viewer ClientIDs and broadcasts SessionEvent
+// "viewing" / "unviewing" to subscribers when the set changes. The
+// resulting count drives the board's "TUI is viewing this ticket"
+// indicator on sibling instances.
+//
+// Distinct from AttachReq: an attached client owns the PTY binary
+// stream and typically stays attached for the session's whole lifetime
+// (spawn → PaneView.Close), while a viewer is the much narrower "user
+// is in agent-view right now" signal. A client can be attached without
+// being a viewer (TUI on the board) and vice versa is forbidden by the
+// TUI's invariants (you must be attached to view), but the daemon
+// doesn't enforce that — it just tallies the calls.
+//
+// Idempotent: SetViewing(true) twice from the same client increments
+// only once. Disconnect implicitly clears the client from every
+// session's viewer set.
+type SetViewingReq struct {
+	SessionID string `json:"session_id"`
+	Viewing   bool   `json:"viewing"`
+}
+
+// SetViewingResp acknowledges a SetViewing call with the session's
+// post-change viewer count.
+type SetViewingResp struct {
+	ViewerCount int `json:"viewer_count"`
+}
+
 // SubscribeReq asks the daemon to start pushing SessionEvent messages
 // over this connection.
 type SubscribeReq struct{}
@@ -384,7 +425,11 @@ type SubscribeReq struct{}
 type SubscribeResp struct{}
 
 // SessionEvent is a server-push update about a session. Event is one
-// of "started", "exited", "attached", "detached", "status".
+// of "started", "exited", "attached", "detached", "viewing",
+// "unviewing", "status". The "viewing" / "unviewing" pair tracks the
+// SetViewing RPC (which client is currently focused in agent view) —
+// distinct from "attached" / "detached" which track the binary PTY
+// stream owner.
 //
 // Expected is only meaningful when Event == "exited". It is true when
 // the daemon initiated the kill via handleTicketDone (i.e. the agent

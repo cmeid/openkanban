@@ -452,6 +452,26 @@ func (c *Client) Owns(ctx context.Context, sessionUUID string) (daemon.OwnsResp,
 	return resp, err
 }
 
+// SetViewing tells the daemon that this client is now (or no longer)
+// in agent-view mode on sessionID. The daemon broadcasts a "viewing"
+// or "unviewing" SessionEvent to subscribers when the call changes
+// state — the board's TUI-viewing indicator on sibling instances is
+// driven off that. Idempotent: SetViewing(true) twice in a row is a
+// silent no-op the second time. Disconnect implicitly clears all of
+// this client's SetViewing(true) calls.
+//
+// Returns the post-call viewer count for sessionID. Unknown
+// sessionID returns 0 with no error — TUIs may race the daemon's
+// "exited" event for a session they were viewing.
+func (c *Client) SetViewing(ctx context.Context, sessionID string, viewing bool) (int, error) {
+	var resp daemon.SetViewingResp
+	err := c.do(ctx, daemon.MsgSetViewingReq, daemon.SetViewingReq{
+		SessionID: sessionID,
+		Viewing:   viewing,
+	}, daemon.MsgSetViewingResp, &resp)
+	return resp.ViewerCount, err
+}
+
 // TicketDone informs the daemon that the agent invoked `openkanban
 // ticket done` or `openkanban ticket in-review` for ticketID — both
 // wrap-up motions take the same daemon path. The daemon scans its live

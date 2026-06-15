@@ -31,7 +31,7 @@ func newHeightTestModel(t *testing.T, width, height int) (*Model, *project.Proje
 	m := &Model{
 		globalStore:    globalStore,
 		panes:          map[board.TicketID]*daemonclient.PaneView{},
-		daemonAttached: map[board.TicketID]int{},
+		daemonViewing: map[board.TicketID]int{},
 		columns:        cols,
 		columnTickets:  make([][]*board.Ticket, len(cols)),
 		columnOffsets:  make([]int, len(cols)),

@@ -37,6 +37,14 @@ type Session struct {
 	attachMu sync.Mutex
 	attached *attachedClient // nil = no current attacher
 
+	// viewersMu guards viewers — the set of client IDs that have called
+	// SetViewing(true) on this session. Distinct from attached because
+	// "viewing" tracks ModeAgentView focus (transient — flips per Enter
+	// / Esc), while "attached" tracks binary PTY ownership (typically
+	// session-lifetime). Multiple clients can view simultaneously.
+	viewersMu sync.Mutex
+	viewers   map[uint16]struct{}
+
 	// subscribers reserved for PR9 fan-out — declared here so the
 	// slice type is stable across PRs. Not populated in PR5.
 	subscribers []*subscriberConn
@@ -136,7 +144,60 @@ func NewSession(req SpawnReq) (*Session, error) {
 		pane:             pane,
 		startedAt:        time.Now().UTC(),
 		agentSessionUUID: req.AgentSessionUUID,
+		viewers:          make(map[uint16]struct{}),
 	}, nil
+}
+
+// SetViewing toggles clientID's membership in the viewers set. Returns
+// the post-change count and whether the call changed the set
+// (idempotent: SetViewing(true) twice in a row returns changed=false
+// on the second call). Server uses `changed` to decide whether to
+// broadcast a "viewing" / "unviewing" SessionEvent — re-broadcasting
+// the same state would just generate noise.
+func (s *Session) SetViewing(clientID uint16, viewing bool) (count int, changed bool) {
+	if s == nil {
+		return 0, false
+	}
+	s.viewersMu.Lock()
+	defer s.viewersMu.Unlock()
+	_, present := s.viewers[clientID]
+	if viewing && !present {
+		s.viewers[clientID] = struct{}{}
+		changed = true
+	} else if !viewing && present {
+		delete(s.viewers, clientID)
+		changed = true
+	}
+	return len(s.viewers), changed
+}
+
+// RemoveViewer drops clientID from the viewers set without taking a
+// position on what the client wanted. Used by the disconnect cleanup
+// to scrub a dead client out of every session it was viewing. Returns
+// true when the client was actually a viewer (so the server can decide
+// whether to broadcast "unviewing").
+func (s *Session) RemoveViewer(clientID uint16) bool {
+	if s == nil {
+		return false
+	}
+	s.viewersMu.Lock()
+	defer s.viewersMu.Unlock()
+	if _, present := s.viewers[clientID]; !present {
+		return false
+	}
+	delete(s.viewers, clientID)
+	return true
+}
+
+// ViewerCount returns the current count of clients viewing this
+// session in agent-view mode.
+func (s *Session) ViewerCount() int {
+	if s == nil {
+		return 0
+	}
+	s.viewersMu.Lock()
+	defer s.viewersMu.Unlock()
+	return len(s.viewers)
 }
 
 // AgentSessionUUID returns the Claude / opencode session UUID this
@@ -240,6 +301,7 @@ func (s *Session) Info() SessionInfo {
 		Rows:           rows,
 		Running:        s.pane.Running(),
 		AttachedClient: attached,
+		ViewerCount:    s.ViewerCount(),
 		StartedAt:      s.startedAt,
 	}
 }

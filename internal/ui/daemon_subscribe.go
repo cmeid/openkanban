@@ -101,14 +101,17 @@ func (e daemonSubscribeErr) Error() string { return string(e) }
 //                   AgentNone. PaneView (if held) is closed; the
 //                   focused-pane mode unwinds to ModeNormal when the
 //                   event lands on the focused ticket.
-//   - "attached"  → no AgentStatus change; increments
-//                   daemonAttached[ticketID] so the board card renders
-//                   the "attached to a TUI" indicator.
-//   - "detached"  → no AgentStatus change; decrements
-//                   daemonAttached[ticketID] (guarded against
-//                   underflow). The local PaneView may already have
-//                   transitioned to PaneViewDetached via its own
-//                   DetachMsg path.
+//   - "attached"  → informational; no model change. PTY-stream
+//                   ownership is tracked elsewhere (PaneView state).
+//   - "detached"  → informational; the local PaneView may already
+//                   have transitioned to PaneViewDetached via its
+//                   own DetachMsg path.
+//   - "viewing"   → no AgentStatus change; increments
+//                   daemonViewing[ticketID] so the board card
+//                   renders the "TUI viewing this ticket" indicator.
+//   - "unviewing" → no AgentStatus change; decrements
+//                   daemonViewing[ticketID] (guarded against
+//                   underflow).
 //
 // Precedence rule: this handler is unconditional — push events
 // authoritatively trump the status-file poll while the daemon
@@ -133,7 +136,7 @@ func (m *Model) handleDaemonSessionEvent(msg daemonSessionEventMsg) (tea.Model, 
 				}
 			case "exited":
 				delete(m.daemonOwned, ticketID)
-				delete(m.daemonAttached, ticketID)
+				delete(m.daemonViewing, ticketID)
 				// Expected=true means the daemon initiated the kill via
 				// handleTicketDone (i.e. the agent invoked `openkanban
 				// ticket done`). Preserve AgentCompleted so the card
@@ -159,17 +162,16 @@ func (m *Model) handleDaemonSessionEvent(msg daemonSessionEventMsg) (tea.Model, 
 					m.mode = ModeNormal
 					m.focusedPane = ""
 				}
-			case "attached":
-				// Counter rather than bool so a takeover's
-				// attached(new)+detached(old) pair leaves us at 1
-				// regardless of arrival order (the daemon emits the
-				// two from separate goroutines).
-				m.daemonAttached[ticketID]++
-			case "detached":
-				if m.daemonAttached[ticketID] > 0 {
-					m.daemonAttached[ticketID]--
-					if m.daemonAttached[ticketID] == 0 {
-						delete(m.daemonAttached, ticketID)
+			case "attached", "detached":
+				// Informational only — PTY-stream ownership; doesn't
+				// drive the board indicator.
+			case "viewing":
+				m.daemonViewing[ticketID]++
+			case "unviewing":
+				if m.daemonViewing[ticketID] > 0 {
+					m.daemonViewing[ticketID]--
+					if m.daemonViewing[ticketID] == 0 {
+						delete(m.daemonViewing, ticketID)
 					}
 				}
 			}
