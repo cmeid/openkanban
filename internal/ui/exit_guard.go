@@ -25,6 +25,7 @@ import (
 // session UUID — see internal/ui/model.go's spawnAgent.
 type daemonGuardAPI interface {
 	PrepareExit(ctx context.Context) (daemon.PrepareExitResp, error)
+	CancelExit(ctx context.Context) error
 	Kill(ctx context.Context, sessionID string, grace time.Duration) error
 	ClientID() uint16
 	Owns(ctx context.Context, sessionUUID string) (daemon.OwnsResp, error)
@@ -62,14 +63,18 @@ const killGracePeriod = 3 * time.Second
 
 // --- Tea messages used by the exit guard. ---
 
-// quitRequestedMsg is dispatched in place of returning tea.Quit
+// QuitRequestedMsg is dispatched in place of returning tea.Quit
 // directly from any quit code path. Routing through the message queue
 // gives the guard a single chokepoint and keeps the PrepareExit RPC
-// off the synchronous Update path. Currently unused by code that
-// directly calls handleQuit (model.go's handleQuit handles its own
-// dispatch); kept as the documented integration point for any future
-// quit site that hasn't been migrated yet (and exercised by tests).
-type quitRequestedMsg struct{}
+// off the synchronous Update path.
+//
+// Exported so out-of-package senders (notably the signal handler in
+// internal/app/app.go, which fires program.Send(ui.QuitRequestedMsg{})
+// from a goroutine on SIGINT/SIGTERM) can dispatch it. With this
+// wiring, Ctrl-C and termination signals flow through the same
+// exit-guard modal as `q` — closing the previously-noted
+// "signal-handler bypass" hole in [[openkanban-exit-guard-always-fires]].
+type QuitRequestedMsg struct{}
 
 // prepareExitResultMsg carries the daemon's PrepareExit response back
 // to the Update loop, where the decision tree (ClientCount > 1 → exit;
@@ -126,17 +131,38 @@ func (m *Model) handleQuitRequested() (tea.Model, tea.Cmd) {
 }
 
 // handlePrepareExitResult decides whether to exit immediately or warn
-// the user. We previously skipped the modal when ClientCount > 1, on
-// the theory that other TUIs would keep the daemon (and its sessions)
-// alive. That shortcut races: when multiple TUIs close near-
-// simultaneously, each sees ClientCount > 1 and silent-quits, and the
-// last one out trips the daemon's defensive "exit-guard was bypassed"
-// kill (see internal/daemon/server.go handleLastClientDisconnect). So
-// whenever the daemon reports live sessions, we now show the modal
-// unconditionally — the user explicitly chose to quit, they get to see
-// what's at stake.
+// the user. The decision tree is:
+//
+//   - OtherActiveClients > 0 → at least one peer TUI is still attached
+//     and has NOT also called PrepareExit, so it will keep the daemon
+//     (and its sessions) alive after we leave. Silent-quit is safe.
+//   - Sessions empty → no live sessions to warn about; exit cleanly.
+//   - Otherwise → we're the last one out and sessions are at stake;
+//     open the modal.
+//
+// Note the load-bearing field is OtherActiveClients, NOT ClientCount.
+// ClientCount races on simultaneous closes (multiple TUIs each see
+// their own connection in the total and silent-quit, then the actual
+// last one out trips the daemon's defensive kill). The daemon computes
+// OtherActiveClients atomically under clientsMu by excluding self and
+// any peer that has also called PrepareExit, so exactly one caller
+// among N simultaneous closers sees 0 — see
+// [[openkanban-exit-guard-always-fires]] for the rationale.
+//
+// Accepted edge cases (do NOT try to fix):
+//   - Two TUIs can both observe OtherActiveClients == 0 if they flip
+//     their exit-intent flags at near-identical instants and both then
+//     read the count; both open the modal. Killing sessions in either
+//     succeeds; daemon de-dupes session state. Non-crashing.
+//   - Rapid Esc→q in the modal issues a new PrepareExit before the
+//     fire-and-forget CancelExit reaches the daemon; a peer's next
+//     PrepareExit may transiently see us as exiting and pop a spurious
+//     modal. Same category as the above.
 func (m *Model) handlePrepareExitResult(msg prepareExitResultMsg) (tea.Model, tea.Cmd) {
 	resp := msg.Resp
+	if resp.OtherActiveClients > 0 {
+		return m, tea.Quit
+	}
 	if len(resp.Sessions) == 0 {
 		return m, tea.Quit
 	}
@@ -258,7 +284,14 @@ func (m *Model) handleConfirmExitMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc", "q":
 		m.confirmExit.reset()
 		m.mode = ModeNormal
-		return m, nil
+		// Tell the daemon we're no longer planning to exit, so peer
+		// TUIs see this client as active again on their next
+		// PrepareExit. Fire-and-forget — UI must not freeze if the
+		// daemon is wedged. A failure is logged but otherwise ignored
+		// (worst case: a peer transiently sees a spurious modal, which
+		// falls under the accepted-edge-cases set documented in
+		// handlePrepareExitResult).
+		return m, m.cancelExitCmd()
 
 	case "up", "k":
 		if m.confirmExit.selectedIdx > 0 {
@@ -325,6 +358,32 @@ func (m *Model) killAllSessions() tea.Cmd {
 		return nil
 	}
 	return tea.Batch(cmds...)
+}
+
+// cancelExitCmd builds a fire-and-forget tea.Cmd that tells the daemon
+// this client is no longer planning to exit (clearing the per-client
+// exiting flag set by PrepareExit). The result message is nil so the
+// Update loop ignores it; failures are logged but never surfaced to
+// the user — trapping the modal-cancel path on a wedged daemon would
+// be worse than the rare spurious-modal a peer might see if the
+// CancelExit is lost.
+//
+// Short timeout: 1s is more than enough for a same-process daemon
+// (handler just flips a bool under clientsMu) and bounds the goroutine
+// lifetime if the daemon is gone.
+func (m *Model) cancelExitCmd() tea.Cmd {
+	if m.guardAPI == nil {
+		return nil
+	}
+	api := m.guardAPI
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+		if err := api.CancelExit(ctx); err != nil {
+			log.Printf("openkanban: exit guard CancelExit failed: %v", err)
+		}
+		return nil
+	}
 }
 
 // killSessionCmd builds the tea.Cmd that performs a single Kill RPC

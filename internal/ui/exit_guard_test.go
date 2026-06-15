@@ -24,18 +24,32 @@ type fakeGuardAPI struct {
 
 	prepareExitResp daemon.PrepareExitResp
 	prepareExitErr  error
+	cancelExitErr   error
 
 	killErrs map[string]error // by SessionID; nil = success
 
 	killCalls    []string
 	prepareCalls int
+	cancelCalls  int
 }
 
+// newFakeGuardAPI seeds a PrepareExit response derived from the
+// provided clientCount: ClientCount mirrors clientCount (legacy field),
+// and OtherActiveClients defaults to max(0, clientCount-1) — the
+// natural interpretation when no peer has also called PrepareExit.
+// Tests that want to exercise the atomic-exit-intent decision tree
+// (e.g. "last TUI sees 0 even when ClientCount is stale") should set
+// fields directly on the returned struct's prepareExitResp.
 func newFakeGuardAPI(sessions []daemon.SessionInfo, clientCount int) *fakeGuardAPI {
+	other := clientCount - 1
+	if other < 0 {
+		other = 0
+	}
 	return &fakeGuardAPI{
 		prepareExitResp: daemon.PrepareExitResp{
-			ClientCount: clientCount,
-			Sessions:    sessions,
+			ClientCount:        clientCount,
+			OtherActiveClients: other,
+			Sessions:           sessions,
 		},
 		killErrs: map[string]error{},
 	}
@@ -51,11 +65,25 @@ func (f *fakeGuardAPI) PrepareExit(_ context.Context) (daemon.PrepareExitResp, e
 	return f.prepareExitResp, nil
 }
 
+func (f *fakeGuardAPI) CancelExit(_ context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cancelCalls++
+	return f.cancelExitErr
+}
+
 func (f *fakeGuardAPI) Kill(_ context.Context, sessionID string, _ time.Duration) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.killCalls = append(f.killCalls, sessionID)
 	return f.killErrs[sessionID]
+}
+
+// cancelCallCount returns the number of CancelExit invocations.
+func (f *fakeGuardAPI) cancelCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.cancelCalls
 }
 
 func (f *fakeGuardAPI) ClientID() uint16 { return 1 }
@@ -154,16 +182,44 @@ func containsQuitMsg(msgs []tea.Msg) bool {
 	return false
 }
 
-// When sessions exist, the modal must appear regardless of how many
-// other TUIs are currently attached. The previous "ClientCount > 1 →
-// silent quit" shortcut raced when multiple TUIs closed near-
-// simultaneously and the daemon ended up defensively killing all
-// sessions (see daemon.log "exit-guard was bypassed" path).
-func TestExitGuard_ClientCountGreaterThanOne_StillShowsModalWhenSessionsLive(t *testing.T) {
+// When sessions are live but the daemon reports at least one OTHER
+// active (non-exiting) client, silent-quit is safe — the peer will
+// keep the daemon (and its sessions) alive. This is the race-free
+// successor to the v1 stopgap "always show modal regardless of
+// ClientCount", now keyed on the daemon's atomic per-client exit-intent
+// flag instead of the snapshot client count. See
+// [[openkanban-exit-guard-always-fires]].
+func TestExitGuard_OtherActiveClientsPositive_SilentQuitsEvenWithSessions(t *testing.T) {
 	sessions := []daemon.SessionInfo{
 		{SessionID: "s1", TicketID: "t1", PID: 100, Running: true},
 	}
-	api := newFakeGuardAPI(sessions, /*clientCount=*/ 5)
+	api := newFakeGuardAPI(sessions, /*clientCount=*/ 5) // → OtherActiveClients = 4
+	m := minimalModel(api)
+
+	_, cmd := m.handleQuitRequested()
+	finalModel, msgs := runCmds(t, m, cmd)
+	if !containsQuitMsg(msgs) {
+		t.Fatalf("expected tea.Quit when OtherActiveClients > 0; got msgs=%v", msgs)
+	}
+	if finalModel.mode == ModeConfirmExit {
+		t.Errorf("expected NOT to enter ModeConfirmExit; got mode=%v", finalModel.mode)
+	}
+}
+
+// Conversely, when the daemon's authoritative count says we're the
+// last active TUI (OtherActiveClients=0) AND sessions are live, the
+// modal must fire — even if the legacy ClientCount field is stale
+// (e.g. peer disconnects mid-RPC). This asserts that the new field is
+// the load-bearing signal, not ClientCount.
+func TestExitGuard_LastTUI_ShowsModalEvenWithStaleClientCount(t *testing.T) {
+	api := newFakeGuardAPI(nil, 0)
+	api.prepareExitResp = daemon.PrepareExitResp{
+		ClientCount:        5, // intentionally stale / inconsistent
+		OtherActiveClients: 0,
+		Sessions: []daemon.SessionInfo{
+			{SessionID: "s1", TicketID: "t1", PID: 100, Running: true},
+		},
+	}
 	m := minimalModel(api)
 
 	_, cmd := m.handleQuitRequested()
@@ -175,8 +231,7 @@ func TestExitGuard_ClientCountGreaterThanOne_StillShowsModalWhenSessionsLive(t *
 	newModel, followup := m.Update(resMsg)
 	mm := newModel.(*Model)
 	if mm.mode != ModeConfirmExit {
-		t.Fatalf("expected ModeConfirmExit even with ClientCount=%d; got %v",
-			api.prepareExitResp.ClientCount, mm.mode)
+		t.Fatalf("expected ModeConfirmExit when OtherActiveClients=0; got %v", mm.mode)
 	}
 	if isQuitCmd(followup) {
 		t.Errorf("expected NOT to quit; got tea.Quit")
@@ -325,17 +380,64 @@ func TestExitGuard_EscCancels(t *testing.T) {
 		t.Fatalf("setup: expected ModeConfirmExit; got %v", m.mode)
 	}
 
-	// Esc → cancel
+	// Esc → cancel. handleConfirmExitMode returns a fire-and-forget
+	// cancelExitCmd; invoke it once so the CancelExit RPC fires, then
+	// assert: (a) the returned message is nil (not tea.QuitMsg — we are
+	// not exiting), (b) exactly one CancelExit call was recorded.
 	newModel, followup := m.handleConfirmExitMode(tea.KeyMsg{Type: tea.KeyEsc})
 	mm := newModel.(*Model)
 	if mm.mode != ModeNormal {
 		t.Errorf("expected mode=ModeNormal after Esc; got %v", mm.mode)
 	}
-	if isQuitCmd(followup) {
-		t.Errorf("expected NOT to exit; got tea.Quit")
+	if followup == nil {
+		t.Fatalf("expected non-nil cancelExitCmd; got nil")
+	}
+	resultMsg := followup()
+	if _, isQuit := resultMsg.(tea.QuitMsg); isQuit {
+		t.Errorf("expected cancelExitCmd to NOT emit tea.Quit; got QuitMsg")
+	}
+	if resultMsg != nil {
+		t.Errorf("expected cancelExitCmd to return nil msg; got %T", resultMsg)
+	}
+	if got := api.cancelCallCount(); got != 1 {
+		t.Errorf("expected exactly 1 CancelExit call; got %d", got)
 	}
 	if calls := api.killCallsCopy(); len(calls) != 0 {
 		t.Errorf("expected zero Kill calls; got %v", calls)
+	}
+}
+
+// TestExitGuard_KillAllThenExit_NoCancel confirms CancelExit is NOT
+// called on the kill-all-then-exit path. The user committed to
+// exiting; the daemon will see the disconnect and the exit-intent
+// flag is moot. Firing CancelExit there would be wrong (the peer's
+// next PrepareExit would briefly see us as active again, which is
+// confusing).
+func TestExitGuard_KillAllThenExit_NoCancel(t *testing.T) {
+	sessions := []daemon.SessionInfo{
+		{SessionID: "s1", TicketID: "t1", PID: 100, Running: true},
+		{SessionID: "s2", TicketID: "t2", PID: 101, Running: true},
+	}
+	api := newFakeGuardAPI(sessions, 1)
+	m := minimalModel(api)
+
+	_, cmd := m.handleQuitRequested()
+	msg := cmd()
+	resMsg := msg.(prepareExitResultMsg)
+	newModel, _ := m.Update(resMsg)
+	m = newModel.(*Model)
+	if m.mode != ModeConfirmExit {
+		t.Fatalf("setup: expected ModeConfirmExit; got %v", m.mode)
+	}
+
+	_, cmd = m.handleConfirmExitMode(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'X'}})
+	_, msgs := runCmds(t, m, cmd)
+
+	if !containsQuitMsg(msgs) {
+		t.Fatalf("expected tea.Quit at end; msgs=%v", msgs)
+	}
+	if got := api.cancelCallCount(); got != 0 {
+		t.Errorf("expected NO CancelExit calls on kill-all path; got %d", got)
 	}
 }
 

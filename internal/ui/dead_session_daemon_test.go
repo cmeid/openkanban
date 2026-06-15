@@ -38,6 +38,10 @@ func (s *ownsStubAPI) PrepareExit(_ context.Context) (daemon.PrepareExitResp, er
 	return daemon.PrepareExitResp{}, nil
 }
 
+func (s *ownsStubAPI) CancelExit(_ context.Context) error {
+	return nil
+}
+
 func (s *ownsStubAPI) Kill(_ context.Context, _ string, _ time.Duration) error {
 	return nil
 }
