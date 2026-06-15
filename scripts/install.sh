@@ -141,6 +141,32 @@ INSTALLED_SHA="$("$INSTALLED_BIN" version 2>/dev/null | awk '/^  source:/ {print
 say "  installed: $INSTALLED_BIN"
 say "  source:    $REPO_ROOT"
 
+# -- macOS: assemble + place the OpenKanban.app bundle -------------------
+# The daemon needs to run from inside an .app bundle so macOS attributes
+# user-facing notifications to the OpenKanban identity (CFBundleIdentifier
+# dev.cmeid.openkanban) instead of the parent terminal app. The bundle is a
+# thin wrapper around the same openkanban binary we just installed —
+# Contents/MacOS/openkanbankd is literally a copy of $GOBIN_DIR/openkanban.
+# At fork time, internal/daemonclient prefers the bundle path over
+# os.Executable() so the daemon process picks up the bundle identity.
+#
+# build-bundle.sh is idempotent (removes any existing OpenKanban.app at the
+# target) and calls lsregister so Launch Services notices immediately.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  step "Installing OpenKanban.app bundle (macOS notifications identity)"
+  BUNDLE_SCRIPT="$REPO_ROOT/dist/macos/build-bundle.sh"
+  if [[ -x "$BUNDLE_SCRIPT" ]]; then
+    if "$BUNDLE_SCRIPT" "$INSTALLED_BIN" "$HOME/Applications"; then
+      say "  OpenKanban.app installed to $HOME/Applications/OpenKanban.app"
+    else
+      warn "build-bundle.sh failed. Desktop notifications will lack the OpenKanban identity until you re-run install.sh."
+    fi
+  else
+    warn "dist/macos/build-bundle.sh not found or not executable; skipping bundle install."
+    say  "  Notifications from the daemon will be attributed to the parent terminal app."
+  fi
+fi
+
 # -- optional: Claude Code hooks ------------------------------------------
 step "Claude Code integration"
 

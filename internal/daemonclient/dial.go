@@ -26,15 +26,19 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
+
+	"github.com/techdufus/openkanban/internal/daemon"
 )
 
 // Environment-variable overrides — must match the ones in
-// internal/daemon/paths.go so a single export honors both sides.
+// internal/daemon/paths.go so a single export honors both sides. The
+// authoritative reader of envBinary now lives in
+// internal/daemon/binary.go; the constant is retained here so existing
+// tests (client_test.go) can reference the same symbol when forcing the
+// autostart fork to a stub binary.
 const (
 	envSocket = "OPENKANBAN_DAEMON_SOCK"
 	envLog    = "OPENKANBAN_DAEMON_LOG"
-	// envBinary lets tests point the autostart fork at a pre-built
-	// binary rather than os.Args[0]. Not honored in production builds.
 	envBinary = "OPENKANBAN_DAEMON_BINARY"
 )
 
@@ -170,29 +174,28 @@ func DialOrStart(ctx context.Context) (net.Conn, error) {
 	return nil, fmt.Errorf("%w: forked daemon did not bind %s within %s", ErrDaemonUnavailable, sock, startWait)
 }
 
-// forkDaemon execs `<self> daemon` (or OPENKANBAN_DAEMON_BINARY if set)
-// detached in a new session, with stdio redirected to the daemon log.
+// forkDaemon execs the daemon binary detached in a new session, with stdio
+// redirected to the daemon log. Binary lookup is delegated to
+// daemon.ResolveBinary, which prefers the OpenKanban.app bundle so the daemon
+// inherits the bundle's identity (required for macOS notifications).
 func forkDaemon() error {
 	if err := ensureRuntimeDir(); err != nil {
 		return err
 	}
 
-	log, err := logPath()
+	logFile, err := logPath()
 	if err != nil {
 		return err
 	}
 
-	exe := os.Getenv(envBinary)
-	if exe == "" {
-		exe, err = os.Executable()
-		if err != nil {
-			return fmt.Errorf("daemonclient: locate self: %w", err)
-		}
+	exe, _, err := daemon.ResolveBinary()
+	if err != nil {
+		return err
 	}
 
-	logF, err := os.OpenFile(log, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	logF, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
-		return fmt.Errorf("daemonclient: open log %s: %w", log, err)
+		return fmt.Errorf("daemonclient: open log %s: %w", logFile, err)
 	}
 
 	cmd := exec.Command(exe, "daemon")
@@ -208,3 +211,8 @@ func forkDaemon() error {
 	logF.Close()
 	return cmd.Process.Release()
 }
+
+// Binary lookup (search order, $OPENKANBAN_DAEMON_BINARY override, fallback
+// warning log) lives in internal/daemon/binary.go as daemon.ResolveBinary so
+// the TUI autostart, the daemon-package autostart, and the launchd installer
+// (cmd/daemon_service.go) share a single implementation.

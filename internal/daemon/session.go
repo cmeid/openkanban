@@ -131,6 +131,13 @@ func NewSession(req SpawnReq) (*Session, error) {
 	if req.TicketID != "" {
 		pane.SetTicketID(req.TicketID)
 	}
+	// SetForwardNotifications must fire BEFORE StartHeadless so the OSC
+	// 9 handler observes the toggle from the first byte the child emits.
+	// The atomic.Bool is read each time the handler runs, so a later
+	// flip would still work — but pinning it up front means the wire
+	// contract ("if SpawnReq says forward, do it") is observable in the
+	// pane's initial output without a race window.
+	pane.SetForwardNotifications(req.ForwardNotifications)
 
 	if err := pane.StartHeadless(req.Command, req.Args, req.Env); err != nil {
 		return nil, fmt.Errorf("daemon: start pane: %w", err)

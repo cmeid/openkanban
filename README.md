@@ -110,6 +110,16 @@ This fork migrates to `charm/x/vt` + `charmbracelet/ultraviolet`, which is corre
 
 See [`internal/terminal/pane.go`](internal/terminal/pane.go), commit `7a787a3`.
 
+### 7. macOS desktop notifications
+
+When Claude Code runs directly in Ghostty / iTerm2 / Wezterm, the terminal surfaces a native desktop notification each time the agent enters a "waiting" state. Inside an openkanban-wrapped session that signal was lost — the daemon's terminal emulator consumed the OSC 9 escape sequence and the TUI's stderr (often redirected to `/dev/null` by launch wrappers) wasn't a reliable delivery channel.
+
+This fork installs a macOS `.app` bundle at `~/Applications/OpenKanban.app` (`CFBundleIdentifier=dev.cmeid.openkanban`, `LSUIElement=true` so no Dock icon) and routes notifications through `NSUserNotification` from inside the daemon process running from that bundle. The result is a native macOS notification with the OpenKanban icon, the agent's exact text passed through 1:1, and a manageable entry under System Settings → Notifications.
+
+The bundle is assembled by `dist/macos/build-bundle.sh` and installed alongside the binary by `scripts/install.sh`. Daemon binary lookup (`internal/daemon.ResolveBinary`) prefers the bundled path so notifications keep the OpenKanban identity even under launchd (`openkanban daemon install-service`). Toggleable via `config.behavior.forward_agent_notifications` (default on).
+
+See [`internal/notify/`](internal/notify/), [`internal/terminal/pane.go`](internal/terminal/pane.go), and [`dist/macos/`](dist/macos/).
+
 ## Bugs fixed in upstream
 
 Seven correctness bugs that exist on `TechDufus/main` today are fixed in this fork. Each is verified against the upstream tree.

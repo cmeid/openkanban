@@ -3738,6 +3738,11 @@ type spawnReqInputs struct {
 	opencodeSessionID string
 	geminiSessionID   string
 	codexSessionID    string
+	// forwardNotifications is the effective config.Behavior.ForwardAgentNotifications
+	// value at spawn time. Threaded through SpawnReq so the daemon's
+	// terminal.Pane gates its OSC 9 → desktop-notification handler on
+	// this per session, rather than relying on a process-wide global.
+	forwardNotifications bool
 }
 
 // buildSpawnReq constructs the daemon.SpawnReq for a ticket given the
@@ -3862,16 +3867,17 @@ func buildSpawnReq(in spawnReqInputs) daemon.SpawnReq {
 	}
 
 	return daemon.SpawnReq{
-		TicketID:         ticketIDStr,
-		SessionName:      in.sessionName,
-		Command:          in.command,
-		Args:             args,
-		Workdir:          in.workdir,
-		Env:              env,
-		Cols:             in.cols,
-		Rows:             in.rows,
-		Scrollback:       0,
-		AgentSessionUUID: in.ticket.AgentSessionID,
+		TicketID:             ticketIDStr,
+		SessionName:          in.sessionName,
+		Command:              in.command,
+		Args:                 args,
+		Workdir:              in.workdir,
+		Env:                  env,
+		Cols:                 in.cols,
+		Rows:                 in.rows,
+		Scrollback:           0,
+		AgentSessionUUID:     in.ticket.AgentSessionID,
+		ForwardNotifications: in.forwardNotifications,
 	}
 }
 
@@ -4028,22 +4034,23 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 		// immediately so the snapshot frames flow into the local
 		// emulator before the model sees the spawnReadyMsg.
 		req := buildSpawnReq(spawnReqInputs{
-			ticket:            ticket,
-			plan:              plan,
-			sessionName:       sessionName,
-			command:           command,
-			workdir:           worktreePath,
-			cols:              width,
-			rows:              height,
-			agentType:         agentType,
-			cleanArgs:         cleanArgs,
-			isNewSession:      isNewSession,
-			promptTemplate:    promptTemplate,
-			ctxData:           ctxData,
-			agentPort:         agentPort,
-			opencodeSessionID: opencodeSessionID,
-			geminiSessionID:   geminiSessionID,
-			codexSessionID:    codexSessionID,
+			ticket:               ticket,
+			plan:                 plan,
+			sessionName:          sessionName,
+			command:              command,
+			workdir:              worktreePath,
+			cols:                 width,
+			rows:                 height,
+			agentType:            agentType,
+			cleanArgs:            cleanArgs,
+			isNewSession:         isNewSession,
+			promptTemplate:       promptTemplate,
+			ctxData:              ctxData,
+			agentPort:            agentPort,
+			opencodeSessionID:    opencodeSessionID,
+			geminiSessionID:      geminiSessionID,
+			codexSessionID:       codexSessionID,
+			forwardNotifications: cfg.Behavior.ForwardAgentNotifications,
 		})
 		spawnCtx, spawnCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		resp, err := daemonClient.Spawn(spawnCtx, req)

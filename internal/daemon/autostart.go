@@ -112,9 +112,9 @@ func forkDaemon() error {
 		return err
 	}
 
-	exe, err := os.Executable()
+	exe, _, err := ResolveBinary()
 	if err != nil {
-		return fmt.Errorf("daemon: locate self: %w", err)
+		return err
 	}
 
 	logF, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
@@ -138,3 +138,8 @@ func forkDaemon() error {
 	// Release detaches the child from this process's lifecycle.
 	return cmd.Process.Release()
 }
+
+// Binary lookup (resolveDaemonBinary, bundleDaemonCandidates,
+// isExecutableFile) lives in binary.go as the exported ResolveBinary so the
+// TUI autostart (internal/daemonclient/dial.go) and the launchd installer
+// (cmd/daemon_service.go) share a single implementation.
