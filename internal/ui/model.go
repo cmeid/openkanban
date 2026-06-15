@@ -126,14 +126,19 @@ const (
 	minColumnWidth = 20
 	columnOverhead = 5
 
-	// ticketHeight is the worst-case rendered height of a ticket card in rows
-	// (2 border + 5 content lines + 1 bottom margin). Used to estimate how many
-	// fit in a column; over-packing here pushes the column past the terminal
-	// height and the top is clipped off-screen.
+	// ticketHeight is the fallback estimate of a ticket card's rendered
+	// height in rows, used by ensureTicketVisible and hitTestTicket only
+	// when the per-render Model.columnTicketHeights cache is empty (e.g.
+	// before the first View() call after a window-size change). The actual
+	// rendered height varies (8 for a single-row title, 9 when the title
+	// wraps to 2 rows) and is measured by renderColumn via lipgloss.Height.
 	ticketHeight       = 8
 	columnHeaderHeight = 3
 	// indicatorReserveRows reserves vertical space for the "▲ N more" and
-	// "▼ N more" overflow indicators rendered inside a column.
+	// "▼ N more" overflow indicators rendered inside a column. Kept as a
+	// constant for the small handful of callers (e.g. ensureTicketVisible
+	// fallback) that still want a worst-case reservation without walking
+	// columnTicketHeights.
 	indicatorReserveRows = 2
 
 	formFieldTitle       = 0
@@ -200,6 +205,15 @@ type Model struct {
 	lastClickTicket int
 
 	columnTickets [][]*board.Ticket
+
+	// columnTicketHeights mirrors columnTickets and holds the measured
+	// rendered height (lipgloss.Height) of every ticket in every column at
+	// the current width. Populated by renderColumn each render. Consumed by
+	// ensureTicketVisible and hitTestTicket to translate between ticket
+	// index and vertical-pixel space when ticket heights vary (e.g. 2-line
+	// title wraps). May be nil/short before the first render — callers
+	// fall back to the ticketHeight constant in that case.
+	columnTicketHeights [][]int
 
 	// sortMode is the user-selected sort applied to each column in
 	// refreshColumnTickets. Session-only (not persisted); SortDefault
@@ -1419,12 +1433,41 @@ func (m *Model) hitTestTicket(relativeY, column int) int {
 		offset = m.columnOffsets[column]
 	}
 
-	ticketIdx := offset + (ticketY / ticketHeight)
-	if ticketIdx >= len(tickets) {
-		return -1
+	// Walk per-ticket heights from `offset`, accumulating until cumulative
+	// height crosses ticketY. With a "▲ N more" indicator above (when
+	// offset > 0) the first card sits one row down, so consume that row
+	// from ticketY before walking.
+	//
+	// Example (offset=0, heights = [8, 9, 8], ticketY=12):
+	//   cum=0  → 8  : 12 not in [0,8)   → index 1 candidate
+	//   cum=8  → 17 : 12 in [8,17)      → return 1
+	if offset > 0 {
+		ticketY-- // ▲ N more row
+		if ticketY < 0 {
+			return -1
+		}
 	}
 
-	return ticketIdx
+	var heights []int
+	if column < len(m.columnTicketHeights) {
+		heights = m.columnTicketHeights[column]
+	}
+	heightOf := func(i int) int {
+		if i < len(heights) && heights[i] > 0 {
+			return heights[i]
+		}
+		return ticketHeight
+	}
+
+	cum := 0
+	for i := offset; i < len(tickets); i++ {
+		next := cum + heightOf(i)
+		if ticketY < next {
+			return i
+		}
+		cum = next
+	}
+	return -1
 }
 
 func (m *Model) dropTicket() (tea.Model, tea.Cmd) {
@@ -2754,15 +2797,6 @@ func (m *Model) moveTicket(delta int) {
 	m.ensureTicketVisible()
 }
 
-func (m *Model) visibleTicketCount() int {
-	availableHeight := m.columnContentHeight() - indicatorReserveRows
-	if availableHeight <= 0 {
-		return 1
-	}
-	count := availableHeight / ticketHeight
-	return max(count, 1)
-}
-
 // boardAreaHeight is the vertical space available for the column row, between
 // the header (with its trailing newline) and the status bar (with its
 // preceding newline). headerHeight() already includes its own padding/border.
@@ -2788,15 +2822,64 @@ func (m *Model) ensureTicketVisible() {
 	}
 
 	offset := m.columnOffsets[m.activeColumn]
-	visible := m.visibleTicketCount()
 
+	// Scroll up if the active ticket is above the visible window.
 	if m.activeTicket < offset {
 		m.columnOffsets[m.activeColumn] = m.activeTicket
-	} else if m.activeTicket >= offset+visible {
-		m.columnOffsets[m.activeColumn] = m.activeTicket - visible + 1
+		return
 	}
 
-	m.columnOffsets[m.activeColumn] = max(m.columnOffsets[m.activeColumn], 0)
+	// Scroll down if the active ticket would fall outside the rendered
+	// budget at the current offset. Walk per-ticket heights (or fall back
+	// to ticketHeight if the heights cache hasn't been populated yet, e.g.
+	// before the first View() after a window-size change).
+	var heights []int
+	if m.activeColumn < len(m.columnTicketHeights) {
+		heights = m.columnTicketHeights[m.activeColumn]
+	}
+	heightOf := func(i int) int {
+		if i < len(heights) && heights[i] > 0 {
+			return heights[i]
+		}
+		return ticketHeight
+	}
+
+	budget := m.columnContentHeight()
+	if offset > 0 {
+		budget -= 1 // ▲ indicator
+	}
+
+	// From the current offset, see if activeTicket fits. If not, advance
+	// the offset one ticket at a time until it does.
+	for {
+		fits := false
+		used := 0
+		// Account for trailing ▼ indicator if there's anything after the
+		// active ticket — keep the active card off the indicator row.
+		for i := offset; i < len(m.columnTickets[m.activeColumn]); i++ {
+			cost := heightOf(i)
+			reserve := 0
+			if i < len(m.columnTickets[m.activeColumn])-1 {
+				reserve = 1
+			}
+			if used+cost+reserve > budget {
+				break
+			}
+			used += cost
+			if i == m.activeTicket {
+				fits = true
+				break
+			}
+		}
+		if fits || offset >= m.activeTicket {
+			break
+		}
+		offset++
+		// Recompute budget: once offset > 0 the ▲ indicator row is reserved.
+		budget = m.columnContentHeight() - 1
+	}
+
+	m.columnOffsets[m.activeColumn] = max(offset, 0)
 }
 
 func (m *Model) createNewTicket() (tea.Model, tea.Cmd) {
@@ -3980,6 +4063,9 @@ func (m *Model) refreshColumnTickets() {
 
 	if len(m.columnOffsets) != len(m.columns) {
 		m.columnOffsets = make([]int, len(m.columns))
+	}
+	if len(m.columnTicketHeights) != len(m.columns) {
+		m.columnTicketHeights = make([][]int, len(m.columns))
 	}
 }
 

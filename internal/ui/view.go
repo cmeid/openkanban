@@ -212,7 +212,7 @@ func (m *Model) renderBoard() string {
 			ticketOffset = m.columnOffsets[i]
 		}
 
-		columns = append(columns, m.renderColumn(col, m.columnTickets[i], isActive, isDragTarget, isHovered, colWidth, isLast, ticketOffset))
+		columns = append(columns, m.renderColumn(i, col, m.columnTickets[i], isActive, isDragTarget, isHovered, colWidth, isLast, ticketOffset))
 	}
 
 	if endCol < len(m.columns) {
@@ -228,7 +228,7 @@ func (m *Model) renderBoard() string {
 	return lipgloss.JoinHorizontal(lipgloss.Top, columns...)
 }
 
-func (m *Model) renderColumn(col board.Column, tickets []*board.Ticket, isActive, isDragTarget, isHovered bool, width int, isLast bool, ticketOffset int) string {
+func (m *Model) renderColumn(colIdx int, col board.Column, tickets []*board.Ticket, isActive, isDragTarget, isHovered bool, width int, isLast bool, ticketOffset int) string {
 	headerColor := m.columnColor(col.Status)
 
 	columnIcons := map[board.TicketStatus]string{
@@ -266,10 +266,65 @@ func (m *Model) renderColumn(col board.Column, tickets []*board.Ticket, isActive
 
 	count := countStyle.Render(" " + countText)
 
-	headerLine := header + count
+	// Clamp the column header to a single row. width-2 matches the column's
+	// effective content width after Padding(0,1) on the column style block
+	// below (see the lipgloss.NewStyle().Border(border)...Width(width).Padding(0,1)
+	// chain near the end of this function); keep these widths in lockstep if
+	// the column padding ever changes. Without this clamp, a long column name
+	// at small widths wraps to 2 rows and breaks the columnHeaderHeight = 3
+	// invariant (top border + header + blank separator).
+	headerLine := lipgloss.NewStyle().MaxHeight(1).Width(width - 2).Render(header + count)
 
-	visibleCount := m.visibleTicketCount()
-	endIdx := min(ticketOffset+visibleCount, len(tickets))
+	// Render and measure every ticket so we can both (1) cache per-ticket
+	// heights for hitTestTicket / ensureTicketVisible (which need the FULL
+	// mapping, not just the visible window) and (2) pack as many visible
+	// tickets as fit within columnContentHeight, accounting for the
+	// ▲/▼ overflow indicators.
+	//
+	// Empirically measured (see empirical_test.go):
+	//   - short-title card height = 8 rows
+	//   - long-title card height  = 9 rows (title wraps to 2 lines)
+	//   - lipgloss.Height(strings.Join(views, "\n")) == sum of individual
+	//     heights — MarginBottom(1) does NOT overlap the join separator
+	//     here, so the per-ticket cost is just h (no -1 adjustment).
+	heights := make([]int, len(tickets))
+	rendered := make([]string, len(tickets))
+	for i, ticket := range tickets {
+		isSelected := isActive && i == m.activeTicket
+		isTicketHovered := isHovered && i == m.hoverTicket
+		v := m.renderTicket(ticket, isSelected, isTicketHovered, width-4, headerColor, i+1, len(tickets))
+		rendered[i] = v
+		heights[i] = lipgloss.Height(v)
+	}
+	if colIdx >= 0 && colIdx < len(m.columnTicketHeights) {
+		m.columnTicketHeights[colIdx] = heights
+	}
+
+	budget := m.columnContentHeight()
+	if ticketOffset > 0 {
+		budget -= 1 // ▲ N more indicator above
+	}
+
+	endIdx := ticketOffset
+	for i := ticketOffset; i < len(tickets); i++ {
+		cost := heights[i]
+		// Reserve a row for the ▼ N more indicator if anything remains
+		// after this card.
+		indicatorReserve := 0
+		if i < len(tickets)-1 {
+			indicatorReserve = 1
+		}
+		if cost+indicatorReserve > budget {
+			break
+		}
+		budget -= cost
+		endIdx = i + 1
+	}
+	// At minimum render the first ticket in the visible window, even if the
+	// budget is too small — the column's MaxHeight clip is the safety net.
+	if endIdx == ticketOffset && ticketOffset < len(tickets) {
+		endIdx = ticketOffset + 1
+	}
 
 	hasMoreAbove := ticketOffset > 0
 	hasMoreBelow := endIdx < len(tickets)
@@ -286,10 +341,7 @@ func (m *Model) renderColumn(col board.Column, tickets []*board.Ticket, isActive
 	}
 
 	for i := ticketOffset; i < endIdx; i++ {
-		ticket := tickets[i]
-		isSelected := isActive && i == m.activeTicket
-		isTicketHovered := isHovered && i == m.hoverTicket
-		ticketViews = append(ticketViews, m.renderTicket(ticket, isSelected, isTicketHovered, width-4, headerColor, i+1, len(tickets)))
+		ticketViews = append(ticketViews, rendered[i])
 	}
 
 	if hasMoreBelow {
@@ -331,9 +383,10 @@ func (m *Model) renderColumn(col board.Column, tickets []*board.Ticket, isActive
 		borderColor = m.colors.overlay
 	}
 
-	// MaxHeight prevents the column from ever exceeding the board area: if the
-	// visibleTicketCount estimate is off by a row, lipgloss clips from the
-	// bottom instead of the terminal scrolling and clipping the top.
+	// MaxHeight prevents the column from ever exceeding the board area: if
+	// the measured-pack loop above lets one too many cards through (e.g. a
+	// last-minute width-dependent re-wrap), lipgloss clips from the bottom
+	// instead of the terminal scrolling and clipping the top.
 	maxHeight := m.boardAreaHeight()
 	if maxHeight < 1 {
 		maxHeight = 1
@@ -436,10 +489,33 @@ func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, w
 	}
 	headerLine := strings.Join(headerParts, "  ")
 
+	// Every non-title card line is clamped to a single row. Title is allowed
+	// to wrap to 2 rows above; the column packing loop measures each card's
+	// actual height to budget visible cards.
+	//
+	// Width is (width - 2) to match the card's effective content width after
+	// cardStyle.Padding(0,1); using `width` here causes lipgloss to wrap a
+	// long line internally before MaxHeight(1) clips it — the first row
+	// chosen is the pre-padded one, which then gets padded and is wider than
+	// the card by 2 columns when re-rendered inside cardStyle.
+	clampLine := func(s string) string {
+		return lipgloss.NewStyle().Width(width - 2).MaxHeight(1).Render(s)
+	}
+
+	// Title is allowed to wrap to 2 rows; the column packing loop measures
+	// each rendered ticket's actual height and pages accordingly, so longer
+	// titles count as taller cards instead of being truncated.
+	//
+	// Width is (width - 2) to match the card's effective content width after
+	// cardStyle.Padding(0,1). Without the -2, lipgloss wraps once at `width`
+	// then the outer Padding(0,1) wraps the already-wrapped output a second
+	// time, producing 3-4 rows from one long title (measured: a 100-rune
+	// title at width=36 rendered at 11 rows instead of 9 with Width(width)).
 	titleStyle := lipgloss.NewStyle().
 		Foreground(m.colors.text).
 		Bold(isSelected).
-		Width(width)
+		Width(width - 2).
+		MaxHeight(2)
 	wrappedTitle := titleStyle.Render(ticket.Title)
 
 	var descLine string
@@ -452,7 +528,8 @@ func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, w
 		descLine = lipgloss.NewStyle().
 			Foreground(m.colors.muted).
 			Italic(true).
-			Width(width).
+			Width(width - 2).
+			MaxHeight(1).
 			Render(desc)
 	}
 
@@ -508,15 +585,15 @@ func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, w
 	}
 	labelsLine := strings.Join(labelParts, " ")
 
-	lines := []string{headerLine, wrappedTitle}
+	lines := []string{clampLine(headerLine), wrappedTitle}
 	if descLine != "" {
 		lines = append(lines, descLine)
 	}
 	if statusLine != "" {
-		lines = append(lines, statusLine)
+		lines = append(lines, clampLine(statusLine))
 	}
 	if labelsLine != "" {
-		lines = append(lines, labelsLine)
+		lines = append(lines, clampLine(labelsLine))
 	}
 
 	content := strings.Join(lines, "\n")
@@ -1834,8 +1911,13 @@ func (m *Model) renderSidebar() string {
 	}
 
 	projects := m.globalStore.Projects()
-	statusHeight := 1
-	availableHeight := m.height - m.headerHeight() - statusHeight
+	// Match the board area exactly so JoinHorizontal(Top, sidebar, board)
+	// produces a row that fits within m.height. Previously this used
+	// m.height - headerHeight() - 1 (only the statusBar), which left the
+	// sidebar 2 rows taller than boardAreaHeight() and pushed View()
+	// output past m.height. See model.go:boardAreaHeight for the
+	// canonical formula.
+	availableHeight := m.boardAreaHeight()
 
 	titleStyle := lipgloss.NewStyle().
 		Foreground(m.colors.primary).
