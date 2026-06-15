@@ -71,7 +71,7 @@ Upstream's CLI was effectively project-management only (`new` / `list` / `delete
 | `openkanban hooks install` | Wires Claude Code `SessionStart` / `UserPromptSubmit` / `Stop` / `Notification` hooks into `~/.claude/settings.json`. Atomic write, timestamped backup, preserves foreign keys, dedupes by command prefix. |
 | `openkanban status set <state>` | Used by the installed hooks to drive ticket `agent_status` from inside a session. |
 | `openkanban config {validate,generate,path}` | Config tooling, including a validator that warns when an agent's `init_prompt` restates rules already in `~/.claude/CLAUDE.md`. |
-| `openkanban update` | Self-update from the source clone; `origin/main` check, `ff-only` pull, `go install` with `SourcePath` preserved. Also ff-fast-forwards local `main` toward `origin/main` even when run from a feature-branch worktree, so the next branch you cut doesn't start from a stale base. Diverged local `main` (has commits not on `origin/main`) is left untouched. |
+| `openkanban update` | Self-update from the source clone; `origin/main` check, `ff-only` pull, `go install` with `SourcePath` preserved. Also ff-fast-forwards local `main` toward `origin/main` even when run from a feature-branch worktree, so the next branch you cut doesn't start from a stale base. Diverged local `main` (has commits not on `origin/main`) is left untouched. Refuses with an actionable message when the source clone is on a non-`main` branch, detached HEAD, a linked git worktree, or not a git repo at all — and on a non-`main` branch offers an opt-in "switch to main & update" prompt rather than silently building from the wrong tree. |
 
 See [`cmd/`](cmd/).
 
@@ -140,7 +140,7 @@ cd openkanban
 
 `scripts/install.sh` checks prerequisites, builds and `go install`s the binary into `$GOBIN`, and — if Claude Code is detected — offers to wire session-status hooks into `~/.claude/settings.json`. Idempotent; safe to re-run. (`scripts/install.sh` is fork-only; upstream doesn't ship one.)
 
-Every launch checks `origin/main` for newer commits and prompts before applying: **Enter** to update + relaunch, **Esc** to skip, **Q** to quit. Disable with `--no-update-check` or `behavior.check_for_updates_on_launch: false` in `~/.config/openkanban/config.json`.
+Every launch checks `origin/main` for newer commits and prompts before applying: **Enter** to update + relaunch, **Esc** to skip, **Q** to quit. Disable with `--no-update-check` or `behavior.check_for_updates_on_launch: false` in `~/.config/openkanban/config.json`. The launch-time check also surfaces every status on stderr ("up to date", "ahead", "diverged", refusals) so it's never silent. When the source clone is parked on a non-`main` branch, the prompt instead offers to switch back to `main` first; detached HEAD / linked-worktree / non-git-repo source clones refuse with an actionable message rather than building from the wrong tree.
 
 You can also update on demand: `openkanban update --check` to print status, `openkanban update` to pull + rebuild + reinstall.
 

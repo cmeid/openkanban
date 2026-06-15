@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -391,5 +392,245 @@ func TestShortHeadSHA_NonRepo(t *testing.T) {
 
 	if _, err := shortHeadSHA(ctx, dir); err == nil {
 		t.Fatal("expected error for non-repo path, got nil")
+	}
+}
+
+func TestUpdateCheckForUpdates_FeatureBranch(t *testing.T) {
+	_, local := setupRepos(t)
+	withSourcePath(t, local)
+
+	// Park the local clone on a non-main branch — the precondition
+	// should refuse before any network call.
+	runGit(t, local, "checkout", "-b", "feat/x")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	status, err := CheckForUpdates(ctx)
+	if err != nil {
+		t.Fatalf("CheckForUpdates: %v", err)
+	}
+	if status.Available {
+		t.Fatalf("expected Available=false, got %+v", status)
+	}
+	if !status.OfferBranchSwitch {
+		t.Fatalf("expected OfferBranchSwitch=true, got %+v", status)
+	}
+	if !strings.Contains(status.Reason, "feat/x") {
+		t.Fatalf("expected Reason to mention 'feat/x'; got %q", status.Reason)
+	}
+	if !strings.Contains(status.Reason, "not main") {
+		t.Fatalf("expected Reason to mention 'not main'; got %q", status.Reason)
+	}
+}
+
+func TestUpdateCheckForUpdates_DetachedHEAD(t *testing.T) {
+	_, local := setupRepos(t)
+	withSourcePath(t, local)
+
+	runGit(t, local, "checkout", "--detach", "HEAD")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	status, err := CheckForUpdates(ctx)
+	if err != nil {
+		t.Fatalf("CheckForUpdates: %v", err)
+	}
+	if status.Available {
+		t.Fatalf("expected Available=false, got %+v", status)
+	}
+	if status.OfferBranchSwitch {
+		t.Fatalf("expected OfferBranchSwitch=false, got %+v", status)
+	}
+	if !strings.Contains(status.Reason, "detached HEAD") {
+		t.Fatalf("expected Reason to mention 'detached HEAD'; got %q", status.Reason)
+	}
+}
+
+func TestUpdateCheckForUpdates_LinkedWorktree_FeatureBranch(t *testing.T) {
+	_, local := setupRepos(t)
+
+	// Create a linked worktree sibling to the local clone on a feature
+	// branch. The worktree path is what we point SourcePath at.
+	wtPath := filepath.Join(filepath.Dir(local), "wt")
+	runGit(t, local, "worktree", "add", "-b", "feat/x", wtPath)
+
+	withSourcePath(t, wtPath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	status, err := CheckForUpdates(ctx)
+	if err != nil {
+		t.Fatalf("CheckForUpdates: %v", err)
+	}
+	if status.Available {
+		t.Fatalf("expected Available=false, got %+v", status)
+	}
+	if status.OfferBranchSwitch {
+		t.Fatalf("expected OfferBranchSwitch=false (linked worktree), got %+v", status)
+	}
+	if !strings.Contains(status.Reason, "linked git worktree") {
+		t.Fatalf("expected Reason to mention 'linked git worktree'; got %q", status.Reason)
+	}
+}
+
+func TestUpdateCheckForUpdates_NotARepo(t *testing.T) {
+	dir := t.TempDir() // empty dir, no .git
+	withSourcePath(t, dir)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	status, err := CheckForUpdates(ctx)
+	if err != nil {
+		t.Fatalf("CheckForUpdates: %v", err)
+	}
+	if status.Available {
+		t.Fatalf("expected Available=false, got %+v", status)
+	}
+	if status.OfferBranchSwitch {
+		t.Fatalf("expected OfferBranchSwitch=false, got %+v", status)
+	}
+	if !strings.Contains(status.Reason, "not a git repo") {
+		t.Fatalf("expected Reason to mention 'not a git repo'; got %q", status.Reason)
+	}
+}
+
+func TestCurrentBranch_OnNamed(t *testing.T) {
+	_, local := setupRepos(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	branch, detached, err := currentBranch(ctx, local)
+	if err != nil {
+		t.Fatalf("currentBranch: %v", err)
+	}
+	if detached {
+		t.Fatalf("expected detached=false, got true")
+	}
+	if branch != "main" {
+		t.Fatalf("expected branch=%q, got %q", "main", branch)
+	}
+}
+
+func TestCurrentBranch_Detached(t *testing.T) {
+	_, local := setupRepos(t)
+	runGit(t, local, "checkout", "--detach", "HEAD")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	branch, detached, err := currentBranch(ctx, local)
+	if err != nil {
+		t.Fatalf("currentBranch: %v", err)
+	}
+	if !detached {
+		t.Fatalf("expected detached=true, got false")
+	}
+	if branch != "" {
+		t.Fatalf("expected empty branch on detached HEAD, got %q", branch)
+	}
+}
+
+func TestIsGitRepo_True(t *testing.T) {
+	_, local := setupRepos(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if !isGitRepo(ctx, local) {
+		t.Fatalf("expected isGitRepo(%s)=true", local)
+	}
+}
+
+func TestIsGitRepo_False(t *testing.T) {
+	dir := t.TempDir() // empty, not a git repo
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if isGitRepo(ctx, dir) {
+		t.Fatalf("expected isGitRepo(%s)=false", dir)
+	}
+}
+
+func TestIsLinkedWorktree_True(t *testing.T) {
+	_, local := setupRepos(t)
+	wtPath := filepath.Join(filepath.Dir(local), "wt")
+	runGit(t, local, "worktree", "add", "-b", "feat/x", wtPath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if !isLinkedWorktree(ctx, wtPath) {
+		t.Fatalf("expected isLinkedWorktree(%s)=true", wtPath)
+	}
+}
+
+func TestIsLinkedWorktree_False(t *testing.T) {
+	_, local := setupRepos(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if isLinkedWorktree(ctx, local) {
+		t.Fatalf("expected isLinkedWorktree(%s)=false (original clone)", local)
+	}
+}
+
+func TestApplyBranchSwitch(t *testing.T) {
+	remote, local := setupRepos(t)
+
+	// Remote advances on main while local is parked on a feature branch.
+	makeCommit(t, remote, "new.txt", "new\n", "second commit on remote")
+	runGit(t, local, "checkout", "-b", "feat/x")
+	// Fetch so origin/main is present locally for the pull --ff-only.
+	runGit(t, local, "fetch", "origin")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := applyBranchSwitch(ctx, local, io.Discard); err != nil {
+		t.Fatalf("applyBranchSwitch: %v", err)
+	}
+
+	gotBranch := strings.TrimSpace(runGit(t, local, "symbolic-ref", "--short", "HEAD"))
+	if gotBranch != "main" {
+		t.Fatalf("expected HEAD on main after switch; got %q", gotBranch)
+	}
+	localMain := revParseRef(t, local, "refs/heads/main")
+	remoteMain := revParseRef(t, remote, "refs/heads/main")
+	if localMain != remoteMain {
+		t.Fatalf("expected local main (%s) == remote main (%s) after pull", localMain, remoteMain)
+	}
+}
+
+func TestBranchSwitchAndRecheck(t *testing.T) {
+	remote, local := setupRepos(t)
+	withSourcePath(t, local)
+
+	// Remote moves ahead; local parked on feature branch with origin/main
+	// fetched so the post-switch pull has the commit available.
+	makeCommit(t, remote, "new.txt", "new\n", "second commit on remote")
+	runGit(t, local, "checkout", "-b", "feat/x")
+	runGit(t, local, "fetch", "origin")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	status, err := branchSwitchAndRecheck(ctx, io.Discard)
+	if err != nil {
+		t.Fatalf("branchSwitchAndRecheck: %v", err)
+	}
+	// After switching to main and pulling, local should be up to date.
+	if status.Available {
+		t.Fatalf("expected Available=false (up to date after pull); got %+v", status)
+	}
+	if status.Reason != "up to date" {
+		t.Fatalf("expected Reason=%q; got %q", "up to date", status.Reason)
+	}
+	if status.OfferBranchSwitch {
+		t.Fatalf("expected OfferBranchSwitch=false after switching to main; got true")
 	}
 }

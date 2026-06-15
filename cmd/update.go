@@ -29,6 +29,13 @@ type UpdateStatus struct {
 	// is false: "up to date", "ahead", "diverged", "no source clone",
 	// "remote unreachable", etc.
 	Reason string
+
+	// OfferBranchSwitch indicates the refusal is fixable by `git checkout
+	// main && git pull --ff-only origin main` on the source clone. True
+	// only when the source is on a non-main named branch AND is not a
+	// linked git worktree (which would refuse the checkout). Callers MAY
+	// prompt the user; CheckForUpdates does not switch on its own.
+	OfferBranchSwitch bool
 }
 
 // updateCheckOnly is bound to --check on the update subcommand.
@@ -69,7 +76,27 @@ var updateCmd = &cobra.Command{
 
 		if !status.Available {
 			fmt.Fprintln(cmd.OutOrStdout(), status.Reason)
-			return nil
+			if !status.OfferBranchSwitch || updateCheckOnly {
+				return nil
+			}
+			// Re-derive the branch name for the prompt. Cheap (~10ms);
+			// avoids adding a field to UpdateStatus just for display.
+			branch, _, _ := currentBranch(cmd.Context(), SourcePath)
+			choice, _ := runBranchSwitchPrompt(branch)
+			if choice != promptApply {
+				return nil
+			}
+			newStatus, err := branchSwitchAndRecheck(cmd.Context(), os.Stderr)
+			if err != nil {
+				return fmt.Errorf("switch to main failed: %w\n"+
+					"fix the source clone manually or reinstall via ./scripts/install.sh", err)
+			}
+			status = newStatus
+			if !status.Available {
+				fmt.Fprintln(cmd.OutOrStdout(), status.Reason)
+				return nil
+			}
+			// Fall through into the "update available" path below.
 		}
 
 		fmt.Fprintf(cmd.OutOrStdout(), "update available: %s -> %s\n", status.LocalSHA, status.RemoteSHA)
@@ -196,6 +223,55 @@ func CheckForUpdates(ctx context.Context) (UpdateStatus, error) {
 		return UpdateStatus{Available: false, Reason: "no source clone"}, nil
 	}
 
+	if !isGitRepo(ctx, SourcePath) {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return UpdateStatus{}, ctxErr
+		}
+		return UpdateStatus{
+			Available: false,
+			Reason: fmt.Sprintf(
+				"source clone at %s is not a git repo (or unreadable) — "+
+					"reinstall via ./scripts/install.sh from a fresh clone",
+				SourcePath),
+		}, nil
+	}
+
+	branch, detached, err := currentBranch(ctx, SourcePath)
+	if err != nil {
+		return UpdateStatus{}, err // context-cancel only
+	}
+
+	switch {
+	case detached:
+		return UpdateStatus{
+			Available: false,
+			Reason: fmt.Sprintf(
+				"source clone at %s has detached HEAD — switch back first:\n"+
+					"  git -C %s checkout main && git -C %s pull --ff-only origin main\n"+
+					"then re-run `openkanban update`",
+				SourcePath, SourcePath, SourcePath),
+		}, nil
+
+	case branch != "main":
+		if isLinkedWorktree(ctx, SourcePath) {
+			return UpdateStatus{
+				Available: false,
+				Reason: fmt.Sprintf(
+					"source clone at %s is a linked git worktree on branch %q — "+
+						"switch the main clone to main and reinstall to update",
+					SourcePath, branch),
+			}, nil
+		}
+		return UpdateStatus{
+			Available:         false,
+			OfferBranchSwitch: true,
+			Reason: fmt.Sprintf(
+				"source clone at %s on branch %q, not main — run `openkanban update` to switch, "+
+					"or `git -C %s checkout main && git -C %s pull --ff-only origin main` manually",
+				SourcePath, branch, SourcePath, SourcePath),
+		}, nil
+	}
+
 	remoteSHA, err := remoteMainSHA(ctx, SourcePath)
 	if err != nil {
 		// Context cancellation is a genuine error — propagate. Anything
@@ -294,6 +370,84 @@ func shortHeadSHA(ctx context.Context, sourcePath string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+// isGitRepo reports whether sourcePath is the working tree of a git
+// repo (handles linked worktrees too — `rev-parse --is-inside-work-tree`
+// returns "true" from inside any worktree). Distinguishes "not a repo"
+// from "detached HEAD" before we touch symbolic-ref.
+func isGitRepo(ctx context.Context, sourcePath string) bool {
+	out, err := exec.CommandContext(ctx, "git", "-C", sourcePath, "rev-parse", "--is-inside-work-tree").Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) == "true"
+}
+
+// currentBranch returns the short name of the branch HEAD points to.
+// Returns ("", true, nil) when HEAD is detached. Returns ("", false,
+// err) only on context cancellation. Callers MUST verify the path is a
+// git repo (via isGitRepo) before calling; behavior on a non-repo path
+// would otherwise collapse to "detached" which would mislead the user.
+func currentBranch(ctx context.Context, sourcePath string) (branch string, detached bool, err error) {
+	out, runErr := exec.CommandContext(ctx, "git", "-C", sourcePath, "symbolic-ref", "--short", "HEAD").Output()
+	if runErr != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", false, ctxErr
+		}
+		return "", true, nil
+	}
+	return strings.TrimSpace(string(out)), false, nil
+}
+
+// isLinkedWorktree reports whether sourcePath is a linked git worktree
+// (as opposed to the original clone). True when --git-dir differs from
+// --git-common-dir; false on any error (we already verified isGitRepo,
+// so an error here is unexpected — fall through to offering the switch
+// rather than suppressing it on a transient git glitch).
+func isLinkedWorktree(ctx context.Context, sourcePath string) bool {
+	gitDir, err1 := exec.CommandContext(ctx, "git", "-C", sourcePath, "rev-parse", "--git-dir").Output()
+	commonDir, err2 := exec.CommandContext(ctx, "git", "-C", sourcePath, "rev-parse", "--git-common-dir").Output()
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	return strings.TrimSpace(string(gitDir)) != strings.TrimSpace(string(commonDir))
+}
+
+// applyBranchSwitch checks out main and fast-forwards from origin in
+// the source clone. Streams git progress to out. Caller is responsible
+// for verifying the clone is not a linked worktree (where `git
+// checkout main` would refuse because main is already checked out in
+// the original clone).
+func applyBranchSwitch(ctx context.Context, sourcePath string, out io.Writer) error {
+	fmt.Fprintf(out, "switching %s to main\n", sourcePath)
+	co := exec.CommandContext(ctx, "git", "-C", sourcePath, "checkout", "main")
+	co.Stdout, co.Stderr = os.Stderr, os.Stderr
+	if err := co.Run(); err != nil {
+		return fmt.Errorf("git checkout main: %w", err)
+	}
+	pull := exec.CommandContext(ctx, "git", "-C", sourcePath, "pull", "--ff-only", "origin", "main")
+	pull.Stdout, pull.Stderr = os.Stderr, os.Stderr
+	if err := pull.Run(); err != nil {
+		return fmt.Errorf("git pull: %w", err)
+	}
+	return nil
+}
+
+// branchSwitchAndRecheck runs applyBranchSwitch with a 60s budget and
+// then re-runs CheckForUpdates with a fresh 5s budget. Extracted from
+// the update subcommand's RunE and the launch-time path so the wiring
+// is unit-testable without driving the bubbletea prompt. Callers are
+// responsible for verifying status.OfferBranchSwitch before calling.
+func branchSwitchAndRecheck(ctx context.Context, out io.Writer) (UpdateStatus, error) {
+	switchCtx, cancelSw := context.WithTimeout(ctx, 60*time.Second)
+	defer cancelSw()
+	if err := applyBranchSwitch(switchCtx, SourcePath, out); err != nil {
+		return UpdateStatus{}, err
+	}
+	recheckCtx, cancelRe := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelRe()
+	return CheckForUpdates(recheckCtx)
 }
 
 // isAncestor reports whether `ancestor` is an ancestor of `descendant`
