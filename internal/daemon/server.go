@@ -105,6 +105,16 @@ type clientConn struct {
 	// subscribed-field precedent above.
 	name string
 
+	// exiting marks this client as having called PrepareExit. Read and
+	// written only inside clientsMu. Used by handlePrepareExit's count
+	// so the calling client and any peer that has also called
+	// PrepareExit are excluded from OtherActiveClients — that is what
+	// makes "am I the last one out?" race-free across simultaneous
+	// closes. handleCancelExit clears it when the user backs out of
+	// the exit modal. No reaper needed: unregisterClient removes the
+	// whole row so a disconnected client's flag goes with it.
+	exiting bool
+
 	// writeMu serializes WriteFrame calls so the JSON response,
 	// push, and (PR5) PTY-output frames produced by separate
 	// goroutines don't interleave on the wire.
@@ -575,6 +585,11 @@ func (s *Server) dispatch(c *clientConn, typeName string, raw json.RawMessage) {
 		_ = json.Unmarshal(raw, &req)
 		s.writeResp(c, MsgPrepareExitResp, s.handlePrepareExit(c, req))
 
+	case MsgCancelExitReq:
+		var req CancelExitReq
+		_ = json.Unmarshal(raw, &req)
+		s.writeResp(c, MsgCancelExitResp, s.handleCancelExit(c, req))
+
 	case MsgShutdownReq:
 		var req ShutdownReq
 		_ = json.Unmarshal(raw, &req)
@@ -834,19 +849,41 @@ func (s *Server) handleSubscribe(c *clientConn, req SubscribeReq) SubscribeResp 
 	return SubscribeResp{}
 }
 
+// handlePrepareExit atomically marks the calling client as exiting and
+// reports back how many peer clients are still *active* (i.e. have NOT
+// also called PrepareExit). The TUI uses OtherActiveClients to decide
+// whether to silent-quit (peers remain to keep the daemon alive) or
+// open the exit-confirm modal (we're the last one out and sessions are
+// at stake).
+//
+// The flag-then-count is done under a single clientsMu acquisition so
+// concurrent PrepareExit calls from multiple TUIs are serialized:
+// exactly one caller observes OtherActiveClients == 0, even when they
+// all fire at the same instant. unregisterClient also takes clientsMu,
+// so a peer disconnecting mid-call can't slip a stale entry into the
+// count.
+//
+// ClientCount is preserved for one release as deprecated wire surface.
 func (s *Server) handlePrepareExit(c *clientConn, req PrepareExitReq) PrepareExitResp {
 	s.clientsMu.Lock()
-	count := len(s.clients)
-	// Count TUI clients OTHER than the asking client. Used by the
-	// CLI subcommands (daemon stop / daemon restart) to decide
-	// whether shutting down would orphan a TUI's live sessions.
+	c.exiting = true
+	total := len(s.clients)
+	// One pass over s.clients produces both peer counts: OtherTUIClients
+	// (filter by ClientNameTUI, used by CLI daemon-stop) and
+	// OtherActiveClients (filter by !exiting, used by TUI exit-guard).
+	// They answer different questions and are not interchangeable —
+	// see PrepareExitResp doc.
 	otherTUIs := 0
-	for _, other := range s.clients {
-		if other.id == c.id {
+	otherActive := 0
+	for id, oc := range s.clients {
+		if id == c.id {
 			continue
 		}
-		if other.name == ClientNameTUI {
+		if oc.name == ClientNameTUI {
 			otherTUIs++
+		}
+		if !oc.exiting {
+			otherActive++
 		}
 	}
 	s.clientsMu.Unlock()
@@ -858,7 +895,24 @@ func (s *Server) handlePrepareExit(c *clientConn, req PrepareExitReq) PrepareExi
 	}
 	s.sessionsMu.RUnlock()
 
-	return PrepareExitResp{ClientCount: count, OtherTUIClients: otherTUIs, Sessions: infos}
+	return PrepareExitResp{
+		ClientCount:        total,
+		OtherTUIClients:    otherTUIs,
+		OtherActiveClients: otherActive,
+		Sessions:           infos,
+	}
+}
+
+// handleCancelExit clears the exit-intent flag set by a prior
+// PrepareExit on this connection. The TUI calls this when the user
+// dismisses the exit-confirm modal (Esc/q), so subsequent PrepareExit
+// RPCs from peer TUIs see this client as active again. Idempotent:
+// calling on a connection that never set exiting is a no-op.
+func (s *Server) handleCancelExit(c *clientConn, req CancelExitReq) CancelExitResp {
+	s.clientsMu.Lock()
+	c.exiting = false
+	s.clientsMu.Unlock()
+	return CancelExitResp{}
 }
 
 func (s *Server) handleShutdown(c *clientConn, req ShutdownReq) ShutdownResp {
