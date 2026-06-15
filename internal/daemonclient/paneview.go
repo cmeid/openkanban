@@ -597,7 +597,6 @@ func (p *PaneView) attach(ctx context.Context, takeover bool) error {
 	// they were live PTY output.
 	p.mu.Lock()
 	p.initEmulatorLocked()
-	vt := p.vt
 	p.mu.Unlock()
 
 	remaining := aresp.SnapshotSize
@@ -622,10 +621,16 @@ func (p *PaneView) attach(ctx context.Context, takeover bool) error {
 		if len(payload) == 0 {
 			continue
 		}
-		// vt.Write is safe-locked internally. We don't drive
-		// scrollback during the snapshot apply — the snapshot IS the
-		// current screen, not the history.
-		vt.Write(payload)
+		// The snapshot byte stream is scrollback history (each row
+		// terminated by \r\n) followed by a SerializeRedraw. Drive
+		// local scrollback capture so the history lines land in the
+		// ring as the emulator scrolls them off the top of the grid.
+		// The redraw portion uses CUP positioning rather than \n
+		// scrolling, so it does not push extra rows; and if the
+		// redraw flips alt-screen on, applySnapshotChunk's
+		// altScreenActive tracking keeps subsequent rows out of the
+		// primary-screen scrollback (matches the live-mode contract).
+		p.applySnapshotChunk(payload)
 		remaining -= len(payload)
 		if remaining < 0 {
 			// Tolerate the daemon overshooting (shouldn't happen in
@@ -775,6 +780,74 @@ func (p *PaneView) handleAttachExit(err error, cleanExit bool) {
 		return
 	}
 	p.emitTeaMsg(PaneDetachedMsg{PaneID: p.id})
+}
+
+// applySnapshotChunk feeds one snapshot payload into the local
+// emulator while driving scrollback capture in the same shape as
+// applyOutput. The daemon ships scrollback history as a \r\n-
+// terminated byte stream BEFORE the SerializeRedraw; we split on
+// \r\n so each history row's scroll-off triggers a CaptureTopRow /
+// PushScrolledLine pair and lands in the ring. Once the redraw
+// flips alt-screen on (\x1b[?1049h), subsequent rows do not
+// contribute to scrollback — matching the live-mode contract
+// enforced by CaptureTopRow/PushScrolledLine.
+func (p *PaneView) applySnapshotChunk(data []byte) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.vt == nil {
+		return
+	}
+	for _, segment := range splitAfterCRLF(data) {
+		if hasSeq(segment, altScreenEnableSeqs) {
+			p.altScreenActive = true
+			p.viewportOffset = 0
+		}
+		if hasSeq(segment, altScreenDisableSeqs) {
+			p.altScreenActive = false
+		}
+		if hasSeq(segment, mouseEnableSeqs) {
+			p.mouseEnabled = true
+		}
+		if hasSeq(segment, mouseDisableSeqs) {
+			p.mouseEnabled = false
+		}
+		p.lastTopRow = terminal.CaptureTopRow(p.vt, p.altScreenActive)
+		p.vt.Write(segment)
+		terminal.PushScrolledLine(p.vt, p.altScreenActive, p.lastTopRow, p.scrollback)
+		p.lastTopRow = nil
+	}
+	p.dirty = true
+	p.cachedView = ""
+}
+
+// splitAfterCRLF splits data into segments ending after each "\r\n"
+// boundary (with the trailing remainder if any). Used by
+// applySnapshotChunk so each scrolled-off row triggers its own
+// scrollback push.
+func splitAfterCRLF(data []byte) [][]byte {
+	var out [][]byte
+	for {
+		idx := indexCRLF(data)
+		if idx < 0 {
+			if len(data) > 0 {
+				out = append(out, data)
+			}
+			return out
+		}
+		end := idx + 2
+		out = append(out, data[:end])
+		data = data[end:]
+	}
+}
+
+// indexCRLF returns the index of the first "\r\n" in data, or -1.
+func indexCRLF(data []byte) int {
+	for i := 0; i+1 < len(data); i++ {
+		if data[i] == '\r' && data[i+1] == '\n' {
+			return i
+		}
+	}
+	return -1
 }
 
 // applyOutput feeds bytes into the local emulator and updates the

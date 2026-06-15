@@ -279,6 +279,22 @@ func (p *Pane) ScrollbackLen() int {
 	return p.scrollback.Len()
 }
 
+// SnapshotScrollback returns a copy of the scrollback ring's contents,
+// oldest line first. Returns nil if scrollback is nil or empty. Used by
+// the daemon to ship scrollback history to attaching clients.
+func (p *Pane) SnapshotScrollback() [][]Glyph {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.scrollback == nil {
+		return nil
+	}
+	n := p.scrollback.Len()
+	if n == 0 {
+		return nil
+	}
+	return p.scrollback.GetRange(0, n)
+}
+
 // ViewportOffset returns how many lines the viewport is scrolled back.
 func (p *Pane) ViewportOffset() int {
 	p.mu.Lock()

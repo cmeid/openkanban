@@ -113,6 +113,79 @@ func SerializeRedraw(vt *xvt.SafeEmulator, cursorVisible, mouseEnabled, altScree
 	return []byte(b.String())
 }
 
+// SerializeScrollback produces an ANSI byte stream that, when written
+// to a vt emulator via vt.Write, reproduces the scrollback rows as
+// lines that scroll off the top of the screen. Each row is emitted as
+// SGR-batched glyph runs (matching writeRow's style), followed by
+// "\r\n" + "\x1b[0m" to reset attributes before the next row.
+//
+// Width=0 continuation cells are skipped (wide-char invariant — see
+// internal/terminal/CLAUDE.md).
+//
+// Returns nil if rows is empty.
+func SerializeScrollback(rows [][]terminal.Glyph) []byte {
+	if len(rows) == 0 {
+		return nil
+	}
+
+	var b strings.Builder
+	// Rough sizing: per row ~3 bytes per cell + a few bytes for the
+	// terminator. Reasonable headroom prevents repeated grows.
+	approxCols := 0
+	for _, r := range rows {
+		if len(r) > approxCols {
+			approxCols = len(r)
+		}
+	}
+	b.Grow(len(rows) * (approxCols*3 + 8))
+
+	for _, row := range rows {
+		writeGlyphRow(&b, row)
+		b.WriteString("\r\n")
+		b.WriteString("\x1b[0m")
+	}
+
+	return []byte(b.String())
+}
+
+// writeGlyphRow is the writeRow counterpart for raw []Glyph rows
+// (rather than reading via vt.CellAt). Emits SGR-batched runs and
+// skips Width=0 continuation cells.
+func writeGlyphRow(b *strings.Builder, row []terminal.Glyph) {
+	var currentStyle terminal.Glyph
+	var batch strings.Builder
+	firstCell := true
+
+	flush := func() {
+		if batch.Len() == 0 {
+			return
+		}
+		if sgr := terminal.GlyphANSI(currentStyle); sgr != "" {
+			b.WriteString(sgr)
+		}
+		b.WriteString(batch.String())
+		b.WriteString("\x1b[0m")
+		batch.Reset()
+	}
+
+	for _, g := range row {
+		if g.Width == 0 {
+			continue
+		}
+		ch := g.Char
+		if ch == 0 {
+			ch = ' '
+		}
+		if !firstCell && !sameStyle(g, currentStyle) {
+			flush()
+		}
+		currentStyle = g
+		firstCell = false
+		batch.WriteRune(ch)
+	}
+	flush()
+}
+
 // writeCUP writes a 1-indexed Cursor Position Report (CSI <row>;<col>H).
 // Inlined as a helper to keep the hot loop readable.
 func writeCUP(b *strings.Builder, row, col int) {
