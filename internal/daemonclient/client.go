@@ -204,8 +204,13 @@ func (c *Client) ProtocolVersion() uint16 { return c.protocolVer }
 func (c *Client) BinaryVersion() string { return c.binaryVer }
 
 // ClientCount returns the daemon's last-known live client count (set
-// at Hello and refreshed by PrepareExit). Useful for the TUI exit-guard
-// in PR8b.
+// at Hello and refreshed by PrepareExit).
+//
+// Deprecated: this value includes self and any peer that has also
+// called PrepareExit, so it's unsafe for "am I the last one out?"
+// decisions — multiple TUIs closing simultaneously all see ClientCount
+// > 1 and race. Use the PrepareExit response's OtherActiveClients
+// field instead, which the daemon computes atomically under clientsMu.
 func (c *Client) ClientCount() int {
 	return int(c.clientCountVal.Load())
 }
@@ -503,6 +508,8 @@ func (c *Client) Subscribe(ctx context.Context) (<-chan daemon.SessionEvent, fun
 
 // PrepareExit asks the daemon for the live-client / live-session
 // summary used by the TUI's exit-guard. Also refreshes ClientCount.
+// The daemon atomically marks this connection as exiting; pair with
+// CancelExit when the user dismisses the exit-confirm modal.
 func (c *Client) PrepareExit(ctx context.Context) (daemon.PrepareExitResp, error) {
 	var resp daemon.PrepareExitResp
 	err := c.do(ctx, daemon.MsgPrepareExitReq, daemon.PrepareExitReq{},
@@ -511,6 +518,16 @@ func (c *Client) PrepareExit(ctx context.Context) (daemon.PrepareExitResp, error
 		c.clientCountVal.Store(int64(resp.ClientCount))
 	}
 	return resp, err
+}
+
+// CancelExit clears the exit-intent flag set by a prior PrepareExit on
+// this connection. The TUI calls this when the user dismisses the
+// exit-confirm modal so subsequent PrepareExit RPCs from peer TUIs see
+// this client as active again. Idempotent.
+func (c *Client) CancelExit(ctx context.Context) error {
+	var resp daemon.CancelExitResp
+	return c.do(ctx, daemon.MsgCancelExitReq, daemon.CancelExitReq{},
+		daemon.MsgCancelExitResp, &resp)
 }
 
 // Shutdown asks the daemon to exit. force=false refuses if any sessions
