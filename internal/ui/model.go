@@ -755,7 +755,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 
-	case quitRequestedMsg:
+	case QuitRequestedMsg:
 		return m.handleQuitRequested()
 
 	case prepareExitResultMsg:
