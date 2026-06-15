@@ -50,15 +50,17 @@ var managedHooks = []hookEntry{
 }
 
 var (
-	hooksInstallPath   string
-	hooksInstallDryRun bool
+	hooksInstallPath     string
+	hooksInstallDryRun   bool
+	hooksUninstallPath   string
+	hooksUninstallDryRun bool
 )
 
 var hooksCmd = &cobra.Command{
 	Use:   "hooks",
 	Short: "Manage Claude Code hook integration",
-	Long: `Install or inspect the Claude Code hooks that report session status
-back to openkanban.`,
+	Long: `Install, uninstall, or inspect the Claude Code hooks that report
+session status back to openkanban.`,
 }
 
 var hooksInstallCmd = &cobra.Command{
@@ -162,6 +164,155 @@ func installHooks(dest string, dryRun bool, out io.Writer) error {
 	}
 	fmt.Fprintf(out, "events updated: %s\n", strings.Join(eventNames(managedHooks), ", "))
 	return nil
+}
+
+var hooksUninstallCmd = &cobra.Command{
+	Use:   "uninstall",
+	Short: "Remove openkanban status hooks from Claude Code settings",
+	Long: `Remove the hook entries that ` + "`openkanban hooks install`" + ` previously
+added to ~/.claude/settings.json. Entries are recognized by the
+"openkanban status set " command prefix; foreign hooks on the same
+events are left untouched.
+
+The original settings.json is backed up with a timestamp suffix before
+write. If no openkanban entries are present the file is not modified.
+
+Use --dry-run to preview the post-uninstall settings.json without
+touching disk.`,
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		dest, err := resolveHooksPath(hooksUninstallPath)
+		if err != nil {
+			return err
+		}
+		return uninstallHooks(dest, hooksUninstallDryRun, cmd.OutOrStdout())
+	},
+}
+
+// uninstallHooks reads dest, drops any managed openkanban entries from
+// settings["hooks"], and writes the result atomically (with a
+// timestamped backup of the original). When dryRun is true, it instead
+// prints the would-be settings.json to out and touches nothing on disk.
+//
+// A non-existent file is a no-op success — uninstall is idempotent.
+// A file with no openkanban entries is also a no-op success: the file
+// is left exactly as it was on disk (no rewrite, no backup), so
+// repeated uninstall invocations don't accumulate empty backups.
+func uninstallHooks(dest string, dryRun bool, out io.Writer) error {
+	original, existed, err := readSettings(dest)
+	if err != nil {
+		return err
+	}
+	if !existed {
+		fmt.Fprintf(out, "no settings.json at %s — nothing to uninstall\n", dest)
+		return nil
+	}
+
+	settings, err := parseSettings(original)
+	if err != nil {
+		// Same policy as install: refuse to clobber a file we can't parse.
+		return fmt.Errorf("parse %s: %w", dest, err)
+	}
+
+	removed, err := removeManagedHooks(settings)
+	if err != nil {
+		return err
+	}
+
+	if removed == 0 {
+		fmt.Fprintf(out, "no openkanban hooks found in %s — nothing to remove\n", dest)
+		return nil
+	}
+
+	merged, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal updated settings: %w", err)
+	}
+	merged = append(merged, '\n')
+
+	if dryRun {
+		fmt.Fprintf(out, "# would write %s (removing %d openkanban entr%s)\n",
+			dest, removed, pluralY(removed))
+		_, _ = out.Write(merged)
+		return nil
+	}
+
+	backupPath := dest + ".bak-" + time.Now().Format("20060102150405")
+	if err := os.WriteFile(backupPath, original, 0644); err != nil {
+		return fmt.Errorf("write backup %s: %w", backupPath, err)
+	}
+
+	tmp := dest + ".tmp"
+	if err := os.WriteFile(tmp, merged, 0644); err != nil {
+		return fmt.Errorf("write temp file %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, dest); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("rename %s -> %s: %w", tmp, dest, err)
+	}
+
+	fmt.Fprintf(out, "wrote %s (removed %d openkanban entr%s)\n",
+		dest, removed, pluralY(removed))
+	fmt.Fprintf(out, "backup %s\n", backupPath)
+	return nil
+}
+
+// removeManagedHooks scrubs settings["hooks"] of openkanban entries
+// (identified by the hookCommandPrefix on the inner command), returns
+// the count removed. An event whose array becomes empty after the
+// scrub is dropped, and a hooks map that becomes empty is dropped from
+// settings entirely — uninstall should not leave behind structural
+// stubs that install never created.
+//
+// Foreign hooks on the same events are preserved verbatim.
+func removeManagedHooks(settings map[string]any) (int, error) {
+	hooksRaw, ok := settings["hooks"]
+	if !ok {
+		return 0, nil
+	}
+	hooksMap, ok := hooksRaw.(map[string]any)
+	if !ok {
+		return 0, fmt.Errorf(`"hooks" key is %T; want object`, hooksRaw)
+	}
+
+	removed := 0
+	for event, raw := range hooksMap {
+		slice, ok := raw.([]any)
+		if !ok {
+			// Foreign shape we don't understand — leave it alone.
+			continue
+		}
+		kept := slice[:0]
+		for _, item := range slice {
+			if isOursOrEmpty(item) {
+				removed++
+				continue
+			}
+			kept = append(kept, item)
+		}
+		if len(kept) == 0 {
+			delete(hooksMap, event)
+		} else {
+			hooksMap[event] = kept
+		}
+	}
+
+	if len(hooksMap) == 0 {
+		delete(settings, "hooks")
+	} else {
+		settings["hooks"] = hooksMap
+	}
+	return removed, nil
+}
+
+// pluralY returns "ies" for n != 1, else "y" — for "entry"/"entries"
+// in user-facing log lines.
+func pluralY(n int) string {
+	if n == 1 {
+		return "y"
+	}
+	return "ies"
 }
 
 // readSettings reads dest. A non-existent file is not an error — we
@@ -312,6 +463,12 @@ func init() {
 	hooksInstallCmd.Flags().BoolVar(&hooksInstallDryRun, "dry-run", false,
 		"Print the would-be settings.json instead of writing")
 
+	hooksUninstallCmd.Flags().StringVar(&hooksUninstallPath, "path", "",
+		"Override settings.json path (default ~/.claude/settings.json)")
+	hooksUninstallCmd.Flags().BoolVar(&hooksUninstallDryRun, "dry-run", false,
+		"Print the post-uninstall settings.json instead of writing")
+
 	hooksCmd.AddCommand(hooksInstallCmd)
+	hooksCmd.AddCommand(hooksUninstallCmd)
 	rootCmd.AddCommand(hooksCmd)
 }

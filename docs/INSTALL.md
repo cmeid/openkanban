@@ -128,12 +128,27 @@ from. If you have multiple clones, install from the one you want
 ## Removal
 
 ```bash
-rm "$(command -v openkanban)"            # binary
-rm -rf ~/.config/openkanban              # projects + config
-rm -rf ~/.cache/openkanban-status        # status markers
+openkanban uninstall           # removes binary + Claude Code hooks
+                               # data dirs are listed but NOT removed
 ```
 
-To remove the Claude Code hooks: open `~/.claude/settings.json` in your
-editor and delete the four `hooks` entries whose `command` field starts
-with `openkanban status set`. (There is no `openkanban hooks uninstall`
-subcommand yet.)
+`uninstall` is opinionated: it removes only install artifacts (the
+binary, the Claude Code hook entries, and the legacy
+`~/.local/bin/update-openkanban` script if present) and prints the
+paths of the data directories it leaves intact. Pass `--dry-run` to
+preview, or `-y` to skip the confirmation prompt.
+
+There is purposefully no automated way to remove data — a reinstall
+should find your projects, config, and ticket files exactly where they
+were. To clean up by hand:
+
+```bash
+rm -rf ~/.config/openkanban              # projects + config + ticket briefs
+rm -rf ~/.cache/openkanban               # daemon runtime + tui.log
+rm -rf ~/.cache/openkanban-status        # per-session status files
+```
+
+To remove just the Claude Code hooks (without touching the binary),
+use `openkanban hooks uninstall`. It scrubs the openkanban entries
+from `~/.claude/settings.json` while preserving any foreign hooks on
+the same events.
