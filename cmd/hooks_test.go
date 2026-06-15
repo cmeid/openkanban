@@ -322,6 +322,249 @@ func TestInstallHooks_DryRunNoExistingFile(t *testing.T) {
 	}
 }
 
+func TestUninstallHooks_NoExistingFile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	dest := filepath.Join(home, ".claude", "settings.json")
+	var buf bytes.Buffer
+	if err := uninstallHooks(dest, false, &buf); err != nil {
+		t.Fatalf("uninstall on missing file: %v", err)
+	}
+
+	if _, err := os.Stat(dest); err == nil {
+		t.Errorf("uninstall created settings.json at %s", dest)
+	} else if !os.IsNotExist(err) {
+		t.Errorf("unexpected stat error: %v", err)
+	}
+	if backup := findBackup(t, dest); backup != "" {
+		t.Errorf("backup created despite no input file: %s", backup)
+	}
+	if !strings.Contains(buf.String(), "nothing to uninstall") {
+		t.Errorf("expected reassurance message, got:\n%s", buf.String())
+	}
+}
+
+func TestUninstallHooks_RemovesAllManagedAfterInstall(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	dest := filepath.Join(home, ".claude", "settings.json")
+	var buf bytes.Buffer
+	if err := installHooks(dest, false, &buf); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	buf.Reset()
+
+	if err := uninstallHooks(dest, false, &buf); err != nil {
+		t.Fatalf("uninstall: %v", err)
+	}
+
+	settings := readJSON(t, dest)
+	for _, h := range managedHooks {
+		if cmds := hookCommands(t, settings, h.Event); len(cmds) != 0 {
+			t.Errorf("event %s after uninstall has commands %v; want none", h.Event, cmds)
+		}
+	}
+	if _, present := settings["hooks"]; present {
+		// hooks map should be dropped entirely when nothing else lived there.
+		t.Errorf(`"hooks" key still present after uninstall: %v`, settings["hooks"])
+	}
+}
+
+func TestUninstallHooks_PreservesUserHookOnSameEvent(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	fixture := `{
+  "hooks": {
+    "Stop": [
+      {"hooks": [{"type": "command", "command": "echo done"}]},
+      {"hooks": [{"type": "command", "command": "openkanban status set idle"}]}
+    ]
+  }
+}`
+	dest := writeSettings(t, home, fixture)
+
+	var buf bytes.Buffer
+	if err := uninstallHooks(dest, false, &buf); err != nil {
+		t.Fatalf("uninstall: %v", err)
+	}
+
+	settings := readJSON(t, dest)
+	cmds := hookCommands(t, settings, "Stop")
+	if len(cmds) != 1 || cmds[0] != "echo done" {
+		t.Errorf("Stop commands after uninstall = %v; want [\"echo done\"]", cmds)
+	}
+}
+
+func TestUninstallHooks_PreservesUnrelatedKeys(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	dest := filepath.Join(home, ".claude", "settings.json")
+	var buf bytes.Buffer
+	if err := installHooks(dest, false, &buf); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	// Sprinkle some user-owned keys so we can verify they survive uninstall.
+	settings := readJSON(t, dest)
+	settings["theme"] = "dark"
+	settings["permissions"] = map[string]any{"defaultMode": "auto"}
+	merged, _ := json.MarshalIndent(settings, "", "  ")
+	if err := os.WriteFile(dest, merged, 0644); err != nil {
+		t.Fatalf("rewrite fixture: %v", err)
+	}
+
+	buf.Reset()
+	if err := uninstallHooks(dest, false, &buf); err != nil {
+		t.Fatalf("uninstall: %v", err)
+	}
+
+	after := readJSON(t, dest)
+	if got, _ := after["theme"].(string); got != "dark" {
+		t.Errorf("theme = %q; want %q", got, "dark")
+	}
+	perms, ok := after["permissions"].(map[string]any)
+	if !ok {
+		t.Fatalf("permissions missing or wrong type: %T", after["permissions"])
+	}
+	if got, _ := perms["defaultMode"].(string); got != "auto" {
+		t.Errorf("permissions.defaultMode = %q; want %q", got, "auto")
+	}
+}
+
+func TestUninstallHooks_NoOurEntries_NoOp(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	fixture := `{
+  "theme": "dark",
+  "hooks": {
+    "Stop": [
+      {"hooks": [{"type": "command", "command": "echo done"}]}
+    ]
+  }
+}`
+	dest := writeSettings(t, home, fixture)
+	originalBytes, _ := os.ReadFile(dest)
+
+	var buf bytes.Buffer
+	if err := uninstallHooks(dest, false, &buf); err != nil {
+		t.Fatalf("uninstall: %v", err)
+	}
+
+	after, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("read after uninstall: %v", err)
+	}
+	if !bytes.Equal(after, originalBytes) {
+		t.Errorf("settings.json was rewritten despite no openkanban entries\nbefore:\n%s\nafter:\n%s",
+			originalBytes, after)
+	}
+	if backup := findBackup(t, dest); backup != "" {
+		t.Errorf("backup created on no-op uninstall: %s", backup)
+	}
+	if !strings.Contains(buf.String(), "nothing to remove") {
+		t.Errorf("expected no-op message, got:\n%s", buf.String())
+	}
+}
+
+func TestUninstallHooks_Idempotent(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	dest := filepath.Join(home, ".claude", "settings.json")
+	var buf bytes.Buffer
+	if err := installHooks(dest, false, &buf); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+
+	buf.Reset()
+	if err := uninstallHooks(dest, false, &buf); err != nil {
+		t.Fatalf("first uninstall: %v", err)
+	}
+	first, _ := os.ReadFile(dest)
+
+	buf.Reset()
+	if err := uninstallHooks(dest, false, &buf); err != nil {
+		t.Fatalf("second uninstall: %v", err)
+	}
+	second, _ := os.ReadFile(dest)
+
+	if !bytes.Equal(first, second) {
+		t.Errorf("second uninstall modified disk\nfirst:\n%s\nsecond:\n%s", first, second)
+	}
+}
+
+func TestUninstallHooks_DryRunDoesNotWrite(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	dest := filepath.Join(home, ".claude", "settings.json")
+	var buf bytes.Buffer
+	if err := installHooks(dest, false, &buf); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	originalBytes, _ := os.ReadFile(dest)
+
+	buf.Reset()
+	if err := uninstallHooks(dest, true, &buf); err != nil {
+		t.Fatalf("dry-run: %v", err)
+	}
+
+	after, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("read after dry-run: %v", err)
+	}
+	if !bytes.Equal(after, originalBytes) {
+		t.Errorf("dry-run modified settings.json on disk")
+	}
+	// Only the install backup should exist — no uninstall backup.
+	dir := filepath.Dir(dest)
+	entries, _ := os.ReadDir(dir)
+	bakCount := 0
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "settings.json.bak-") {
+			bakCount++
+		}
+	}
+	if bakCount != 0 {
+		t.Errorf("dry-run created %d backup file(s)", bakCount)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "would write") {
+		t.Errorf("dry-run stdout missing preview header:\n%s", out)
+	}
+	if strings.Contains(out, "openkanban status set") {
+		t.Errorf("dry-run preview should not contain openkanban entries (they're being removed):\n%s", out)
+	}
+}
+
+func TestUninstallHooks_MalformedJSONRefuses(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	fixture := `{ this is not json `
+	dest := writeSettings(t, home, fixture)
+	originalBytes, _ := os.ReadFile(dest)
+
+	var buf bytes.Buffer
+	err := uninstallHooks(dest, false, &buf)
+	if err == nil {
+		t.Fatal("expected error on malformed JSON, got nil")
+	}
+
+	after, readErr := os.ReadFile(dest)
+	if readErr != nil {
+		t.Fatalf("read after refusal: %v", readErr)
+	}
+	if !bytes.Equal(after, originalBytes) {
+		t.Errorf("settings.json was modified despite parse failure")
+	}
+}
+
 // TestManagedHooksCoversPostToolUse pins the expected event coverage so a
 // future edit that drops PostToolUse fails loudly. PostToolUse → working
 // is what brings the file back to "working" after a Notification +
