@@ -128,10 +128,22 @@ func Run(cfg *config.Config, filterPath, version string, autostartDaemon bool) e
 		defer watcher.Close()
 	}
 
+	// Route SIGINT/SIGTERM through the exit-guard so signals don't
+	// silently destroy live agent sessions. program.Send is the
+	// goroutine-safe Bubble Tea entry point; the Update loop picks up
+	// QuitRequestedMsg and dispatches handleQuitRequested, which fires
+	// the PrepareExit RPC and either silent-quits (peers attached or
+	// no live sessions) or opens the exit-confirm modal. The deferred
+	// model.Cleanup() above still runs when program.Run returns, so
+	// no cleanup work is lost.
+	//
+	// User-visible behavior change: Ctrl-C with a live session no
+	// longer instantly exits — the user must answer the modal (kill or
+	// cancel) just like pressing `q`. With NO live sessions the modal
+	// short-circuits to tea.Quit so Ctrl-C still feels instant.
 	go func() {
 		<-sigChan
-		model.Cleanup()
-		program.Quit()
+		program.Send(ui.QuitRequestedMsg{})
 	}()
 
 	_, err = program.Run()
