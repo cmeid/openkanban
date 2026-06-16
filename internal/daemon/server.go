@@ -263,7 +263,11 @@ func (s *Server) Serve(ctx context.Context) error {
 	// Diagnostic: dump every goroutine's stack on SIGUSR1 so we can
 	// inspect the daemon's runtime state without restarting it. The
 	// handler never exits the process — only the existing shutdown
-	// paths can do that.
+	// paths can do that. The handler goroutine itself exits when
+	// shutdown begins, which un-registers the signal and closes the
+	// channel; without this the goroutine would leak under repeated
+	// Serve→shutdown cycles (visible only in tests, since prod runs
+	// one Server for the daemon's lifetime).
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGUSR1)
 	go func() {
@@ -272,6 +276,11 @@ func (s *Server) Serve(ctx context.Context) error {
 			n := runtime.Stack(buf, true)
 			log.Printf("openkanbankd: SIGUSR1 received, goroutine dump:\n%s", buf[:n])
 		}
+	}()
+	go func() {
+		<-s.shutdown
+		signal.Stop(sigChan)
+		close(sigChan)
 	}()
 	log.Printf("openkanbankd: SIGUSR1 goroutine-dump handler ready")
 
