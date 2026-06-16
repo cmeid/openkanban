@@ -237,14 +237,20 @@ func (p *PaneView) State() PaneViewState {
 	return p.state
 }
 
-// SetStateForTest is a test-only setter that bypasses the normal
-// Attach / DetachRPC state machine. Production code MUST NOT call
-// this — the real state machine takes responsibility for the binary
-// stream lifecycle, and skipping it leaves the view in an inconsistent
-// shape (e.g. Attached without a live conn). Used by tests that need
-// to exercise behavior keyed on a specific PaneView state without
-// standing up a daemon.
-func (p *PaneView) SetStateForTest(s PaneViewState) {
+// SetPaneStateForTest forces the view's state field, bypassing the
+// normal Attach / Detach state machine. Used by cross-package tests
+// (notably internal/ui's resync tests) that need to drive a PaneView
+// into a specific state without standing up a real daemon.
+//
+// PRODUCTION CODE MUST NOT CALL THIS. The real state machine takes
+// responsibility for the binary stream lifecycle; skipping it leaves
+// the view in an inconsistent shape (e.g. Attached without a live
+// conn). The "ForTest" suffix is the only enforcement Go offers here
+// — we'd prefer this to live in export_test.go, but that file is only
+// visible to same-package tests and the only caller is in
+// internal/ui, a different package. Linters / reviewers should grep
+// for "ForTest" calls outside of *_test.go files.
+func (p *PaneView) SetPaneStateForTest(s PaneViewState) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.state = s

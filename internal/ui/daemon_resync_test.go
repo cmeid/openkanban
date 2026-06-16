@@ -57,6 +57,13 @@ func (s *listStubAPI) List(_ context.Context) (daemon.ListResp, error) {
 	return daemon.ListResp{Sessions: append([]daemon.SessionInfo(nil), s.responseSessions...)}, nil
 }
 
+// Spawn is a no-op stub pre-added so this fake stays compatible with
+// the sibling fix/client-spawn-discipline PR (which widens
+// daemonGuardAPI with Spawn). Not exercised by the resync tests.
+func (s *listStubAPI) Spawn(_ context.Context, _ daemon.SpawnReq) (daemon.SpawnResp, error) {
+	return daemon.SpawnResp{}, nil
+}
+
 // makeReconcileTestModel builds a minimal Model wired with everything
 // the resync handlers touch: a globalStore (so PaneView creation has
 // a backing ticket), the empty daemonOwned / panes / daemonViewing
@@ -85,8 +92,14 @@ func makeReconcileTestModel(t *testing.T, api daemonGuardAPI, tickets []board.Ti
 	}
 
 	return &Model{
-		globalStore:     globalStore,
-		guardAPI:        api,
+		globalStore: globalStore,
+		guardAPI:    api,
+		// daemonClient is a non-nil zero value so the resync add-pane
+		// path's nil-guard doesn't short-circuit pane materialization.
+		// The PaneView is constructed with this pointer but the tests
+		// never invoke any method that dereferences it (no Attach /
+		// Close / Spawn etc.), so the zero client is safe as a fixture.
+		daemonClient:    &daemonclient.Client{},
 		panes:           map[board.TicketID]*daemonclient.PaneView{},
 		daemonOwned:     map[board.TicketID]struct{}{},
 		daemonViewing:   map[board.TicketID]int{},
@@ -233,6 +246,38 @@ func TestPeriodicResync_NewPaneIsUnattached(t *testing.T) {
 	}
 }
 
+// TestPeriodicResync_NilDaemonClientSkipsPaneBuild covers the
+// degenerate-but-reachable case where the daemon disconnected
+// mid-run (m.daemonClient is now nil) but a periodic resync still
+// fires because m.guardAPI was set from a fake / earlier state. The
+// add-pane path must NOT construct a PaneView with a nil client —
+// daemonOwned bookkeeping is updated instead so the indicator still
+// renders, but no dangling pane is created.
+func TestPeriodicResync_NilDaemonClientSkipsPaneBuild(t *testing.T) {
+	stub := &listStubAPI{}
+	const tid board.TicketID = "T-NIL"
+	m := makeReconcileTestModel(t, stub, []board.TicketID{tid})
+	m.daemonClient = nil // simulate mid-run daemon disconnect
+
+	msg := daemonResyncMsg{
+		sessions: map[board.TicketID]daemon.SessionInfo{
+			tid: {
+				SessionID: "s-nil",
+				TicketID:  string(tid),
+				Running:   true,
+			},
+		},
+	}
+	_, _ = m.handleDaemonResyncMsg(msg)
+
+	if _, ok := m.panes[tid]; ok {
+		t.Errorf("panes[%s] present; expected nil-daemonClient guard to skip pane build", tid)
+	}
+	if _, ok := m.daemonOwned[tid]; !ok {
+		t.Errorf("daemonOwned[%s] missing; bookkeeping must still track ownership even when pane build is skipped", tid)
+	}
+}
+
 // TestPeriodicResync_RemovesGoneDaemonOwnedTicket — model has an
 // Unattached pane; the daemon's session set is now empty. The pane
 // must be removed (external kill while we weren't subscribed).
@@ -281,7 +326,7 @@ func TestPeriodicResync_PreservesAttachedPane(t *testing.T) {
 		TicketID:  string(tid),
 		Running:   true,
 	})
-	pv.SetStateForTest(daemonclient.PaneViewAttached)
+	pv.SetPaneStateForTest(daemonclient.PaneViewAttached)
 	m.panes[tid] = pv
 	m.daemonOwned[tid] = struct{}{}
 

@@ -41,6 +41,15 @@ const startupReconcileTimeout = 10 * time.Second
 // failure-surface to the user with more delay.
 const startupReconcileBackoff = 500 * time.Millisecond
 
+// daemonResyncRPCTimeout is the per-attempt context timeout for the
+// periodic 30s resync List RPC. Deliberately shorter than the
+// startup timeout: at this point the TUI is already running with a
+// reconciled session set, so a slow / stuck daemon should fail fast
+// and the next tick (30s away) re-tries. Sharing the 10s startup
+// budget here meant a wedged daemon could keep the periodic Update
+// goroutine blocked for a third of the tick interval before re-arming.
+const daemonResyncRPCTimeout = 3 * time.Second
+
 // startupReconcileFailureMsg is the toast the user sees when every
 // retry failed. It points at "restart openkanban" because the rest of
 // the TUI is going to behave as if no sessions are owned by the
@@ -89,6 +98,17 @@ func listSessionsWithRetry(api daemonListAPI, attempts int, timeout, backoff tim
 	}
 	var lastErr error
 	for i := 0; i < attempts; i++ {
+		if i == 0 {
+			// Stderr breadcrumb so a slow startup reconcile isn't a
+			// silent freeze. The worst case here is ~30s
+			// (attempts * timeout); without this line the user staring
+			// at the launching TUI has no signal that anything is
+			// happening. A real spinner UI is the right long-term fix
+			// (tracked separately as ui-spinner-for-long-running-
+			// daemon-ops) — this is the minimum the code-review pass
+			// asked for.
+			log.Printf("openkanban: contacting daemon...")
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		resp, err := api.List(ctx)
 		cancel()
@@ -138,7 +158,7 @@ func (m *Model) handleDaemonResyncTick() (tea.Model, tea.Cmd) {
 	}
 	api := m.guardAPI
 	return m, func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), startupReconcileTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), daemonResyncRPCTimeout)
 		defer cancel()
 		resp, err := api.List(ctx)
 		if err != nil {
@@ -201,6 +221,16 @@ func (m *Model) handleDaemonResyncMsg(msg daemonResyncMsg) (tea.Model, tea.Cmd) 
 		// would dangle.
 		ticket, _ := m.globalStore.Get(ticketID)
 		if ticket == nil {
+			m.daemonOwned[ticketID] = struct{}{}
+			continue
+		}
+		// Defensive: m.daemonClient can be nil in degenerate states
+		// (daemon disconnected mid-run, guardAPI satisfied by a fake
+		// in tests) even though m.guardAPI is non-nil. NewPaneView with
+		// a nil client builds a pane whose Attach path will dereference
+		// nil — leave the daemonOwned bookkeeping so the indicator
+		// still renders, but skip constructing a dangling pane.
+		if m.daemonClient == nil {
 			m.daemonOwned[ticketID] = struct{}{}
 			continue
 		}
