@@ -274,6 +274,16 @@ type Model struct {
 	focusedPane    board.TicketID
 	statusDetector *agent.StatusDetector
 
+	// cycleAttachPrompt is set when the user has used Ctrl+] / Ctrl+\
+	// to cycle focus to a peer session that this TUI is not yet
+	// attached to. View() renders an "Enter to attach" modal over the
+	// agent view; handleAgentViewMode swallows all keys until the user
+	// confirms (Enter), cancels (Esc → board), or cycles further. The
+	// modal exists specifically to absorb the user's "I want to switch
+	// to this session" keystroke so it doesn't get eaten by the
+	// AttachFirstMsg handshake the first time they type into the pane.
+	cycleAttachPrompt bool
+
 	// daemonClient is the long-lived control connection to openkanbankd.
 	// nil when the daemon couldn't be reached at startup — every call
 	// site MUST nil-check before use (the TUI degrades to a no-spawn
@@ -1709,11 +1719,31 @@ func (m *Model) cleanupAsync() tea.Cmd {
 }
 
 func (m *Model) handleAgentViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// The cycle-attach modal swallows all keys until the user resolves
+	// it (Enter attaches, Esc returns to the board, Ctrl+\ / Ctrl+]
+	// continue cycling). Handled before any pane dispatch so the PTY
+	// never sees these keys.
+	if m.cycleAttachPrompt {
+		return m.handleCycleAttachPromptKey(msg)
+	}
+
 	pane, ok := m.panes[m.focusedPane]
 	if !ok {
 		m.mode = ModeNormal
 		m.focusedPane = ""
 		return m, m.maybeSetWindowTitle()
+	}
+
+	// Session-cycle bindings are intercepted before the pane forwards
+	// keystrokes to the PTY child — otherwise claude/whatever-agent
+	// would consume them. Ctrl+\ and Ctrl+] are the closest survivable
+	// pair to the original Ctrl+[/Ctrl+] request (Ctrl+[ is bytewise
+	// indistinguishable from Esc in this bubbletea build).
+	switch msg.String() {
+	case "ctrl+]":
+		return m.cycleUnattachedSession(1)
+	case "ctrl+\\":
+		return m.cycleUnattachedSession(-1)
 	}
 
 	if result := pane.HandleKey(msg); result != nil {
@@ -1733,6 +1763,37 @@ func (m *Model) handleAgentViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, m.maybeSetWindowTitle()
+}
+
+// handleCycleAttachPromptKey resolves the modal opened by
+// cycleUnattachedSession. Enter attaches to the currently focused
+// pane and clears the modal; Esc cancels and returns to the board;
+// Ctrl+\ / Ctrl+] keep cycling; every other key is swallowed so the
+// modal can't be bypassed by a stray keystroke landing in the PTY.
+func (m *Model) handleCycleAttachPromptKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		pv, ok := m.panes[m.focusedPane]
+		if !ok || pv == nil {
+			m.cycleAttachPrompt = false
+			m.mode = ModeNormal
+			m.focusedPane = ""
+			return m, m.maybeSetWindowTitle()
+		}
+		m.cycleAttachPrompt = false
+		cmd := m.attachExisting(m.focusedPane, pv)
+		return m, tea.Batch(cmd, m.maybeSetWindowTitle())
+	case "esc":
+		m.cycleAttachPrompt = false
+		m.mode = ModeNormal
+		m.focusedPane = ""
+		return m, m.maybeSetWindowTitle()
+	case "ctrl+]":
+		return m.cycleUnattachedSession(1)
+	case "ctrl+\\":
+		return m.cycleUnattachedSession(-1)
+	}
+	return m, nil
 }
 
 func (m *Model) handleAgentViewMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
@@ -3354,6 +3415,70 @@ func (m *Model) adjustPriority(delta int) (tea.Model, tea.Cmd) {
 		m.notify(fmt.Sprintf("Priority lowered to %d", next))
 	}
 	return m, nil
+}
+
+// cycleUnattachedSession moves the agent-view focus to the next
+// (delta=+1) or previous (delta=-1) open session that this TUI is not
+// currently attached to. Ordering is board order — the same order the
+// user sees in columnTickets, so the cycle is predictable from the
+// board layout. The currently-attached pane is excluded by definition
+// (its State() is PaneViewAttached, not PaneViewUnattached); cycling
+// from the modal landing state continues to advance through unattached
+// peers and never returns to the original attached one. The user
+// presses Esc to exit back to the board, from which the original pane
+// is still attached and reachable via the normal flow.
+//
+// Sets cycleAttachPrompt so View renders the "press Enter to attach"
+// modal — this absorbs the user's switch-to-session keystroke so it
+// doesn't get eaten by the AttachFirstMsg handshake.
+func (m *Model) cycleUnattachedSession(delta int) (tea.Model, tea.Cmd) {
+	if delta != 1 && delta != -1 {
+		return m, nil
+	}
+
+	var candidates []board.TicketID
+	for _, col := range m.columnTickets {
+		for _, t := range col {
+			pv, ok := m.panes[t.ID]
+			if !ok || pv == nil {
+				continue
+			}
+			if pv.State() != daemonclient.PaneViewUnattached {
+				continue
+			}
+			candidates = append(candidates, t.ID)
+		}
+	}
+
+	if len(candidates) == 0 {
+		m.notify("No other open sessions")
+		return m, nil
+	}
+
+	cur := -1
+	for i, id := range candidates {
+		if id == m.focusedPane {
+			cur = i
+			break
+		}
+	}
+	var next board.TicketID
+	if cur == -1 {
+		if delta > 0 {
+			next = candidates[0]
+		} else {
+			next = candidates[len(candidates)-1]
+		}
+	} else {
+		next = candidates[(cur+delta+len(candidates))%len(candidates)]
+	}
+
+	m.focusedPane = next
+	if pv, ok := m.panes[next]; ok && pv != nil {
+		pv.SetSize(m.width, m.height-2)
+	}
+	m.cycleAttachPrompt = true
+	return m, m.maybeSetWindowTitle()
 }
 
 // cycleSortMode advances to the next sort mode and re-renders the board.
