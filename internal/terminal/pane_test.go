@@ -8,6 +8,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 	xvt "github.com/charmbracelet/x/vt"
 )
 
@@ -348,6 +349,91 @@ func TestTranslateKey(t *testing.T) {
 				t.Errorf("translateKey(%v) = %q, want %q", tt.msg, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestTranslateKey_DECCKM exercises the application-cursor-keys branch
+// of translateKey. When DECCKM is set (cursorAppMode true), arrow keys
+// must encode as SS3 (ESC O A/B/C/D); when reset, they use CSI. This is
+// what charm/x/vt's SendKey does internally and what iTerm2 emits —
+// without it, Claude Code's input handler can't tell openkanban's
+// arrows from generic cursor-up-in-text, which scrolls/mutates the
+// chat view instead of navigating prompt history.
+func TestTranslateKey_DECCKM(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  tea.KeyMsg
+		on   []byte
+		off  []byte
+	}{
+		{name: "Up", msg: tea.KeyMsg{Type: tea.KeyUp}, on: []byte("\x1bOA"), off: []byte("\x1b[A")},
+		{name: "Down", msg: tea.KeyMsg{Type: tea.KeyDown}, on: []byte("\x1bOB"), off: []byte("\x1b[B")},
+		{name: "Right", msg: tea.KeyMsg{Type: tea.KeyRight}, on: []byte("\x1bOC"), off: []byte("\x1b[C")},
+		{name: "Left", msg: tea.KeyMsg{Type: tea.KeyLeft}, on: []byte("\x1bOD"), off: []byte("\x1b[D")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name+"/off", func(t *testing.T) {
+			p := &Pane{}
+			got := p.translateKey(tt.msg)
+			if !bytes.Equal(got, tt.off) {
+				t.Errorf("DECCKM off: translateKey(%v) = %q, want %q", tt.msg, got, tt.off)
+			}
+		})
+		t.Run(tt.name+"/on", func(t *testing.T) {
+			p := &Pane{}
+			p.cursorAppMode.Store(true)
+			got := p.translateKey(tt.msg)
+			if !bytes.Equal(got, tt.on) {
+				t.Errorf("DECCKM on: translateKey(%v) = %q, want %q", tt.msg, got, tt.on)
+			}
+		})
+	}
+}
+
+// TestPaneCursorAppModeCallback wires the EnableMode/DisableMode
+// callbacks against a real emulator and feeds the DECCKM enable/reset
+// byte sequences. Pins the integration that translateKey's branch
+// relies on: the callback fires synchronously inside vt.Write, the
+// atomic flips, and a subsequent key translation sees the new value.
+// No PTY needed.
+func TestPaneCursorAppModeCallback(t *testing.T) {
+	p := New("test", 80, 24, 1000)
+	p.vt = xvt.NewSafeEmulator(80, 24)
+	p.vt.SetCallbacks(xvt.Callbacks{
+		EnableMode: func(mode ansi.Mode) {
+			if mode == ansi.ModeCursorKeys {
+				p.cursorAppMode.Store(true)
+			}
+		},
+		DisableMode: func(mode ansi.Mode) {
+			if mode == ansi.ModeCursorKeys {
+				p.cursorAppMode.Store(false)
+			}
+		},
+	})
+
+	if p.cursorAppMode.Load() {
+		t.Fatalf("cursorAppMode before any DECCKM byte = true, want false")
+	}
+	if got := p.translateKey(tea.KeyMsg{Type: tea.KeyUp}); !bytes.Equal(got, []byte("\x1b[A")) {
+		t.Fatalf("baseline Up encoding = %q, want %q", got, "\x1b[A")
+	}
+
+	p.vt.Write([]byte("\x1b[?1h"))
+	if !p.cursorAppMode.Load() {
+		t.Fatalf("after ESC[?1h, cursorAppMode = false, want true")
+	}
+	if got := p.translateKey(tea.KeyMsg{Type: tea.KeyUp}); !bytes.Equal(got, []byte("\x1bOA")) {
+		t.Errorf("DECCKM-on Up encoding = %q, want %q", got, "\x1bOA")
+	}
+
+	p.vt.Write([]byte("\x1b[?1l"))
+	if p.cursorAppMode.Load() {
+		t.Fatalf("after ESC[?1l, cursorAppMode = true, want false")
+	}
+	if got := p.translateKey(tea.KeyMsg{Type: tea.KeyUp}); !bytes.Equal(got, []byte("\x1b[A")) {
+		t.Errorf("post-reset Up encoding = %q, want %q", got, "\x1b[A")
 	}
 }
 

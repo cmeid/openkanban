@@ -89,6 +89,8 @@ These flags drive openkanban's own mouse-forwarding and selection behavior. char
 
 charm/x/vt does not expose a public `CursorVisible()` getter (the `Cursor` struct with `Hidden bool` lives on the private `Screen`). We track DECTCEM state via `Callbacks.CursorVisibility` into an `atomic.Bool` on the Pane (`cursorHidden`), which the renderer reads lock-free.
 
+The same pattern is used for **DECCKM** (application cursor keys, `\x1b[?1h` / `\x1b[?1l`): `Callbacks.EnableMode` / `DisableMode` fire when modes flip and store into `Pane.cursorAppMode atomic.Bool`. `translateKey` reads the flag and emits `\x1bOA/B/C/D` (SS3) instead of `\x1b[A/B/C/D` (CSI) when set — matching iTerm2/xterm/charm-vt's own `SendKey`. Same convention applies to any future DEC mode mirror: vt has no generic `IsModeSet` getter, so use `Callbacks.EnableMode/DisableMode` + atomic. The reentrancy rule below applies — these callbacks fire synchronously inside `vt.Write`, must not take `p.mu`.
+
 ## OSC Handlers — Reentrancy Convention
 
 `charm/x/vt` dispatches OSC handlers registered via `RegisterOscHandler(cmd, fn)` **synchronously inside `vt.Write(bytes)`**. The handler runs on the same goroutine that called `vt.Write` — which, in this package, is `handleOutput` while it holds `p.mu`.

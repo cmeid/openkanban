@@ -16,6 +16,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 	xvt "github.com/charmbracelet/x/vt"
 
 	"github.com/techdufus/openkanban/internal/daemon"
@@ -139,6 +140,13 @@ type PaneView struct {
 	cachedView      string
 	dirty           bool
 	cursorHidden    atomic.Bool
+	// cursorAppMode tracks DECCKM (application cursor keys mode). When
+	// the inner agent enables it via ESC[?1h, arrow keys must be encoded
+	// as SS3 (ESC O A/B/C/D) instead of CSI (ESC [ A/B/C/D). The flag is
+	// written from the EnableMode/DisableMode callbacks below, which fire
+	// SYNCHRONOUSLY inside vt.Write — must stay lock-free re: p.mu, hence
+	// the atomic.
+	cursorAppMode   atomic.Bool
 	mouseEnabled    bool
 	altScreenActive bool
 	// lastTopRow is the row-0 snapshot taken inside applyOutput just
@@ -440,8 +448,19 @@ func (p *PaneView) initEmulatorLocked() {
 		CursorVisibility: func(visible bool) {
 			p.cursorHidden.Store(!visible)
 		},
+		EnableMode: func(mode ansi.Mode) {
+			if mode == ansi.ModeCursorKeys {
+				p.cursorAppMode.Store(true)
+			}
+		},
+		DisableMode: func(mode ansi.Mode) {
+			if mode == ansi.ModeCursorKeys {
+				p.cursorAppMode.Store(false)
+			}
+		},
 	})
 	p.cursorHidden.Store(false)
+	p.cursorAppMode.Store(false)
 	p.scrollback = terminal.NewScrollbackBuffer(10000)
 	p.selection = terminal.NewSelectionState()
 	titleHandler := func(data []byte) bool {
@@ -1083,7 +1102,7 @@ func (p *PaneView) HandleKey(msg tea.KeyMsg) tea.Msg {
 	if conn == nil {
 		return nil
 	}
-	input := translateKey(msg)
+	input := p.translateKey(msg)
 	if len(input) == 0 {
 		return nil
 	}
@@ -1507,7 +1526,16 @@ func (p *PaneView) Refresh(info daemon.SessionInfo) {
 // translateKey converts a BubbleTea KeyMsg into PTY byte input.
 // Duplicated from terminal.translateKey (which is unexported) so the
 // client doesn't drag the Pane lock just to translate.
-func translateKey(msg tea.KeyMsg) []byte {
+//
+// Cursor/arrow keys honor DECCKM (application cursor keys mode): when
+// the inner emulator has it set (CC and most modern TUIs enable it via
+// ESC[?1h), we emit SS3 sequences (ESC O A/B/C/D) instead of CSI
+// (ESC [ A/B/C/D). This matches how iTerm2 / xterm / charm/x/vt's own
+// SendKey behave; without it, arrows fall into whatever default the
+// inner app applies to a "normal-mode" arrow keystroke, which in
+// Claude Code can mutate the visible chat content rather than navigate
+// input history.
+func (p *PaneView) translateKey(msg tea.KeyMsg) []byte {
 	key := msg.String()
 
 	switch {
@@ -1516,6 +1544,8 @@ func translateKey(msg tea.KeyMsg) []byte {
 	case len(key) == 5 && key[:4] == "alt+" && key[4] >= 'a' && key[4] <= 'z':
 		return []byte{27, key[4]}
 	}
+
+	appCursor := p.cursorAppMode.Load()
 
 	switch msg.Type {
 	case tea.KeyEnter:
@@ -1535,12 +1565,24 @@ func translateKey(msg tea.KeyMsg) []byte {
 	case tea.KeyShiftTab:
 		return []byte("\x1b[Z")
 	case tea.KeyUp:
+		if appCursor {
+			return []byte("\x1bOA")
+		}
 		return []byte("\x1b[A")
 	case tea.KeyDown:
+		if appCursor {
+			return []byte("\x1bOB")
+		}
 		return []byte("\x1b[B")
 	case tea.KeyRight:
+		if appCursor {
+			return []byte("\x1bOC")
+		}
 		return []byte("\x1b[C")
 	case tea.KeyLeft:
+		if appCursor {
+			return []byte("\x1bOD")
+		}
 		return []byte("\x1b[D")
 	case tea.KeyEscape:
 		return []byte{27}
