@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/techdufus/openkanban/internal/agent"
 	"github.com/techdufus/openkanban/internal/board"
 	"github.com/techdufus/openkanban/internal/config"
 )
@@ -272,13 +273,25 @@ func (s *TicketStore) Delete(id board.TicketID) error {
 	return nil
 }
 
-func (s *TicketStore) Move(id board.TicketID, newStatus board.TicketStatus) error {
+// Move flips a ticket to newStatus. When the transition crosses into
+// in_review or done, any new claude-code approvals collected in the
+// ticket's worktree are promoted into the source repo's
+// .claude/settings.local.json so they persist across future tickets.
+// Returns the slice of promoted approval entries (empty when nothing
+// new went global, nil on error or non-promoting transition).
+func (s *TicketStore) Move(id board.TicketID, newStatus board.TicketStatus) ([]string, error) {
 	t, ok := s.Tickets[id]
 	if !ok {
-		return board.ErrTicketNotFound
+		return nil, board.ErrTicketNotFound
 	}
+	oldStatus := t.Status
 	t.SetStatus(newStatus)
-	return nil
+	added, err := agent.PromoteClaudeSettingsOnTransition(t.WorktreePath, s.repoPath, oldStatus, newStatus)
+	if err != nil {
+		log.Printf("openkanban: promote claude settings (%s → %s): %v", oldStatus, newStatus, err)
+		return nil, nil
+	}
+	return added, nil
 }
 
 func (s *TicketStore) GetByStatus(status board.TicketStatus) []*board.Ticket {
@@ -396,17 +409,17 @@ func (g *GlobalTicketStore) Delete(id board.TicketID) error {
 	return nil
 }
 
-func (g *GlobalTicketStore) Move(id board.TicketID, newStatus board.TicketStatus) error {
+func (g *GlobalTicketStore) Move(id board.TicketID, newStatus board.TicketStatus) ([]string, error) {
 	ticket, ok := g.allTickets[id]
 	if !ok {
-		return board.ErrTicketNotFound
+		return nil, board.ErrTicketNotFound
 	}
 
 	store := g.ticketStores[ticket.ProjectID]
-	if store != nil {
-		store.Move(id, newStatus)
+	if store == nil {
+		return nil, nil
 	}
-	return nil
+	return store.Move(id, newStatus)
 }
 
 // MoveProject reassigns a ticket from its current project to a new

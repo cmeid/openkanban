@@ -707,6 +707,41 @@ and the live PTY keeps running. Use it when a session needs to flag
 itself as actively working (e.g. an agent resuming from a paused
 state and wanting the board to reflect that).
 
+## Claude approval persistence across tickets
+
+Each new openkanban ticket gets a clean worktree, and the new-session policy in `prepareSpawnWith` forces `--permission-mode plan` (so the user reviews the proposed approach before any tree mutation). The combination produced significant repeat-approval friction: a user who clicked **"Yes, and don't ask again"** for `Bash(go test *)` in one ticket would be re-prompted in the next, because Claude Code persists approvals to `./.claude/settings.local.json` — a path that, inside a worktree, dies with the worktree.
+
+The fork wires Claude's local-settings file into the ticket lifecycle so approvals persist per-source-repo without giving up the per-ticket trust isolation:
+
+### Seed on worktree create
+
+After every successful `CreateWorktree` (`setupWorktree` for in-progress-on-demand, the closure inside `prepareSpawnWith` for spawn-time creation), the UI calls `agent.SeedClaudeSettings(worktreePath, proj.RepoPath)`. The helper merges `<repo>/.claude/settings.local.json` into `<worktree>/.claude/settings.local.json` — source-repo entries land in the worktree, worktree-local entries are preserved. The ticket's first Claude session opens with every approval the user has ever promoted for that source repo already in place.
+
+A defensive `<repo>/.claude/.gitignore` (containing `settings.local.json`) is created when the repo's existing ignore stack — root `.gitignore`, nested ignores, global excludesFile — doesn't already cover `.claude/`. The local settings file holds user-specific approvals and must never be committed; the inner gitignore is a belt-and-suspenders guarantee.
+
+### Promote on `→ in_review` / `→ done`
+
+`project.TicketStore.Move` is the single funnel for UI-driven status transitions (drag-drop, `space` quick-move, `backspace` quick-move-back). After delegating to `SetStatus`, it calls `agent.PromoteClaudeSettingsOnTransition(t.WorktreePath, s.repoPath, oldStatus, newStatus)`. The transition gate fires only when `newStatus ∈ {in_review, done}` and `oldStatus != newStatus` — moves into `in_progress` or `backlog` are explicit no-ops. The CLI path `wrapUpSessionTicketAt` (used by `openkanban ticket in-review` and `ticket done`) routes through `store.Move` rather than `ticket.SetStatus` directly so the same promotion fires for in-session self-completion.
+
+The newly-promoted entries surface as a UI status-bar toast — `Moved to in_review · promoted 2 approvals to repo defaults` — so silent trust escalation isn't possible. The CLI prints the equivalent line to stderr (`openkanban: promoted N claude approval(s) to repo defaults`).
+
+### Trust boundary
+
+Approvals collected in a ticket only escape its worktree if the user **consciously advances the ticket to in_review or done**. Tickets abandoned, archived, or deleted from the backlog never promote — exploratory `Bash(curl ...)` approvals granted during an ill-fated investigation stay confined to the throwaway worktree. The human-mediated review gate is the trust boundary, not the act of approving.
+
+### Merge semantics
+
+`agent.mergeSettingsLocal` is a pure additive merge over the `permissions.{allow,ask,deny}` arrays. No deletes, no reorders, no duplicates. Every other top-level key in the destination file is untouched, and unknown keys in the source are ignored. This means future Claude Code settings keys round-trip safely as long as they don't share the `permissions` name. All three helpers (`Seed`, `Promote`, `PromoteOnTransition`) are idempotent: running them twice in a row is a no-op on the second call.
+
+### What is not changing
+
+- `--permission-mode plan` stays forced for new sessions — design intent is unchanged.
+- User-level `~/.claude/settings.json` and the openkanban-installed hook entries are not touched.
+- Committed `<repo>/.claude/settings.json` is not touched.
+- Errors at any layer are non-fatal: a settings-write failure logs and degrades to today's per-worktree allowlist behavior, it never blocks a spawn or a status transition.
+
+See `internal/agent/claude_settings.go` (helpers + 28 subtests covering merge, seed, promote, transition-gate, round-trip).
+
 ## Adding New Agents
 
 ### 1. Add Configuration

@@ -120,6 +120,20 @@ The bundle is assembled by `dist/macos/build-bundle.sh` and installed alongside 
 
 See [`internal/notify/`](internal/notify/), [`internal/terminal/pane.go`](internal/terminal/pane.go), and [`dist/macos/`](dist/macos/).
 
+### 8. Claude Code approvals persist across tickets
+
+Upstream spawns each ticket's agent in a fresh worktree with an empty `.claude/settings.local.json`. Tools the user has approved in previous tickets ("Yes, and don't ask again") don't carry over — every new ticket re-prompts for `Bash(go test *)`, `Skill(...)`, the same handful of repeats. The fork's new-session policy forces `--permission-mode plan`, which makes the re-approval friction worse, not better.
+
+This fork wires Claude's local-settings file into a per-source-repo lifecycle:
+
+- **On worktree create**, openkanban merges entries from `<repo>/.claude/settings.local.json` into the new `<worktree>/.claude/settings.local.json`. The ticket starts pre-approved for everything you've ever promoted in this repo.
+- **On `→ in_review` / `→ done` transition**, openkanban does the reverse merge: any approvals the ticket's agent collected get promoted into the source repo's file so the next ticket inherits them. Abandoned or archived tickets that never reach in-review/done don't pollute the per-repo defaults — the trust gate is human-mediated.
+- Merges are additive and idempotent; `permissions.{allow,ask,deny}` are all covered. A defensive `<repo>/.claude/.gitignore` is auto-written when the repo's existing ignore stack doesn't already cover `.claude/`, so the file can never be committed.
+
+A status-bar toast surfaces how many approvals just went global (`Moved to in_review · promoted 2 approvals to repo defaults`) so silent trust escalation isn't possible.
+
+See [`internal/agent/claude_settings.go`](internal/agent/claude_settings.go) and wiring in [`internal/ui/model.go`](internal/ui/model.go), [`internal/project/tickets.go`](internal/project/tickets.go), [`cmd/ticket_done.go`](cmd/ticket_done.go).
+
 ## Bugs fixed in upstream
 
 Seven correctness bugs that exist on `TechDufus/main` today are fixed in this fork. Each is verified against the upstream tree.
