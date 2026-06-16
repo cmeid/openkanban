@@ -783,13 +783,63 @@ func (s *Server) handleHello(c *clientConn, req HelloReq) HelloResp {
 	}
 }
 
+// handleSpawn is idempotent per TicketID. The invariant the daemon
+// enforces is 1:1 ticket↔session: a second Spawn for a ticket whose
+// session is already live returns the existing SessionID instead of
+// constructing a new one. This is the only place the dedup is enforced
+// — every client-side spawn discipline gap (panicked TUI, racing CLI
+// `ticket continue`, etc.) collapses here.
+//
+// Empty TicketID skips the dedup and constructs unconditionally — the
+// 1:1 invariant only makes sense per-ticket, and anonymous spawns
+// (currently only theoretical, but the wire shape allows them) keep
+// their original semantics.
+//
+// The check happens in two phases to close the construct-outside-lock
+// race window: an RLock fast path that avoids NewSession when a match
+// already exists, and a WLock re-check that catches the case where two
+// concurrent spawns both saw an empty slot under RLock and raced into
+// NewSession. The loser of the WLock re-check kills its just-spawned
+// session and returns the winner's SessionID — the agent process the
+// loser forked is the only collateral, and it's terminated before
+// handleSpawn returns.
 func (s *Server) handleSpawn(c *clientConn, req SpawnReq) (SpawnResp, error) {
+	// Fast path: if a session for this TicketID already exists, return
+	// it without constructing a new one. Empty TicketID skips this
+	// check (preserves current behavior for any caller that legitimately
+	// spawns anonymously).
+	if req.TicketID != "" {
+		s.sessionsMu.RLock()
+		existing := s.findSessionForTicketLocked(req.TicketID)
+		s.sessionsMu.RUnlock()
+		if existing != nil {
+			log.Printf("openkanbankd: client %d spawn idempotent hit ticket=%s reused session=%s pid=%d",
+				c.id, req.TicketID, existing.ID(), existing.pane.PID())
+			return SpawnResp{SessionID: existing.ID(), PID: existing.pane.PID()}, nil
+		}
+	}
+
 	sess, err := NewSession(req)
 	if err != nil {
 		return SpawnResp{}, err
 	}
 
+	// Re-check under WLock to close the construct-outside-lock race
+	// window: two concurrent spawns may both have seen no existing
+	// session under RLock and both called NewSession. Exactly one wins
+	// the WLock; the other discards its just-built session.
 	s.sessionsMu.Lock()
+	if req.TicketID != "" {
+		if winner := s.findSessionForTicketLocked(req.TicketID); winner != nil {
+			s.sessionsMu.Unlock()
+			log.Printf("openkanbankd: client %d spawn lost race ticket=%s discarding new session in favor of %s",
+				c.id, req.TicketID, winner.ID())
+			if killErr := sess.Kill(0); killErr != nil {
+				log.Printf("openkanbankd: cleanup of race-loser session %s: %v", sess.ID(), killErr)
+			}
+			return SpawnResp{SessionID: winner.ID(), PID: winner.pane.PID()}, nil
+		}
+	}
 	s.sessions[sess.ID()] = sess
 	s.sessionsMu.Unlock()
 
@@ -804,6 +854,23 @@ func (s *Server) handleSpawn(c *clientConn, req SpawnReq) (SpawnResp, error) {
 	s.emitEvent(SessionEvent{Event: "started", SessionID: sess.ID(), TicketID: sess.TicketID(), Status: "working", LastActivityAt: sess.LastActivity()})
 
 	return SpawnResp{SessionID: sess.ID(), PID: sess.pane.PID()}, nil
+}
+
+// findSessionForTicketLocked returns the (sole) session whose TicketID
+// matches, or nil if none. Caller must hold sessionsMu (R or W). After
+// handleSpawn enforces uniqueness on insert, at most one match exists
+// — but handleTicketDone defensively iterates the full map for any
+// duplicates inherited from older daemons that lacked this check.
+func (s *Server) findSessionForTicketLocked(ticketID string) *Session {
+	if ticketID == "" {
+		return nil
+	}
+	for _, sess := range s.sessions {
+		if sess.TicketID() == ticketID {
+			return sess
+		}
+	}
+	return nil
 }
 
 // watchSessionExit subscribes to sess.pane's event stream and emits an
@@ -948,54 +1015,66 @@ func (s *Server) handleKill(c *clientConn, req KillReq) (KillResp, error) {
 // done` and `openkanban ticket in-review` — both CLIs send the same
 // TicketDoneReq because the daemon-side motion is identical (terminate
 // the live PTY as an expected wrap-up; the CLI is responsible for the
-// status the ticket lands in). It scans the live sessions for one
-// bound to req.TicketID; if found, it flips that session's
+// status the ticket lands in). It scans the live sessions for any
+// bound to req.TicketID; for each, it flips that session's
 // expected-completion flag, removes it from the registry, and kicks
 // off the kill in a goroutine. The resulting "exited" SessionEvent
 // (emitted by watchSessionExit when the pane publishes ExitEvent)
 // carries Expected=true / Reason="ticket_done" so subscribers preserve
 // AgentCompleted instead of resetting to AgentNone.
 //
-// Returns synchronously: Killed:true plus the daemon-internal SessionID
-// on hit; Killed:false (no error) on miss. The CLI treats the miss as
-// informational — the .md and status-file writes are authoritative.
+// Iterates all matches (not just the first) as defense-in-depth: a
+// daemon that ran on a pre-dedup binary may have ended up with two
+// sessions sharing a TicketID. handleSpawn now refuses to create such
+// a duplicate, but any inherited one is cleaned up here on the next
+// ticket-done flow. The response carries the first match's SessionID
+// for backward compatibility with clients that index off it; the
+// per-session SessionEvent broadcasts surface the rest.
+//
+// Returns synchronously: Killed:true plus the first matched session's
+// SessionID on hit; Killed:false (no error) on miss. The CLI treats
+// the miss as informational — the .md and status-file writes are
+// authoritative.
 func (s *Server) handleTicketDone(c *clientConn, req TicketDoneReq) (TicketDoneResp, error) {
 	if req.TicketID == "" {
 		return TicketDoneResp{}, nil
 	}
 
 	s.sessionsMu.Lock()
-	var match *Session
+	matches := make([]*Session, 0, 1)
 	for _, sess := range s.sessions {
 		if sess.TicketID() == req.TicketID {
-			match = sess
-			break
+			matches = append(matches, sess)
 		}
 	}
-	if match != nil {
-		delete(s.sessions, match.ID())
+	for _, m := range matches {
+		delete(s.sessions, m.ID())
 	}
 	s.sessionsMu.Unlock()
 
-	if match == nil {
+	if len(matches) == 0 {
 		return TicketDoneResp{Killed: false}, nil
 	}
 
-	match.MarkExpectedCompletion()
+	if len(matches) > 1 {
+		log.Printf("WARN: openkanbankd: client %d ticket-done found %d sessions for ticket=%s (pre-dedup duplicates); terminating all", c.id, len(matches), req.TicketID)
+	}
 
-	log.Printf("openkanbankd: client %d ticket-done session %s (ticket=%s)", c.id, match.ID(), req.TicketID)
+	for _, m := range matches {
+		m.MarkExpectedCompletion()
+		log.Printf("openkanbankd: client %d ticket-done session %s (ticket=%s)", c.id, m.ID(), req.TicketID)
+		// Kill in a goroutine so the RPC returns synchronously. The
+		// grace window matches shutdownGraceSeconds — agents may have
+		// a few seconds of cleanup. The watcher emits the "exited"
+		// event when the pane's ExitEvent lands.
+		go func(sess *Session) {
+			if err := sess.Kill(shutdownGraceSeconds); err != nil {
+				log.Printf("openkanbankd: ticket-done kill session %s: %v", sess.ID(), err)
+			}
+		}(m)
+	}
 
-	// Kill in a goroutine so the RPC returns synchronously. The grace
-	// window matches shutdownGraceSeconds — agents may have a few
-	// seconds of cleanup. The watcher emits the "exited" event when
-	// the pane's ExitEvent lands.
-	go func(sess *Session) {
-		if err := sess.Kill(shutdownGraceSeconds); err != nil {
-			log.Printf("openkanbankd: ticket-done kill session %s: %v", sess.ID(), err)
-		}
-	}(match)
-
-	return TicketDoneResp{SessionID: match.ID(), Killed: true}, nil
+	return TicketDoneResp{SessionID: matches[0].ID(), Killed: true}, nil
 }
 
 // handleOwns answers whether the daemon currently owns the agent

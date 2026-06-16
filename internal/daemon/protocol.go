@@ -254,6 +254,17 @@ type HelloResp struct {
 
 // SpawnReq asks the daemon to start a new PTY-backed session.
 //
+// Spawn is idempotent per TicketID: a second Spawn for a TicketID
+// whose session is already live returns the existing SessionID
+// instead of creating a new one (SpawnResp carries the existing
+// session's SessionID and PID; no new process is forked). This
+// enforces the 1:1 ticket↔session invariant on the daemon side, so
+// any client-side spawn-discipline gap (panicked TUI re-spawning,
+// concurrent CLI invocations, etc.) cannot produce a duplicate. An
+// empty TicketID skips the dedup and always constructs a fresh
+// session — the wire shape preserves the "anonymous spawn" path even
+// though no current caller uses it.
+//
 // AgentSessionUUID is the Claude / opencode session UUID this spawn is
 // linked to (i.e. the value that ended up in ticket.AgentSessionID, if
 // set). It is recorded on the daemon-side Session so that Owns queries
@@ -282,7 +293,11 @@ type SpawnReq struct {
 	ForwardNotifications bool `json:"forward_notifications,omitempty"`
 }
 
-// SpawnResp acknowledges a successful spawn.
+// SpawnResp acknowledges a successful spawn. When the daemon hit the
+// idempotency fast path (a session for the requested TicketID already
+// existed), SessionID and PID describe that pre-existing session
+// rather than a freshly-forked one — the caller is expected to treat
+// them identically. See SpawnReq's idempotency note.
 type SpawnResp struct {
 	SessionID string `json:"session_id"`
 	PID       int    `json:"pid"`
