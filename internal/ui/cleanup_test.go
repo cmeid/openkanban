@@ -4,12 +4,15 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/techdufus/openkanban/internal/board"
+	"github.com/techdufus/openkanban/internal/config"
 	"github.com/techdufus/openkanban/internal/daemon"
 	"github.com/techdufus/openkanban/internal/daemonclient"
+	"github.com/techdufus/openkanban/internal/project"
 )
 
 // TestCleanup_LeavesDaemonSessionsAlive is the regression test for the
@@ -119,4 +122,152 @@ func TestCleanup_LeavesDaemonSessionsAlive(t *testing.T) {
 		}
 	}
 	t.Errorf("session %s missing from daemon after Cleanup; the daemon-side session must outlive a single TUI's exit", resp.SessionID)
+}
+
+// ticketDoneRecorderAPI is a daemonGuardAPI fake purpose-built for the
+// performTicketCleanup tests. It records every TicketDone invocation so
+// tests can assert that the cleanup path fires the RPC unconditionally
+// (the rescue path for daemon-owned sessions the resync hasn't yet
+// imported into m.panes — see B3 in tickets/investigate-whether-there-might-ever-be.md).
+type ticketDoneRecorderAPI struct {
+	calls atomic.Int32
+	last  atomic.Value // stores string — the last ticketID passed to TicketDone
+}
+
+func (s *ticketDoneRecorderAPI) PrepareExit(_ context.Context) (daemon.PrepareExitResp, error) {
+	return daemon.PrepareExitResp{}, nil
+}
+func (s *ticketDoneRecorderAPI) CancelExit(_ context.Context) error { return nil }
+func (s *ticketDoneRecorderAPI) Kill(_ context.Context, _ string, _ time.Duration) error {
+	return nil
+}
+func (s *ticketDoneRecorderAPI) ClientID() uint16 { return 1 }
+func (s *ticketDoneRecorderAPI) Owns(_ context.Context, _ string) (daemon.OwnsResp, error) {
+	return daemon.OwnsResp{Owned: false}, nil
+}
+func (s *ticketDoneRecorderAPI) TicketDone(_ context.Context, ticketID string) (daemon.TicketDoneResp, error) {
+	s.calls.Add(1)
+	s.last.Store(ticketID)
+	return daemon.TicketDoneResp{Killed: false}, nil
+}
+func (s *ticketDoneRecorderAPI) List(_ context.Context) (daemon.ListResp, error) {
+	return daemon.ListResp{}, nil
+}
+func (s *ticketDoneRecorderAPI) Spawn(_ context.Context, _ daemon.SpawnReq) (daemon.SpawnResp, error) {
+	return daemon.SpawnResp{}, nil
+}
+
+func (s *ticketDoneRecorderAPI) lastTicketID() string {
+	v := s.last.Load()
+	if v == nil {
+		return ""
+	}
+	return v.(string)
+}
+
+// TestPerformTicketCleanup_NotifiesDaemonEvenWithoutLocalPane pins B3:
+// when the user deletes a ticket whose daemon-owned session has NOT yet
+// been imported into m.panes by the 30s resync (sibling-TUI window), the
+// cleanup path must still send TicketDone to the daemon so the orphan
+// session is reaped. The pre-fix code only called the daemon when a
+// local pane existed, which left the daemon-side session pointing at a
+// now-deleted ticket.
+func TestPerformTicketCleanup_NotifiesDaemonEvenWithoutLocalPane(t *testing.T) {
+	t.Setenv("OPENKANBAN_CONFIG_DIR", t.TempDir())
+
+	proj := &project.Project{ID: "test", RepoPath: t.TempDir()}
+	globalStore := project.NewGlobalTicketStore(nil)
+	globalStore.AddProject(proj)
+
+	ticket := &board.Ticket{
+		ID:        "T-CLEAN-NOPANE",
+		Title:     "no local pane",
+		ProjectID: proj.ID,
+		Status:    board.StatusInProgress,
+	}
+	if err := globalStore.Add(ticket); err != nil {
+		t.Fatalf("Add ticket: %v", err)
+	}
+
+	api := &ticketDoneRecorderAPI{}
+	m := &Model{
+		globalStore:   globalStore,
+		panes:         map[board.TicketID]*daemonclient.PaneView{}, // intentionally empty
+		columnTickets: [][]*board.Ticket{{}, {ticket}, {}, {}},
+		columnOffsets: []int{0, 0, 0, 0},
+		mode:          ModeNormal,
+		activeColumn:  1,
+		activeTicket:  0,
+		width:         120,
+		height:        40,
+		config:        &config.Config{Agents: map[string]config.AgentConfig{}},
+		guardAPI:      api,
+	}
+
+	m.performTicketCleanup(ticket)
+
+	if got := api.calls.Load(); got != 1 {
+		t.Errorf("TicketDone called %d times; want exactly 1 (rescue path must fire even with no local pane)", got)
+	}
+	if got := api.lastTicketID(); got != string(ticket.ID) {
+		t.Errorf("TicketDone called with ticketID=%q; want %q", got, ticket.ID)
+	}
+}
+
+// TestPerformTicketCleanup_NotifiesDaemonWhenLocalPaneExists confirms the
+// notify is UNCONDITIONAL: even when the local pane already exists (and
+// pane.Stop has handled the writer-side teardown), the daemon RPC still
+// fires. On the daemon side this becomes a no-op (handleTicketDone
+// returns Killed=false on miss when pane.Stop's Kill already removed
+// the session), but firing it unconditionally is what closes the
+// sibling-TUI orphan window — we don't gate on local state.
+func TestPerformTicketCleanup_NotifiesDaemonWhenLocalPaneExists(t *testing.T) {
+	t.Setenv("OPENKANBAN_CONFIG_DIR", t.TempDir())
+
+	proj := &project.Project{ID: "test", RepoPath: t.TempDir()}
+	globalStore := project.NewGlobalTicketStore(nil)
+	globalStore.AddProject(proj)
+
+	ticket := &board.Ticket{
+		ID:        "T-CLEAN-PANE",
+		Title:     "with local pane",
+		ProjectID: proj.ID,
+		Status:    board.StatusInProgress,
+	}
+	if err := globalStore.Add(ticket); err != nil {
+		t.Fatalf("Add ticket: %v", err)
+	}
+
+	// Detached pane with sessionID="" — Stop is a no-op so we don't
+	// need a live daemon (see makeDetachedPane / PaneView.stop's
+	// early return for state==Detached || sessionID=="").
+	pane := makeDetachedPane("")
+
+	api := &ticketDoneRecorderAPI{}
+	m := &Model{
+		globalStore:   globalStore,
+		panes:         map[board.TicketID]*daemonclient.PaneView{ticket.ID: pane},
+		columnTickets: [][]*board.Ticket{{}, {ticket}, {}, {}},
+		columnOffsets: []int{0, 0, 0, 0},
+		mode:          ModeNormal,
+		activeColumn:  1,
+		activeTicket:  0,
+		width:         120,
+		height:        40,
+		config:        &config.Config{Agents: map[string]config.AgentConfig{}},
+		guardAPI:      api,
+	}
+
+	m.performTicketCleanup(ticket)
+
+	if got := api.calls.Load(); got != 1 {
+		t.Errorf("TicketDone called %d times; want exactly 1 (notify must fire unconditionally, not gated on local pane existence)", got)
+	}
+	if got := api.lastTicketID(); got != string(ticket.ID) {
+		t.Errorf("TicketDone called with ticketID=%q; want %q", got, ticket.ID)
+	}
+	// And the local pane was removed as part of cleanup.
+	if _, ok := m.panes[ticket.ID]; ok {
+		t.Errorf("panes[%s] still present after performTicketCleanup; want deleted", ticket.ID)
+	}
 }
