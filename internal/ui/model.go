@@ -2391,7 +2391,14 @@ func (m *Model) saveTicketForm(isEdit bool) (tea.Model, tea.Cmd) {
 		ticket.UseWorktree = m.ticketUseWorktree
 		ticket.AgentType = m.ticketAgent
 		ticket.BlockedBy = blockedBy
-		ticket.Status = m.columns[m.activeColumn].Status
+		// in_review and done are "outbound" columns — landing a brand new
+		// ticket there is almost never intentional, so fall back to
+		// in_progress. backlog and in_progress keep the focused column.
+		status := m.columns[m.activeColumn].Status
+		if status == board.StatusInReview || status == board.StatusDone {
+			status = board.StatusInProgress
+		}
+		ticket.Status = status
 		m.globalStore.Add(ticket)
 		m.refreshColumnTickets()
 		m.selectTicketByID(ticket.ID)

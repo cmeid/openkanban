@@ -384,7 +384,7 @@ All keybindings are shown in-app with `?`. Custom keybindings coming soon.
 | `space` | Move ticket to next column |
 | `-` | Move ticket to previous column |
 | `enter` | Attach to running agent |
-| `n` | Create new ticket |
+| `n` | Create new ticket (lands in the focused column; in_review/done route to in_progress) |
 | `e` | Edit ticket |
 | `s` | Spawn agent for ticket |
 | `S` | Stop agent |
