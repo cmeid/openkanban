@@ -922,10 +922,10 @@ func (m *Model) renderCycleAttachModal() string {
 		body = projBadge + "  " + body
 	}
 
-	keys := keyStyle.Render("[Enter]") + dimStyle.Render(" Attach   ") +
-		keyStyle.Render("[Ctrl+\\]") + dimStyle.Render(" Prev   ") +
-		keyStyle.Render("[Ctrl+]]") + dimStyle.Render(" Next   ") +
-		keyStyle.Render("[Esc]") + dimStyle.Render(" Cancel")
+	keys := keyStyle.Render("{Enter}") + dimStyle.Render(" Attach   ") +
+		keyStyle.Render("{Ctrl+\\}") + dimStyle.Render(" Prev   ") +
+		keyStyle.Render("{Ctrl+]}") + dimStyle.Render(" Next   ") +
+		keyStyle.Render("{Esc}") + dimStyle.Render(" Cancel")
 
 	content := header + "\n\n" +
 		"  " + body + "\n\n" +
