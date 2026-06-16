@@ -66,6 +66,8 @@ This means a default-mode daemon process never outlives its useful work. It also
 
 **Persistent mode** (`--persistent`, used by `daemon install-service`) inverts the last-client gate: the daemon stays alive when all clients disconnect, and only exits via explicit `openkanban daemon stop`, SIGTERM, or its own staleness watcher (after a binary upgrade with no sessions attached — see below). To avoid silently orphaning live sessions, `daemon stop` prompts before shutting down if sessions are alive AND no TUI is currently watching (pass `--force` to skip).
 
+For per-session control without tearing down the whole daemon, `openkanban daemon close <id>` gracefully terminates a single session. The `<id>` argument resolves in this order: exact SessionID, then 4+ char SessionID prefix (matches the leftmost column of `daemon list`), then exact TicketID. SessionID matches route through `KillReq`; TicketID matches route through `TicketDoneReq` so duplicate-TicketID defense-in-depth still kills every match. `--grace <duration>` controls the SIGTERM-to-SIGKILL window (default 3s, `--grace 0` for hard-kill); `-y` skips the interactive confirm. This is the recovery hatch for cases the orphan-prevention fixes at the construction sites — `handleSpawn` refuses empty TicketID, `DeleteProject`/`ticket delete`/`performTicketCleanup` notify the daemon — don't cover.
+
 ### One attacher per session, with Takeover
 
 The PTY's output stream is a single producer (the agent) and the daemon multiplexes it. Only one client is the *attached* client at a time — the one whose keystrokes reach stdin and whose viewport sets the resize. Additional clients can subscribe to *status* events without attaching.
