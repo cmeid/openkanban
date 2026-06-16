@@ -89,6 +89,19 @@ These flags drive openkanban's own mouse-forwarding and selection behavior. char
 
 charm/x/vt does not expose a public `CursorVisible()` getter (the `Cursor` struct with `Hidden bool` lives on the private `Screen`). We track DECTCEM state via `Callbacks.CursorVisibility` into an `atomic.Bool` on the Pane (`cursorHidden`), which the renderer reads lock-free.
 
+## OSC Handlers — Reentrancy Convention
+
+`charm/x/vt` dispatches OSC handlers registered via `RegisterOscHandler(cmd, fn)` **synchronously inside `vt.Write(bytes)`**. The handler runs on the same goroutine that called `vt.Write` — which, in this package, is `handleOutput` while it holds `p.mu`.
+
+**Any OSC handler MUST be lock-free with respect to `p.mu`.** Taking `p.mu` from inside an OSC handler causes a reentrant lock-up — the daemon's TUI fan-out wedges on the first frame carrying an OSC sequence. We hit this once already with the OSC 0/2 title handler; see commit `7dcb7f7` for the symptom and fix.
+
+The currently-registered handlers and their lock-free state slots:
+
+- **OSC 0 / OSC 2** (window title) — store into `Pane.cachedTitle atomic.Value // string`
+- **OSC 9** (desktop notification) — gated by `Pane.forwardNotifications atomic.Bool`; on fire, calls `internal/notify.Send(payload)` (cgo NSUserNotification via the OpenKanban.app bundle). The toggle's source of truth is `config.Behavior.ForwardAgentNotifications`, plumbed via `SpawnReq.ForwardNotifications` and applied by `pane.SetForwardNotifications` before `StartHeadless`.
+
+Future handlers (e.g. OSC 7 cwd, OSC 133 prompt-marks, OSC 52 clipboard) must follow the same convention: use `atomic.Value` / `atomic.Bool` / channel-based dispatch; never `p.mu`.
+
 ## Anti-Patterns
 
 - Don't write to PTY without checking if alive
