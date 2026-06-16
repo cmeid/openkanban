@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/atotto/clipboard"
 	tea "github.com/charmbracelet/bubbletea"
@@ -624,12 +625,38 @@ func (p *Pane) forwardNotificationHandler(data []byte) bool {
 	if body == "" {
 		return false
 	}
+	// iTerm2's OSC 9 progress-bar protocol shares the OSC 9 cmd
+	// namespace with simple-text notifications. The progress form is
+	// "\x1b]9;<state>;<value>\x07" where state ∈ 0..4 (0 clear, 1 set
+	// percent, 2 indeterminate, 3 error, 4 warning); Claude Code emits
+	// these to drive the terminal's progress indicator, NOT to raise a
+	// desktop notification. After parseOscTitlePayload strips the
+	// leading "9;", a progress payload looks like "4;3;" / "1;50" /
+	// "2" — digits + semicolons only, no letters. Discriminate by
+	// checking for any alphabetic rune: real notification text always
+	// contains letters; progress control payloads don't.
+	if !payloadContainsLetter(body) {
+		return false
+	}
 	// Errors from notify.Send are swallowed: there's no actionable
 	// recovery from the emulator callback, and a logging side-effect
 	// would surface inside vt.Write under p.mu. The notify package
 	// itself is responsible for any necessary observability.
 	_ = notify.Send(body)
 	return true
+}
+
+// payloadContainsLetter reports whether s has any Unicode letter rune.
+// Used by forwardNotificationHandler to discriminate notification text
+// from iTerm2 OSC 9 progress-bar control sequences (which are digits +
+// semicolons only — no alphabetic characters).
+func payloadContainsLetter(s string) bool {
+	for _, r := range s {
+		if unicode.IsLetter(r) {
+			return true
+		}
+	}
+	return false
 }
 
 // SetForwardNotifications toggles OSC 9 → desktop notification
