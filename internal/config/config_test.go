@@ -652,15 +652,21 @@ func TestLoadWithValidation_NonExistentFile(t *testing.T) {
 	}
 }
 
+// promptData is the test fixture for exercising defaultAgentPrompt.
+// Its shape must match the production ContextData payload so the
+// template renders against the same field set production sees.
+type promptData struct {
+	Title, Description, BranchName, BaseBranch, Status, BriefPath string
+	HasBrief, IsExternalResume                                    bool
+}
+
 func TestDefaultAgentPrompt_FreshSpawn(t *testing.T) {
-	data := struct {
-		Title, Description, BranchName, BaseBranch, BriefPath string
-		HasBrief, IsExternalResume                            bool
-	}{
+	data := promptData{
 		Title:            "Test ticket",
 		Description:      "do the thing",
 		BranchName:       "task/test",
 		BaseBranch:       "main",
+		Status:           "in_progress",
 		BriefPath:        "tickets/test.md",
 		HasBrief:         true,
 		IsExternalResume: false,
@@ -685,6 +691,46 @@ func TestDefaultAgentPrompt_FreshSpawn(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("want substring %q in:\n%s", want, got)
 		}
+	}
+}
+
+// TestDefaultAgentPrompt_FreshSpawn_NonInProgress pins the status-
+// conditional contract: when a ticket is re-spawned at a non-in_progress
+// status (typically in_review), the prompt must NOT claim "moved to
+// in_progress on spawn" — that claim was false on every re-spawn and
+// produced "wait, didn't we just merge this?" UX. The prompt acknowledges
+// the actual current status instead.
+func TestDefaultAgentPrompt_FreshSpawn_NonInProgress(t *testing.T) {
+	cases := []string{"in_review", "backlog", "done"}
+	for _, status := range cases {
+		t.Run(status, func(t *testing.T) {
+			data := promptData{
+				Title:      "Test ticket",
+				BranchName: "task/test",
+				BaseBranch: "main",
+				Status:     status,
+				HasBrief:   false,
+			}
+			tmpl, err := template.New("p").Parse(defaultAgentPrompt)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			var buf bytes.Buffer
+			if err := tmpl.Execute(&buf, data); err != nil {
+				t.Fatalf("exec: %v", err)
+			}
+			got := buf.String()
+
+			if strings.Contains(got, "moved this ticket to in_progress") {
+				t.Errorf("prompt falsely claims status was moved to in_progress for status=%q\nfull prompt:\n%s", status, got)
+			}
+			if !strings.Contains(got, "Ticket status is `"+status+"`") {
+				t.Errorf("prompt does not acknowledge actual status=%q\nfull prompt:\n%s", status, got)
+			}
+			if !strings.Contains(got, "OpenKanban does not change ticket status on spawn") {
+				t.Errorf("prompt missing clarifying line about status not being auto-changed\nfull prompt:\n%s", got)
+			}
+		})
 	}
 }
 
