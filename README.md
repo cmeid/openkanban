@@ -134,6 +134,20 @@ A status-bar toast surfaces how many approvals just went global (`Moved to in_re
 
 See [`internal/agent/claude_settings.go`](internal/agent/claude_settings.go) and wiring in [`internal/ui/model.go`](internal/ui/model.go), [`internal/project/tickets.go`](internal/project/tickets.go), [`cmd/ticket_done.go`](cmd/ticket_done.go).
 
+### 9. PTY-activity overrides "waiting" state
+
+Claude Code emits an OSC 9 notification when it enters a permission-prompt state — the file-based status detector picks that up and renders the ticket card as **waiting**. After the user approves, the prompt clears and the tool runs, but no hook fires until `PostToolUse` returns N seconds later. During that gap the spinner is animating and the agent is doing autonomous work, but the card still reads **waiting**. The status is misleading exactly when the user most needs to know what's happening.
+
+This fork closes the gap with a PTY-activity heartbeat:
+
+- **Daemon side.** `terminal.Pane` timestamps every non-empty `vt.Write` — bytes-flowed, not grid-hash. (Cursor blinks are terminal-side, idle prompts emit no bytes, the spinner emits ~10 Hz throughout tool execution.) A 2-second broadcaster ticks `SessionEvent{Event:"activity", LastActivityAt:...}` only when the timestamp advanced, so idle sessions produce zero traffic. The same field rides on `started`/`exited`/`attached`/`detached` events so subscribers seed before the first heartbeat.
+- **UI side.** `DetectStatusWithActivity` layers an override on top of `DetectStatusWithPort`: when the status file reads `waiting` but the session had PTY activity within the last 60 seconds (`WaitingActivityTTL`), the card renders **working** instead. Other states (idle, completed, error) pass through untouched.
+- **Backward compat.** `SessionEvent.LastActivityAt` is `omitempty`, so older clients that don't understand the field just see today's events.
+
+The net effect: the moment Claude responds to a permission grant by emitting any byte, the card flips from waiting to working — no waiting for the next hook fire.
+
+See [`internal/terminal/pane.go`](internal/terminal/pane.go) (`LastActivity`, write-timestamping), [`internal/daemon/server.go`](internal/daemon/server.go) (`broadcastActivity`), [`internal/agent/status.go`](internal/agent/status.go) (`DetectStatusWithActivity`, `WaitingActivityTTL`), and [`internal/ui/daemon_subscribe.go`](internal/ui/daemon_subscribe.go) / [`internal/ui/model.go`](internal/ui/model.go) (`m.lastPTYActivity` map + override wiring).
+
 ## Bugs fixed in upstream
 
 Seven correctness bugs that exist on `TechDufus/main` today are fixed in this fork. Each is verified against the upstream tree.
