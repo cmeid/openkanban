@@ -810,6 +810,12 @@ func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 			)
 
 		case spawnErrorMsg:
+			// Mid-spawn error path: clear the ModeSpawning bookkeeping
+			// and toast. Kept inside this block (rather than relying on
+			// the top-level handler) because the ModeSpawning switch
+			// ends with `return m, nil` for unhandled cases, which would
+			// otherwise swallow the message before it ever reached the
+			// top-level handler below.
 			if msg.ticketID == m.spawningTicketID {
 				m.mode = ModeNormal
 				m.spawningTicketID = ""
@@ -880,6 +886,28 @@ func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
+
+	case spawnErrorMsg:
+		// Surface attach/spawn errors arriving outside ModeSpawning. The
+		// ModeSpawning case is handled in the block above (since that
+		// block's trailing `return m, nil` would otherwise swallow this
+		// message before it reached here). What's left to handle is
+		// every OTHER caller of attachExisting — the Unattached and
+		// Detached arms of spawnAgent (B6) flip to ModeAgentView before
+		// kicking off the attach, and AttachFirstMsg / cycleAttachPrompt
+		// never enter ModeSpawning at all. Before the fix those attach
+		// failures had no handler at any level and dropped silently,
+		// parking the user with a dead pane.
+		//
+		// Choice rationale (option a from review): dropping the
+		// ticketID gate is safer than coupling the attach-from-attach
+		// path to the spawn state machine via m.spawningTicketID —
+		// that coupling would be load-bearing-but-misleading. Spawn
+		// errors are always worth surfacing; if a future flow returns
+		// spawnErrorMsg and does NOT want a toast, it can introduce a
+		// separate message type.
+		m.notify(msg.err)
+		return m, nil
 
 	case QuitRequestedMsg:
 		return m.handleQuitRequested()
@@ -4205,7 +4233,8 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 		// Runs BEFORE the mgr nil-check so the fast path doesn't need a
 		// worktree manager: a daemon-owned session already has its
 		// worktree set up from the original spawn, so re-fetching mgr
-		// is wasted work in the resume case.
+		// is wasted work in the resume case. (cwd already locked in by
+		// the running PTY — local Workdir is decorative.)
 		//
 		// Guarded on ticket.AgentSessionID being set: tickets that have
 		// never had a session linked to them have no UUID to query, so
@@ -4431,14 +4460,37 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 
 // attachWithRetry calls pv.Attach() up to spawnAttachMaxRetries+1
 // times with linear backoff between tries. Returns nil on success or
-// the final error if every attempt failed. The first attempt uses a 5s
-// timeout (matching the historical single-shot behaviour); retries
-// use 3s each so the cumulative ceiling stays reasonable. The backoff
-// is short (200ms, 400ms) because the failure modes we care about —
-// transient socket-level hiccup, brief daemon goroutine contention —
-// resolve quickly; longer waits would just punish the user.
+// the final error if every attempt failed. See spawnAttachRetrySchedule
+// for the exact timeouts/sleeps; the backoff is short because the
+// failure modes we care about — transient socket-level hiccup, brief
+// daemon goroutine contention — resolve quickly; longer waits would
+// just punish the user.
 func attachWithRetry(pv *daemonclient.PaneView) error {
 	return retryAttach(func(ctx context.Context) error { return pv.Attach(ctx) })
+}
+
+// retryStep is one entry in the post-Spawn attach retry schedule. sleep
+// is taken before this attempt fires (so the first step's sleep is the
+// gap between the initial attempt and the first retry); timeout is the
+// context bound for the attach call on this step.
+type retryStep struct {
+	sleep   time.Duration
+	timeout time.Duration
+}
+
+// spawnAttachRetrySchedule is the post-Spawn attach retry schedule.
+// Worst-case wall clock on full failure:
+//
+//	initial(5s) + 200ms + retry1(1.5s) + 400ms + retry2(1.5s) ≈ 8.6s
+//
+// Previously the retry timeouts were 3s each, giving a ~11.6s ceiling
+// under a misleading "Spawning…" splash. The splash work is queued as
+// a separate ticket (ui-spinner-for-long-running-daemon-ops); for now
+// we just tighten the budget. Pulled into a named variable so future
+// tuning (or unit testing of the schedule itself) is straightforward.
+var spawnAttachRetrySchedule = []retryStep{
+	{sleep: 200 * time.Millisecond, timeout: 1500 * time.Millisecond},
+	{sleep: 400 * time.Millisecond, timeout: 1500 * time.Millisecond},
 }
 
 // retryAttach is the testable core of attachWithRetry — same retry
@@ -4452,9 +4504,12 @@ func retryAttach(attach func(ctx context.Context) error) error {
 	if attachErr == nil {
 		return nil
 	}
-	for i := 0; i < spawnAttachMaxRetries && attachErr != nil; i++ {
-		time.Sleep(time.Duration(200*(i+1)) * time.Millisecond)
-		retryCtx, retryCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	for _, step := range spawnAttachRetrySchedule {
+		if attachErr == nil {
+			break
+		}
+		time.Sleep(step.sleep)
+		retryCtx, retryCancel := context.WithTimeout(context.Background(), step.timeout)
 		attachErr = attach(retryCtx)
 		retryCancel()
 	}
@@ -4462,9 +4517,9 @@ func retryAttach(attach func(ctx context.Context) error) error {
 }
 
 // spawnAttachMaxRetries is the cap on post-Spawn attach retry attempts
-// (additional tries beyond the initial one). With backoff steps of
-// 200ms and 400ms, a fully-failing path takes ~600ms of sleep plus up
-// to 9s of attach timeouts before reporting failure.
+// (additional tries beyond the initial one). Kept in sync with
+// len(spawnAttachRetrySchedule) so callers and tests that count
+// attempts have a single named constant to anchor on.
 const spawnAttachMaxRetries = 2
 
 // sessionNameFor mirrors the priority used inside the prepareSpawnWith

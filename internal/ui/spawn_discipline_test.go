@@ -48,6 +48,13 @@ func (s *spawnDisciplineStubAPI) Spawn(_ context.Context, _ daemon.SpawnReq) (da
 	return daemon.SpawnResp{SessionID: "sid-from-spawn"}, nil
 }
 
+// List is a no-op stub kept here so this fake stays compatible with
+// the sibling fix/startup-resync PR, which extends daemonGuardAPI with
+// List for its startup-reconcile / 30s-resync paths.
+func (s *spawnDisciplineStubAPI) List(_ context.Context) (daemon.ListResp, error) {
+	return daemon.ListResp{}, nil
+}
+
 // makeDetachedPane constructs a PaneView in PaneViewDetached state with
 // the given sessionID. info=nil keeps the constructor on the no-info
 // branch — state stays Detached. The daemon client is nil because the
@@ -489,6 +496,145 @@ func TestSessionNameFor(t *testing.T) {
 				t.Errorf("sessionNameFor = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestSpawnAgent_DetachedAttachFailure_SurfacesError pins the B6
+// silent-swallow fix: when the Detached arm of spawnAgent kicks off an
+// attachExisting and the resulting attach errors out, the user MUST
+// see the failure as a notification — not get parked silently in
+// ModeAgentView with a dead pane.
+//
+// Test mechanics: we don't drive a real daemon-backed attachExisting
+// (that would require standing up a daemonclient with a controllable
+// failure mode). The change under test is in Update's spawnErrorMsg
+// handler — it used to gate notification on
+// `msg.ticketID == m.spawningTicketID` AND only fire inside
+// `m.mode == ModeSpawning`. The Detached arm sets m.mode = ModeAgentView
+// before kicking off attachExisting, and never enters ModeSpawning, so
+// before the fix the spawnErrorMsg arrived in a mode that had no
+// handler at all. Now the handler is at the top-level switch with the
+// gate dropped, so a spawnErrorMsg fired into a Model in ModeAgentView
+// (mimicking the post-Detached-arm state) MUST set the notification.
+func TestSpawnAgent_DetachedAttachFailure_SurfacesError(t *testing.T) {
+	t.Setenv("OPENKANBAN_CONFIG_DIR", t.TempDir())
+
+	proj := &project.Project{ID: "test", RepoPath: t.TempDir()}
+	globalStore := project.NewGlobalTicketStore(nil)
+	globalStore.AddProject(proj)
+
+	ticket := &board.Ticket{
+		ID:        "T-DETACH-ERR",
+		Title:     "detached attach failure",
+		ProjectID: proj.ID,
+		Status:    board.StatusInProgress,
+	}
+	if err := globalStore.Add(ticket); err != nil {
+		t.Fatalf("Add ticket: %v", err)
+	}
+
+	pane := daemonclient.NewPaneView(nil, string(ticket.ID), "sid-daemon", nil)
+
+	m := &Model{
+		globalStore:   globalStore,
+		panes:         map[board.TicketID]*daemonclient.PaneView{ticket.ID: pane},
+		columnTickets: [][]*board.Ticket{{}, {ticket}, {}, {}},
+		columnOffsets: []int{0, 0, 0, 0},
+		// Post-Detached-arm state: spawnAgent set mode to ModeAgentView,
+		// did NOT touch spawningTicketID/spawningAgent, then kicked off
+		// the attach. We're modeling the moment the attach errored back.
+		mode:             ModeAgentView,
+		focusedPane:      ticket.ID,
+		activeColumn:     1,
+		activeTicket:     0,
+		width:            120,
+		height:           40,
+		config:           &config.Config{Agents: map[string]config.AgentConfig{}},
+		spawningTicketID: "", // deliberately empty — the pre-fix gate
+		spawningAgent:    "",
+	}
+
+	// Construct the message attachExisting would produce on Attach error
+	// (see model.go's attachExisting: "attach failed: " + err.Error()).
+	errMsg := spawnErrorMsg{
+		ticketID: ticket.ID,
+		err:      "attach failed: dial tcp: connection refused",
+	}
+
+	updated, _ := m.Update(errMsg)
+	got, ok := updated.(*Model)
+	if !ok {
+		t.Fatalf("Update returned %T, want *Model", updated)
+	}
+
+	if got.notification == "" {
+		t.Errorf("notification = \"\", want a non-empty attach-failure toast (pre-fix bug: gate dropped the message)")
+	}
+	if got.notification != errMsg.err {
+		t.Errorf("notification = %q, want %q", got.notification, errMsg.err)
+	}
+	// We did NOT enter ModeSpawning, so the spawning-bookkeeping branch
+	// should not have fired. Verify mode wasn't clobbered back to
+	// ModeNormal by accident.
+	if got.mode != ModeAgentView {
+		t.Errorf("mode = %v, want ModeAgentView (handler must not flip mode when not mid-spawn)", got.mode)
+	}
+}
+
+// TestSpawnErrorMsg_DuringSpawningStillClearsState complements the
+// gate-drop test by pinning the ModeSpawning branch: when an error
+// arrives mid-spawn for the spawning ticket, the handler clears the
+// ModeSpawning bookkeeping (mode → ModeNormal, spawningTicketID/Agent
+// → "") AND fires the toast. This keeps the existing spawn-path UX
+// intact while broadening the handler to cover the attach-only callers.
+func TestSpawnErrorMsg_DuringSpawningStillClearsState(t *testing.T) {
+	t.Setenv("OPENKANBAN_CONFIG_DIR", t.TempDir())
+
+	proj := &project.Project{ID: "test", RepoPath: t.TempDir()}
+	globalStore := project.NewGlobalTicketStore(nil)
+	globalStore.AddProject(proj)
+
+	ticket := &board.Ticket{
+		ID:        "T-SPAWNING",
+		Title:     "spawn failure mid-spawn",
+		ProjectID: proj.ID,
+		Status:    board.StatusInProgress,
+	}
+	if err := globalStore.Add(ticket); err != nil {
+		t.Fatalf("Add ticket: %v", err)
+	}
+
+	m := &Model{
+		globalStore:      globalStore,
+		panes:            map[board.TicketID]*daemonclient.PaneView{},
+		columnTickets:    [][]*board.Ticket{{}, {ticket}, {}, {}},
+		columnOffsets:    []int{0, 0, 0, 0},
+		mode:             ModeSpawning,
+		spawningTicketID: ticket.ID,
+		spawningAgent:    "claude",
+		width:            120,
+		height:           40,
+		config:           &config.Config{Agents: map[string]config.AgentConfig{}},
+	}
+
+	errMsg := spawnErrorMsg{
+		ticketID: ticket.ID,
+		err:      "spawn failed: daemon refused",
+	}
+	updated, _ := m.Update(errMsg)
+	got := updated.(*Model)
+
+	if got.mode != ModeNormal {
+		t.Errorf("mode = %v, want ModeNormal (mid-spawn error should drop us back)", got.mode)
+	}
+	if got.spawningTicketID != "" {
+		t.Errorf("spawningTicketID = %q, want \"\"", got.spawningTicketID)
+	}
+	if got.spawningAgent != "" {
+		t.Errorf("spawningAgent = %q, want \"\"", got.spawningAgent)
+	}
+	if got.notification != errMsg.err {
+		t.Errorf("notification = %q, want %q", got.notification, errMsg.err)
 	}
 }
 
