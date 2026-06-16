@@ -213,6 +213,21 @@ remain quiet when the daemon happens to be down.`,
 		// remove the .md first and then the daemon RPC fails, we've
 		// orphaned the daemon session AND lost the on-disk record.
 		// Order: kill the live daemon session, then unlink the ticket.
+		//
+		// Two layered RPCs:
+		//
+		//  1. UUID-keyed Owns/Kill (only when AgentSessionID is set):
+		//     terminates the session via its Claude session UUID. This
+		//     is the legacy path and is the cheapest hit when the UUID
+		//     is already back-filled on the ticket.
+		//
+		//  2. TicketID-keyed TicketDone (unconditional): catches the
+		//     freshly-spawned-but-not-yet-backfilled case, where the
+		//     daemon DOES have a live session for the ticket but the
+		//     ticket .md still has AgentSessionID="". TicketDone is a
+		//     no-op on miss, so it's safe to layer on top of (1) — if
+		//     (1) already killed the session, (2) just reports
+		//     Killed=false.
 		if t.AgentSessionID != "" {
 			ownsResp, daemonUp, daemonOwns, perr := probeDaemonOwnership(t.AgentSessionID)
 			if perr != nil {
@@ -223,6 +238,12 @@ remain quiet when the daemon happens to be down.`,
 					return fmt.Errorf("kill daemon session %s: %w", ownsResp.SessionID, kerr)
 				}
 			}
+		}
+		if derr := notifyDaemonTicketDoneCLI(string(t.ID), 3*time.Second); derr != nil {
+			// Best-effort: log + continue. The .md unlink below is the
+			// authoritative "ticket is gone" signal; a transient daemon
+			// failure must not block deletion.
+			fmt.Fprintf(os.Stderr, "openkanbankd: ticket_done for %s: %v\n", t.ID, derr)
 		}
 
 		if err := store.Delete(board.TicketID(ticketDeleteID)); err != nil {
@@ -460,6 +481,50 @@ func probeDaemonOwnership(uuid string) (daemon.OwnsResp, bool, bool, error) {
 		return daemon.OwnsResp{}, true, false, fmt.Errorf("daemon owns query: %w", err)
 	}
 	return resp, true, resp.Owned, nil
+}
+
+// notifyDaemonTicketDoneCLI fires a TicketDone RPC keyed by TicketID
+// against a running daemon (no autostart). Used by `openkanban ticket
+// delete` as the second layer of daemon-side cleanup: it catches the
+// freshly-spawned-but-not-yet-backfilled case where the daemon owns a
+// live session for this ticket but the ticket .md still has
+// AgentSessionID="" (so the UUID-keyed Owns/Kill path can't fire).
+//
+// Same conservative dial contract as probeDaemonOwnership: a scripted
+// `ticket delete` must NOT autostart a background daemon. A daemon-down
+// dial is treated as success (there are by definition no sessions to
+// clean up). Other RPC failures bubble up so the caller can log them,
+// but the caller is expected to treat the .md unlink as authoritative
+// and not block deletion on a transient daemon hiccup.
+//
+// `resp.Killed=false` is NOT an error — it just means the daemon had
+// no live session matching the TicketID, which is the common case.
+func notifyDaemonTicketDoneCLI(ticketID string, grace time.Duration) error {
+	// Allow grace plus a bit for the RPC round-trip, matching the
+	// killDaemonSession budget.
+	ctx, cancel := context.WithTimeout(context.Background(), grace+2*time.Second)
+	defer cancel()
+
+	conn, err := daemonclient.Dial(ctx)
+	if err != nil {
+		if errors.Is(err, daemonclient.ErrDaemonUnavailable) {
+			return nil
+		}
+		return fmt.Errorf("dial daemon: %w", err)
+	}
+
+	client, err := daemonclient.NewWithConn(ctx, conn)
+	if err != nil {
+		// NewWithConn closes the conn on Hello failure. Treat a wedged
+		// daemon the same way probeDaemonOwnership does — no-op.
+		return nil
+	}
+	defer client.Close()
+
+	if _, err := client.TicketDone(ctx, ticketID); err != nil {
+		return fmt.Errorf("ticket_done RPC: %w", err)
+	}
+	return nil
 }
 
 // killDaemonSession opens a short-lived client connection (no autostart)

@@ -790,10 +790,11 @@ func (s *Server) handleHello(c *clientConn, req HelloReq) HelloResp {
 // — every client-side spawn discipline gap (panicked TUI, racing CLI
 // `ticket continue`, etc.) collapses here.
 //
-// Empty TicketID skips the dedup and constructs unconditionally — the
-// 1:1 invariant only makes sense per-ticket, and anonymous spawns
-// (currently only theoretical, but the wire shape allows them) keep
-// their original semantics.
+// Empty TicketID is rejected outright with an error. Anonymous sessions
+// are disallowed structurally: with no TicketID, the daemon cannot
+// dedup, cannot route TicketDone, and cannot be reaped on ticket
+// deletion — i.e. it would be an orphan. The wire shape still permits
+// the field to be empty, but handleSpawn refuses it at the entry.
 //
 // The check happens in two phases to close the construct-outside-lock
 // race window: an RLock fast path that avoids NewSession when a match
@@ -804,10 +805,19 @@ func (s *Server) handleHello(c *clientConn, req HelloReq) HelloResp {
 // loser forked is the only collateral, and it's terminated before
 // handleSpawn returns.
 func (s *Server) handleSpawn(c *clientConn, req SpawnReq) (SpawnResp, error) {
+	// Reject anonymous spawns at the door: no TicketID means no dedup,
+	// no TicketDone routing, no cleanup path — i.e. an orphan by
+	// construction. The dispatcher surfaces this as a spawn_failed
+	// error to the client.
+	if req.TicketID == "" {
+		return SpawnResp{}, fmt.Errorf("spawn: empty TicketID rejected (anonymous sessions disallowed)")
+	}
+
 	// Fast path: if a session for this TicketID already exists, return
-	// it without constructing a new one. Empty TicketID skips this
-	// check (preserves current behavior for any caller that legitimately
-	// spawns anonymously).
+	// it without constructing a new one. The empty-TicketID guard above
+	// makes the `req.TicketID != ""` test below unreachable in practice,
+	// but it's kept as belt-and-braces in case the entry check is ever
+	// removed or refactored.
 	if req.TicketID != "" {
 		s.sessionsMu.RLock()
 		existing := s.findSessionForTicketLocked(req.TicketID)
@@ -827,7 +837,9 @@ func (s *Server) handleSpawn(c *clientConn, req SpawnReq) (SpawnResp, error) {
 	// Re-check under WLock to close the construct-outside-lock race
 	// window: two concurrent spawns may both have seen no existing
 	// session under RLock and both called NewSession. Exactly one wins
-	// the WLock; the other discards its just-built session.
+	// the WLock; the other discards its just-built session. As above,
+	// the empty-TicketID guard at function entry makes this nil-check
+	// belt-and-braces — left in to defend against future refactors.
 	s.sessionsMu.Lock()
 	if req.TicketID != "" {
 		if winner := s.findSessionForTicketLocked(req.TicketID); winner != nil {
@@ -862,6 +874,10 @@ func (s *Server) handleSpawn(c *clientConn, req SpawnReq) (SpawnResp, error) {
 // — but handleTicketDone defensively iterates the full map for any
 // duplicates inherited from older daemons that lacked this check.
 func (s *Server) findSessionForTicketLocked(ticketID string) *Session {
+	// Belt-and-braces: no caller should ever pass empty TicketID;
+	// handleSpawn rejects it at the door. Kept defensively so a future
+	// caller wired up with sloppy validation can't trigger a full-map
+	// scan that returns the first arbitrary session.
 	if ticketID == "" {
 		return nil
 	}

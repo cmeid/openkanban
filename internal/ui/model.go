@@ -3426,6 +3426,22 @@ func (m *Model) performTicketCleanup(ticket *board.Ticket) {
 		delete(m.panes, ticket.ID)
 	}
 
+	// Unconditional daemon notify: when the local pane exists, pane.Stop
+	// above already killed the writer process and handleTicketDone is a
+	// no-op (returns Killed=false on miss). When the local pane does NOT
+	// exist but the daemon owns a session (sibling-TUI window — the
+	// 30s resync hasn't yet imported it), this is the rescue path that
+	// keeps daemon-owned sessions from being orphaned by TUI ticket
+	// deletion. Best-effort; failures logged but not surfaced — same
+	// contract as wrapUpSessionForTicket.
+	if m.guardAPI != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if _, err := m.guardAPI.TicketDone(ctx, string(ticket.ID)); err != nil {
+			log.Printf("openkanban: TicketDone(%s) on ticket cleanup: %v", ticket.ID, err)
+		}
+		cancel()
+	}
+
 	proj := m.globalStore.GetProjectForTicket(ticket)
 	if proj != nil {
 		mgr := m.worktreeMgrs[proj.ID]
