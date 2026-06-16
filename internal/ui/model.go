@@ -225,6 +225,13 @@ type Model struct {
 	// session-only lifetime as sortMode; cycled with 'w'.
 	sessionFilter SessionFilter
 
+	// alwaysShowWorking, when true, exempts daemon-owned ("open")
+	// sessions from the project and text-search filters so working
+	// sessions remain visible across project narrowing. The session
+	// filter ('w') still applies on top. Session-only lifetime;
+	// toggled with 'W'.
+	alwaysShowWorking bool
+
 	showHelp    bool
 	showConfirm bool
 	confirmMsg  string
@@ -1242,6 +1249,8 @@ func (m *Model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.cycleSortMode()
 	case "w":
 		return m.cycleSessionFilter()
+	case "W":
+		return m.toggleAlwaysShowWorking()
 
 	case ":":
 		m.mode = ModeCommand
@@ -3367,6 +3376,21 @@ func (m *Model) cycleSessionFilter() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *Model) toggleAlwaysShowWorking() (tea.Model, tea.Cmd) {
+	ticket := m.selectedTicket()
+	m.alwaysShowWorking = !m.alwaysShowWorking
+	m.refreshColumnTickets()
+	if ticket != nil {
+		m.selectTicketByID(ticket.ID)
+	}
+	state := "off"
+	if m.alwaysShowWorking {
+		state = "on"
+	}
+	m.notify("Always show working: " + state)
+	return m, nil
+}
+
 func (m *Model) quickMoveTicketBackward() (tea.Model, tea.Cmd) {
 	ticket := m.selectedTicket()
 	if ticket == nil {
@@ -4135,6 +4159,20 @@ func (m *Model) selectTicketByID(ticketID board.TicketID) {
 			}
 		}
 	}
+	// Target no longer visible (filtered out by a refresh). Clamp
+	// activeTicket to the current column's bounds so callers don't
+	// see an out-of-range index. Without this, toggling a filter that
+	// hides the selected ticket leaves the cursor pointing past the
+	// end of a now-shorter column.
+	if m.activeColumn >= 0 && m.activeColumn < len(m.columnTickets) {
+		if n := len(m.columnTickets[m.activeColumn]); m.activeTicket >= n {
+			if n > 0 {
+				m.activeTicket = n - 1
+			} else {
+				m.activeTicket = 0
+			}
+		}
+	}
 }
 
 func (m *Model) refreshColumnTickets() {
@@ -4193,21 +4231,31 @@ func effectivePriority(p int) int {
 }
 
 func (m *Model) ticketMatchesFilter(t *board.Ticket) bool {
-	if len(m.filterProjectIDs) > 0 && !m.filterProjectIDs[t.ProjectID] {
+	_, isOpenSession := m.daemonOwned[t.ID]
+	// alwaysShowWorking exempts daemon-owned sessions from the project
+	// and text-search filters, but the session filter ('w') below still
+	// applies — narrowing to "waiting" must keep hiding working-status
+	// sessions even with the bypass on.
+	bypassProjectAndQuery := m.alwaysShowWorking && isOpenSession
+
+	if !bypassProjectAndQuery && len(m.filterProjectIDs) > 0 && !m.filterProjectIDs[t.ProjectID] {
 		return false
 	}
 	switch m.sessionFilter {
 	case SessionFilterOpen:
-		if _, ok := m.daemonOwned[t.ID]; !ok {
+		if !isOpenSession {
 			return false
 		}
 	case SessionFilterWaiting:
-		if _, ok := m.daemonOwned[t.ID]; !ok {
+		if !isOpenSession {
 			return false
 		}
 		if t.AgentStatus != board.AgentWaiting {
 			return false
 		}
+	}
+	if bypassProjectAndQuery {
+		return true
 	}
 	if m.filterQuery == "" {
 		return true
