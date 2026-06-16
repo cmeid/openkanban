@@ -4376,10 +4376,23 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 			ownsResp, ownsErr := dapi.Owns(ownsCtx, ticket.AgentSessionID)
 			ownsCancel()
 			if ownsErr == nil && ownsResp.Owned && ownsResp.SessionID != "" {
+				// Prefer the daemon's stored SessionName over a local
+				// recompute via sessionNameFor(). The daemon's value is
+				// what the live agent's OPENKANBAN_SESSION env var holds
+				// (baked at original spawn, possibly by a pre-fix binary
+				// that used the UUID priority) and is therefore the
+				// correct status-file lookup key. Empty SessionName
+				// (e.g. older daemon that doesn't return the field)
+				// falls back to local computation — same behavior as
+				// before the field existed.
+				resolvedName := ownsResp.SessionName
+				if resolvedName == "" {
+					resolvedName = sessionNameFor(ticket, branchName)
+				}
 				return attachExistingFastPath(
 					ticketID,
 					ownsResp.SessionID,
-					sessionNameFor(ticket, branchName),
+					resolvedName,
 					worktreePath,
 					branchName,
 					baseBranch,
@@ -4433,22 +4446,26 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 		baseBranch = base
 
 		// Session name for terminal identification (priority:
-		// AgentSessionID > branch > ticket). The daemon picks this up
-		// in SpawnReq.SessionName and wires it into OPENKANBAN_SESSION
-		// via the terminal pane's buildCleanEnv.
-		sessionName := string(ticketID)
-		if branchName != "" {
-			sessionName = branchName
-		}
-		if ticket.AgentSessionID != "" {
-			sessionName = ticket.AgentSessionID
-		}
+		// branch > ticket). The daemon picks this up in SpawnReq.SessionName
+		// and wires it into OPENKANBAN_SESSION via the terminal pane's
+		// buildCleanEnv. AgentSessionID is intentionally NOT used here:
+		// the Claude UUID is for `--resume`, not for hook identification,
+		// and using it would couple OPENKANBAN_SESSION to a value that
+		// can be back-filled mid-session — diverging from the env var
+		// the live agent's hook process already has. See sessionNameFor().
+		sessionName := sessionNameFor(ticket, branchName)
 		// sessionName + ticketID flow through SpawnReq below; daemon-side
 		// pane.SetSessionName + pane.SetTicketID happen in StartHeadless.
 
 		// Clean up any stale status file from previous sessions that may not have
-		// been properly cleaned up (e.g., if the app was closed while an agent was running)
+		// been properly cleaned up (e.g., if the app was closed while an agent was running).
+		// Also scrub the legacy UUID-keyed path: pre-fix spawns may have written
+		// `<UUID>.status` files that the new poll won't read but which would
+		// linger on disk indefinitely.
 		agent.CleanupStatusFile(sessionName)
+		if ticket.AgentSessionID != "" && ticket.AgentSessionID != sessionName {
+			agent.CleanupStatusFile(ticket.AgentSessionID)
+		}
 
 		isNewSession := ticket.AgentSpawnedAt == nil
 		// cleanArgs strips empty-string entries from the configured args so a
@@ -4659,17 +4676,21 @@ func retryAttach(attach func(ctx context.Context) error) error {
 const spawnAttachMaxRetries = 2
 
 // sessionNameFor mirrors the priority used inside the prepareSpawnWith
-// closure (AgentSessionID > branchName > ticketID) so the Owns
-// fast-path constructs a PaneView with the same identity the regular
-// spawn path would. Exposed as a helper so the fast-path closure
-// branch and the spawn-path closure branch agree.
+// closure (branchName > ticketID) so the Owns fast-path constructs a
+// PaneView with the same identity the regular spawn path would.
+// Exposed as a helper so the fast-path closure branch and the
+// spawn-path closure branch agree.
+//
+// AgentSessionID (the Claude UUID) is intentionally NOT in the
+// priority chain. It identifies a journal for `--resume`, not the
+// agent's OPENKANBAN_SESSION env var — and conflating them creates a
+// mid-session divergence where the back-fill (status-poll) silently
+// changes which file the UI tries to read while the live hook keeps
+// writing to the original branch-keyed path.
 func sessionNameFor(ticket *board.Ticket, branchName string) string {
 	name := string(ticket.ID)
 	if branchName != "" {
 		name = branchName
-	}
-	if ticket.AgentSessionID != "" {
-		name = ticket.AgentSessionID
 	}
 	return name
 }
@@ -5207,11 +5228,24 @@ func (m *Model) Cleanup() {
 
 func (m *Model) pollAgentStatusesAsync() tea.Cmd {
 	type paneInfo struct {
-		ticketID        board.TicketID
+		ticketID board.TicketID
+		// fileSessionName mirrors OPENKANBAN_SESSION in the live agent's
+		// env — what the status hook used to choose its file path. It
+		// comes from PaneView.SessionName(), which is sourced from the
+		// daemon's SessionInfo at spawn (or resync), so it cannot drift
+		// from the env var. Don't substitute ticket.AgentSessionID here:
+		// the Claude UUID back-fill (commit c718699) writes that field
+		// MID-session, while OPENKANBAN_SESSION stays whatever was baked
+		// in at spawn. Using the UUID for the file lookup is the bug
+		// this whole struct exists to fix.
+		fileSessionName string
 		agentType       string
 		worktreePath    string
 		branchName      string
 		agentPort       int
+		// agentSessionID is the back-filled Claude/opencode UUID. Used
+		// for the opencode HTTP API lookup (where the API id is the
+		// match key in the response), NOT for the file lookup.
 		agentSessionID  string
 		running         bool
 		terminalContent string
@@ -5228,8 +5262,13 @@ func (m *Model) pollAgentStatusesAsync() tea.Cmd {
 		if worktreePath == "" {
 			worktreePath = ticket.WorktreePath
 		}
+		// Snapshot PaneView.SessionName() now (UI goroutine) so the
+		// async closure below doesn't reach into the pane from another
+		// goroutine.
+		fileSessionName := pane.SessionName()
 		panes = append(panes, paneInfo{
 			ticketID:        ticketID,
+			fileSessionName: fileSessionName,
 			agentType:       ticket.AgentType,
 			worktreePath:    worktreePath,
 			branchName:      ticket.BranchName,
@@ -5252,41 +5291,45 @@ func (m *Model) pollAgentStatusesAsync() tea.Cmd {
 				continue
 			}
 
-			sessionID := p.agentSessionID
-			if sessionID == "" && p.agentType == "opencode" && p.worktreePath != "" {
+			// Back-fill the agent's persistent session UUID into the
+			// ticket if it isn't already pinned. This is unrelated to
+			// the file-lookup key (fileSessionName) — see the field
+			// comments above. Keeping it here so --resume picks up the
+			// UUID on the next spawn / external-resume detection.
+			apiSessionID := p.agentSessionID
+			if apiSessionID == "" && p.agentType == "opencode" && p.worktreePath != "" {
 				if id := agent.FindOpencodeSession(p.worktreePath); id != "" {
-					sessionID = id
+					apiSessionID = id
 					if ticket, _ := globalStore.Get(p.ticketID); ticket != nil {
-						ticket.AgentSessionID = sessionID
+						ticket.AgentSessionID = apiSessionID
 						globalStore.Save(ticket)
 					}
 				}
 			}
-			// Mirror the opencode back-fill for claude. agent.FindClaudeSession
-			// returns the UUID of the freshest live (has real assistant content)
-			// journal under ~/.claude/projects/<encoded-cwd>/, so this only
-			// stamps the ticket once the agent has produced at least one real
-			// turn — same idempotent guard as opencode. With AgentSessionID
-			// persisted, subsequent spawns pass --resume <uuid> deterministically
-			// instead of leaning on claude's `--continue` "pick most recent"
-			// heuristic, which silently breaks after a ForceFresh re-spawn.
-			if sessionID == "" && p.agentType == "claude" && p.worktreePath != "" {
+			if apiSessionID == "" && p.agentType == "claude" && p.worktreePath != "" {
 				if id := agent.FindClaudeSession(p.worktreePath); id != "" {
-					sessionID = id
+					apiSessionID = id
 					if ticket, _ := globalStore.Get(p.ticketID); ticket != nil {
-						ticket.AgentSessionID = sessionID
+						ticket.AgentSessionID = apiSessionID
 						globalStore.Save(ticket)
 					}
 				}
-			}
-			if sessionID == "" {
-				sessionID = p.branchName
-			}
-			if sessionID == "" {
-				sessionID = string(p.ticketID)
 			}
 
-			status := detector.DetectStatusWithActivity(p.agentType, sessionID, p.worktreePath, p.agentPort, true, p.terminalContent, p.lastActivity)
+			// fileSessionName is what the status hook wrote with. If
+			// PaneView didn't have one (legacy spawn path, or a
+			// detached/resynced pane that never received a name), fall
+			// back to branch / ticketID — same priority the spawn code
+			// uses for sessionName.
+			fileKey := p.fileSessionName
+			if fileKey == "" {
+				fileKey = p.branchName
+			}
+			if fileKey == "" {
+				fileKey = string(p.ticketID)
+			}
+
+			status := detector.DetectStatusWithActivity(p.agentType, fileKey, apiSessionID, p.worktreePath, p.agentPort, true, p.terminalContent, p.lastActivity)
 			results[p.ticketID] = status
 		}
 		return results

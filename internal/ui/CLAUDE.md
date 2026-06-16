@@ -104,6 +104,12 @@ Why the second signal exists: a shipped, pulled-back ticket typically has an emp
 
 The three choice closures (`d`/`u`/`n` → `spawnPlan{ForceFresh}`/`{InjectResumeNotice}`/`{SkipMerge}`) are unchanged; only the trigger condition and the modal message vary.
 
+## Status-file lookup key
+
+`pollAgentStatusesAsync` looks up `~/.cache/openkanban-status/<key>.status` using `pane.SessionName()` — the value the daemon stamped into the agent's `OPENKANBAN_SESSION` env var at spawn time, and what the status hook reads back when it calls `openkanban status set <state>`. The detector splits this from `apiSessionID` (the back-filled Claude/opencode UUID, used only for opencode's HTTP lookup) via `DetectStatusWithActivity(agentType, fileSessionName, apiSessionID, ...)`.
+
+**Don't substitute `ticket.AgentSessionID` for the file lookup.** The UUID gets back-filled mid-session by `FindClaudeSession`, while `OPENKANBAN_SESSION` stays whatever was baked at original spawn. Conflating them creates a divergence where the hook keeps writing under the env var (the branch name) but the UI reads under the UUID, the file is missing, the detector falls through to terminal-content scraping, and Claude's `━` prompt-border heuristic mis-classifies idle/waiting sessions as "working". `sessionNameFor(ticket, branchName)` is now `branchName > ticketID` (no UUID), and `OwnsResp.SessionName` carries the daemon's stored value so the Owns fast-path doesn't need to recompute. See `[[reference_openkanban_status_file_key_invariant]]`.
+
 ## Status-mutation wrap-up
 
 When the user moves a ticket OUT of `in_progress` to a terminal status (`in_review` or `done`) via the **board** (quick-move keys or drag), `wrapUpSessionForTicket` runs BEFORE `m.globalStore.Move(...)`. It mirrors the CLI's `cmd/ticket_done.go:wrapUpSessionTicketAt`: stops the local pane, sends `TicketDone` to the daemon to terminate the live PTY, and stamps `AgentStatus=Completed` via `SetAgentStatus`. The pre-Move ordering matters — the helper's gate ("is the ticket leaving in_progress?") reads the **current** status, which `Move`'s call to `SetStatus` mutates in place.

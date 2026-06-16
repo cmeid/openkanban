@@ -1108,7 +1108,11 @@ func (s *Server) handleOwns(c *clientConn, req OwnsReq) OwnsResp {
 	defer s.sessionsMu.RUnlock()
 	for _, sess := range s.sessions {
 		if sess.AgentSessionUUID() == req.SessionUUID {
-			return OwnsResp{Owned: true, SessionID: sess.ID()}
+			return OwnsResp{
+				Owned:       true,
+				SessionID:   sess.ID(),
+				SessionName: sess.SessionName(),
+			}
 		}
 	}
 	return OwnsResp{Owned: false}
