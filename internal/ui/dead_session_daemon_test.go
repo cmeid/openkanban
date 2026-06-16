@@ -48,6 +48,14 @@ func (s *ownsStubAPI) Kill(_ context.Context, _ string, _ time.Duration) error {
 
 func (s *ownsStubAPI) ClientID() uint16 { return 1 }
 
+// TicketDone is unused by the dead-session gate tests but required to
+// satisfy daemonGuardAPI (wrapUpSessionForTicket calls it on board
+// promotion). Returns Killed=false so any accidental invocation
+// resolves cleanly.
+func (s *ownsStubAPI) TicketDone(_ context.Context, _ string) (daemon.TicketDoneResp, error) {
+	return daemon.TicketDoneResp{Killed: false}, nil
+}
+
 func (s *ownsStubAPI) Owns(ctx context.Context, sessionUUID string) (daemon.OwnsResp, error) {
 	s.calls.Add(1)
 	s.lastUUID.Store(sessionUUID)
