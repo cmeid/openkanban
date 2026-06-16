@@ -796,6 +796,14 @@ func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 			m.panes[msg.ticketID] = msg.pane
+			// Spawn just succeeded — there genuinely IS a daemon-side
+			// session for this ticket, so register it in daemonOwned
+			// immediately rather than waiting for the next periodic
+			// resync (~30s). Without this, the 'w' session filter and
+			// the 'W' "always show working" bypass miss freshly-spawned
+			// sessions, which is the most user-visible window since
+			// users tend to interact with sessions right after spawn.
+			m.daemonOwned[msg.ticketID] = struct{}{}
 			m.focusedPane = msg.ticketID
 			if msg.notice != "" {
 				m.notify(msg.notice)
