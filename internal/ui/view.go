@@ -709,68 +709,129 @@ func (m *Model) renderStatusBar() string {
 }
 
 func (m *Model) contextualHints(hintStyle lipgloss.Style, sep string) string {
+	// Every key the UI handles in this mode/state should appear here. The
+	// `?` help modal (renderHelp below) is the canonical reference; keep
+	// both surfaces in sync when adding or rebinding keys.
+	hint := func(key, label string) string {
+		return hintStyle.Render(key) + m.dimStyle().Render(" "+label)
+	}
+	join := func(parts ...string) string {
+		return strings.Join(parts, sep)
+	}
+
 	switch m.mode {
 	case ModeFilter:
-		return hintStyle.Render("Enter") + m.dimStyle().Render(" apply") + sep +
-			hintStyle.Render("Esc") + m.dimStyle().Render(" cancel") + sep +
-			m.dimStyle().Render("@project to filter by project")
+		return join(
+			hint("Enter", "apply"),
+			hint("Esc", "cancel"),
+			m.dimStyle().Render("@project to filter by project"),
+		)
 
 	case ModeSettings:
-		return hintStyle.Render("j/k") + m.dimStyle().Render(" navigate") + sep +
-			hintStyle.Render("Enter") + m.dimStyle().Render(" select") + sep +
-			hintStyle.Render("Esc") + m.dimStyle().Render(" close")
+		return join(
+			hint("j/k", "navigate"),
+			hint("Enter/Space", "edit"),
+			hint("Esc/q", "close"),
+		)
 
 	case ModeCreateTicket, ModeEditTicket:
 		action := "create"
 		if m.mode == ModeEditTicket {
 			action = "save"
 		}
-		return hintStyle.Render("Tab") + m.dimStyle().Render(" next") + sep +
-			hintStyle.Render("Ctrl+S") + m.dimStyle().Render(" "+action) + sep +
-			hintStyle.Render("Esc") + m.dimStyle().Render(" cancel")
+		return join(
+			hint("Tab/Shift+Tab", "fields"),
+			hint("Ctrl+S", action),
+			hint("Esc", "cancel"),
+		)
+
+	case ModeCreateProject:
+		return join(
+			hint("Enter", "create"),
+			hint("Esc", "cancel"),
+		)
 
 	case ModeAgentView:
-		return hintStyle.Render("Ctrl+G") + m.dimStyle().Render(" back to board") + sep +
-			m.dimStyle().Render("Shift+click to select text")
+		return join(
+			hint("Ctrl+G", "board"),
+			hint("Ctrl+]/\\", "cycle sessions"),
+			m.dimStyle().Render("Shift+click to select text"),
+		)
 
 	case ModeNormal:
 		if m.sidebarFocused {
-			return hintStyle.Render("j/k") + m.dimStyle().Render(" navigate") + sep +
-				hintStyle.Render("Space/Enter") + m.dimStyle().Render(" toggle") + sep +
-				hintStyle.Render("l") + m.dimStyle().Render(" board")
+			return join(
+				hint("j/k", "navigate"),
+				hint("Space/Enter", "toggle"),
+				hint("a", "add"),
+				hint("d", "delete"),
+				hint("l/Esc", "back"),
+			)
 		}
 
 		if m.filterQuery != "" || len(m.filterProjectIDs) > 0 {
-			return hintStyle.Render("Esc") + m.dimStyle().Render(" clear filter") + sep +
-				hintStyle.Render("/") + m.dimStyle().Render(" edit filter") + sep +
-				hintStyle.Render("?") + m.dimStyle().Render(" help")
+			return join(
+				hint("Esc", "clear filter"),
+				hint("/", "edit filter"),
+				hint("h/j/k/l", "navigate"),
+				hint("?", "help"),
+			)
 		}
 
 		ticket := m.selectedTicket()
 		if ticket != nil {
 			if _, hasPane := m.panes[ticket.ID]; hasPane {
-				return hintStyle.Render("Enter/s") + m.dimStyle().Render(" open agent") + sep +
-					hintStyle.Render("S") + m.dimStyle().Render(" stop agent") + sep +
-					hintStyle.Render("Space") + m.dimStyle().Render(" move") + sep +
-					hintStyle.Render("?") + m.dimStyle().Render(" help")
+				return join(
+					hint("Enter/s", "open agent"),
+					hint("S", "stop"),
+					hint("Space/-", "move"),
+					hint("e", "edit"),
+					hint("d", "del"),
+					hint("K/J", "prio"),
+					hint("o", "sort"),
+					hint("w", "filter"),
+					hint("[", "sidebar"),
+					hint("?", "help"),
+				)
 			}
 			if ticket.Status == board.StatusInProgress {
-				return hintStyle.Render("Enter/s") + m.dimStyle().Render(" spawn agent") + sep +
-					hintStyle.Render("Space") + m.dimStyle().Render(" move") + sep +
-					hintStyle.Render("e") + m.dimStyle().Render(" edit") + sep +
-					hintStyle.Render("?") + m.dimStyle().Render(" help")
+				return join(
+					hint("Enter/s", "spawn agent"),
+					hint("Space/-", "move"),
+					hint("e", "edit"),
+					hint("d", "del"),
+					hint("K/J", "prio"),
+					hint("o", "sort"),
+					hint("w", "filter"),
+					hint("[", "sidebar"),
+					hint("?", "help"),
+				)
 			}
 		}
 
-		return hintStyle.Render("h/l") + m.dimStyle().Render(" columns") + sep +
-			hintStyle.Render("n") + m.dimStyle().Render(" new") + sep +
-			hintStyle.Render("Space") + m.dimStyle().Render(" move") + sep +
-			hintStyle.Render("/") + m.dimStyle().Render(" search") + sep +
-			hintStyle.Render("?") + m.dimStyle().Render(" help")
+		return join(
+			hint("h/j/k/l", "nav"),
+			hint("n", "new"),
+			hint("e", "edit"),
+			hint("d", "del"),
+			hint("Space/-", "move"),
+			hint("s", "spawn"),
+			hint("K/J", "prio"),
+			hint("o", "sort"),
+			hint("w", "filter"),
+			hint("W", "global"),
+			hint("/", "search"),
+			hint("[", "sidebar"),
+			hint("O", "settings"),
+			hint("?", "help"),
+			hint("q", "quit"),
+		)
 
 	default:
-		return hintStyle.Render("Esc") + m.dimStyle().Render(" back") + sep +
-			hintStyle.Render("?") + m.dimStyle().Render(" help")
+		return join(
+			hint("Esc", "back"),
+			hint("?", "help"),
+		)
 	}
 }
 
@@ -799,27 +860,37 @@ func (m *Model) renderHelp() string {
 		sep + "\n" +
 		sectionStyle.Render("  🧭 Navigation") + "                 " + sectionStyle.Render("📝 Actions") + "\n" +
 		sep + "\n" +
-		"  " + keyStyle.Render("h/l") + descStyle.Render("   Move between columns  ") + keyStyle.Render("n") + descStyle.Render("       New ticket") + "\n" +
-		"  " + keyStyle.Render("j/k") + descStyle.Render("   Move between tickets  ") + keyStyle.Render("e") + descStyle.Render("       Edit ticket") + "\n" +
-		"  " + keyStyle.Render("g") + descStyle.Render("     Go to first ticket    ") + keyStyle.Render("d") + descStyle.Render("       Delete ticket") + "\n" +
-		"  " + keyStyle.Render("G") + descStyle.Render("     Go to last ticket     ") + keyStyle.Render("Space") + descStyle.Render("   Move forward") + "\n" +
-		"  " + keyStyle.Render(" ") + descStyle.Render("                            ") + keyStyle.Render("-") + descStyle.Render("       Move backward") + "\n" +
-		"  " + keyStyle.Render(" ") + descStyle.Render("                            ") + keyStyle.Render("K/J") + descStyle.Render("     Raise/lower priority") + "\n\n" +
+		"  " + keyStyle.Render("h/l") + descStyle.Render("   Move between columns  ") + keyStyle.Render("n") + descStyle.Render("           New ticket") + "\n" +
+		"  " + keyStyle.Render("j/k") + descStyle.Render("   Move between tickets  ") + keyStyle.Render("e") + descStyle.Render("           Edit ticket") + "\n" +
+		"  " + keyStyle.Render("g") + descStyle.Render("     Go to first ticket    ") + keyStyle.Render("d") + descStyle.Render("           Delete ticket") + "\n" +
+		"  " + keyStyle.Render("G") + descStyle.Render("     Go to last ticket     ") + keyStyle.Render("Space") + descStyle.Render("       Move forward") + "\n" +
+		"  " + keyStyle.Render(" ") + descStyle.Render("                            ") + keyStyle.Render("-/Backspace") + descStyle.Render(" Move backward") + "\n" +
+		"  " + keyStyle.Render(" ") + descStyle.Render("                            ") + keyStyle.Render("K/J") + descStyle.Render("         Raise/lower priority") + "\n\n" +
 		sep + "\n" +
 		sectionStyle.Render("  📂 Sidebar") + "                    " + sectionStyle.Render("🤖 Agent") + "\n" +
 		sep + "\n" +
-		"  " + keyStyle.Render("[") + descStyle.Render("     Toggle sidebar        ") + keyStyle.Render("s/Enter") + descStyle.Render(" Open agent") + "\n" +
-		"  " + keyStyle.Render("h") + descStyle.Render("     Enter sidebar         ") + keyStyle.Render("S") + descStyle.Render("       Stop agent") + "\n" +
-		"  " + keyStyle.Render("l") + descStyle.Render("     Exit sidebar          ") + keyStyle.Render("Ctrl+g") + descStyle.Render("  Exit agent view") + "\n" +
+		"  " + keyStyle.Render("[") + descStyle.Render("     Toggle sidebar          ") + keyStyle.Render("s/Enter") + descStyle.Render(" Open agent") + "\n" +
+		"  " + keyStyle.Render("Tab") + descStyle.Render("   Focus sidebar           ") + keyStyle.Render("S") + descStyle.Render("       Stop agent") + "\n" +
+		"  " + keyStyle.Render("h/l") + descStyle.Render("   Enter / exit sidebar    ") + keyStyle.Render("Ctrl+g") + descStyle.Render("  Exit agent view") + "\n" +
 		"  " + keyStyle.Render("j/k") + descStyle.Render("   Navigate projects       ") + keyStyle.Render("Ctrl+]") + descStyle.Render("  Next session (in view)") + "\n" +
-		"  " + keyStyle.Render(" ") + descStyle.Render("                            ") + keyStyle.Render("Ctrl+\\") + descStyle.Render("  Prev session (in view)") + "\n\n" +
+		"  " + keyStyle.Render("a") + descStyle.Render("     Add project             ") + keyStyle.Render("Ctrl+\\") + descStyle.Render("  Prev session (in view)") + "\n" +
+		"  " + keyStyle.Render("d") + descStyle.Render("     Delete project") + "\n\n" +
 		sep + "\n" +
-		sectionStyle.Render("  👁 View") + "\n" +
+		sectionStyle.Render("  👁 View") + "                       " + sectionStyle.Render("⚙ System") + "\n" +
 		sep + "\n" +
 		"  " + keyStyle.Render("/") + descStyle.Render("     Search/filter         ") + keyStyle.Render("O") + descStyle.Render("       Settings") + "\n" +
 		"  " + keyStyle.Render("o") + descStyle.Render("     Cycle sort order      ") + keyStyle.Render("?") + descStyle.Render("       Toggle help") + "\n" +
-		"  " + keyStyle.Render("w") + descStyle.Render("     Toggle session filter ") + keyStyle.Render("q") + descStyle.Render("       Quit") + "\n" +
-		"  " + keyStyle.Render("W") + descStyle.Render("     Show working sessions across all projects") + "\n\n" +
+		"  " + keyStyle.Render("w") + descStyle.Render("     Toggle session filter ") + keyStyle.Render("Esc") + descStyle.Render("     Cancel / back") + "\n" +
+		"  " + keyStyle.Render("W") + descStyle.Render("     Show working sessions ") + keyStyle.Render("Ctrl+R") + descStyle.Render("  Restart (when binary updates)") + "\n" +
+		"  " + keyStyle.Render(" ") + descStyle.Render("       across all projects ") + keyStyle.Render("q") + descStyle.Render("       Quit") + "\n\n" +
+		sep + "\n" +
+		sectionStyle.Render("  ✎ Ticket form") + "                " + sectionStyle.Render("⚙ Settings & dialogs") + "\n" +
+		sep + "\n" +
+		"  " + keyStyle.Render("Tab") + descStyle.Render("       Next field      ") + keyStyle.Render("j/k") + descStyle.Render("         Navigate items") + "\n" +
+		"  " + keyStyle.Render("Shift+Tab") + descStyle.Render(" Previous field  ") + keyStyle.Render("Enter/Space") + descStyle.Render(" Edit / toggle") + "\n" +
+		"  " + keyStyle.Render("Ctrl+S") + descStyle.Render("    Save            ") + keyStyle.Render("Esc/q") + descStyle.Render("       Close") + "\n" +
+		"  " + keyStyle.Render("1-5") + descStyle.Render("       Set priority    ") + keyStyle.Render("y/n") + descStyle.Render("         Confirm dialog") + "\n" +
+		"  " + keyStyle.Render("Esc") + descStyle.Render("       Cancel form") + "\n\n" +
 		sep + "\n" +
 		"  " + lipgloss.NewStyle().Foreground(m.colors.warning).Render("💡") + m.dimStyle().Render(" Tip: Hold Shift to select text in agent view") + "\n\n" +
 		"  " + m.dimStyle().Render("Press any key to close")
