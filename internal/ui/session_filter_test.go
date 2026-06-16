@@ -539,3 +539,54 @@ func TestCompactColumnOffsets_TinyTerminal_NoPanic(t *testing.T) {
 		t.Errorf("tiny-terminal offset = %d, want 5 (unchanged via early return)", got)
 	}
 }
+
+func TestWindowSizeMsg_GrowCompactsOffsets(t *testing.T) {
+	// A resize that grows the terminal increases the column budget. Any
+	// offset the user manually scrolled to that was valid at the smaller
+	// budget may now be unnecessarily deep — the new wantTarget (smallest
+	// offset still keeping the tail visible) drops, and compaction must
+	// reduce the user's offset to surface more cards.
+	//
+	// Without the compactColumnOffsets call in the WindowSizeMsg handler,
+	// the user would grow their terminal and still see "▲ 15 more" with
+	// only a few cards rendered, even though all of them now fit.
+	all := makeBacklogTickets(20)
+	m := makePrioritySortModel(t, all)
+	m.refreshColumnTickets()
+
+	// Seed a hand-scrolled offset that's valid at the default budget
+	// (height=40 ⇒ budget ≈ 29 rows). The user is partway down the column.
+	m.columnOffsets[0] = 15
+
+	// Grow the window. height=120 yields a much bigger budget; wantTarget
+	// drops, so compaction must pull the offset down.
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 120})
+
+	// Derive the expected post-grow target via the same backward walk the
+	// production code uses, so this test survives layout-constant changes.
+	budget := m.columnContentHeight()
+	if budget <= 0 {
+		t.Fatalf("post-grow budget should be positive, got %d", budget)
+	}
+	n := 20
+	wantTarget := 0
+	used := 0
+	for j := n - 1; j >= 0; j-- {
+		cost := ticketHeight
+		reserve := 0
+		if j > 0 {
+			reserve = 1
+		}
+		if used+cost+reserve > budget {
+			wantTarget = j + 1
+			break
+		}
+		used += cost
+	}
+	if wantTarget >= 15 {
+		t.Skipf("test fixture grew too little: wantTarget=%d ≥ seeded 15", wantTarget)
+	}
+	if got := m.columnOffsets[0]; got != wantTarget {
+		t.Errorf("post-grow offset compaction: got %d, want %d (budget=%d after grow)", got, wantTarget, budget)
+	}
+}
