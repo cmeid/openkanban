@@ -461,6 +461,171 @@ func TestIsClaudeSessionDead(t *testing.T) {
 	})
 }
 
+func TestFindClaudeSession(t *testing.T) {
+	t.Run("no_project_dir", func(t *testing.T) {
+		withFakeHome(t)
+		if got := FindClaudeSession("/tmp/never-touched"); got != "" {
+			t.Errorf("FindClaudeSession = %q, want \"\" (no project dir)", got)
+		}
+	})
+
+	t.Run("empty_string_worktree", func(t *testing.T) {
+		withFakeHome(t)
+		if got := FindClaudeSession(""); got != "" {
+			t.Errorf("FindClaudeSession(\"\") = %q, want \"\"", got)
+		}
+	})
+
+	t.Run("no_jsonl_files", func(t *testing.T) {
+		home := withFakeHome(t)
+		worktree := "/worktree/empty"
+		dir := filepath.Join(home, ".claude", "projects", encodeWorktree(worktree))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if got := FindClaudeSession(worktree); got != "" {
+			t.Errorf("FindClaudeSession = %q, want \"\" (empty dir)", got)
+		}
+	})
+
+	t.Run("dead_session_returns_empty", func(t *testing.T) {
+		home := withFakeHome(t)
+		worktree := "/worktree/dead"
+		dir := filepath.Join(home, ".claude", "projects", encodeWorktree(worktree))
+		events := []map[string]any{
+			{
+				"type": "assistant",
+				"message": map[string]any{
+					"role":    "assistant",
+					"content": "No response requested.",
+				},
+			},
+		}
+		writeJSONL(t, dir, "11111111-2222-3333-4444-555555555555.jsonl", events)
+		if got := FindClaudeSession(worktree); got != "" {
+			t.Errorf("FindClaudeSession = %q, want \"\" (only auto-replies)", got)
+		}
+	})
+
+	t.Run("live_session_returns_uuid", func(t *testing.T) {
+		home := withFakeHome(t)
+		worktree := "/worktree/live"
+		dir := filepath.Join(home, ".claude", "projects", encodeWorktree(worktree))
+		uuid := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+		events := []map[string]any{
+			{
+				"type": "assistant",
+				"message": map[string]any{
+					"role":    "assistant",
+					"content": "Real reply.",
+				},
+			},
+		}
+		writeJSONL(t, dir, uuid+".jsonl", events)
+		if got := FindClaudeSession(worktree); got != uuid {
+			t.Errorf("FindClaudeSession = %q, want %q", got, uuid)
+		}
+	})
+
+	t.Run("non_uuid_basename_returns_empty", func(t *testing.T) {
+		home := withFakeHome(t)
+		worktree := "/worktree/garbage"
+		dir := filepath.Join(home, ".claude", "projects", encodeWorktree(worktree))
+		events := []map[string]any{
+			{
+				"type": "assistant",
+				"message": map[string]any{
+					"role":    "assistant",
+					"content": "Real reply.",
+				},
+			},
+		}
+		writeJSONL(t, dir, "not-a-uuid.jsonl", events)
+		if got := FindClaudeSession(worktree); got != "" {
+			t.Errorf("FindClaudeSession = %q, want \"\" (non-uuid basename)", got)
+		}
+	})
+
+	t.Run("picks_freshest_by_mtime", func(t *testing.T) {
+		home := withFakeHome(t)
+		worktree := "/worktree/multi-fresh"
+		dir := filepath.Join(home, ".claude", "projects", encodeWorktree(worktree))
+
+		liveEvents := []map[string]any{
+			{
+				"type": "assistant",
+				"message": map[string]any{
+					"role":    "assistant",
+					"content": "Real reply.",
+				},
+			},
+		}
+		olderUUID := "11111111-1111-1111-1111-111111111111"
+		newerUUID := "22222222-2222-2222-2222-222222222222"
+		olderPath := writeJSONL(t, dir, olderUUID+".jsonl", liveEvents)
+		newerPath := writeJSONL(t, dir, newerUUID+".jsonl", liveEvents)
+
+		oldTime := time.Now().Add(-2 * time.Hour)
+		newTime := time.Now()
+		if err := os.Chtimes(olderPath, oldTime, oldTime); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(newerPath, newTime, newTime); err != nil {
+			t.Fatal(err)
+		}
+
+		if got := FindClaudeSession(worktree); got != newerUUID {
+			t.Errorf("FindClaudeSession = %q, want newer %q", got, newerUUID)
+		}
+	})
+
+	t.Run("newer_dead_takes_precedence_over_older_live", func(t *testing.T) {
+		// Matches IsClaudeSessionDead's "picks_most_recent_jsonl"
+		// behaviour: we look at the freshest file only, and judge its
+		// aliveness. An older live session does NOT rescue a newer
+		// dead one — that prevents us from back-filling a stale UUID
+		// when the user just did ForceFresh and the new session is
+		// still warming up.
+		home := withFakeHome(t)
+		worktree := "/worktree/newer-dead"
+		dir := filepath.Join(home, ".claude", "projects", encodeWorktree(worktree))
+
+		liveEvents := []map[string]any{
+			{
+				"type": "assistant",
+				"message": map[string]any{
+					"role":    "assistant",
+					"content": "Old session said something real.",
+				},
+			},
+		}
+		deadEvents := []map[string]any{
+			{
+				"type": "assistant",
+				"message": map[string]any{
+					"role":    "assistant",
+					"content": "No response requested.",
+				},
+			},
+		}
+		olderPath := writeJSONL(t, dir, "11111111-1111-1111-1111-111111111111.jsonl", liveEvents)
+		newerPath := writeJSONL(t, dir, "22222222-2222-2222-2222-222222222222.jsonl", deadEvents)
+
+		oldTime := time.Now().Add(-2 * time.Hour)
+		newTime := time.Now()
+		if err := os.Chtimes(olderPath, oldTime, oldTime); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(newerPath, newTime, newTime); err != nil {
+			t.Fatal(err)
+		}
+
+		if got := FindClaudeSession(worktree); got != "" {
+			t.Errorf("FindClaudeSession = %q, want \"\" (newer file is dead)", got)
+		}
+	})
+}
+
 func TestDeleteClaudeSession(t *testing.T) {
 	t.Run("empty_path", func(t *testing.T) {
 		if err := DeleteClaudeSession(""); err != nil {
