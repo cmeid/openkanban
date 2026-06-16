@@ -278,6 +278,251 @@ var daemonRestartCmd = &cobra.Command{
 	},
 }
 
+// daemonCloseFlagYes is the -y/--yes flag on `daemon close` — when set,
+// skip the interactive confirmation prompt.
+var daemonCloseFlagYes bool
+
+// daemonCloseFlagGrace is the --grace duration on `daemon close`. It
+// becomes the SIGTERM-to-SIGKILL grace window the daemon honors when
+// terminating the resolved session(s). The default of 3 seconds matches
+// the daemon's internal shutdownGraceSeconds constant (see
+// internal/daemon/server.go); that constant is package-private so we
+// hard-code the same value here rather than reach across the package
+// boundary.
+var daemonCloseFlagGrace time.Duration
+
+// daemonCloseDefaultGrace mirrors internal/daemon.shutdownGraceSeconds
+// (3s). Kept here so the CLI doesn't need to import the daemon's private
+// constant; if the daemon's grace changes, this default should be revised
+// in lock-step.
+const daemonCloseDefaultGrace = 3 * time.Second
+
+// minSessionPrefixLen is the shortest SessionID prefix `daemon close`
+// will accept. `daemon list` prints the leading 8 chars; 4 is the soft
+// floor that keeps ambiguity manageable without requiring users to
+// retype the full 16-char SessionID.
+const minSessionPrefixLen = 4
+
+// daemonClosePlan is what daemonCloseRun resolves an arbitrary arg into:
+// either a Kill of a single SessionID or a TicketDone for a TicketID
+// that may map to multiple sessions (defense-in-depth against pre-dedup
+// duplicates).
+type daemonClosePlan struct {
+	// Kind is "kill" or "ticket_done".
+	Kind string
+	// Sessions are the sessions the daemon will terminate. For Kind=kill
+	// this has exactly one entry; for Kind=ticket_done it has >=1.
+	Sessions []daemon.SessionInfo
+	// TicketID is set when Kind=ticket_done.
+	TicketID string
+}
+
+// daemonCloseRun is the testable core of `openkanban daemon close`. It
+// dials the daemon, lists sessions, resolves arg into a plan, and (if
+// !dryRun) executes the kill/ticket_done RPC. The cobra RunE wraps this
+// with TTY-aware confirmation between the resolve and the execute steps.
+//
+// Returns the resolved plan even when execute is false, so tests can
+// assert on resolution independent of execution.
+func daemonCloseRun(ctx context.Context, arg string, grace time.Duration, execute bool) (daemonClosePlan, error) {
+	conn, err := dialDaemon(ctx)
+	if err != nil {
+		return daemonClosePlan{}, err
+	}
+	defer conn.Close()
+
+	r := bufio.NewReader(conn)
+	if _, err := exchange(conn, r, daemon.MsgHelloReq, daemon.HelloReq{
+		ProtocolVersion: daemon.ProtocolVersion,
+		BinaryVersion:   Version,
+		ClientName:      daemon.ClientNameCLI,
+	}); err != nil {
+		return daemonClosePlan{}, fmt.Errorf("hello: %w", err)
+	}
+
+	raw, err := exchange(conn, r, daemon.MsgListReq, daemon.ListReq{})
+	if err != nil {
+		return daemonClosePlan{}, fmt.Errorf("list: %w", err)
+	}
+	var list daemon.ListResp
+	if err := json.Unmarshal(raw, &list); err != nil {
+		return daemonClosePlan{}, fmt.Errorf("decode ListResp: %w", err)
+	}
+
+	plan, err := resolveDaemonCloseArg(arg, list.Sessions)
+	if err != nil {
+		return plan, err
+	}
+
+	if !execute {
+		return plan, nil
+	}
+
+	switch plan.Kind {
+	case "kill":
+		s := plan.Sessions[0]
+		raw, err := exchange(conn, r, daemon.MsgKillReq, daemon.KillReq{
+			SessionID:    s.SessionID,
+			GraceSeconds: int(grace / time.Second),
+		})
+		if err != nil {
+			return plan, fmt.Errorf("kill: %w", err)
+		}
+		var resp daemon.KillResp
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			return plan, fmt.Errorf("decode KillResp: %w", err)
+		}
+		return plan, nil
+	case "ticket_done":
+		raw, err := exchange(conn, r, daemon.MsgTicketDoneReq, daemon.TicketDoneReq{
+			TicketID: plan.TicketID,
+		})
+		if err != nil {
+			return plan, fmt.Errorf("ticket_done: %w", err)
+		}
+		var resp daemon.TicketDoneResp
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			return plan, fmt.Errorf("decode TicketDoneResp: %w", err)
+		}
+		return plan, nil
+	default:
+		return plan, fmt.Errorf("internal: unknown plan kind %q", plan.Kind)
+	}
+}
+
+// resolveDaemonCloseArg maps a user-supplied positional argument to a
+// daemonClosePlan using the documented precedence: exact SessionID > 4+
+// char SessionID prefix > exact TicketID. No match returns an error; an
+// ambiguous prefix returns an error listing the candidates.
+func resolveDaemonCloseArg(arg string, sessions []daemon.SessionInfo) (daemonClosePlan, error) {
+	if arg == "" {
+		return daemonClosePlan{}, fmt.Errorf("empty id")
+	}
+
+	// 1. Exact SessionID match (single, by definition — SessionID is
+	//    unique in the daemon's map).
+	for _, s := range sessions {
+		if s.SessionID == arg {
+			return daemonClosePlan{Kind: "kill", Sessions: []daemon.SessionInfo{s}}, nil
+		}
+	}
+
+	// 2. SessionID prefix match (min length guard). The 8-char display
+	//    width of `daemon list` is the typical input, but anything
+	//    >= minSessionPrefixLen is fair game.
+	if len(arg) >= minSessionPrefixLen {
+		var prefixMatches []daemon.SessionInfo
+		for _, s := range sessions {
+			if strings.HasPrefix(s.SessionID, arg) {
+				prefixMatches = append(prefixMatches, s)
+			}
+		}
+		if len(prefixMatches) == 1 {
+			return daemonClosePlan{Kind: "kill", Sessions: prefixMatches}, nil
+		}
+		if len(prefixMatches) > 1 {
+			var lines []string
+			for _, s := range prefixMatches {
+				short := s.SessionID
+				if len(short) > 8 {
+					short = short[:8]
+				}
+				lines = append(lines, fmt.Sprintf("  %s ticket=%s pid=%d", short, s.TicketID, s.PID))
+			}
+			return daemonClosePlan{}, fmt.Errorf("ambiguous prefix %q matches %d sessions:\n%s",
+				arg, len(prefixMatches), strings.Join(lines, "\n"))
+		}
+	}
+
+	// 3. Exact TicketID match. May yield multiple via pre-dedup defense;
+	//    that's fine — handleTicketDone iterates and kills all.
+	var ticketMatches []daemon.SessionInfo
+	for _, s := range sessions {
+		if s.TicketID == arg {
+			ticketMatches = append(ticketMatches, s)
+		}
+	}
+	if len(ticketMatches) > 0 {
+		return daemonClosePlan{
+			Kind:     "ticket_done",
+			Sessions: ticketMatches,
+			TicketID: arg,
+		}, nil
+	}
+
+	return daemonClosePlan{}, fmt.Errorf("no session for %q; daemon list shows %d session(s)", arg, len(sessions))
+}
+
+// daemonCloseCmd is the user-facing recovery hatch for terminating a
+// single daemon-owned session. Other commands (`daemon stop`, `daemon
+// restart`) kill ALL sessions; `close` operates on exactly one (or, in
+// the rare pre-dedup-duplicate case, all sessions sharing one TicketID,
+// matching the daemon's own ticket-done semantics).
+//
+// Resolution precedence:
+//
+//	exact SessionID  →  4+ char SessionID prefix  →  exact TicketID
+//
+// The first non-empty match wins. An ambiguous prefix is reported as an
+// error listing the candidates. Empty arg, no match, or a daemon that
+// isn't running all return a clean error.
+var daemonCloseCmd = &cobra.Command{
+	Use:           "close <id>",
+	Short:         "Gracefully terminate a single daemon session",
+	Long:          "Resolves <id> as an exact SessionID, then a SessionID prefix (>= 4 chars), then a TicketID, and asks the daemon to terminate the matching session(s). The daemon honors a SIGTERM-then-SIGKILL grace window (see --grace). With sessions still alive, prompts on an interactive TTY; pass -y to skip the prompt.",
+	Args:          cobra.ExactArgs(1),
+	SilenceUsage:  true,
+	SilenceErrors: false,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		// First pass: resolve only — don't execute yet, so we can show
+		// the plan and ask for confirmation before pulling the trigger.
+		plan, err := daemonCloseRun(cmd.Context(), args[0], daemonCloseFlagGrace, false)
+		if err != nil {
+			return err
+		}
+
+		// Echo the matched session(s) in the same one-line format `daemon
+		// list` uses, so users see what they're about to kill.
+		for _, s := range plan.Sessions {
+			short := s.SessionID
+			if len(short) > 8 {
+				short = short[:8]
+			}
+			fmt.Printf("%s ticket=%s session=%s pid=%d running=%v started=%s\n",
+				short, s.TicketID, s.SessionName, s.PID, s.Running, time.Since(s.StartedAt).Round(time.Second))
+		}
+
+		if !daemonCloseFlagYes && stderrIsTTY() {
+			if !confirm(os.Stdin, os.Stderr, "Close this session? [y/N] ") {
+				return nil
+			}
+		}
+
+		// Second pass: re-resolve and execute. We dial a fresh conn (the
+		// first call's defer has already closed it) and re-run the
+		// resolution — the live session set MAY have changed between
+		// prompt and confirmation; refusing to assume a stale plan is
+		// still valid is the safer move.
+		plan, err = daemonCloseRun(cmd.Context(), args[0], daemonCloseFlagGrace, true)
+		if err != nil {
+			return err
+		}
+
+		switch plan.Kind {
+		case "kill":
+			s := plan.Sessions[0]
+			short := s.SessionID
+			if len(short) > 8 {
+				short = short[:8]
+			}
+			fmt.Printf("closed: ticket=%s session=%s pid=%d\n", s.TicketID, short, s.PID)
+		case "ticket_done":
+			fmt.Printf("closed: %d session(s) for ticket=%s\n", len(plan.Sessions), plan.TicketID)
+		}
+		return nil
+	},
+}
+
 // stderrIsTTY reports whether stderr is attached to a character device.
 // Used to decide whether `daemon restart` should prompt the user before
 // killing live sessions. We deliberately use os.Stderr.Stat instead of
@@ -391,10 +636,13 @@ func init() {
 	daemonCmd.Flags().BoolVar(&daemonFlagPersistent, "persistent", false, "Stay alive when the last client disconnects (used by launchd / systemd integration)")
 	daemonStopCmd.Flags().BoolVar(&daemonStopFlagForce, "force", false, "skip the interactive 'continue?' prompt even if live sessions exist")
 	daemonRestartCmd.Flags().BoolVar(&daemonRestartFlagForce, "force", false, "skip the interactive 'continue?' prompt even if live sessions exist")
+	daemonCloseCmd.Flags().BoolVarP(&daemonCloseFlagYes, "yes", "y", false, "skip the interactive confirmation prompt")
+	daemonCloseCmd.Flags().DurationVar(&daemonCloseFlagGrace, "grace", daemonCloseDefaultGrace, "SIGTERM-to-SIGKILL grace window when terminating the resolved session(s)")
 
 	daemonCmd.AddCommand(daemonListCmd)
 	daemonCmd.AddCommand(daemonStopCmd)
 	daemonCmd.AddCommand(daemonRestartCmd)
+	daemonCmd.AddCommand(daemonCloseCmd)
 	daemonCmd.AddCommand(daemonLogCmd)
 	rootCmd.AddCommand(daemonCmd)
 }
