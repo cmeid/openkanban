@@ -386,6 +386,13 @@ type Model struct {
 	// See internal/ui/reload.go.
 	recentSelfWrites map[string]selfWriteRecord
 
+	// boardResyncSnap is the prior tick's snapshot of every known
+	// ticket file's mtime+size+projectID, keyed by absolute path. The
+	// periodic board resync (internal/ui/board_resync.go) diffs the
+	// current scan against this map to decide which paths to reload
+	// and which to drop. Nil until the first tick completes.
+	boardResyncSnap map[string]boardFileMeta
+
 	// lastWindowTitle is the most recent value passed to
 	// tea.SetWindowTitle, used to dedupe redundant title updates.
 	// See computeWindowTitle / maybeSetWindowTitle.
@@ -606,6 +613,13 @@ func (m *Model) Init() tea.Cmd {
 	if cmd := m.scheduleDaemonResync(); cmd != nil {
 		cmds = append(cmds, cmd)
 	}
+	// Arm the periodic board-state resync. Reconciles in-memory
+	// tickets + projects against the on-disk source of truth so
+	// changes made by a sibling TUI (or any process editing ticket
+	// .md files) surface even when the fsnotify watcher missed the
+	// event or never subscribed to the affected project. See
+	// internal/ui/board_resync.go.
+	cmds = append(cmds, m.scheduleBoardResync())
 	return tea.Batch(cmds...)
 }
 
@@ -748,6 +762,10 @@ func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleDaemonResyncTick()
 	case daemonResyncMsg:
 		return m.handleDaemonResyncMsg(msg)
+	case boardResyncTickMsg:
+		return m.handleBoardResyncTick()
+	case boardResyncMsg:
+		return m.handleBoardResyncMsg(msg)
 	}
 
 	if m.mode == ModeShuttingDown {

@@ -522,6 +522,38 @@ func (g *GlobalTicketStore) AddProject(p *Project) {
 	g.ticketStores[p.ID] = NewTicketStore(p.ID, p.RepoPath)
 }
 
+// AddProjectAndLoad registers a project AND reads its ticket files
+// from disk into the in-memory index. Used by the periodic board
+// resync when a sibling TUI added a project to projects.json after
+// startup. Returns an error from LoadTicketStore but always installs
+// the project itself, so a parse error on one ticket doesn't keep the
+// project invisible.
+//
+// Safe to call from a Bubble Tea Update goroutine. Not safe to call
+// concurrently with Save/Reload methods on the same store.
+func (g *GlobalTicketStore) AddProjectAndLoad(p *Project) error {
+	store, err := LoadTicketStore(p)
+	if err != nil {
+		g.projects[p.ID] = p
+		g.ticketStores[p.ID] = NewTicketStore(p.ID, p.RepoPath)
+		return err
+	}
+	g.projects[p.ID] = p
+	g.ticketStores[p.ID] = store
+	for id, ticket := range store.Tickets {
+		g.allTickets[id] = ticket
+	}
+	return nil
+}
+
+// HasProject reports whether the in-memory index already tracks a
+// project with the given ID. Used by the periodic board resync to
+// detect sibling-TUI-added projects without iterating Projects().
+func (g *GlobalTicketStore) HasProject(id string) bool {
+	_, ok := g.projects[id]
+	return ok
+}
+
 // RemoveProject archives the project's whole ticket directory by
 // renaming tickets/{id}/ to tickets/archived/{id}_{ts}/, then drops
 // in-memory references.

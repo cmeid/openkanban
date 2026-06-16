@@ -90,9 +90,21 @@ Two seams worth knowing about:
 - **`daemonGuardAPI` interface** (`exit_guard.go`) — extended with `TicketDone(ctx, ticketID)` so UI tests can substitute a fake without spinning up a real daemon. New daemon RPCs needed from UI code should be added here for the same reason.
 - **`handleDaemonSessionEvent("exited")` conditional clear** (`daemon_subscribe.go`) — clears `ticket.AgentSessionID` / `AgentSpawnedAt` only when `ev.Expected == true`. Unexpected exits (daemon crash, transient PTY tear-down) deliberately preserve the residue so `--resume` can still pick up a JSONL that's still on disk. The persistence work in commit `c718699` (`feat(session): persist UUID, prefer --resume`) is what makes this matter — clearing on every exit would un-do it.
 
+## tea.Cmd goroutines must not touch shared Model state
+
+Returning a `tea.Cmd` from Update causes the framework to run it in a goroutine. That goroutine can run concurrently with subsequent Update calls, so it MUST NOT touch state that Update mutates — in particular `m.projectRegistry` and `m.globalStore`. Reading them is also a race if Update writes them (e.g. `handleFsChanged`'s `projectRegistry.ReloadFromDisk`, ticket-creation paths).
+
+Discipline:
+
+- **Goroutine:** read-only filesystem work; load registry/state from disk into *local* fresh copies (e.g. `project.LoadRegistry()`).
+- **Update handler:** the only place that mutates `m.projectRegistry`, `m.globalStore`, `m.panes`, etc.
+
+The race detector only catches observed concurrency. A test that drives the cmd synchronously (`cmd()` inline) will miss the race. See `board_resync.go` for the canonical shape — goroutine loads its own `*ProjectRegistry`; the handler reloads the model's registry. `daemon_resync.go` follows the same rule: its goroutine reads only `api` (externally synchronized) and never touches `m`.
+
 ## Anti-Patterns
 
 - Don't block in Update() - use Cmd for async
 - Don't render directly in Update() - only in View()
 - Don't store computed strings - recompute in View()
 - Don't access panes without nil check
+- Don't mutate `m.*` from a tea.Cmd goroutine — see the section above
