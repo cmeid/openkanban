@@ -62,10 +62,11 @@ type ticketFrontmatter struct {
 	Priority  int                `yaml:"priority"`
 	Labels    []string           `yaml:"labels"`
 
-	CreatedAt   time.Time  `yaml:"created_at"`
-	UpdatedAt   time.Time  `yaml:"updated_at"`
-	StartedAt   *time.Time `yaml:"started_at,omitempty"`
-	CompletedAt *time.Time `yaml:"completed_at,omitempty"`
+	CreatedAt       time.Time  `yaml:"created_at"`
+	UpdatedAt       time.Time  `yaml:"updated_at"`
+	StartedAt       *time.Time `yaml:"started_at,omitempty"`
+	CompletedAt     *time.Time `yaml:"completed_at,omitempty"`
+	StatusChangedAt *time.Time `yaml:"status_changed_at,omitempty"`
 
 	UseWorktree  bool   `yaml:"use_worktree"`
 	WorktreePath string `yaml:"worktree_path,omitempty"`
@@ -109,6 +110,7 @@ func toFrontmatter(t *board.Ticket) ticketFrontmatter {
 		UpdatedAt:        t.UpdatedAt,
 		StartedAt:        t.StartedAt,
 		CompletedAt:      t.CompletedAt,
+		StatusChangedAt:  t.StatusChangedAt,
 		UseWorktree:      t.UseWorktree,
 		WorktreePath:     t.WorktreePath,
 		BranchName:       t.BranchName,
@@ -160,6 +162,7 @@ func fromFrontmatter(fm ticketFrontmatter, body string) *board.Ticket {
 		UpdatedAt:        fm.UpdatedAt,
 		StartedAt:        fm.StartedAt,
 		CompletedAt:      fm.CompletedAt,
+		StatusChangedAt:  fm.StatusChangedAt,
 		Labels:           labels,
 		Priority:         fm.Priority,
 		Meta:             meta,

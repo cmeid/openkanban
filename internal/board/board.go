@@ -93,6 +93,11 @@ type Ticket struct {
 	UpdatedAt   time.Time  `json:"updated_at"`
 	StartedAt   *time.Time `json:"started_at,omitempty"`
 	CompletedAt *time.Time `json:"completed_at,omitempty"`
+	// StatusChangedAt records the last time Status or AgentStatus
+	// transitioned. Bumped by SetStatus and SetAgentStatus, not by
+	// Touch — ordinary edits (rename, priority) must not move it.
+	// Used by the "sort by status change" mode.
+	StatusChangedAt *time.Time `json:"status_changed_at,omitempty"`
 
 	Labels   []string          `json:"labels,omitempty"`
 	Priority int               `json:"priority,omitempty"`
