@@ -2160,12 +2160,10 @@ func (m *Model) confirmDeleteProject(p *project.Project) {
 
 	m.showConfirm = true
 	m.confirmFn = func() tea.Cmd {
-		if err := m.projectRegistry.Delete(p.ID); err != nil {
+		if err := m.globalStore.RemoveProject(p.ID); err != nil {
 			m.notify("Failed to delete: " + err.Error())
 			return nil
 		}
-
-		m.globalStore.RemoveProject(p.ID)
 		delete(m.worktreeMgrs, p.ID)
 
 		projects := m.globalStore.Projects()
