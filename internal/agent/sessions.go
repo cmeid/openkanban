@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,17 @@ import (
 	"syscall"
 	"time"
 )
+
+// ClaudePrimingPrefixes are the leading phrases of the priming prompts
+// openkanban delivers via argv at spawn time (see
+// internal/config/agent_prompt.tmpl). Two variants: a fresh-spawn brief
+// and an external-resume brief. Both are template-invariant; if the
+// template's first sentences are edited, these must be updated in
+// lockstep. TestClaudePrimingPrefixes_MatchTemplate guards the contract.
+var ClaudePrimingPrefixes = []string{
+	"You have been spawned by OpenKanban for focused work on one ticket.",
+	`OpenKanban has scoped this session to ticket "`,
+}
 
 // SessionUUIDPattern matches a canonical Claude Code session UUID
 // (lowercase hex, 8-4-4-4-12). The Claude Code CLI writes its session
@@ -334,8 +346,13 @@ func extractAssistantText(content json.RawMessage) string {
 	return ""
 }
 
-// DeleteClaudeSession removes the JSONL transcript at sessionPath.
-// Returns nil if sessionPath is empty. Wraps os.Remove errors.
+// DeleteClaudeSession removes the JSONL transcript at sessionPath and,
+// if the basename is a recognizable session UUID, also purges that
+// session's openkanban priming entries from ~/.claude/history.jsonl so
+// they don't dominate Claude Code's up-arrow input ring on future
+// sessions for the same project. Returns nil if sessionPath is empty.
+// Wraps os.Remove errors; history-purge failures are logged but
+// non-fatal (the transcript removal is the primary contract).
 func DeleteClaudeSession(sessionPath string) error {
 	if sessionPath == "" {
 		return nil
@@ -343,5 +360,128 @@ func DeleteClaudeSession(sessionPath string) error {
 	if err := os.Remove(sessionPath); err != nil {
 		return fmt.Errorf("delete claude session %s: %w", sessionPath, err)
 	}
+	uuid := strings.TrimSuffix(filepath.Base(sessionPath), ".jsonl")
+	if !SessionUUIDPattern.MatchString(uuid) {
+		return nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Printf("openkanban agent: skip history purge for %s (no homedir): %v", uuid, err)
+		return nil
+	}
+	historyPath := filepath.Join(home, ".claude", "history.jsonl")
+	if err := PurgeClaudePrimingHistory(historyPath, uuid, ClaudePrimingPrefixes...); err != nil {
+		log.Printf("openkanban agent: purge history for %s: %v", uuid, err)
+	}
+	return nil
+}
+
+// PurgeClaudePrimingHistory rewrites historyPath in place, dropping any
+// JSONL line whose sessionId == uuid AND whose display string starts
+// with one of the given prefixes. The atomic rewrite uses a temp file
+// in the same directory plus os.Rename.
+//
+// Refuses to act as a wildcard purge:
+//   - uuid == "" → returns nil, file untouched.
+//   - len(prefixes) == 0 → returns nil, file untouched.
+//   - file does not exist → returns nil (nothing to purge).
+//
+// Malformed JSON lines are preserved verbatim — this function does not
+// validate or rewrite the user's own history; it only removes entries
+// we authored that match both gates exactly.
+//
+// There is a tiny race window between read and rename where a
+// concurrent claude process may append a new line that gets discarded.
+// The window is sub-millisecond and the same race exists between any
+// two concurrent claude writers; Claude Code itself does not lock the
+// file.
+func PurgeClaudePrimingHistory(historyPath, uuid string, prefixes ...string) error {
+	if historyPath == "" || uuid == "" || len(prefixes) == 0 {
+		return nil
+	}
+	in, err := os.Open(historyPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("open history: %w", err)
+	}
+	defer in.Close()
+
+	info, err := in.Stat()
+	if err != nil {
+		return fmt.Errorf("stat history: %w", err)
+	}
+	mode := info.Mode().Perm()
+
+	scanner := bufio.NewScanner(in)
+	// Default token limit is 64KB; priming prompts are ~3.5KB but a user
+	// could paste a much larger entry. Bump to 1MB so we never error mid-file.
+	scanner.Buffer(make([]byte, 0, 64*1024), 1<<20)
+
+	tmp, err := os.CreateTemp(filepath.Dir(historyPath), filepath.Base(historyPath)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temp: %w", err)
+	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	writer := bufio.NewWriter(tmp)
+
+	var match struct {
+		SessionID string `json:"sessionId"`
+		Display   string `json:"display"`
+	}
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		drop := false
+		if err := json.Unmarshal(line, &match); err == nil {
+			if match.SessionID == uuid {
+				for _, p := range prefixes {
+					if p != "" && strings.HasPrefix(match.Display, p) {
+						drop = true
+						break
+					}
+				}
+			}
+		}
+		// Malformed JSON or non-matching line → preserve.
+		if drop {
+			continue
+		}
+		if _, err := writer.Write(line); err != nil {
+			tmp.Close()
+			return fmt.Errorf("write temp: %w", err)
+		}
+		if err := writer.WriteByte('\n'); err != nil {
+			tmp.Close()
+			return fmt.Errorf("write temp: %w", err)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("scan history: %w", err)
+	}
+	if err := writer.Flush(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("flush temp: %w", err)
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		tmp.Close()
+		return fmt.Errorf("chmod temp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp: %w", err)
+	}
+	if err := os.Rename(tmpPath, historyPath); err != nil {
+		return fmt.Errorf("rename temp: %w", err)
+	}
+	cleanup = false
 	return nil
 }

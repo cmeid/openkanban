@@ -22,6 +22,18 @@ Returns session ID or empty string. No error path — callers retry on the next 
 
 Four parallel funcs by design — see `feedback_openkanban_no_premature_service_abstraction`; no `SessionDiscoverer` interface until a 5th caller exists.
 
+### Claude history.jsonl purge
+
+`PurgeClaudePrimingHistory(historyPath, uuid, prefixes...)` rewrites `~/.claude/history.jsonl` to drop entries whose `sessionId == uuid` AND whose `display` starts with one of the given prefixes. Atomic via temp file + `os.Rename`. Refuses to wildcard-purge: empty uuid OR empty prefixes returns nil.
+
+Why this exists: openkanban delivers the priming prompt to claude as a positional argv argument (`internal/ui/model.go` at the `args = append(args, prompt)` line in the claude `case`). Claude Code records that argv prompt to `history.jsonl` as a normal up-arrow recall entry. Claude Code's input ring then surfaces it on `↑` instead of the user's real recent prompts — both for live sessions and after `DeleteClaudeSession` deletes the transcript and leaves the history entry orphaned.
+
+Two call sites:
+- `DeleteClaudeSession(sessionPath)` — derives the UUID from the basename, calls the purge after `os.Remove`. Catches the orphan case (transcript gone, history.jsonl entry would otherwise leak forever).
+- `pollAgentStatusesAsync`'s claude back-fill branch (`internal/ui/model.go` near the `FindClaudeSession` call) — runs once per ticket the first time the UUID is back-filled. Catches the live-session case (session is fine but its priming would otherwise dominate the ring until deletion).
+
+`ClaudePrimingPrefixes` holds the two template-leading sentences (fresh-spawn + external-resume). `TestClaudePrimingPrefixes_MatchTemplate` renders both branches and asserts the constants stay in sync — guards against drift if `agent_prompt.tmpl` is later edited.
+
 ## Context Prompts
 
 `BuildContextPrompt(promptTemplate string, data ContextData) string` renders Go templates:

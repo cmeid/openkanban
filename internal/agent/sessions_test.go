@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"os"
@@ -9,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/techdufus/openkanban/internal/config"
 )
 
 func TestSessionUUIDPattern(t *testing.T) {
@@ -656,6 +659,330 @@ func TestDeleteClaudeSession(t *testing.T) {
 		}
 		if !errors.Is(err, os.ErrNotExist) {
 			t.Errorf("err = %v, want one wrapping os.ErrNotExist", err)
+		}
+	})
+
+	t.Run("uuid_path_purges_history", func(t *testing.T) {
+		home := withFakeHome(t)
+		uuid := "abcdef12-3456-4789-abcd-0123456789ab"
+		// Place the transcript at the path DeleteClaudeSession is given.
+		projDir := filepath.Join(home, ".claude", "projects", "enc")
+		if err := os.MkdirAll(projDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		transcript := filepath.Join(projDir, uuid+".jsonl")
+		if err := os.WriteFile(transcript, []byte("{}\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		// Seed a history.jsonl with: a priming entry for our uuid, an
+		// unrelated entry for the same uuid (user-typed), and an entry
+		// for a different uuid.
+		hist := filepath.Join(home, ".claude", "history.jsonl")
+		entries := []map[string]any{
+			{"sessionId": uuid, "display": ClaudePrimingPrefixes[0] + " more", "project": "/p"},
+			{"sessionId": uuid, "display": "some user prompt", "project": "/p"},
+			{"sessionId": "deadbeef-1234-4321-abcd-0123456789ab", "display": ClaudePrimingPrefixes[0] + " other", "project": "/p"},
+		}
+		writeHistory(t, hist, entries)
+
+		if err := DeleteClaudeSession(transcript); err != nil {
+			t.Fatalf("DeleteClaudeSession: %v", err)
+		}
+		// Transcript gone.
+		if _, err := os.Stat(transcript); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("transcript still present: %v", err)
+		}
+		// History: only the priming entry for OUR uuid should be gone.
+		got := readHistory(t, hist)
+		if len(got) != 2 {
+			t.Fatalf("history len = %d, want 2; got=%v", len(got), got)
+		}
+		if got[0]["display"] != "some user prompt" {
+			t.Errorf("entry[0].display = %v, want user prompt", got[0]["display"])
+		}
+		if got[1]["sessionId"] != "deadbeef-1234-4321-abcd-0123456789ab" {
+			t.Errorf("entry[1].sessionId = %v, want the other uuid", got[1]["sessionId"])
+		}
+	})
+
+	t.Run("non_uuid_basename_skips_purge", func(t *testing.T) {
+		home := withFakeHome(t)
+		dir := t.TempDir()
+		path := filepath.Join(dir, "not-a-uuid.jsonl")
+		if err := os.WriteFile(path, []byte("{}\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		hist := filepath.Join(home, ".claude", "history.jsonl")
+		seeded := []map[string]any{
+			{"sessionId": "abcdef12-3456-4789-abcd-0123456789ab", "display": ClaudePrimingPrefixes[0] + " x", "project": "/p"},
+		}
+		writeHistory(t, hist, seeded)
+
+		if err := DeleteClaudeSession(path); err != nil {
+			t.Fatalf("DeleteClaudeSession: %v", err)
+		}
+		// History untouched.
+		got := readHistory(t, hist)
+		if len(got) != 1 {
+			t.Fatalf("history len = %d, want 1 (untouched)", len(got))
+		}
+	})
+}
+
+// writeHistory writes the given entries as JSONL at path, creating
+// parent dirs as needed.
+func writeHistory(t *testing.T, path string, entries []map[string]any) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir parent: %v", err)
+	}
+	var sb strings.Builder
+	for _, e := range entries {
+		b, err := json.Marshal(e)
+		if err != nil {
+			t.Fatalf("marshal entry: %v", err)
+		}
+		sb.Write(b)
+		sb.WriteByte('\n')
+	}
+	if err := os.WriteFile(path, []byte(sb.String()), 0o600); err != nil {
+		t.Fatalf("write history: %v", err)
+	}
+}
+
+// readHistory parses a JSONL file back into a slice of maps.
+func readHistory(t *testing.T, path string) []map[string]any {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open history: %v", err)
+	}
+	defer f.Close()
+	var out []map[string]any
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	for sc.Scan() {
+		var m map[string]any
+		if err := json.Unmarshal(sc.Bytes(), &m); err != nil {
+			t.Fatalf("unmarshal line %q: %v", sc.Text(), err)
+		}
+		out = append(out, m)
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatalf("scan history: %v", err)
+	}
+	return out
+}
+
+func TestPurgeClaudePrimingHistory(t *testing.T) {
+	const uuid = "abcdef12-3456-4789-abcd-0123456789ab"
+	const otherUUID = "deadbeef-1234-4321-abcd-0123456789ab"
+	prim := ClaudePrimingPrefixes[0] + " continued"
+
+	t.Run("file_missing", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "history.jsonl")
+		if err := PurgeClaudePrimingHistory(path, uuid, ClaudePrimingPrefixes...); err != nil {
+			t.Errorf("err = %v, want nil", err)
+		}
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("missing file was created: %v", err)
+		}
+	})
+
+	t.Run("empty_uuid_refuses_wildcard", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "history.jsonl")
+		entries := []map[string]any{{"sessionId": uuid, "display": prim}}
+		writeHistory(t, path, entries)
+		if err := PurgeClaudePrimingHistory(path, "", ClaudePrimingPrefixes...); err != nil {
+			t.Errorf("err = %v, want nil", err)
+		}
+		if len(readHistory(t, path)) != 1 {
+			t.Errorf("file was modified despite empty uuid")
+		}
+	})
+
+	t.Run("no_prefixes_refuses_wildcard", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "history.jsonl")
+		entries := []map[string]any{{"sessionId": uuid, "display": prim}}
+		writeHistory(t, path, entries)
+		if err := PurgeClaudePrimingHistory(path, uuid); err != nil {
+			t.Errorf("err = %v, want nil", err)
+		}
+		if len(readHistory(t, path)) != 1 {
+			t.Errorf("file was modified despite no prefixes")
+		}
+	})
+
+	t.Run("single_match_removed", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "history.jsonl")
+		entries := []map[string]any{{"sessionId": uuid, "display": prim}}
+		writeHistory(t, path, entries)
+		if err := PurgeClaudePrimingHistory(path, uuid, ClaudePrimingPrefixes...); err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		got := readHistory(t, path)
+		if len(got) != 0 {
+			t.Errorf("history len = %d, want 0", len(got))
+		}
+	})
+
+	t.Run("uuid_match_prefix_mismatch_preserved", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "history.jsonl")
+		entries := []map[string]any{{"sessionId": uuid, "display": "my own prompt"}}
+		writeHistory(t, path, entries)
+		if err := PurgeClaudePrimingHistory(path, uuid, ClaudePrimingPrefixes...); err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		got := readHistory(t, path)
+		if len(got) != 1 || got[0]["display"] != "my own prompt" {
+			t.Errorf("history = %v, want 1 entry preserved", got)
+		}
+	})
+
+	t.Run("prefix_match_uuid_mismatch_preserved", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "history.jsonl")
+		entries := []map[string]any{{"sessionId": otherUUID, "display": prim}}
+		writeHistory(t, path, entries)
+		if err := PurgeClaudePrimingHistory(path, uuid, ClaudePrimingPrefixes...); err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		got := readHistory(t, path)
+		if len(got) != 1 || got[0]["sessionId"] != otherUUID {
+			t.Errorf("history = %v, want other-uuid entry preserved", got)
+		}
+	})
+
+	t.Run("mixed_multiple_matches", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "history.jsonl")
+		// 5 entries: A:priming, A:user, B:priming, A:priming-resume, A:user-2
+		// Expect: keep A:user, B:priming, A:user-2 (3 entries, order preserved).
+		entries := []map[string]any{
+			{"sessionId": uuid, "display": ClaudePrimingPrefixes[0] + " #1"},
+			{"sessionId": uuid, "display": "user prompt 1"},
+			{"sessionId": otherUUID, "display": ClaudePrimingPrefixes[0] + " B"},
+			{"sessionId": uuid, "display": ClaudePrimingPrefixes[1] + "ticket\""},
+			{"sessionId": uuid, "display": "user prompt 2"},
+		}
+		writeHistory(t, path, entries)
+		if err := PurgeClaudePrimingHistory(path, uuid, ClaudePrimingPrefixes...); err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		got := readHistory(t, path)
+		if len(got) != 3 {
+			t.Fatalf("history len = %d, want 3; got=%v", len(got), got)
+		}
+		if got[0]["display"] != "user prompt 1" ||
+			got[1]["sessionId"] != otherUUID ||
+			got[2]["display"] != "user prompt 2" {
+			t.Errorf("unexpected surviving entries: %v", got)
+		}
+	})
+
+	t.Run("malformed_line_preserved", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "history.jsonl")
+		// Mix: a valid match, a malformed garbage line, a valid non-match.
+		var sb strings.Builder
+		sb.WriteString(`{"sessionId":"` + uuid + `","display":"` + prim + `"}` + "\n")
+		sb.WriteString("not-valid-json-at-all\n")
+		sb.WriteString(`{"sessionId":"` + otherUUID + `","display":"keep me"}` + "\n")
+		if err := os.WriteFile(path, []byte(sb.String()), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := PurgeClaudePrimingHistory(path, uuid, ClaudePrimingPrefixes...); err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
+		if len(lines) != 2 {
+			t.Fatalf("lines = %d, want 2; raw=%q", len(lines), raw)
+		}
+		if lines[0] != "not-valid-json-at-all" {
+			t.Errorf("malformed line not preserved: got %q", lines[0])
+		}
+	})
+
+	t.Run("oversized_line", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "history.jsonl")
+		// 256KB display payload, no match.
+		big := strings.Repeat("x", 256*1024)
+		entries := []map[string]any{{"sessionId": otherUUID, "display": big}}
+		writeHistory(t, path, entries)
+		if err := PurgeClaudePrimingHistory(path, uuid, ClaudePrimingPrefixes...); err != nil {
+			t.Fatalf("err = %v on oversized line", err)
+		}
+		got := readHistory(t, path)
+		if len(got) != 1 {
+			t.Errorf("history len = %d, want 1 (preserved)", len(got))
+		}
+	})
+
+	t.Run("preserves_file_mode", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "history.jsonl")
+		entries := []map[string]any{{"sessionId": uuid, "display": prim}}
+		writeHistory(t, path, entries)
+		// writeHistory sets 0o600; confirm purge preserves that.
+		if err := PurgeClaudePrimingHistory(path, uuid, ClaudePrimingPrefixes...); err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Errorf("perm = %#o, want 0o600", perm)
+		}
+	})
+}
+
+// TestClaudePrimingPrefixes_MatchTemplate guards against drift between
+// the ClaudePrimingPrefixes constants and the shipped template body. If
+// agent_prompt.tmpl's leading sentences are edited, this test fails
+// until the constants are updated in lockstep.
+func TestClaudePrimingPrefixes_MatchTemplate(t *testing.T) {
+	tmpl := config.DefaultAgentPrompt()
+	if tmpl == "" {
+		t.Fatal("DefaultAgentPrompt returned empty string")
+	}
+
+	t.Run("fresh_spawn_starts_with_prefix_0", func(t *testing.T) {
+		data := ContextData{
+			Title:        "fixture",
+			BranchName:   "task/fixture",
+			BaseBranch:   "main",
+			Status:       "in_progress",
+			WorktreePath: "/tmp/fixture",
+		}
+		got := BuildContextPrompt(tmpl, data)
+		if !strings.HasPrefix(got, ClaudePrimingPrefixes[0]) {
+			t.Errorf("fresh-spawn rendering does not start with prefix\n  prefix=%q\n  got=%q", ClaudePrimingPrefixes[0], got[:min(len(got), 200)])
+		}
+	})
+
+	t.Run("external_resume_starts_with_prefix_1", func(t *testing.T) {
+		data := ContextData{
+			Title:            "fixture",
+			BranchName:       "task/fixture",
+			BaseBranch:       "main",
+			Status:           "in_progress",
+			WorktreePath:     "/tmp/fixture",
+			IsExternalResume: true,
+		}
+		got := BuildContextPrompt(tmpl, data)
+		if !strings.HasPrefix(got, ClaudePrimingPrefixes[1]) {
+			t.Errorf("external-resume rendering does not start with prefix\n  prefix=%q\n  got=%q", ClaudePrimingPrefixes[1], got[:min(len(got), 200)])
 		}
 	})
 }
