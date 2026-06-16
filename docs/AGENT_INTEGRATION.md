@@ -596,6 +596,12 @@ case agentStatusMsg:
 2. Global `defaults.init_prompt` in config
 3. Built-in default prompt — embedded from [`internal/config/agent_prompt.tmpl`](../internal/config/agent_prompt.tmpl) via `//go:embed`. Edit the markdown file, not a Go string constant. On `Load`, `mergeAgentDefaults` restores the embedded default when a user's `init_prompt` field is empty or absent, so clearing the override falls through to the binary's shipped content (not to the much shorter generic `defaultGlobalPrompt`).
 
+### Design intent of the shipped template
+
+The embedded `agent_prompt.tmpl` is deliberately **generic about cross-cutting workflow discipline**. It points at categories of help — "code-review, validation, cross-stack risk subagents", "adversarial / multi-role doc reviewer" — without naming specific agents, plugins, or skills that may not be installed in the spawned environment. Personal subagent loadouts and named-agent guidance belong in the user's own `~/.claude/CLAUDE.md`, which the template explicitly defers to. When extending the template, prefer naming a role over naming a tool; if you want to name a specific agent, the right home is your global CLAUDE.md.
+
+`validateInitPromptOverlap` (in `internal/config/validate.go`) backs this discipline up with a warning when a user-supplied `init_prompt` restates rules from their global CLAUDE.md. Its `strongRuleMarkers` are universal patterns (`HARD RULE`, `NEVER gh pr create / git push`, `\bglobal rule\b`) — not phrases lifted from any one user's CLAUDE.md.
+
 ## Environment Isolation
 
 When spawning agents, OpenKanban filters environment variables to

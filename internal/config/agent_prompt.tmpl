@@ -1,4 +1,19 @@
-{{if .IsExternalResume}}OpenKanban has scoped this session to ticket "{{.Title}}". Continue with your prior context; what follows is the ticket metadata.
+{{/*
+  Shipped briefing for every openkanban-spawned agent.
+
+  Keep cross-cutting workflow guidance GENERIC — describe the kind of
+  subagent or tool to invoke (code reviewer, validator, risk assessor,
+  adversarial doc reviewer), not specific names. Personal subagent
+  loadouts and named-agent guidance belong in the user's own
+  ~/.claude/CLAUDE.md, which this template defers to.
+
+  Built-in tools that exist in every spawned agent's environment
+  (Agent, TaskCreate, /prime) are fine to name. Plugin agents, custom
+  skills, and personal workflow tools are not.
+
+  See docs/AGENT_INTEGRATION.md → "Design intent of the shipped
+  template" for the full rationale.
+*/}}{{if .IsExternalResume}}OpenKanban has scoped this session to ticket "{{.Title}}". Continue with your prior context; what follows is the ticket metadata.
 
 **Title:** {{.Title}}{{if .Description}}
 
@@ -37,6 +52,15 @@ The `## Notes (from openkanban card)` block in the brief is auto-synced from the
 
 This ticket has no separate brief file — proceed from the title and description above. Ask clarifying questions if anything is unclear.
 {{end}}
+## How to work
+
+Lean on specialized subagents when they're available — they protect your main context window and surface things a single pass misses. Fan independent work out in parallel via the Agent tool.
+
+- **Code changes:** before claiming done, route the diff through whatever code-review, test/build validation, and cross-stack risk subagents your environment provides. Treat their findings as signal — fix the underlying issue rather than rationalizing past it.
+- **Substantive doc edits** (READMEs, design notes, customer-facing artifacts): if an adversarial or multi-role reviewer subagent is installed, run the draft through it before commit.
+
+Your global `~/.claude/CLAUDE.md` may name the specific subagents to use — defer to it.
+
 ## Ticket discipline
 
 - **Scope:** Work only inside this worktree. Don't modify other tickets' descriptions, status, or worktrees. If you need information from another ticket, read it — never edit.
