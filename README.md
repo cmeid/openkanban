@@ -258,7 +258,35 @@ openkanban daemon stop      # clean shutdown
 
 Override the socket path with `OPENKANBAN_DAEMON_SOCK` if you need to.
 
-The daemon will **never** outlive the TUI as a tmux-style detached session. If you want kanban state to persist across reboots, the on-disk `.md` files are the source of truth — relaunch the TUI and respawn the agents.
+The daemon will **never** outlive the TUI as a tmux-style detached session in default mode. If you want kanban state to persist across reboots, the on-disk `.md` files are the source of truth — relaunch the TUI and respawn the agents. Persistent ([launchd-managed](./docs/AGENT_INTEGRATION.md#lifecycle-default-vs-persistent)) mode is opt-in via `openkanban daemon install-service`.
+
+### Knowing the daemon's version
+
+There is no `openkanban daemon version` command — the daemon reports its build info on every client handshake (`HelloResp.BinaryVersion`, see [`internal/daemon/protocol.go`](./internal/daemon/protocol.go)), but the easiest way to inspect it is the log:
+
+```bash
+openkanban daemon log | head    # startup banner includes binary version + commit
+```
+
+`openkanban version` reports the CLI binary on `$PATH`. If the daemon was started from an older binary, the two can drift for the lifetime of that daemon — see below.
+
+### Updates and the running daemon
+
+`openkanban update` rebuilds and reinstalls the binary on disk. It does **not** stop or restart the running daemon. The daemon polls its own on-disk binary (`watchBinaryStaleness` in [`internal/daemon/server.go`](./internal/daemon/server.go)) and reacts based on whether sessions are attached:
+
+| State when binary changes | Daemon behavior |
+|---|---|
+| Zero live sessions | Exits immediately; next TUI launch autostarts a fresh daemon on the new binary. |
+| Live sessions, default mode | Logs a `WARN` and keeps running; picks up the new binary on the next last-client-disconnect (which already terminates sessions). |
+| Live sessions, persistent mode | Logs a `WARN` and keeps running indefinitely. Pick up the new binary with `openkanban daemon restart` once your sessions are expendable. |
+
+Normal flow: `openkanban update` → finish your work → close the TUI → the daemon auto-recycles on the next launch. No explicit daemon command needed in default mode.
+
+The handshake reports both `ProtocolVersion` and `BinaryVersion`. The daemon does not refuse mismatched clients at the protocol level — `daemonclient` warns and degrades to "no agent spawn" mode instead of crashing (see [version-skew note above](#5-openkanbankd-daemon-for-multi-window-state)).
+
+### Forcing a daemon refresh with live sessions
+
+`openkanban daemon restart` terminates the daemon, which SIGTERMs all live PTYs with a 3 s grace then SIGKILL — running agent sessions die. Use it only when you actually want the new daemon binary right now and the running sessions are expendable. The interactive prompt protects you by default; `--force` skips it.
 
 ## Backup & restore
 

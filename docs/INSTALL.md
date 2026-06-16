@@ -131,6 +131,13 @@ Three options:
   `behavior.check_for_updates_on_launch: false` in
   `~/.config/openkanban/config.json`.
 
+`openkanban update` rebuilds the binary on disk only; it does not restart
+the running `openkanbankd` process. The daemon detects its own staleness
+and auto-recycles when no sessions are attached (or on the next
+last-client-disconnect when sessions are live). See the
+[Daemon section in the README](../README.md#daemon) for the full update /
+restart matrix and how to inspect the daemon's running version.
+
 The update flow **refuses** when the source clone would silently build
 the wrong tree: source on a non-`main` named branch, detached HEAD, not
 a git repo (unreadable / wiped), or a linked git worktree. Each refusal
