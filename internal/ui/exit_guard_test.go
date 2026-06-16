@@ -15,11 +15,17 @@ import (
 )
 
 // fakeGuardAPI is a tiny in-memory stand-in for *daemonclient.Client
-// that records every call and returns canned responses. Built solely
-// to test the exit-guard's decision tree without a real daemon
-// process. Safe for concurrent use because tea.Cmd callbacks run on a
-// separate goroutine.
+// that records every exit-guard-relevant call and returns canned
+// responses. Built solely to test the exit-guard's decision tree
+// without a real daemon process. Safe for concurrent use because
+// tea.Cmd callbacks run on a separate goroutine.
+//
+// Embeds daemonAPINoop so the methods the exit-guard never touches
+// (Owns / TicketDone / List / Spawn) resolve to zero-value returns
+// without having to stub them here.
 type fakeGuardAPI struct {
+	daemonAPINoop
+
 	mu sync.Mutex
 
 	prepareExitResp daemon.PrepareExitResp
@@ -88,38 +94,6 @@ func (f *fakeGuardAPI) cancelCallCount() int {
 
 func (f *fakeGuardAPI) ClientID() uint16 { return 1 }
 
-// Owns is unused by the exit-guard tests but required to satisfy
-// daemonGuardAPI (the spawn-path gate calls it — see model.go's
-// shouldCleanupDeadSession). Always answers "not owned" so any
-// accidental Owns call during an exit-guard test resolves cleanly.
-func (f *fakeGuardAPI) Owns(_ context.Context, _ string) (daemon.OwnsResp, error) {
-	return daemon.OwnsResp{Owned: false}, nil
-}
-
-// TicketDone is unused by the exit-guard tests but required to satisfy
-// daemonGuardAPI (the board-promotion wrap-up calls it — see
-// wrapUpSessionForTicket in model.go). Returns Killed=false so any
-// accidental invocation resolves cleanly without faking a kill.
-func (f *fakeGuardAPI) TicketDone(_ context.Context, _ string) (daemon.TicketDoneResp, error) {
-	return daemon.TicketDoneResp{Killed: false}, nil
-}
-
-// List is unused by the exit-guard tests but required to satisfy
-// daemonGuardAPI (the startup reconcile + periodic resync route
-// through it). Returns an empty session list so any accidental call
-// resolves to a no-op reconcile.
-func (f *fakeGuardAPI) List(_ context.Context) (daemon.ListResp, error) {
-	return daemon.ListResp{}, nil
-}
-
-// Spawn is unused by the exit-guard tests but required to satisfy
-// daemonGuardAPI (prepareSpawnWith routes Spawn through this seam so
-// the Owns fast-path test can assert no Spawn was issued). Returns
-// an empty response so any accidental invocation resolves cleanly.
-func (f *fakeGuardAPI) Spawn(_ context.Context, _ daemon.SpawnReq) (daemon.SpawnResp, error) {
-	return daemon.SpawnResp{}, nil
-}
-
 func (f *fakeGuardAPI) killCallsCopy() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -131,11 +105,11 @@ func (f *fakeGuardAPI) killCallsCopy() []string {
 // minimalModel returns a Model wired with just enough state to drive
 // the exit guard. It deliberately leaves panes / store / config zero
 // so the test can't accidentally exercise the legacy quit path — the
-// guard runs entirely off m.guardAPI.
-func minimalModel(api daemonGuardAPI) *Model {
+// guard runs entirely off m.daemon.
+func minimalModel(api daemonAPI) *Model {
 	return &Model{
-		mode:     ModeNormal,
-		guardAPI: api,
+		mode:   ModeNormal,
+		daemon: api,
 	}
 }
 
@@ -522,11 +496,11 @@ func TestExitGuard_PrepareExitFails_LocalSessions_ShowsModal(t *testing.T) {
 	}
 }
 
-func TestExitGuard_NilGuardAPI_ExitsImmediately(t *testing.T) {
+func TestExitGuard_NilDaemonAPI_ExitsImmediately(t *testing.T) {
 	m := minimalModel(nil)
 	_, cmd := m.handleQuitRequested()
 	if !isQuitCmd(cmd) {
-		t.Fatalf("expected tea.Quit when guardAPI is nil; got %T", cmd)
+		t.Fatalf("expected tea.Quit when m.daemon is nil; got %T", cmd)
 	}
 }
 

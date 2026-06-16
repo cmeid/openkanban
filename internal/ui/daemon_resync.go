@@ -57,15 +57,6 @@ const daemonResyncRPCTimeout = 3 * time.Second
 // silently wrong — better to surface the inconsistency.
 const startupReconcileFailureMsg = "Daemon reconcile failed; restart openkanban to re-sync"
 
-// daemonListAPI is the subset of daemonGuardAPI the resync paths
-// touch. Held separately from the full guard interface so the
-// reconcile helper can take a narrower seam, but in practice every
-// call site uses m.guardAPI (which already satisfies it via the
-// extension in exit_guard.go).
-type daemonListAPI interface {
-	List(ctx context.Context) (daemon.ListResp, error)
-}
-
 // daemonResyncTickMsg fires when the 30s resync timer expires. The
 // Update handler turns it into an actual List RPC via a tea.Cmd so
 // the network call doesn't block the Update goroutine.
@@ -89,7 +80,7 @@ type daemonResyncMsg struct {
 // Returned even on partial success (one attempt succeeded after
 // retries) — the caller can't tell from the result map whether retries
 // fired, only from the absence of error.
-func listSessionsWithRetry(api daemonListAPI, attempts int, timeout, backoff time.Duration) (map[board.TicketID]daemon.SessionInfo, error) {
+func listSessionsWithRetry(api daemonAPI, attempts int, timeout, backoff time.Duration) (map[board.TicketID]daemon.SessionInfo, error) {
 	if api == nil {
 		return map[board.TicketID]daemon.SessionInfo{}, nil
 	}
@@ -133,11 +124,11 @@ func listSessionsWithRetry(api daemonListAPI, attempts int, timeout, backoff tim
 // (to arm the first tick) and by the resync handler (to re-arm after
 // each completed reconcile).
 //
-// Returns nil when there's no guardAPI — without a daemon there's
+// Returns nil when m.daemon is missing — without a daemon there's
 // nothing to resync against. Callers should batch this in
 // unconditionally; the nil-cmd is dropped by tea.Batch.
 func (m *Model) scheduleDaemonResync() tea.Cmd {
-	if m.guardAPI == nil {
+	if m.daemon == nil {
 		return nil
 	}
 	return tea.Tick(daemonResyncInterval, func(time.Time) tea.Msg {
@@ -151,12 +142,12 @@ func (m *Model) scheduleDaemonResync() tea.Cmd {
 // tick after applying the result, NOT here — re-arming here would
 // create a runaway loop if the RPC takes longer than the interval.
 func (m *Model) handleDaemonResyncTick() (tea.Model, tea.Cmd) {
-	if m.guardAPI == nil {
+	if m.daemon == nil {
 		// Daemon went away mid-run; stop the timer chain. The Init
 		// wiring will re-arm on the next NewModel call.
 		return m, nil
 	}
-	api := m.guardAPI
+	api := m.daemon
 	return m, func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), daemonResyncRPCTimeout)
 		defer cancel()
@@ -225,8 +216,8 @@ func (m *Model) handleDaemonResyncMsg(msg daemonResyncMsg) (tea.Model, tea.Cmd) 
 			continue
 		}
 		// Defensive: m.daemonClient can be nil in degenerate states
-		// (daemon disconnected mid-run, guardAPI satisfied by a fake
-		// in tests) even though m.guardAPI is non-nil. NewPaneView with
+		// (daemon disconnected mid-run, m.daemon satisfied by a fake
+		// in tests) even though m.daemon is non-nil. NewPaneView with
 		// a nil client builds a pane whose Attach path will dereference
 		// nil — leave the daemonOwned bookkeeping so the indicator
 		// still renders, but skip constructing a dangling pane.

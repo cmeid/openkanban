@@ -15,31 +15,20 @@ import (
 	"github.com/techdufus/openkanban/internal/project"
 )
 
-// listStubAPI is a daemonGuardAPI stand-in focused on the List
-// surface. Other methods return zero values — the resync paths only
-// call List. failuresLeft fails the first N invocations with err
-// before falling through to responseSessions; callsTotal records the
-// total invocations so tests can assert the retry budget was
-// actually exercised.
+// listStubAPI is a daemonAPI stand-in focused on the List surface —
+// the resync paths only call List. Every other method falls through
+// to daemonAPINoop's zero-value returns. failuresLeft fails the first
+// N invocations with err before falling through to responseSessions;
+// callsTotal records the total invocations so tests can assert the
+// retry budget was actually exercised.
 type listStubAPI struct {
+	daemonAPINoop
+
 	mu               sync.Mutex
 	responseSessions []daemon.SessionInfo
 	err              error
 	failuresLeft     int
 	callsTotal       atomic.Int32
-}
-
-func (s *listStubAPI) PrepareExit(_ context.Context) (daemon.PrepareExitResp, error) {
-	return daemon.PrepareExitResp{}, nil
-}
-func (s *listStubAPI) CancelExit(_ context.Context) error                    { return nil }
-func (s *listStubAPI) Kill(_ context.Context, _ string, _ time.Duration) error { return nil }
-func (s *listStubAPI) ClientID() uint16                                       { return 1 }
-func (s *listStubAPI) Owns(_ context.Context, _ string) (daemon.OwnsResp, error) {
-	return daemon.OwnsResp{Owned: false}, nil
-}
-func (s *listStubAPI) TicketDone(_ context.Context, _ string) (daemon.TicketDoneResp, error) {
-	return daemon.TicketDoneResp{}, nil
 }
 
 func (s *listStubAPI) List(_ context.Context) (daemon.ListResp, error) {
@@ -57,21 +46,14 @@ func (s *listStubAPI) List(_ context.Context) (daemon.ListResp, error) {
 	return daemon.ListResp{Sessions: append([]daemon.SessionInfo(nil), s.responseSessions...)}, nil
 }
 
-// Spawn is a no-op stub pre-added so this fake stays compatible with
-// the sibling fix/client-spawn-discipline PR (which widens
-// daemonGuardAPI with Spawn). Not exercised by the resync tests.
-func (s *listStubAPI) Spawn(_ context.Context, _ daemon.SpawnReq) (daemon.SpawnResp, error) {
-	return daemon.SpawnResp{}, nil
-}
-
 // makeReconcileTestModel builds a minimal Model wired with everything
 // the resync handlers touch: a globalStore (so PaneView creation has
 // a backing ticket), the empty daemonOwned / panes / daemonViewing
-// maps, and the supplied guardAPI.
+// maps, and the supplied daemonAPI.
 //
 // The store is seeded with the tickets listed in tickets so the
 // reconcile sees them; status defaults to StatusInProgress.
-func makeReconcileTestModel(t *testing.T, api daemonGuardAPI, tickets []board.TicketID) *Model {
+func makeReconcileTestModel(t *testing.T, api daemonAPI, tickets []board.TicketID) *Model {
 	t.Helper()
 	t.Setenv("OPENKANBAN_CONFIG_DIR", t.TempDir())
 
@@ -93,7 +75,7 @@ func makeReconcileTestModel(t *testing.T, api daemonGuardAPI, tickets []board.Ti
 
 	return &Model{
 		globalStore: globalStore,
-		guardAPI:    api,
+		daemon:      api,
 		// daemonClient is a non-nil zero value so the resync add-pane
 		// path's nil-guard doesn't short-circuit pane materialization.
 		// The PaneView is constructed with this pointer but the tests
@@ -249,7 +231,7 @@ func TestPeriodicResync_NewPaneIsUnattached(t *testing.T) {
 // TestPeriodicResync_NilDaemonClientSkipsPaneBuild covers the
 // degenerate-but-reachable case where the daemon disconnected
 // mid-run (m.daemonClient is now nil) but a periodic resync still
-// fires because m.guardAPI was set from a fake / earlier state. The
+// fires because m.daemon was set from a fake / earlier state. The
 // add-pane path must NOT construct a PaneView with a nil client —
 // daemonOwned bookkeeping is updated instead so the indicator still
 // renders, but no dangling pane is created.
@@ -363,35 +345,35 @@ func TestPeriodicResync_ReArmsTickOnError(t *testing.T) {
 	_ = cmd
 }
 
-// TestHandleDaemonResyncTick_NilGuardAPIIsNoOp — if guardAPI got
+// TestHandleDaemonResyncTick_NilDaemonAPIIsNoOp — if m.daemon got
 // cleared mid-run (daemon disconnect), the tick handler must NOT
 // dispatch a List RPC and must NOT re-arm.
-func TestHandleDaemonResyncTick_NilGuardAPIIsNoOp(t *testing.T) {
+func TestHandleDaemonResyncTick_NilDaemonAPIIsNoOp(t *testing.T) {
 	m := &Model{
 		panes:       map[board.TicketID]*daemonclient.PaneView{},
 		daemonOwned: map[board.TicketID]struct{}{},
 	}
 	_, cmd := m.handleDaemonResyncTick()
 	if cmd != nil {
-		t.Errorf("cmd = %T, want nil (no RPC dispatched without guardAPI)", cmd)
+		t.Errorf("cmd = %T, want nil (no RPC dispatched without m.daemon)", cmd)
 	}
 }
 
-// TestScheduleDaemonResync_NilGuardAPIReturnsNil — Init batches the
-// returned cmd unconditionally; if guardAPI is nil the timer chain
+// TestScheduleDaemonResync_NilDaemonAPIReturnsNil — Init batches the
+// returned cmd unconditionally; if m.daemon is nil the timer chain
 // must not start (no daemon to query).
-func TestScheduleDaemonResync_NilGuardAPIReturnsNil(t *testing.T) {
+func TestScheduleDaemonResync_NilDaemonAPIReturnsNil(t *testing.T) {
 	m := &Model{}
 	if cmd := m.scheduleDaemonResync(); cmd != nil {
-		t.Errorf("scheduleDaemonResync with nil guardAPI returned non-nil cmd")
+		t.Errorf("scheduleDaemonResync with nil m.daemon returned non-nil cmd")
 	}
 }
 
-// TestScheduleDaemonResync_WithAPIReturnsTick — a present guardAPI
+// TestScheduleDaemonResync_WithAPIReturnsTick — a present m.daemon
 // produces a non-nil tea.Cmd. Used by Init / handleDaemonResyncMsg to
 // chain the next tick.
 func TestScheduleDaemonResync_WithAPIReturnsTick(t *testing.T) {
-	m := &Model{guardAPI: &listStubAPI{}}
+	m := &Model{daemon: &listStubAPI{}}
 	cmd := m.scheduleDaemonResync()
 	if cmd == nil {
 		t.Fatalf("scheduleDaemonResync returned nil cmd; expected tea.Tick")

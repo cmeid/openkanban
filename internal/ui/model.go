@@ -339,11 +339,14 @@ type Model struct {
 	// case branch.
 	viewingSessionID string
 
-	// guardAPI is the subset of daemonclient.Client used by the exit
-	// guard (PrepareExit / Kill / ClientID). Held as an interface so
-	// tests can substitute a fake without standing up a real daemon. Set
-	// from daemonClient in NewModel; nil when the daemon is unreachable.
-	guardAPI daemonGuardAPI
+	// daemon is the testable seam for daemonclient.Client RPCs that
+	// the UI uses (exit-guard handshake, Owns / List queries, Spawn /
+	// Kill / TicketDone lifecycle). Held as an interface so tests can
+	// substitute a fake without standing up a real daemon. Set from
+	// daemonClient in NewModel; nil when the daemon is unreachable.
+	// See daemon_api.go for the full surface and its sub-interface
+	// decomposition.
+	daemon daemonAPI
 
 	// confirmExit carries modal state for ModeConfirmExit. Populated by
 	// handlePrepareExitResult when the user requests quit, cleared when
@@ -495,7 +498,7 @@ func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projec
 		daemonClient:       daemonClient,
 	}
 	if daemonClient != nil {
-		m.guardAPI = daemonClient
+		m.daemon = daemonClient
 	}
 	if filterProjectID != "" {
 		m.filterProjectIDs[filterProjectID] = true
@@ -520,8 +523,8 @@ func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projec
 	//      empty owned-set; the periodic resync (armed in Init) will
 	//      pick up state the next time the daemon answers.
 	ownedByDaemon := map[board.TicketID]daemon.SessionInfo{}
-	if m.guardAPI != nil {
-		got, err := listSessionsWithRetry(m.guardAPI,
+	if m.daemon != nil {
+		got, err := listSessionsWithRetry(m.daemon,
 			startupReconcileAttempts, startupReconcileTimeout, startupReconcileBackoff)
 		if err != nil {
 			log.Printf("openkanban: startup reconcile failed after %d retries: %v",
@@ -599,7 +602,7 @@ func (m *Model) Init() tea.Cmd {
 	// startup reconcile populated m.panes / m.daemonOwned from the
 	// initial List; this tick keeps that view in sync as the daemon's
 	// session set drifts (sibling TUI spawns, daemon restart, external
-	// kills). Returns nil when guardAPI is missing — batch absorbs it.
+	// kills). Returns nil when m.daemon is missing — batch absorbs it.
 	if cmd := m.scheduleDaemonResync(); cmd != nil {
 		cmds = append(cmds, cmd)
 	}
@@ -1742,7 +1745,7 @@ func (m *Model) handleQuit() (tea.Model, tea.Cmd) {
 	// The guard's PrepareExit RPC tells us the authoritative ClientCount
 	// + Sessions snapshot, and the modal (ModeConfirmExit) gates exit on
 	// the user explicitly killing them. See handleQuitRequested.
-	if m.guardAPI != nil {
+	if m.daemon != nil {
 		return m.handleQuitRequested()
 	}
 
@@ -3734,9 +3737,9 @@ func (m *Model) shouldCleanupDeadSession(ticket *board.Ticket) (bool, string) {
 	if ticket == nil {
 		return false, ""
 	}
-	if m.guardAPI != nil && ticket.AgentSessionID != "" {
+	if m.daemon != nil && ticket.AgentSessionID != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), ownsProbeTimeout)
-		resp, err := m.guardAPI.Owns(ctx, ticket.AgentSessionID)
+		resp, err := m.daemon.Owns(ctx, ticket.AgentSessionID)
 		cancel()
 		switch {
 		case err == nil && resp.Owned:
@@ -4218,14 +4221,17 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 	mgr := m.worktreeMgrs[proj.ID]
 	cfg := m.config
 	daemonClient := m.daemonClient
-	// Capture guardAPI by value so the closure routes Spawn/Owns through
+	// Capture m.daemon by value so the closure routes Spawn/Owns through
 	// the same testable seam as the exit-guard and TicketDone paths.
 	// nil in two cases the closure must tolerate:
-	//   1. daemon never reachable at startup (m.guardAPI = nil)
+	//   1. daemon never reachable at startup (m.daemon = nil)
 	//   2. tests that exercise non-daemon branches
 	// The daemonClient nil-check below covers (1); the fast-path Owns
 	// call also nil-checks before dereferencing.
-	guardAPI := m.guardAPI
+	//
+	// Bound to `dapi` (rather than `daemon`) so we don't shadow the
+	// `daemon` package import the closure uses below.
+	dapi := m.daemon
 
 	return func() tea.Msg {
 		// Fast path (B4): if the daemon already owns the agent UUID this
@@ -4246,9 +4252,9 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 		// Guarded on ticket.AgentSessionID being set: tickets that have
 		// never had a session linked to them have no UUID to query, so
 		// the fast path is meaningless.
-		if guardAPI != nil && ticket.AgentSessionID != "" {
+		if dapi != nil && ticket.AgentSessionID != "" {
 			ownsCtx, ownsCancel := context.WithTimeout(context.Background(), ownsProbeTimeout)
-			ownsResp, ownsErr := guardAPI.Owns(ownsCtx, ticket.AgentSessionID)
+			ownsResp, ownsErr := dapi.Owns(ownsCtx, ticket.AgentSessionID)
 			ownsCancel()
 			if ownsErr == nil && ownsResp.Owned && ownsResp.SessionID != "" {
 				return attachExistingFastPath(
@@ -4415,8 +4421,8 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 			resp daemon.SpawnResp
 			err  error
 		)
-		if guardAPI != nil {
-			resp, err = guardAPI.Spawn(spawnCtx, req)
+		if dapi != nil {
+			resp, err = dapi.Spawn(spawnCtx, req)
 		} else {
 			resp, err = daemonClient.Spawn(spawnCtx, req)
 		}
@@ -4656,11 +4662,11 @@ func (m *Model) wrapUpSessionForTicket(ticket *board.Ticket, newStatus board.Tic
 
 	// Tell the daemon (best-effort; failures are not fatal — same
 	// contract as cmd/ticket_done.go:notifyDaemonTicketDone). Routed
-	// through m.guardAPI so tests can substitute a fake.
-	if m.guardAPI != nil {
+	// through m.daemon so tests can substitute a fake.
+	if m.daemon != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		if _, err := m.guardAPI.TicketDone(ctx, string(ticket.ID)); err != nil {
+		if _, err := m.daemon.TicketDone(ctx, string(ticket.ID)); err != nil {
 			log.Printf("openkanban: TicketDone(%s) on board promotion: %v", ticket.ID, err)
 		}
 	}

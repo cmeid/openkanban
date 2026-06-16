@@ -12,29 +12,19 @@ import (
 	"github.com/techdufus/openkanban/internal/project"
 )
 
-// ticketDoneStubAPI is a minimal daemonGuardAPI focused on the
+// ticketDoneStubAPI is a minimal daemonAPI focused on the
 // wrap-up-on-promotion path. It records every TicketDone invocation so
-// tests can assert the daemon notification fired (or didn't). All
-// other interface methods return zero values — the wrap-up helper
-// only calls TicketDone, so the rest of the surface is intentionally
-// inert.
+// tests can assert the daemon notification fired (or didn't). The
+// wrap-up helper only calls TicketDone, so every other method falls
+// through to daemonAPINoop's zero-value returns.
 type ticketDoneStubAPI struct {
+	daemonAPINoop
+
 	calls         atomic.Int32
 	lastTicketID  atomic.Value // string
 	ticketDoneErr atomic.Value // error
 }
 
-func (s *ticketDoneStubAPI) PrepareExit(_ context.Context) (daemon.PrepareExitResp, error) {
-	return daemon.PrepareExitResp{}, nil
-}
-func (s *ticketDoneStubAPI) CancelExit(_ context.Context) error { return nil }
-func (s *ticketDoneStubAPI) Kill(_ context.Context, _ string, _ time.Duration) error {
-	return nil
-}
-func (s *ticketDoneStubAPI) ClientID() uint16 { return 1 }
-func (s *ticketDoneStubAPI) Owns(_ context.Context, _ string) (daemon.OwnsResp, error) {
-	return daemon.OwnsResp{Owned: false}, nil
-}
 func (s *ticketDoneStubAPI) TicketDone(_ context.Context, ticketID string) (daemon.TicketDoneResp, error) {
 	s.calls.Add(1)
 	s.lastTicketID.Store(ticketID)
@@ -44,16 +34,6 @@ func (s *ticketDoneStubAPI) TicketDone(_ context.Context, ticketID string) (daem
 		}
 	}
 	return daemon.TicketDoneResp{Killed: true}, nil
-}
-func (s *ticketDoneStubAPI) List(_ context.Context) (daemon.ListResp, error) {
-	return daemon.ListResp{}, nil
-}
-
-// Spawn is unused by these wrap-up tests but required to satisfy
-// daemonGuardAPI now that prepareSpawnWith routes Spawn through this
-// seam. Returns an empty response.
-func (s *ticketDoneStubAPI) Spawn(_ context.Context, _ daemon.SpawnReq) (daemon.SpawnResp, error) {
-	return daemon.SpawnResp{}, nil
 }
 
 // newWrapUpModel builds a minimal Model wired with the column stack,
@@ -95,7 +75,7 @@ func newWrapUpModel(t *testing.T, status board.TicketStatus) (*Model, *board.Tic
 
 	m := &Model{
 		globalStore:     globalStore,
-		guardAPI:        stub,
+		daemon:          stub,
 		panes:           map[board.TicketID]*daemonclient.PaneView{ticket.ID: pv},
 		daemonOwned:     map[board.TicketID]struct{}{ticket.ID: {}},
 		daemonViewing:   map[board.TicketID]int{},
@@ -230,18 +210,18 @@ func TestWrapUpSessionForTicket_NoLivePane_StillNotifiesDaemon(t *testing.T) {
 	}
 }
 
-// TestWrapUpSessionForTicket_NilGuardAPI_DoesNotPanic exercises the
+// TestWrapUpSessionForTicket_NilDaemonAPI_DoesNotPanic exercises the
 // daemon-unreachable case: the TUI started before the daemon was up,
-// so m.guardAPI is nil. Local cleanup must still proceed; the daemon
+// so m.daemon is nil. Local cleanup must still proceed; the daemon
 // notification is silently skipped.
-func TestWrapUpSessionForTicket_NilGuardAPI_DoesNotPanic(t *testing.T) {
+func TestWrapUpSessionForTicket_NilDaemonAPI_DoesNotPanic(t *testing.T) {
 	m, ticket, _ := newWrapUpModel(t, board.StatusInProgress)
-	m.guardAPI = nil
+	m.daemon = nil
 
 	m.wrapUpSessionForTicket(ticket, board.StatusInReview)
 
 	if _, ok := m.panes[ticket.ID]; ok {
-		t.Errorf("panes[%s] still present after wrap-up with nil guardAPI", ticket.ID)
+		t.Errorf("panes[%s] still present after wrap-up with nil m.daemon", ticket.ID)
 	}
 	if ticket.AgentStatus != board.AgentCompleted {
 		t.Errorf("AgentStatus = %v, want %v", ticket.AgentStatus, board.AgentCompleted)
