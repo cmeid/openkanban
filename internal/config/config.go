@@ -31,6 +31,13 @@ Focus on completing this ticket. Ask clarifying questions if the description is 
 //go:embed agent_prompt.tmpl
 var defaultAgentPrompt string
 
+// DefaultAgentPrompt returns the shipped priming template. Exposed so
+// tests in sibling packages can render it and assert invariants
+// (e.g. that the leading phrases still match agent.ClaudePrimingPrefixes).
+func DefaultAgentPrompt() string {
+	return defaultAgentPrompt
+}
+
 const defaultAiderPrompt = `OpenKanban Ticket: {{.Title}}
 
 Description:
