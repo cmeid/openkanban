@@ -530,6 +530,16 @@ func (g *GlobalTicketStore) RemoveProject(id string) error {
 		log.Printf("openkanban: archived project %s tickets to %s", id, dstDir)
 	}
 
+	// Drop orphaned tickets from the global index. Without this,
+	// All() / Count() / GetByStatus() and friends would keep
+	// returning the removed project's tickets even though
+	// projects/ticketStores no longer reference them.
+	for ticketID, ticket := range g.allTickets {
+		if ticket.ProjectID == id {
+			delete(g.allTickets, ticketID)
+		}
+	}
+
 	delete(g.projects, id)
 	delete(g.ticketStores, id)
 
