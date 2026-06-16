@@ -12,12 +12,15 @@ Configured in `config.json` under `agents` map:
 
 Find existing sessions to resume:
 ```go
+FindClaudeSession(workdir) string   // freshest LIVE .jsonl UUID in ~/.claude/projects/<encoded-cwd>/
 FindOpencodeSession(workdir) string
 FindGeminiSession(workdir) string
 FindCodexSession(workdir) string
 ```
 
-Returns session ID or empty string.
+Returns session ID or empty string. No error path — callers retry on the next status-poll tick. `FindClaudeSession` additionally gates on the `.jsonl` having at least one real assistant turn so the UI doesn't back-fill an abandoned UUID into `Ticket.AgentSessionID`.
+
+Four parallel funcs by design — see `feedback_openkanban_no_premature_service_abstraction`; no `SessionDiscoverer` interface until a 5th caller exists.
 
 ## Context Prompts
 

@@ -161,35 +161,29 @@ func ForceExitSession(uuid string, grace time.Duration) error {
 	return fmt.Errorf("session %s still held after SIGKILL", uuid)
 }
 
-// IsClaudeSessionDead reports whether the most-recent claude session for
-// the given worktree has no real assistant work in its transcript. Used
-// by openkanban to silently clean up never-engaged sessions when the
-// user respawns.
-//
-// "Dead" means: no assistant message has text content other than the
-// auto-response "No response requested.". A missing project directory
-// or missing .jsonl also counts as dead.
-//
-// Returns the path to the most-recent session JSONL (so callers can
-// delete it) and any non-fatal error encountered while walking the
-// directory or reading the file.
-func IsClaudeSessionDead(worktreePath string) (dead bool, sessionPath string, err error) {
+// latestClaudeJSONL returns the path to the most-recent (.jsonl, by
+// mtime) claude session transcript for the given worktree, scanning
+// `~/.claude/projects/<encoded-worktree-path>/`. Returns ("", nil) for
+// an empty worktreePath, a missing project dir, or a dir with no
+// .jsonl files — i.e. "no session found" is not an error. A read
+// failure on the project dir is a real error.
+func latestClaudeJSONL(worktreePath string) (string, error) {
 	if worktreePath == "" {
-		return true, "", nil
+		return "", nil
 	}
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
-		return false, "", fmt.Errorf("user home dir: %w", err)
+		return "", fmt.Errorf("user home dir: %w", err)
 	}
 	encoded := strings.ReplaceAll(worktreePath, "/", "-")
 	dir := filepath.Join(homeDir, ".claude", "projects", encoded)
 
 	entries, err := os.ReadDir(dir)
 	if os.IsNotExist(err) {
-		return true, "", nil
+		return "", nil
 	}
 	if err != nil {
-		return false, "", fmt.Errorf("read claude projects dir: %w", err)
+		return "", fmt.Errorf("read claude projects dir: %w", err)
 	}
 
 	var latestPath string
@@ -207,13 +201,18 @@ func IsClaudeSessionDead(worktreePath string) (dead bool, sessionPath string, er
 			latestMtime = info.ModTime()
 		}
 	}
-	if latestPath == "" {
-		return true, "", nil
-	}
+	return latestPath, nil
+}
 
-	f, err := os.Open(latestPath)
+// jsonlHasRealAssistantContent scans a claude session transcript and
+// reports whether any assistant message has user-visible text other
+// than the auto-reply "No response requested.". Returns (false, err)
+// only if the file can't be opened; malformed lines mid-stream are
+// skipped, not treated as failure.
+func jsonlHasRealAssistantContent(path string) (bool, error) {
+	f, err := os.Open(path)
 	if err != nil {
-		return false, latestPath, fmt.Errorf("open session %s: %w", latestPath, err)
+		return false, fmt.Errorf("open session %s: %w", path, err)
 	}
 	defer f.Close()
 
@@ -239,11 +238,68 @@ func IsClaudeSessionDead(worktreePath string) (dead bool, sessionPath string, er
 		if text == "" || text == "No response requested." {
 			continue
 		}
-		// Found a real assistant response → alive
-		return false, latestPath, nil
+		return true, nil
 	}
-	// No real assistant work in any event → dead
-	return true, latestPath, nil
+	return false, nil
+}
+
+// IsClaudeSessionDead reports whether the most-recent claude session for
+// the given worktree has no real assistant work in its transcript. Used
+// by openkanban to silently clean up never-engaged sessions when the
+// user respawns.
+//
+// "Dead" means: no assistant message has text content other than the
+// auto-response "No response requested.". A missing project directory
+// or missing .jsonl also counts as dead.
+//
+// Returns the path to the most-recent session JSONL (so callers can
+// delete it) and any non-fatal error encountered while walking the
+// directory or reading the file.
+func IsClaudeSessionDead(worktreePath string) (dead bool, sessionPath string, err error) {
+	latestPath, err := latestClaudeJSONL(worktreePath)
+	if err != nil {
+		return false, "", err
+	}
+	if latestPath == "" {
+		return true, "", nil
+	}
+
+	alive, err := jsonlHasRealAssistantContent(latestPath)
+	if err != nil {
+		return false, latestPath, err
+	}
+	return !alive, latestPath, nil
+}
+
+// FindClaudeSession returns the UUID of the most-recent live claude
+// session for the given worktree — the inverse of IsClaudeSessionDead.
+// "Live" means the same alive-check IsClaudeSessionDead uses: at least
+// one assistant message with real text. Returns "" when there's no
+// project dir, no .jsonl, the most-recent .jsonl has only auto-replies,
+// or the .jsonl basename isn't a UUID (defensive — claude always names
+// them by session UUID, but we don't want to write garbage back to the
+// ticket's AgentSessionID field).
+//
+// Used by the TUI status-poll loop to back-fill Ticket.AgentSessionID
+// after a fresh claude spawn so subsequent re-spawns can pass
+// --resume <uuid> deterministically. Mirrors FindOpencodeSession /
+// FindGeminiSession / FindCodexSession in signature (no error path —
+// returns "" on any failure since the caller retries on the next tick).
+func FindClaudeSession(worktreePath string) string {
+	latestPath, err := latestClaudeJSONL(worktreePath)
+	if err != nil || latestPath == "" {
+		return ""
+	}
+	alive, err := jsonlHasRealAssistantContent(latestPath)
+	if err != nil || !alive {
+		return ""
+	}
+	base := filepath.Base(latestPath)
+	uuid := strings.TrimSuffix(base, ".jsonl")
+	if !SessionUUIDPattern.MatchString(uuid) {
+		return ""
+	}
+	return uuid
 }
 
 // extractAssistantText pulls user-visible text from a claude message

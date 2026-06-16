@@ -430,3 +430,155 @@ func TestResolveBrief_SkipMergeNoFileReportsAbsent(t *testing.T) {
 		t.Errorf("brief file %s was created despite SkipMerge", fullPath)
 	}
 }
+
+// TestBuildSpawnReq_ResumeUUID_PreferredOverContinue asserts the
+// deterministic-resume contract: when a re-spawn happens for a claude
+// ticket whose AgentSessionID has been back-filled with a valid UUID,
+// argv carries `--resume <uuid>` instead of the positional `--continue`
+// heuristic. This is what closes the "ForceFresh-then-re-spawn picks
+// the wrong journal" failure mode `--continue` has.
+func TestBuildSpawnReq_ResumeUUID_PreferredOverContinue(t *testing.T) {
+	const uuid = "7f3a9b2c-1d8e-4a5b-9c3d-2f1e0a8b9c4d"
+
+	in := baseClaudeInputs(t, "TICK-UUID", "task/uuid")
+	in.ticket.AgentSessionID = uuid
+
+	req := buildSpawnReq(in)
+
+	if !argsHavePair(req.Args, "--resume", uuid) {
+		t.Errorf("argv must contain --resume %s pair, got %v", uuid, req.Args)
+	}
+	if argsContain(req.Args, "--continue") {
+		t.Errorf("argv must NOT contain --continue when --resume <uuid> is present, got %v", req.Args)
+	}
+}
+
+// TestBuildSpawnReq_ResumeUUID_WithInjectResumeNotice asserts the
+// InjectResumeNotice positional still lands AFTER --resume <uuid>,
+// not after a non-existent --continue. Pins the order so the notice
+// is parsed as the first new user turn by claude.
+func TestBuildSpawnReq_ResumeUUID_WithInjectResumeNotice(t *testing.T) {
+	const uuid = "7f3a9b2c-1d8e-4a5b-9c3d-2f1e0a8b9c4d"
+
+	in := baseClaudeInputs(t, "TICK-UUID-NOTICE", "task/notice")
+	in.ticket.AgentSessionID = uuid
+	in.plan = spawnPlan{InjectResumeNotice: true}
+
+	req := buildSpawnReq(in)
+
+	if !argsHavePair(req.Args, "--resume", uuid) {
+		t.Errorf("argv must contain --resume %s pair, got %v", uuid, req.Args)
+	}
+	resumeIdx, posIdx := -1, -1
+	for i, a := range req.Args {
+		if a == "--resume" {
+			resumeIdx = i
+		}
+		if strings.HasPrefix(a, "Brief updated at tickets/") {
+			posIdx = i
+		}
+	}
+	if resumeIdx == -1 || posIdx == -1 || posIdx <= resumeIdx+1 {
+		// posIdx must be at least resumeIdx + 2 (skip the UUID value)
+		t.Errorf("expected resume-notice positional after --resume <uuid>, got args=%v", req.Args)
+	}
+}
+
+// TestBuildSpawnReq_NoAgentSessionID_FallsBackToContinue asserts the
+// graceful-degradation contract for tickets predating the back-fill
+// (Task 1/2): if AgentSessionID isn't populated yet, claude still
+// resumes via --continue (the legacy heuristic). Newer status-poll
+// ticks will populate AgentSessionID and subsequent re-spawns will
+// upgrade to --resume <uuid>.
+func TestBuildSpawnReq_NoAgentSessionID_FallsBackToContinue(t *testing.T) {
+	in := baseClaudeInputs(t, "TICK-LEGACY", "task/legacy")
+	// AgentSessionID intentionally left empty.
+
+	req := buildSpawnReq(in)
+
+	if !argsContain(req.Args, "--continue") {
+		t.Errorf("argv must fall back to --continue when AgentSessionID is empty, got %v", req.Args)
+	}
+	if argsContain(req.Args, "--resume") {
+		t.Errorf("argv must NOT contain --resume when AgentSessionID is empty, got %v", req.Args)
+	}
+}
+
+// TestBuildSpawnReq_InvalidAgentSessionID_FallsBackToContinue asserts
+// defensive validation: a malformed UUID (e.g. an opencode-style ref
+// accidentally stamped into AgentSessionID, or a corrupted value) must
+// not be passed as --resume. Falls back to --continue.
+func TestBuildSpawnReq_InvalidAgentSessionID_FallsBackToContinue(t *testing.T) {
+	in := baseClaudeInputs(t, "TICK-BAD", "task/bad")
+	in.ticket.AgentSessionID = "not-a-uuid"
+
+	req := buildSpawnReq(in)
+
+	if !argsContain(req.Args, "--continue") {
+		t.Errorf("argv must fall back to --continue for invalid AgentSessionID, got %v", req.Args)
+	}
+	if argsContain(req.Args, "--resume") {
+		t.Errorf("argv must NOT pass invalid AgentSessionID as --resume, got %v", req.Args)
+	}
+}
+
+// TestBuildSpawnReq_UserConfigContinue_NotOverridden asserts the user-
+// config escape hatch: if --continue or --resume is already in the
+// caller's cleanArgs (from a user's agent config), buildSpawnReq must
+// NOT add another resume flag. Today's hasFlag guard at the !isNewSession
+// branch handles this; the test pins it across both --continue and
+// --resume preset variants.
+func TestBuildSpawnReq_UserConfigContinue_NotOverridden(t *testing.T) {
+	const uuid = "7f3a9b2c-1d8e-4a5b-9c3d-2f1e0a8b9c4d"
+
+	t.Run("user_preset_continue", func(t *testing.T) {
+		in := baseClaudeInputs(t, "TICK-PRESET-C", "task/preset-c")
+		in.ticket.AgentSessionID = uuid // would otherwise trigger --resume
+		in.cleanArgs = []string{"--continue"}
+
+		req := buildSpawnReq(in)
+
+		// Exactly one --continue, no --resume.
+		var continueCount, resumeCount int
+		for _, a := range req.Args {
+			if a == "--continue" {
+				continueCount++
+			}
+			if a == "--resume" {
+				resumeCount++
+			}
+		}
+		if continueCount != 1 {
+			t.Errorf("--continue count = %d, want 1 (preset preserved), args=%v", continueCount, req.Args)
+		}
+		if resumeCount != 0 {
+			t.Errorf("--resume must NOT be added when preset contains --continue, args=%v", req.Args)
+		}
+	})
+
+	t.Run("user_preset_resume", func(t *testing.T) {
+		in := baseClaudeInputs(t, "TICK-PRESET-R", "task/preset-r")
+		in.ticket.AgentSessionID = uuid
+		// Simulate a user who hand-pinned --resume <other-uuid> in their config.
+		in.cleanArgs = []string{"--resume", "11111111-1111-1111-1111-111111111111"}
+
+		req := buildSpawnReq(in)
+
+		// Exactly one --resume (theirs), no auto-added --resume or --continue.
+		var continueCount, resumeCount int
+		for _, a := range req.Args {
+			if a == "--continue" {
+				continueCount++
+			}
+			if a == "--resume" {
+				resumeCount++
+			}
+		}
+		if resumeCount != 1 {
+			t.Errorf("--resume count = %d, want 1 (preset preserved), args=%v", resumeCount, req.Args)
+		}
+		if continueCount != 0 {
+			t.Errorf("--continue must NOT be added when preset contains --resume, args=%v", req.Args)
+		}
+	})
+}

@@ -3775,26 +3775,55 @@ func (m *Model) spawnAgent() (tea.Model, tea.Cmd) {
 		_ = m.opencodeServer.Start() // Best effort, ignore errors
 	}
 
-	// Stale-brief detection (claude only): if a prior session exists AND
-	// the merge would change the brief on disk, ask the user how to
-	// proceed before transitioning to ModeSpawning.
-	if agentType == "claude" && ticket.AgentSpawnedAt != nil {
-		// T3: Dead-session auto-cleanup is gated by daemon ownership.
-		// If the daemon currently owns the live PTY for this session
-		// UUID, the on-disk JSONL may legitimately look "dead" (no
-		// assistant content yet, mid-write) while the runtime session
-		// is fine. Deleting the JSONL in that case would break a
-		// future `--continue`. shouldCleanupDeadSession encapsulates
-		// the Owns probe + IsClaudeSessionDead decision.
-		shouldCleanup, deadPath := m.shouldCleanupDeadSession(ticket)
-		if shouldCleanup {
-			if deadPath != "" {
-				_ = agent.DeleteClaudeSession(deadPath)
+	// Stale-brief detection (claude only): if there's a prior journal
+	// the agent could resume into AND merging the openkanban card's
+	// description into the on-disk brief would change it, ask the user
+	// how to proceed before transitioning to ModeSpawning.
+	//
+	// Two resume paths qualify:
+	//   1. Regular re-spawn (AgentSpawnedAt != nil) — this TUI spawned
+	//      the prior session itself. Includes the dead-session cleanup
+	//      step that reaps abandoned journals before the chooser would
+	//      otherwise fire on them.
+	//   2. External resume (AgentSpawnedAt == nil, AgentSessionID set
+	//      to a valid UUID via `openkanban ticket new --session <uuid>`
+	//      or the status-poll back-fill) — a journal from an externally
+	//      created or back-filled session exists; we DON'T cleanup-on-
+	//      dead here because the journal isn't ours to delete.
+	if agentType == "claude" {
+		offerChooser := false
+
+		if ticket.AgentSpawnedAt != nil {
+			// T3: Dead-session auto-cleanup is gated by daemon ownership.
+			// If the daemon currently owns the live PTY for this session
+			// UUID, the on-disk JSONL may legitimately look "dead" (no
+			// assistant content yet, mid-write) while the runtime session
+			// is fine. Deleting the JSONL in that case would break a
+			// future `--continue`. shouldCleanupDeadSession encapsulates
+			// the Owns probe + IsClaudeSessionDead decision.
+			shouldCleanup, deadPath := m.shouldCleanupDeadSession(ticket)
+			if shouldCleanup {
+				if deadPath != "" {
+					_ = agent.DeleteClaudeSession(deadPath)
+				}
+				ticket.AgentSpawnedAt = nil
+				m.saveTicket(ticket)
+				// fall through to the empty-plan spawn path below
+			} else {
+				offerChooser = true
 			}
-			ticket.AgentSpawnedAt = nil
-			m.saveTicket(ticket)
-			// fall through to the empty-plan spawn path below
-		} else {
+		} else if agent.SessionUUIDPattern.MatchString(ticket.AgentSessionID) {
+			// External resume: the chooser is only meaningful if a journal
+			// exists on disk — otherwise there's no prior context for the
+			// brief-change to matter against. FindClaudeSession returns ""
+			// when the journal is missing or never engaged (no real
+			// assistant turn), which is the right early-exit.
+			if agent.FindClaudeSession(ticket.WorktreePath) != "" {
+				offerChooser = true
+			}
+		}
+
+		if offerChooser {
 			_, _, wouldChange, _, _ := agent.PreviewBriefMerge(ticket, ticket.WorktreePath)
 			if wouldChange {
 				// Capture ticket/proj/agentCfg into each callback. Each option
@@ -3960,18 +3989,35 @@ func buildSpawnReq(in spawnReqInputs) daemon.SpawnReq {
 				}
 			}
 		} else {
+			// Honor a user-config preset that's already chosen the resume
+			// flag (e.g. `--continue` in their agent config Args). Also
+			// guards against double-injecting --resume on repeated calls.
 			hasFlag := false
 			for _, arg := range args {
-				if arg == "--continue" || arg == "-c" {
+				if arg == "--continue" || arg == "-c" || arg == "--resume" {
 					hasFlag = true
 					break
 				}
 			}
 			if !hasFlag {
-				args = append(args, "--continue")
+				// Prefer --resume <uuid> when the status-poll loop has
+				// back-filled a known UUID (see internal/ui/model.go's
+				// claude back-fill ~line 4522 and agent.FindClaudeSession).
+				// --resume is deterministic; --continue is positional
+				// ("most recent journal in cwd") and silently picks the
+				// wrong journal after a ForceFresh re-spawn. Fall back
+				// to --continue for tickets whose poll hasn't tagged
+				// them yet (pre-back-fill tickets, or a session whose
+				// first turn hasn't landed on disk).
+				if agent.SessionUUIDPattern.MatchString(in.ticket.AgentSessionID) {
+					args = append(args, "--resume", in.ticket.AgentSessionID)
+				} else {
+					args = append(args, "--continue")
+				}
 				// plan.InjectResumeNotice (option 'u'): append a positional
-				// message after --continue so the resumed claude session
-				// sees the brief-updated notice as the first new user turn.
+				// message after the resume flag so the resumed claude
+				// session sees the brief-updated notice as the first new
+				// user turn. Works for both --resume <uuid> and --continue.
 				if in.plan.InjectResumeNotice {
 					slug := agent.BranchSlug(in.ticket.BranchName)
 					if slug != "" {
@@ -4741,6 +4787,23 @@ func (m *Model) pollAgentStatusesAsync() tea.Cmd {
 			sessionID := p.agentSessionID
 			if sessionID == "" && p.agentType == "opencode" && p.worktreePath != "" {
 				if id := agent.FindOpencodeSession(p.worktreePath); id != "" {
+					sessionID = id
+					if ticket, _ := globalStore.Get(p.ticketID); ticket != nil {
+						ticket.AgentSessionID = sessionID
+						globalStore.Save(ticket)
+					}
+				}
+			}
+			// Mirror the opencode back-fill for claude. agent.FindClaudeSession
+			// returns the UUID of the freshest live (has real assistant content)
+			// journal under ~/.claude/projects/<encoded-cwd>/, so this only
+			// stamps the ticket once the agent has produced at least one real
+			// turn — same idempotent guard as opencode. With AgentSessionID
+			// persisted, subsequent spawns pass --resume <uuid> deterministically
+			// instead of leaning on claude's `--continue` "pick most recent"
+			// heuristic, which silently breaks after a ForceFresh re-spawn.
+			if sessionID == "" && p.agentType == "claude" && p.worktreePath != "" {
+				if id := agent.FindClaudeSession(p.worktreePath); id != "" {
 					sessionID = id
 					if ticket, _ := globalStore.Get(p.ticketID); ticket != nil {
 						ticket.AgentSessionID = sessionID
