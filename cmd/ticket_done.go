@@ -92,7 +92,7 @@ func wrapUpSessionTicketAt(target board.TicketStatus) error {
 		if err != nil {
 			return fmt.Errorf("move ticket %s: %w", ticket.ID, err)
 		}
-		ticket.AgentStatus = board.AgentCompleted
+		ticket.SetAgentStatus(board.AgentCompleted)
 		if err := store.SaveTicket(ticket); err != nil {
 			return fmt.Errorf("save ticket %s: %w", ticket.ID, err)
 		}

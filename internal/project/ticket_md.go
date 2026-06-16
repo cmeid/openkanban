@@ -62,10 +62,11 @@ type ticketFrontmatter struct {
 	Priority  int                `yaml:"priority"`
 	Labels    []string           `yaml:"labels"`
 
-	CreatedAt   time.Time  `yaml:"created_at"`
-	UpdatedAt   time.Time  `yaml:"updated_at"`
-	StartedAt   *time.Time `yaml:"started_at,omitempty"`
-	CompletedAt *time.Time `yaml:"completed_at,omitempty"`
+	CreatedAt       time.Time  `yaml:"created_at"`
+	UpdatedAt       time.Time  `yaml:"updated_at"`
+	StartedAt       *time.Time `yaml:"started_at,omitempty"`
+	CompletedAt     *time.Time `yaml:"completed_at,omitempty"`
+	StatusChangedAt *time.Time `yaml:"status_changed_at,omitempty"`
 
 	UseWorktree  bool   `yaml:"use_worktree"`
 	WorktreePath string `yaml:"worktree_path,omitempty"`
@@ -109,6 +110,7 @@ func toFrontmatter(t *board.Ticket) ticketFrontmatter {
 		UpdatedAt:        t.UpdatedAt,
 		StartedAt:        t.StartedAt,
 		CompletedAt:      t.CompletedAt,
+		StatusChangedAt:  t.StatusChangedAt,
 		UseWorktree:      t.UseWorktree,
 		WorktreePath:     t.WorktreePath,
 		BranchName:       t.BranchName,
@@ -160,6 +162,7 @@ func fromFrontmatter(fm ticketFrontmatter, body string) *board.Ticket {
 		UpdatedAt:        fm.UpdatedAt,
 		StartedAt:        fm.StartedAt,
 		CompletedAt:      fm.CompletedAt,
+		StatusChangedAt:  fm.StatusChangedAt,
 		Labels:           labels,
 		Priority:         fm.Priority,
 		Meta:             meta,
@@ -275,6 +278,14 @@ func validateFrontmatter(fm *ticketFrontmatter) error {
 	}
 	if fm.UpdatedAt.IsZero() {
 		fm.UpdatedAt = now
+	}
+
+	// Pre-StatusChangedAt files lack the field; fall back to UpdatedAt
+	// so the new "status change" sort has a meaningful value. In-memory
+	// only — the file stays byte-identical until a real mutation flushes.
+	if fm.StatusChangedAt == nil {
+		ts := fm.UpdatedAt
+		fm.StatusChangedAt = &ts
 	}
 
 	if fm.Priority == 0 {

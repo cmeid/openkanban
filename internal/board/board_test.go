@@ -159,6 +159,13 @@ func TestNewTicket(t *testing.T) {
 		t.Errorf("ticket.UpdatedAt = %v; want between %v and %v", ticket.UpdatedAt, before, after)
 	}
 
+	if ticket.StatusChangedAt == nil {
+		t.Fatal("ticket.StatusChangedAt should be set on new ticket")
+	}
+	if !ticket.StatusChangedAt.Equal(ticket.CreatedAt) {
+		t.Errorf("ticket.StatusChangedAt = %v; want CreatedAt = %v", *ticket.StatusChangedAt, ticket.CreatedAt)
+	}
+
 	if ticket.Labels == nil {
 		t.Error("ticket.Labels should not be nil")
 	}
@@ -252,6 +259,83 @@ func TestTicket_SetStatus(t *testing.T) {
 
 		if !ticket.UpdatedAt.After(originalUpdatedAt) {
 			t.Error("SetStatus should update UpdatedAt")
+		}
+	})
+
+	t.Run("stamps StatusChangedAt on transition", func(t *testing.T) {
+		ticket := NewTicket("Test", "project-1")
+		originalStatusChangedAt := *ticket.StatusChangedAt
+
+		time.Sleep(time.Millisecond)
+		ticket.SetStatus(StatusInProgress)
+
+		if ticket.StatusChangedAt == nil {
+			t.Fatal("StatusChangedAt should be non-nil after SetStatus")
+		}
+		if !ticket.StatusChangedAt.After(originalStatusChangedAt) {
+			t.Errorf("SetStatus should advance StatusChangedAt; got %v, original %v",
+				*ticket.StatusChangedAt, originalStatusChangedAt)
+		}
+	})
+}
+
+func TestTicket_SetAgentStatus(t *testing.T) {
+	t.Run("no-op when status unchanged", func(t *testing.T) {
+		ticket := NewTicket("Test", "project-1")
+		ticket.AgentStatus = AgentWorking
+		originalUpdatedAt := ticket.UpdatedAt
+		originalStatusChangedAt := *ticket.StatusChangedAt
+
+		time.Sleep(time.Millisecond)
+		changed := ticket.SetAgentStatus(AgentWorking)
+
+		if changed {
+			t.Error("SetAgentStatus should return false on no-op")
+		}
+		if !ticket.UpdatedAt.Equal(originalUpdatedAt) {
+			t.Error("UpdatedAt should not change on no-op")
+		}
+		if !ticket.StatusChangedAt.Equal(originalStatusChangedAt) {
+			t.Error("StatusChangedAt should not change on no-op")
+		}
+	})
+
+	t.Run("real change stamps and returns true", func(t *testing.T) {
+		ticket := NewTicket("Test", "project-1")
+		originalUpdatedAt := ticket.UpdatedAt
+		originalStatusChangedAt := *ticket.StatusChangedAt
+
+		time.Sleep(time.Millisecond)
+		changed := ticket.SetAgentStatus(AgentWaiting)
+
+		if !changed {
+			t.Fatal("SetAgentStatus should return true on real change")
+		}
+		if ticket.AgentStatus != AgentWaiting {
+			t.Errorf("AgentStatus = %q; want %q", ticket.AgentStatus, AgentWaiting)
+		}
+		if !ticket.UpdatedAt.After(originalUpdatedAt) {
+			t.Error("UpdatedAt should advance on change")
+		}
+		if ticket.StatusChangedAt == nil {
+			t.Fatal("StatusChangedAt should be non-nil after change")
+		}
+		if !ticket.StatusChangedAt.After(originalStatusChangedAt) {
+			t.Errorf("StatusChangedAt should advance; got %v, original %v",
+				*ticket.StatusChangedAt, originalStatusChangedAt)
+		}
+	})
+
+	t.Run("Touch does not bump StatusChangedAt", func(t *testing.T) {
+		ticket := NewTicket("Test", "project-1")
+		originalStatusChangedAt := *ticket.StatusChangedAt
+
+		time.Sleep(time.Millisecond)
+		ticket.Touch()
+
+		if !ticket.StatusChangedAt.Equal(originalStatusChangedAt) {
+			t.Errorf("Touch should not bump StatusChangedAt; got %v, original %v",
+				*ticket.StatusChangedAt, originalStatusChangedAt)
 		}
 	})
 }

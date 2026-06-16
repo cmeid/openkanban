@@ -106,6 +106,97 @@ func TestSortTickets(t *testing.T) {
 		}
 	})
 
+	t.Run("status change sorts newest transition first", func(t *testing.T) {
+		ptr := func(ts time.Time) *time.Time { return &ts }
+		input := []*board.Ticket{
+			{
+				ID:              board.NewTicketID(),
+				Title:           "stale-waiting",
+				Status:          board.StatusInProgress,
+				StatusChangedAt: ptr(base),
+				CreatedAt:       base,
+			},
+			{
+				ID:              board.NewTicketID(),
+				Title:           "fresh-working",
+				Status:          board.StatusInProgress,
+				StatusChangedAt: ptr(base.Add(2 * time.Hour)),
+				CreatedAt:       base,
+			},
+			{
+				ID:              board.NewTicketID(),
+				Title:           "middle",
+				Status:          board.StatusInProgress,
+				StatusChangedAt: ptr(base.Add(time.Hour)),
+				CreatedAt:       base,
+			},
+		}
+		sortTickets(input, SortStatusChange)
+		got := titles(input)
+		want := []string{"fresh-working", "middle", "stale-waiting"}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("status change sort: pos %d = %q, want %q (full=%v)", i, got[i], want[i], got)
+			}
+		}
+	})
+
+	t.Run("status change ties break by created-at desc", func(t *testing.T) {
+		ptr := func(ts time.Time) *time.Time { return &ts }
+		stamp := base.Add(time.Hour)
+		input := []*board.Ticket{
+			{
+				ID:              board.NewTicketID(),
+				Title:           "older-ticket",
+				Status:          board.StatusInProgress,
+				StatusChangedAt: ptr(stamp),
+				CreatedAt:       base,
+			},
+			{
+				ID:              board.NewTicketID(),
+				Title:           "newer-ticket",
+				Status:          board.StatusInProgress,
+				StatusChangedAt: ptr(stamp),
+				CreatedAt:       base.Add(30 * time.Minute),
+			},
+		}
+		sortTickets(input, SortStatusChange)
+		got := titles(input)
+		want := []string{"newer-ticket", "older-ticket"}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("status change tiebreak: pos %d = %q, want %q (full=%v)", i, got[i], want[i], got)
+			}
+		}
+	})
+
+	t.Run("status change falls back to UpdatedAt when stamp is nil", func(t *testing.T) {
+		input := []*board.Ticket{
+			{
+				ID:        board.NewTicketID(),
+				Title:     "nil-stamp-newer",
+				Status:    board.StatusInProgress,
+				UpdatedAt: base.Add(2 * time.Hour),
+				CreatedAt: base,
+			},
+			{
+				ID:        board.NewTicketID(),
+				Title:     "nil-stamp-older",
+				Status:    board.StatusInProgress,
+				UpdatedAt: base,
+				CreatedAt: base,
+			},
+		}
+		sortTickets(input, SortStatusChange)
+		got := titles(input)
+		want := []string{"nil-stamp-newer", "nil-stamp-older"}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("status change nil fallback: pos %d = %q, want %q (full=%v)", i, got[i], want[i], got)
+			}
+		}
+	})
+
 	t.Run("priority sorts highest first with 0 treated as 3", func(t *testing.T) {
 		input := []*board.Ticket{
 			mk("low", 5, 0),
@@ -145,7 +236,7 @@ func TestSortTickets(t *testing.T) {
 func TestNextSortMode(t *testing.T) {
 	// Cycle must reach every mode and return to default — guards
 	// against silently dropping a mode if the slice is reordered.
-	cycle := []SortMode{SortDefault, SortName, SortAge, SortPriority, SortDefault}
+	cycle := []SortMode{SortDefault, SortName, SortAge, SortStatusChange, SortPriority, SortDefault}
 	cur := SortDefault
 	for i := 1; i < len(cycle); i++ {
 		cur = nextSortMode(cur)
@@ -196,12 +287,14 @@ func TestCycleSortMode_AppliesSortAndKeepsSelection(t *testing.T) {
 		t.Errorf("selection drifted after sort change; selected=%+v want low (%s)", sel, low.ID)
 	}
 
-	// 'o' a second time → SortAge, third → SortPriority. Priority
-	// sort: high (1) ahead of low (5), and selection still tracks low.
+	// 'o' a second time → SortAge, third → SortStatusChange, fourth →
+	// SortPriority. Priority sort: high (1) ahead of low (5), and
+	// selection still tracks low.
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
 	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
 	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
 	if m.sortMode != SortPriority {
-		t.Fatalf("after three 'o' presses, sortMode = %q, want %q", m.sortMode, SortPriority)
+		t.Fatalf("after four 'o' presses, sortMode = %q, want %q", m.sortMode, SortPriority)
 	}
 	if m.columnTickets[0][0].ID != high.ID {
 		t.Errorf("priority sort: pos 0 = %q, want %q", m.columnTickets[0][0].Title, high.Title)

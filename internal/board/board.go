@@ -93,6 +93,11 @@ type Ticket struct {
 	UpdatedAt   time.Time  `json:"updated_at"`
 	StartedAt   *time.Time `json:"started_at,omitempty"`
 	CompletedAt *time.Time `json:"completed_at,omitempty"`
+	// StatusChangedAt records the last time Status or AgentStatus
+	// transitioned. Bumped by SetStatus and SetAgentStatus, not by
+	// Touch — ordinary edits (rename, priority) must not move it.
+	// Used by the "sort by status change" mode.
+	StatusChangedAt *time.Time `json:"status_changed_at,omitempty"`
 
 	Labels   []string          `json:"labels,omitempty"`
 	Priority int               `json:"priority,omitempty"`
@@ -105,17 +110,18 @@ type Ticket struct {
 func NewTicket(title, projectID string) *Ticket {
 	now := time.Now()
 	return &Ticket{
-		ID:          NewTicketID(),
-		ProjectID:   projectID,
-		Title:       title,
-		Status:      StatusBacklog,
-		AgentStatus: AgentNone,
-		UseWorktree: true,
-		Priority:    3,
-		CreatedAt:   now,
-		UpdatedAt:   now,
-		Labels:      []string{},
-		Meta:        map[string]string{},
+		ID:              NewTicketID(),
+		ProjectID:       projectID,
+		Title:           title,
+		Status:          StatusBacklog,
+		AgentStatus:     AgentNone,
+		UseWorktree:     true,
+		Priority:        3,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+		StatusChangedAt: &now,
+		Labels:          []string{},
+		Meta:            map[string]string{},
 	}
 }
 
@@ -127,6 +133,7 @@ func (t *Ticket) SetStatus(status TicketStatus) {
 	now := time.Now()
 	t.Status = status
 	t.UpdatedAt = now
+	t.StatusChangedAt = &now
 
 	switch status {
 	case StatusInProgress:
@@ -134,6 +141,21 @@ func (t *Ticket) SetStatus(status TicketStatus) {
 	case StatusDone:
 		t.CompletedAt = &now
 	}
+}
+
+// SetAgentStatus updates AgentStatus and stamps the transition.
+// Returns true if the status actually changed (caller should
+// persist), false on no-op. Mirrors SetStatus for the agent
+// dimension.
+func (t *Ticket) SetAgentStatus(as AgentStatus) bool {
+	if t.AgentStatus == as {
+		return false
+	}
+	now := time.Now()
+	t.AgentStatus = as
+	t.UpdatedAt = now
+	t.StatusChangedAt = &now
+	return true
 }
 
 type Column struct {
