@@ -29,7 +29,7 @@ Key handlers dispatch by mode: `handleNormalMode()`, `handleAgentViewMode()`
 Vim-style navigation:
 - `h/j/k/l` - movement
 - `g/G` - jump to start/end
-- `n` - new item
+- `n` - new item (in_review/done columns route the new ticket to in_progress)
 - `d` - delete
 - `Enter` - select/confirm
 - `Esc` - cancel/back
