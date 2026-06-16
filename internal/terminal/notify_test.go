@@ -157,3 +157,72 @@ func TestForwardNotificationHandler_VTIntegrationDisabled(t *testing.T) {
 		t.Errorf("notify.Send invoked despite disabled forwarding: %v", got)
 	}
 }
+
+// TestForwardNotificationHandler_SuppressesProgressBar covers iTerm2's
+// OSC 9 progress-bar protocol: \x1b]9;<state>;<value>\x07 where state
+// ∈ 0..4 (0 clear, 1 set percent, 2 indeterminate, 3 error, 4 warning).
+// Claude Code emits these as terminal-progress directives; they MUST
+// NOT surface as desktop notifications. After parseOscTitlePayload
+// strips the leading "9;" the body has no letters, which is the
+// discriminator the handler uses to skip notify.Send.
+func TestForwardNotificationHandler_SuppressesProgressBar(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string // value passed to forwardNotificationHandler (already-cmd-stripped on the vt side)
+	}{
+		{"warning subtype 4 with value", "9;4;3;"},
+		{"set-percent subtype 1", "9;1;50"},
+		{"indeterminate subtype 2", "9;2"},
+		{"error subtype 3", "9;3"},
+		{"clear subtype 0", "9;0"},
+		{"trailing semicolons only", "9;4;3;;;"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := withRecordedSend(t)
+			p := newOscPane(t)
+			p.SetForwardNotifications(true)
+
+			if p.forwardNotificationHandler([]byte(tt.payload)) {
+				t.Errorf("handler returned true for progress-bar payload %q; want false (no notify)", tt.payload)
+			}
+			if got := rec.calls(); len(got) != 0 {
+				t.Errorf("notify.Send invoked for progress-bar payload %q: %v", tt.payload, got)
+			}
+		})
+	}
+}
+
+// TestForwardNotificationHandler_AllowsLetterPayloads is the positive
+// pair: payloads that contain ANY letter pass the discriminator and
+// fire notify.Send. Covers the common shapes claude code uses.
+func TestForwardNotificationHandler_AllowsLetterPayloads(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+		want    string
+	}{
+		{"simple text", "9;Hello", "Hello"},
+		{"with punctuation", "9;Claude needs your input", "Claude needs your input"},
+		{"single letter", "9;X", "X"},
+		{"digits + letters mixed", "9;Step 1 of 3", "Step 1 of 3"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := withRecordedSend(t)
+			p := newOscPane(t)
+			p.SetForwardNotifications(true)
+
+			if !p.forwardNotificationHandler([]byte(tt.payload)) {
+				t.Fatalf("handler returned false for text payload %q; want true", tt.payload)
+			}
+			got := rec.calls()
+			if len(got) != 1 {
+				t.Fatalf("notify.Send call count = %d, want 1 (recorded=%v)", len(got), got)
+			}
+			if got[0] != tt.want {
+				t.Errorf("notify.Send body = %q, want %q", got[0], tt.want)
+			}
+		})
+	}
+}
