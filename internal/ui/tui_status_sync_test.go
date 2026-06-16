@@ -49,9 +49,9 @@ func (s *ticketDoneStubAPI) List(_ context.Context) (daemon.ListResp, error) {
 	return daemon.ListResp{}, nil
 }
 
-// Spawn is a no-op stub pre-added so this fake stays compatible with
-// the sibling fix/client-spawn-discipline PR (which widens
-// daemonGuardAPI with Spawn). Not exercised by any wrap-up test.
+// Spawn is unused by these wrap-up tests but required to satisfy
+// daemonGuardAPI now that prepareSpawnWith routes Spawn through this
+// seam. Returns an empty response.
 func (s *ticketDoneStubAPI) Spawn(_ context.Context, _ daemon.SpawnReq) (daemon.SpawnResp, error) {
 	return daemon.SpawnResp{}, nil
 }
