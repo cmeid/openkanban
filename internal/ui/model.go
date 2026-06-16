@@ -3516,67 +3516,112 @@ func (m *Model) adjustPriority(delta int) (tea.Model, tea.Cmd) {
 }
 
 // cycleUnattachedSession moves the agent-view focus to the next
-// (delta=+1) or previous (delta=-1) open session that this TUI is not
-// currently attached to. Ordering is board order — the same order the
-// user sees in columnTickets, so the cycle is predictable from the
-// board layout. The currently-attached pane is excluded by definition
-// (its State() is PaneViewAttached, not PaneViewUnattached); cycling
-// from the modal landing state continues to advance through unattached
-// peers and never returns to the original attached one. The user
-// presses Esc to exit back to the board, from which the original pane
-// is still attached and reachable via the normal flow.
+// (delta=+1) or previous (delta=-1) open session in board order.
 //
-// Sets cycleAttachPrompt so View renders the "press Enter to attach"
-// modal — this absorbs the user's switch-to-session keystroke so it
-// doesn't get eaten by the AttachFirstMsg handshake.
+// "Open" means the local PaneView is in Attached or Unattached state
+// (the daemon owns a live session for it). PaneViewDetached panes are
+// excluded — they're not open in any meaningful sense. The currently-
+// focused pane is excluded so the user actually moves; landing back
+// on yourself wouldn't be a cycle.
+//
+// On arrival at an Unattached peer, the helper auto-attaches via
+// `attachExisting` so the modal's backdrop populates with live session
+// content as soon as the snapshot arrives. The attach is async; the
+// modal renders synchronously on a blank pane for the first frame,
+// then the PaneAttachedMsg triggers a re-render with content. When
+// cycling to an already-Attached peer (a previously-cycled-through
+// pane, or the originally-attached pane on wrap-around) no new attach
+// is needed; the pane already holds the live snapshot.
+//
+// The function name predates auto-attach (the original ship was
+// strictly Unattached-only — see [[openkanban-cycle-unattached-sessions-decisions]]
+// for the history); kept as-is to preserve git blame continuity. The
+// caller-visible semantics are now "cycle through all open peers."
+//
+// Sets cycleAttachPrompt so View dispatches to
+// renderAgentViewWithCycleModal — the modal absorbs the user's
+// switch-to-session keystroke so it doesn't get eaten by the
+// AttachFirstMsg handshake (only relevant for the first frame before
+// the auto-attach completes).
 func (m *Model) cycleUnattachedSession(delta int) (tea.Model, tea.Cmd) {
 	if delta != 1 && delta != -1 {
 		return m, nil
 	}
 
-	var candidates []board.TicketID
+	// Build the ordered list of all open peers in board order, including
+	// the focused pane. Excluding the focused pane up front would make
+	// the wrap-around math (cur+delta) ambiguous when the focused pane
+	// sits between two candidates: "first after me" needs me-in-the-list
+	// to be defined. Detached panes are excluded — they have no daemon
+	// session and pane.View() would be blank no matter what.
+	var allOpen []board.TicketID
 	for _, col := range m.columnTickets {
 		for _, t := range col {
 			pv, ok := m.panes[t.ID]
 			if !ok || pv == nil {
 				continue
 			}
-			if pv.State() != daemonclient.PaneViewUnattached {
-				continue
+			switch pv.State() {
+			case daemonclient.PaneViewAttached, daemonclient.PaneViewUnattached:
+				allOpen = append(allOpen, t.ID)
 			}
-			candidates = append(candidates, t.ID)
 		}
 	}
 
-	if len(candidates) == 0 {
-		m.notify("No other open sessions")
-		return m, nil
-	}
-
 	cur := -1
-	for i, id := range candidates {
+	for i, id := range allOpen {
 		if id == m.focusedPane {
 			cur = i
 			break
 		}
 	}
+	// Count peers that aren't the focused pane. If the focused pane is
+	// in allOpen we subtract it; if it isn't (we're focused on a
+	// Detached pane or a ticket with no session at all) every entry is
+	// a peer. Zero peers → nothing to cycle to.
+	otherPeers := len(allOpen)
+	if cur != -1 {
+		otherPeers--
+	}
+	if otherPeers == 0 {
+		m.notify("No other open sessions")
+		return m, nil
+	}
 	var next board.TicketID
 	if cur == -1 {
+		// Focused pane isn't in the open set (unusual — means we're
+		// focused on a Detached pane, e.g. daemon went away). Pick the
+		// nearest end in the requested direction.
 		if delta > 0 {
-			next = candidates[0]
+			next = allOpen[0]
 		} else {
-			next = candidates[len(candidates)-1]
+			next = allOpen[len(allOpen)-1]
 		}
 	} else {
-		next = candidates[(cur+delta+len(candidates))%len(candidates)]
+		next = allOpen[(cur+delta+len(allOpen))%len(allOpen)]
 	}
 
 	m.focusedPane = next
-	if pv, ok := m.panes[next]; ok && pv != nil {
-		pv.SetSize(m.width, m.height-2)
+	pv, ok := m.panes[next]
+	if !ok || pv == nil {
+		// Defensive — allOpen was built from m.panes a few lines up, so
+		// this shouldn't fire. Bail with the modal flag set so the user
+		// at least sees the prompt with the bare ticket title.
+		m.cycleAttachPrompt = true
+		return m, m.maybeSetWindowTitle()
 	}
+	pv.SetSize(m.width, m.height-2)
 	m.cycleAttachPrompt = true
-	return m, m.maybeSetWindowTitle()
+
+	// Auto-attach if the target is Unattached so the modal backdrop
+	// shows live content. Already-Attached peers (cycled-through from
+	// a previous Ctrl+] hop, or the originally-attached pane on wrap)
+	// already have a populated vt — no new attach needed.
+	var attachCmd tea.Cmd
+	if pv.State() == daemonclient.PaneViewUnattached {
+		attachCmd = m.attachExisting(next, pv)
+	}
+	return m, tea.Batch(attachCmd, m.maybeSetWindowTitle())
 }
 
 // cycleSortMode advances to the next sort mode and re-renders the board.

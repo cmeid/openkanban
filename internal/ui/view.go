@@ -940,14 +940,17 @@ func (m *Model) renderCycleAttachModal() string {
 
 // renderAgentViewWithCycleModal stacks the cycle-attach modal as a
 // horizontal band at the top of the screen, with the focused pane's
-// agent view rendered below it. This gives the user a peek at the
-// session's current state (chrome: title, status pill, duration, deps)
-// while the modal is open so they can decide whether to commit
-// (Enter) or keep cycling (Ctrl+] / Ctrl+\). For unattached panes the
-// pane content area renders blank because the local emulator's vt is
-// nil until Attach completes — the chrome above it still carries the
-// daemon-pushed AgentStatus, which is the highest-signal "what is this
-// session doing" indicator a non-attached client can show.
+// agent view rendered below it. The user sees the modal asking
+// "Enter to attach?" sitting on top of the actual session view —
+// chrome (title, status pill, duration, deps) plus the live PTY
+// content from the local emulator.
+//
+// `cycleUnattachedSession` auto-attaches Unattached peers on cycle so
+// the pane's `vt` populates from the snapshot the moment the modal
+// opens. The first frame may still be blank for ~50ms (attach is
+// async; PaneAttachedMsg triggers the re-render); after that the
+// content matches what the user would see if they committed via
+// Enter.
 //
 // The agent view is rendered at full height. The modal is composed
 // on top; the bottom rows of the pane are clipped by the terminal,

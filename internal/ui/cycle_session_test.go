@@ -158,11 +158,18 @@ func TestCycleUnattachedSession_BoardOrderBackward(t *testing.T) {
 	}
 }
 
-func TestCycleUnattachedSession_SkipsNonUnattached(t *testing.T) {
-	// A pane in PaneViewDetached state (constructed with info=nil)
-	// MUST be excluded from the candidate set. This stands in for the
-	// PaneViewAttached case as well — both states fall through the
-	// filter, and what matters is "only Unattached is included".
+func TestCycleUnattachedSession_SkipsDetached(t *testing.T) {
+	// PaneViewDetached panes (constructed with info=nil) MUST be
+	// excluded from the cycle set — the daemon doesn't own them, so
+	// "open" doesn't apply. PaneViewAttached panes, by contrast, ARE
+	// included in the cycle set since the auto-attach change: a peer
+	// that was attached on a previous cycle hop (or by another flow)
+	// is still an "open" session worth cycling to. We can't easily
+	// build a PaneViewAttached fixture without spinning up a real
+	// daemon (see [[openkanban-paneview-test-fixture]]), so this test
+	// exercises the Detached-exclusion half of the filter directly and
+	// relies on the Attached-inclusion case being covered by the
+	// identical switch arm in cycleUnattachedSession.
 	tA := &board.Ticket{ID: "T-A"}
 	tB := &board.Ticket{ID: "T-B"}
 	tC := &board.Ticket{ID: "T-C"}
@@ -191,7 +198,8 @@ func TestCycleUnattachedSession_SkipsNonUnattached(t *testing.T) {
 	}
 
 	model, _ := m.cycleUnattachedSession(1)
-	// Candidate set is {T-A, T-C}; cycling forward from T-A → T-C.
+	// Open set is {T-A, T-C}; cycling forward from T-A → T-C. (T-B
+	// dropped by the Detached exclusion.)
 	if got := model.(*Model).focusedPane; got != "T-C" {
 		t.Errorf("focusedPane = %q, want \"T-C\" (Detached pane T-B should have been skipped)", got)
 	}
