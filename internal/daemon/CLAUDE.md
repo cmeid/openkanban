@@ -11,7 +11,7 @@ Two-phase check closes the construct-outside-lock race window:
 1. **RLock fast path** — look up an existing session for `req.TicketID`. If found, return it without calling `NewSession` (which forks/execs an agent).
 2. **WLock re-check** — after `NewSession` returns, re-scan under the write lock. If a concurrent spawn won the race, `sess.Kill(0)` the loser before returning the winner's info.
 
-Empty `TicketID` skips the dedup (preserves semantics for any anonymous spawn, currently theoretical but supported by the wire shape).
+Empty `TicketID` is rejected outright at the entry of `handleSpawn` with `fmt.Errorf("spawn: empty TicketID rejected (anonymous sessions disallowed)")`. Anonymous sessions are structurally impossible: with no TicketID the daemon cannot dedup, route `TicketDone`, or reap on ticket deletion — an orphan by construction. The wire shape still allows the field to be empty, but the server refuses it.
 
 Helper: `findSessionForTicketLocked(ticketID string) *Session` — caller must hold `sessionsMu` (R or W). Linear scan; the map is small in practice.
 

@@ -224,57 +224,6 @@ func TestHandleSpawn_DifferentTicketIDsCoexist(t *testing.T) {
 	waitServerDone(t, errCh, 5*time.Second)
 }
 
-// TestHandleSpawn_EmptyTicketIDStillAllowed verifies that the dedup
-// check skips empty TicketIDs: a Spawn with TicketID="" creates a
-// session as if dedup were not enforced (backward compatibility for
-// the anonymous-spawn wire path).
-func TestHandleSpawn_EmptyTicketIDStillAllowed(t *testing.T) {
-	srv, errCh := startServer(t)
-
-	a := dialTestClient(t, srv.SocketPath())
-	ra := bufio.NewReader(a)
-	helloAndUnpack(t, a, ra)
-
-	first := spawnAndDecode(t, a, ra, SpawnReq{
-		TicketID:    "",
-		SessionName: "anon-1",
-		Command:     "/bin/cat",
-		Cols:        80,
-		Rows:        24,
-		Scrollback:  1000,
-	}, 0)
-	second := spawnAndDecode(t, a, ra, SpawnReq{
-		TicketID:    "",
-		SessionName: "anon-2",
-		Command:     "/bin/cat",
-		Cols:        80,
-		Rows:        24,
-		Scrollback:  1000,
-	}, 0)
-
-	if first.SessionID == second.SessionID {
-		t.Errorf("anonymous spawns collapsed to same SessionID=%q; empty TicketID must bypass dedup",
-			first.SessionID)
-	}
-
-	srv.sessionsMu.RLock()
-	gotCount := len(srv.sessions)
-	srv.sessionsMu.RUnlock()
-	if gotCount != 2 {
-		t.Errorf("sessions count=%d want 2 (no dedup on empty TicketID)", gotCount)
-	}
-
-	for _, id := range []string{first.SessionID, second.SessionID} {
-		writeReq(t, a, MsgKillReq, KillReq{SessionID: id, GraceSeconds: 0})
-		a.SetReadDeadline(time.Now().Add(3 * time.Second))
-		readResp(t, ra)
-		a.SetReadDeadline(time.Time{})
-	}
-
-	a.Close()
-	waitServerDone(t, errCh, 5*time.Second)
-}
-
 // TestHandleTicketDone_KillsAllMatchesForTicket verifies the
 // defense-in-depth path in handleTicketDone: a daemon that already has
 // two sessions sharing a TicketID (simulating duplicates inherited
