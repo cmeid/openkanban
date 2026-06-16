@@ -224,15 +224,34 @@ if [ "$(uname -s)" = "Darwin" ]; then
       y|Y|yes|YES)
         # `daemon install-service` refuses if any daemon is currently
         # bound to the socket — the new service would race it for the
-        # pidlock. User already said yes; stop the running daemon for
-        # them instead of failing with "run `daemon stop` first".
+        # pidlock. Auto-stopping a sessionless daemon is a courtesy;
+        # auto-stopping one with live agent sessions would silently kill
+        # in-flight work, which is what this branch must NOT do — the
+        # user asked to install a service, not to destroy their work.
         proceed=1
-        if "$INSTALLED_BIN" daemon list >/dev/null 2>&1; then
-          say "  openkanbankd is already running. Stopping it so the launchd service can take over..."
-          if ! "$INSTALLED_BIN" daemon stop; then
-            warn "openkanban daemon stop failed or was declined. Skipping launchd install."
-            say  "      Stop the daemon yourself, then run: openkanban daemon install-service"
+        list_output=""
+        if list_output="$("$INSTALLED_BIN" daemon list 2>/dev/null)"; then
+          # Daemon reachable. Count live sessions; each session line carries
+          # `running=true|false` (see `openkanban daemon list` in cmd/daemon.go).
+          live_count=0
+          if printf '%s\n' "$list_output" | grep -q 'running=true'; then
+            live_count="$(printf '%s\n' "$list_output" | grep -c 'running=true')"
+          fi
+          if [ "$live_count" -gt 0 ]; then
+            say "  openkanbankd is already running with ${live_count} live agent session(s)."
+            say "  Skipping launchd-service install so we don't terminate them."
+            say "  The freshly-installed binary will be picked up on the daemon's next"
+            say "  restart (see README §\"Updates and the running daemon\")."
+            say "  After those sessions finish, re-run:"
+            say "      openkanban daemon install-service"
             proceed=0
+          else
+            say "  openkanbankd is already running with no live sessions. Stopping it so the launchd service can take over..."
+            if ! "$INSTALLED_BIN" daemon stop; then
+              warn "openkanban daemon stop failed or was declined. Skipping launchd install."
+              say  "      Stop the daemon yourself, then run: openkanban daemon install-service"
+              proceed=0
+            fi
           fi
         fi
         if [ "$proceed" = "1" ]; then
