@@ -871,6 +871,12 @@ func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		// A resize that shrinks the terminal can strand m.columnOffsets[i]
+		// at a value the new (smaller) budget can no longer justify — same
+		// underlying bug as the filter path that compactColumnOffsets was
+		// added for. Safe to call before the first ticket load: the method
+		// no-ops when m.columnTickets is empty and when the budget is ≤ 0.
+		m.compactColumnOffsets()
 		if m.focusedPane != "" {
 			if pane, ok := m.panes[m.focusedPane]; ok {
 				pane.SetSize(m.width, m.height-2)
