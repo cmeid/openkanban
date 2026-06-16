@@ -524,10 +524,16 @@ SSH-signed via 1Password.
 			wantWarnSubstr: []string{"NEVER", "gh pr create"},
 		},
 		{
-			name:           "strong marker: every repo, every project",
-			prompt:         "Approval required, every repo, every project, every context.",
+			name:           "strong marker: global rule",
+			prompt:         "Following the global rule, never push without approval.",
 			globalContent:  globalWithPushSection,
-			wantWarnSubstr: []string{"every repo, every project"},
+			wantWarnSubstr: []string{"global rule"},
+		},
+		{
+			name:           "strong marker: global rule fires even when global is absent",
+			prompt:         "Per my global rule, ask before pushing.",
+			globalContent:  "",
+			wantWarnSubstr: []string{"global rule"},
 		},
 		{
 			name:           "section header overlap on PR",
@@ -629,7 +635,7 @@ func TestValidateInitPromptOverlap_NeverError(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Agents["custom"] = AgentConfig{
 		Command:    "echo",
-		InitPrompt: "## PR guardrail (HARD RULE)\nNEVER run `gh pr create`. Every repo, every project, every context.",
+		InitPrompt: "## PR guardrail (HARD RULE)\nNEVER run `gh pr create`. Following the global rule, every context.",
 	}
 
 	result := cfg.Validate()

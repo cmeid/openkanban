@@ -251,16 +251,18 @@ func findGlobalClaudeMd() string {
 }
 
 // strongRuleMarkers are textual patterns whose presence in an init_prompt
-// signals that the prompt is restating a global rule. Each entry is a
-// compiled regexp + a human-friendly label used in the warning message.
+// signals that the prompt is restating a cross-cutting rule that usually
+// lives in the user's global CLAUDE.md. Each entry is a compiled regexp +
+// a human-friendly label used in the warning message. Patterns here are
+// intentionally universal — they should fire for any user, not just the
+// person who happened to write openkanban.
 var strongRuleMarkers = []struct {
 	pattern *regexp.Regexp
 	label   string
 }{
 	{regexp.MustCompile(`(?i)HARD RULE`), "HARD RULE"},
 	{regexp.MustCompile("(?i)NEVER\\s+(?:run\\s+)?[`']?(?:gh pr create|git push)"), "NEVER gh pr create / git push"},
-	{regexp.MustCompile(`(?i)every repo,\s*every project`), "every repo, every project"},
-	{regexp.MustCompile(`(?i)Per\s+\w+'s\s+global\s+rule`), "Per <name>'s global rule"},
+	{regexp.MustCompile(`(?i)\bglobal rule\b`), "global rule"},
 }
 
 // globalRuleKeywords are topic keywords used to flag when a local
