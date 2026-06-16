@@ -111,7 +111,7 @@ func TestIntegration_TicketStatusTransition(t *testing.T) {
 		t.Errorf("initial status = %s; want %s", ticket.Status, board.StatusBacklog)
 	}
 
-	if err := store.Move(ticket.ID, board.StatusInProgress); err != nil {
+	if _, err := store.Move(ticket.ID, board.StatusInProgress); err != nil {
 		t.Fatalf("failed to move ticket: %v", err)
 	}
 

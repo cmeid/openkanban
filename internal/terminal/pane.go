@@ -132,6 +132,21 @@ type Pane struct {
 	// request's ForwardNotifications field.
 	forwardNotifications atomic.Bool
 
+	// lastActivityNs is the unix-nanosecond timestamp of the last
+	// observed PTY output for this pane — stamped from handleOutput on
+	// every non-empty vt.Write. Used by the daemon's activity broadcaster
+	// to push "activity" SessionEvents to subscribers, which the UI uses
+	// to distinguish "stuck at waiting" (no bytes flowing) from "actively
+	// working" (Claude's spinner / tool output streaming). atomic.Int64
+	// so daemon goroutines can read without taking p.mu.
+	//
+	// Why bytes-flowed rather than grid-changed: cursor blinks are
+	// terminal-side (not PTY output), and Claude's "Cogitating…" /
+	// "Combobulating…" spinner emits bytes throughout tool execution.
+	// Hashing the grid added cost on every handleOutput without
+	// catching anything bytes-flowed misses in practice.
+	lastActivityNs atomic.Int64
+
 	// drainStop stops the goroutine that pipes emulator-emitted responses
 	// (DA queries, etc.) back to the PTY. Without that drain charm/x/vt
 	// deadlocks on its first device-attributes write.
@@ -1055,7 +1070,29 @@ func (p *Pane) handleOutput(data []byte) {
 	PushScrolledLine(p.vt, p.altScreenActive, p.lastTopRow, p.scrollback)
 	p.lastTopRow = nil
 
+	// Stamp activity for the daemon's status broadcaster. Lock-free
+	// write — readers (the broadcaster goroutine) use atomic.Load.
+	if len(data) > 0 {
+		p.lastActivityNs.Store(time.Now().UnixNano())
+	}
+
 	p.dirty = true
+}
+
+// LastActivity returns the timestamp of the most recent PTY output
+// observed by this pane, or the zero time if the pane has produced no
+// output yet. Safe to call from any goroutine; reads atomically without
+// taking p.mu so the daemon's activity broadcaster doesn't contend with
+// the read loop.
+func (p *Pane) LastActivity() time.Time {
+	if p == nil {
+		return time.Time{}
+	}
+	ns := p.lastActivityNs.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
 }
 
 // detectMouseModeChanges scans output for mouse tracking mode escape sequences.

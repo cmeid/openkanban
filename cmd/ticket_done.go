@@ -82,10 +82,22 @@ func wrapUpSessionTicketAt(target board.TicketStatus) error {
 	// auto-stop transition is re-armed for any pane that's somehow
 	// still alive.
 	if ticket.Status != target {
-		ticket.SetStatus(target)
+		// Route through Move so any claude-code approvals collected in
+		// this worktree get promoted to the repo's settings.local.json
+		// before the worktree (and the agent's permission scope with
+		// it) is dismantled. Move is a thin wrapper over SetStatus —
+		// the AgentStatus update and the SaveTicket below land
+		// authoritatively after.
+		promoted, err := store.Move(ticket.ID, target)
+		if err != nil {
+			return fmt.Errorf("move ticket %s: %w", ticket.ID, err)
+		}
 		ticket.AgentStatus = board.AgentCompleted
 		if err := store.SaveTicket(ticket); err != nil {
 			return fmt.Errorf("save ticket %s: %w", ticket.ID, err)
+		}
+		if n := len(promoted); n > 0 {
+			fmt.Fprintf(os.Stderr, "openkanban: promoted %d claude approval(s) to repo defaults\n", n)
 		}
 	}
 

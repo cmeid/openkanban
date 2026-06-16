@@ -81,7 +81,7 @@ func (s *Server) handleAttach(c *clientConn, req AttachReq) {
 	// attaching client sees its response first (the response demuxer
 	// is in JSON-mode; the push interleaves before the connection
 	// upgrades to binary).
-	s.emitEvent(SessionEvent{Event: "attached", SessionID: req.SessionID, TicketID: sess.TicketID()})
+	s.emitEvent(SessionEvent{Event: "attached", SessionID: req.SessionID, TicketID: sess.TicketID(), LastActivityAt: sess.LastActivity()})
 
 	// Ship the snapshot as one or more TypePTYOutput frames. We do
 	// this under writeMu just like fanOut would — keeps any future
@@ -119,7 +119,7 @@ func (s *Server) handleAttach(c *clientConn, req AttachReq) {
 	// is now done. Subscribers can treat "detached" as informational
 	// (the session may still be alive with a new attacher) and reconcile
 	// against List/owns-by snapshots if they care.
-	s.emitEvent(SessionEvent{Event: "detached", SessionID: req.SessionID, TicketID: sess.TicketID()})
+	s.emitEvent(SessionEvent{Event: "detached", SessionID: req.SessionID, TicketID: sess.TicketID(), LastActivityAt: sess.LastActivity()})
 
 	// Wait for the fan-out to fully exit before returning. Without
 	// this, a late publish could race the conn close and log a

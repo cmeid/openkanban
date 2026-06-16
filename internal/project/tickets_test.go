@@ -87,7 +87,7 @@ func TestTicketStore_Move(t *testing.T) {
 	ticket := board.NewTicket("Test", "project-1")
 	store.Add(ticket)
 
-	if err := store.Move(ticket.ID, board.StatusInProgress); err != nil {
+	if _, err := store.Move(ticket.ID, board.StatusInProgress); err != nil {
 		t.Fatalf("Move() error: %v", err)
 	}
 
@@ -98,6 +98,61 @@ func TestTicketStore_Move(t *testing.T) {
 
 	if retrieved.StartedAt == nil {
 		t.Error("StartedAt should be set after moving to in_progress")
+	}
+}
+
+// TestTicketStore_Move_PromotesClaudeApprovals locks in the wiring:
+// transitioning a ticket whose worktree has new claude approvals into
+// in_review must return the promoted entries AND write them into the
+// source repo's .claude/settings.local.json. Covers the integration
+// boundary between project.TicketStore and agent.Promote*.
+func TestTicketStore_Move_PromotesClaudeApprovals(t *testing.T) {
+	// Isolate from the user's global git config / excludesFile so the
+	// ensure-gitignore branch behaves predictably (same reasoning as
+	// internal/agent's setupRepoAndWorktree).
+	isolation := t.TempDir()
+	t.Setenv("HOME", isolation)
+	t.Setenv("XDG_CONFIG_HOME", isolation)
+	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(isolation, ".gitconfig-absent"))
+	t.Setenv("GIT_CONFIG_SYSTEM", filepath.Join(isolation, ".gitconfig-system-absent"))
+
+	root := t.TempDir()
+	repoPath := filepath.Join(root, "repo")
+	worktreePath := filepath.Join(root, "wt")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(worktreePath, ".claude"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(worktreePath, ".claude", "settings.local.json"),
+		[]byte(`{"permissions":{"allow":["Bash(go test *)"]}}`),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	store := NewTicketStore("project-1", repoPath)
+	ticket := board.NewTicket("Test", "project-1")
+	ticket.WorktreePath = worktreePath
+	ticket.Status = board.StatusInProgress
+	store.Add(ticket)
+
+	added, err := store.Move(ticket.ID, board.StatusInReview)
+	if err != nil {
+		t.Fatalf("Move: %v", err)
+	}
+	if len(added) != 1 || added[0] != "Bash(go test *)" {
+		t.Errorf("promoted entries: got %v, want [Bash(go test *)]", added)
+	}
+
+	repoFile, err := os.ReadFile(filepath.Join(repoPath, ".claude", "settings.local.json"))
+	if err != nil {
+		t.Fatalf("repo settings.local.json not written: %v", err)
+	}
+	if !strings.Contains(string(repoFile), "Bash(go test *)") {
+		t.Errorf("repo file missing promoted entry: %s", repoFile)
 	}
 }
 

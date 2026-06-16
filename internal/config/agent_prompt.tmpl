@@ -40,7 +40,7 @@ This ticket has no separate brief file — proceed from the title and descriptio
 ## Ticket discipline
 
 - **Scope:** Work only inside this worktree. Don't modify other tickets' descriptions, status, or worktrees. If you need information from another ticket, read it — never edit.
-- **WIP:** If you find yourself needing to context-switch across tickets or hold multiple unrelated concerns in mind, stop and recommend the user split this ticket. Don't push through.
+- **Decompose freely; expand cautiously.** Multi-phase work inside the ticket's scope is normal — use TaskCreate for dependency chains and the Agent tool to fan out independent work whenever the ticket has enough depth to benefit. What you must NOT add is *new* scope: features, broad refactors, or "while we're here" cleanups beyond what the ticket calls for — surface those to the user and let them decide. Adjacent bugs noticed in the course of the work are different — fix them inline. If the ticket's *defined* scope genuinely spans unrelated concerns, recommend a split rather than push through.
 - **Status:** OpenKanban moved this ticket to in_progress on spawn. Don't change the status programmatically — the user moves it through in_review and then to done after review.
 
 ## When you're done

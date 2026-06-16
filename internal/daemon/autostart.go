@@ -95,9 +95,19 @@ func DialOrStart(ctx context.Context) (net.Conn, error) {
 	return nil, fmt.Errorf("daemon: forked daemon did not bind %s within %s", sock, startWait)
 }
 
-// forkDaemon execs `<self> daemon` in a new session-leader process so
-// the child outlives the current shell, with stdout/stderr redirected
-// to the daemon log file (append mode).
+// forkDaemon execs `<self> daemon --persistent` in a new session-leader
+// process so the child outlives the current shell, with stdout/stderr
+// redirected to the daemon log file (append mode).
+//
+// --persistent is load-bearing: without it, a TUI-forked daemon exits
+// when the last client disconnects, killing every live agent session
+// it owned. The whole point of the daemon is to outlive any one TUI
+// process, so fork sites MUST pass --persistent. The launchd plist
+// passes the same flag for the same reason.
+//
+// OPENKANBAN_DAEMON_SOURCE=tui-fork makes the daemon log line at
+// startup announce who spawned it (vs launchd / manual), which is
+// the diagnostic we wished we had when this bug was discovered.
 //
 // The child is intentionally not Waited on: cmd.Process.Release frees
 // the parent's bookkeeping and the kernel reaps the child when it
@@ -122,10 +132,11 @@ func forkDaemon() error {
 		return fmt.Errorf("daemon: open log %s: %w", logPath, err)
 	}
 
-	cmd := exec.Command(exe, "daemon")
+	cmd := exec.Command(exe, "daemon", "--persistent")
 	cmd.Stdout = logF
 	cmd.Stderr = logF
 	cmd.Stdin = nil
+	cmd.Env = append(os.Environ(), "OPENKANBAN_DAEMON_SOURCE=tui-fork")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
 	if err := cmd.Start(); err != nil {

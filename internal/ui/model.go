@@ -225,6 +225,13 @@ type Model struct {
 	// session-only lifetime as sortMode; cycled with 'w'.
 	sessionFilter SessionFilter
 
+	// alwaysShowWorking, when true, exempts daemon-owned ("open")
+	// sessions from the project and text-search filters so working
+	// sessions remain visible across project narrowing. The session
+	// filter ('w') still applies on top. Session-only lifetime;
+	// toggled with 'W'.
+	alwaysShowWorking bool
+
 	showHelp    bool
 	showConfirm bool
 	confirmMsg  string
@@ -302,6 +309,17 @@ type Model struct {
 	// calls from every connected TUI's mode transitions). Reset on
 	// daemon disconnect.
 	daemonViewing map[board.TicketID]int
+
+	// lastPTYActivity tracks the most recent PTY-output timestamp per
+	// ticket, populated from SessionEvent.LastActivityAt on every event
+	// the daemon emits. The status detector consults this to override a
+	// stale file-based "waiting" → "working": Claude Code emits no hook
+	// between Notification (permission granted) and PostToolUse (tool
+	// finished), so during a long-running tool the file says "waiting"
+	// for the whole duration even though the agent is producing output.
+	// Cleared on "exited" so the map can't grow unboundedly across the
+	// TUI's lifetime.
+	lastPTYActivity map[board.TicketID]time.Time
 
 	// viewingSessionID is the daemon SessionID this TUI most recently
 	// told the daemon it was viewing (via SetViewing(true)). Used by
@@ -457,6 +475,7 @@ func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projec
 		panes:              make(map[board.TicketID]*daemonclient.PaneView),
 		daemonOwned:        make(map[board.TicketID]struct{}),
 		daemonViewing:      make(map[board.TicketID]int),
+		lastPTYActivity:    make(map[board.TicketID]time.Time),
 		statusDetector:     agent.NewStatusDetector(),
 		selectedProject:    selectedProject,
 		sidebarVisible:     cfg.UI.SidebarVisible,
@@ -1242,6 +1261,8 @@ func (m *Model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.cycleSortMode()
 	case "w":
 		return m.cycleSessionFilter()
+	case "W":
+		return m.toggleAlwaysShowWorking()
 
 	case ":":
 		m.mode = ModeCommand
@@ -1585,7 +1606,7 @@ func (m *Model) dropTicket() (tea.Model, tea.Cmd) {
 		}
 	}
 
-	m.globalStore.Move(ticket.ID, targetStatus)
+	promoted, _ := m.globalStore.Move(ticket.ID, targetStatus)
 	m.refreshColumnTickets()
 	m.saveTicket(ticket)
 
@@ -1594,7 +1615,7 @@ func (m *Model) dropTicket() (tea.Model, tea.Cmd) {
 	m.ensureColumnVisible()
 	m.ensureTicketVisible()
 
-	m.notify("Moved to " + string(targetStatus))
+	m.notify(moveAndPromoteMsg(targetStatus, promoted))
 	m.dragging = false
 	m.dragTargetColumn = 0
 
@@ -3289,11 +3310,11 @@ func (m *Model) quickMoveTicket() (tea.Model, tea.Cmd) {
 		}
 	}
 
-	m.globalStore.Move(ticket.ID, nextStatus)
+	promoted, _ := m.globalStore.Move(ticket.ID, nextStatus)
 	m.refreshColumnTickets()
 	m.selectTicketByID(ticket.ID)
 	m.saveTicket(ticket)
-	m.notify("Moved to " + string(nextStatus))
+	m.notify(moveAndPromoteMsg(nextStatus, promoted))
 
 	return m, nil
 }
@@ -3365,6 +3386,21 @@ func (m *Model) cycleSessionFilter() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *Model) toggleAlwaysShowWorking() (tea.Model, tea.Cmd) {
+	ticket := m.selectedTicket()
+	m.alwaysShowWorking = !m.alwaysShowWorking
+	m.refreshColumnTickets()
+	if ticket != nil {
+		m.selectTicketByID(ticket.ID)
+	}
+	state := "off"
+	if m.alwaysShowWorking {
+		state = "on"
+	}
+	m.notify("Always show working: " + state)
+	return m, nil
+}
+
 func (m *Model) quickMoveTicketBackward() (tea.Model, tea.Cmd) {
 	ticket := m.selectedTicket()
 	if ticket == nil {
@@ -3376,11 +3412,11 @@ func (m *Model) quickMoveTicketBackward() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	m.globalStore.Move(ticket.ID, prevStatus)
+	promoted, _ := m.globalStore.Move(ticket.ID, prevStatus)
 	m.refreshColumnTickets()
 	m.selectTicketByID(ticket.ID)
 	m.saveTicket(ticket)
-	m.notify("Moved to " + string(prevStatus))
+	m.notify(moveAndPromoteMsg(prevStatus, promoted))
 
 	return m, nil
 }
@@ -3402,6 +3438,10 @@ func (m *Model) setupWorktree(ticket *board.Ticket) error {
 	path, err := mgr.CreateWorktree(branchName, baseBranch)
 	if err != nil {
 		return err
+	}
+
+	if err := agent.SeedClaudeSettings(path, proj.RepoPath); err != nil {
+		log.Printf("openkanban: seed claude settings (%s): %v", path, err)
 	}
 
 	ticket.WorktreePath = path
@@ -3936,6 +3976,9 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 				if err != nil {
 					return spawnErrorMsg{ticketID: ticketID, err: "worktree failed: " + err.Error()}
 				}
+				if err := agent.SeedClaudeSettings(path, proj.RepoPath); err != nil {
+					log.Printf("openkanban: seed claude settings (%s): %v", path, err)
+				}
 				worktreePath = path
 			}
 		} else {
@@ -4133,6 +4176,20 @@ func (m *Model) selectTicketByID(ticketID board.TicketID) {
 			}
 		}
 	}
+	// Target no longer visible (filtered out by a refresh). Clamp
+	// activeTicket to the current column's bounds so callers don't
+	// see an out-of-range index. Without this, toggling a filter that
+	// hides the selected ticket leaves the cursor pointing past the
+	// end of a now-shorter column.
+	if m.activeColumn >= 0 && m.activeColumn < len(m.columnTickets) {
+		if n := len(m.columnTickets[m.activeColumn]); m.activeTicket >= n {
+			if n > 0 {
+				m.activeTicket = n - 1
+			} else {
+				m.activeTicket = 0
+			}
+		}
+	}
 }
 
 func (m *Model) refreshColumnTickets() {
@@ -4191,21 +4248,31 @@ func effectivePriority(p int) int {
 }
 
 func (m *Model) ticketMatchesFilter(t *board.Ticket) bool {
-	if len(m.filterProjectIDs) > 0 && !m.filterProjectIDs[t.ProjectID] {
+	_, isOpenSession := m.daemonOwned[t.ID]
+	// alwaysShowWorking exempts daemon-owned sessions from the project
+	// and text-search filters, but the session filter ('w') below still
+	// applies — narrowing to "waiting" must keep hiding working-status
+	// sessions even with the bypass on.
+	bypassProjectAndQuery := m.alwaysShowWorking && isOpenSession
+
+	if !bypassProjectAndQuery && len(m.filterProjectIDs) > 0 && !m.filterProjectIDs[t.ProjectID] {
 		return false
 	}
 	switch m.sessionFilter {
 	case SessionFilterOpen:
-		if _, ok := m.daemonOwned[t.ID]; !ok {
+		if !isOpenSession {
 			return false
 		}
 	case SessionFilterWaiting:
-		if _, ok := m.daemonOwned[t.ID]; !ok {
+		if !isOpenSession {
 			return false
 		}
 		if t.AgentStatus != board.AgentWaiting {
 			return false
 		}
+	}
+	if bypassProjectAndQuery {
+		return true
 	}
 	if m.filterQuery == "" {
 		return true
@@ -4255,6 +4322,23 @@ func (m *Model) previousStatus(current board.TicketStatus) board.TicketStatus {
 	default:
 		return current
 	}
+}
+
+// moveAndPromoteMsg formats the post-Move status-bar toast. When the
+// transition into in_review/done promoted N claude-code approvals from
+// the worktree into the source repo's settings.local.json, it appends a
+// "promoted N approval(s)" suffix so the user sees what just went
+// global. Empty promoted → only the "Moved to <status>" core message.
+func moveAndPromoteMsg(target board.TicketStatus, promoted []string) string {
+	msg := "Moved to " + string(target)
+	switch n := len(promoted); n {
+	case 0:
+	case 1:
+		msg += " · promoted 1 approval to repo defaults"
+	default:
+		msg += fmt.Sprintf(" · promoted %d approvals to repo defaults", n)
+	}
+	return msg
 }
 
 func (m *Model) notify(msg string) {
@@ -4424,6 +4508,7 @@ func (m *Model) pollAgentStatusesAsync() tea.Cmd {
 		agentSessionID  string
 		running         bool
 		terminalContent string
+		lastActivity    time.Time
 	}
 
 	var panes []paneInfo
@@ -4445,6 +4530,7 @@ func (m *Model) pollAgentStatusesAsync() tea.Cmd {
 			agentSessionID:  ticket.AgentSessionID,
 			running:         pane.Running(),
 			terminalContent: pane.GetContent(),
+			lastActivity:    m.lastPTYActivity[ticketID],
 		})
 	}
 
@@ -4476,7 +4562,7 @@ func (m *Model) pollAgentStatusesAsync() tea.Cmd {
 				sessionID = string(p.ticketID)
 			}
 
-			status := detector.DetectStatusWithPort(p.agentType, sessionID, p.worktreePath, p.agentPort, true, p.terminalContent)
+			status := detector.DetectStatusWithActivity(p.agentType, sessionID, p.worktreePath, p.agentPort, true, p.terminalContent, p.lastActivity)
 			results[p.ticketID] = status
 		}
 		return results

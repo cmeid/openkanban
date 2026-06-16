@@ -125,6 +125,19 @@ func (m *Model) handleDaemonSessionEvent(msg daemonSessionEventMsg) (tea.Model, 
 		ev.Event, ev.SessionID, ev.TicketID, ev.Expected)
 
 	if ticketID != "" {
+		// Stamp the per-ticket activity timestamp from any event that
+		// carries one. The daemon seeds it on lifecycle events (started,
+		// attached, detached, exited) and emits it on every "activity"
+		// heartbeat, so the UI map stays warm both at session boundaries
+		// and during steady-state work. Used by the status detector to
+		// override "waiting" → "working" when bytes are flowing despite
+		// the Notification hook's stale file.
+		if !ev.LastActivityAt.IsZero() {
+			if cur, ok := m.lastPTYActivity[ticketID]; !ok || ev.LastActivityAt.After(cur) {
+				m.lastPTYActivity[ticketID] = ev.LastActivityAt
+			}
+		}
+
 		ticket, _ := m.globalStore.Get(ticketID)
 		if ticket != nil {
 			switch ev.Event {
@@ -137,6 +150,7 @@ func (m *Model) handleDaemonSessionEvent(msg daemonSessionEventMsg) (tea.Model, 
 			case "exited":
 				delete(m.daemonOwned, ticketID)
 				delete(m.daemonViewing, ticketID)
+				delete(m.lastPTYActivity, ticketID)
 				// Expected=true means the daemon initiated the kill via
 				// handleTicketDone (i.e. the agent invoked `openkanban
 				// ticket done`). Preserve AgentCompleted so the card
@@ -174,6 +188,9 @@ func (m *Model) handleDaemonSessionEvent(msg daemonSessionEventMsg) (tea.Model, 
 						delete(m.daemonViewing, ticketID)
 					}
 				}
+			case "activity":
+				// Pure-heartbeat event — the lastPTYActivity stamp above
+				// already absorbed the timestamp. No further state change.
 			}
 		}
 	}

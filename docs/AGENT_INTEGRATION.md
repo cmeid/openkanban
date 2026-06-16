@@ -119,6 +119,11 @@ The persistent-mode / launchd integration shipped 2026-06-15 has a small set of 
 10. **`--no-launch-daemon` is ONE-WAY.** `=true` suppresses autostart; `=false` does NOT force autostart on (config controls). There's a code comment at `cmd/root.go` enforcing this so a future contributor doesn't refactor it into a tri-state.
 11. **TUI clients identify themselves as `"openkanban-tui"`; CLI subcommands as `"openkanban-cli"`.** Constants live in `internal/daemon/protocol.go` (`ClientNameTUI` / `ClientNameCLI`). `daemon stop` uses `PrepareExitResp.OtherTUIClients` to decide whether shutting down would orphan live agent work — the warning prompt only fires when no TUI is watching. Don't drop the ClientName tracking; don't reuse those string values for non-TUI/non-CLI clients.
 12. **Existing default-mode integration tests stay default-mode.** Persistent-mode behavior has its own siblings (`TestServerLifecycle_PersistentSurvivesLastDisconnect`, `TestPrepareExit_OtherTUIClients`). Don't add a `persistent` knob to `startServer()`; copy-paste a new test fixture instead — keeps the test harness from accidentally coupling the two modes.
+13. **TUI-forked daemons ALWAYS pass `--persistent`.** Both fork sites (`internal/daemon/autostart.go`, `internal/daemonclient/dial.go`) must invoke `exec.Command(exe, "daemon", "--persistent")`. The "ephemeral daemon that dies with the TUI" variant looks innocuous but kills every live agent session on TUI close — the headline bug behind this hardening pass. Verified by the second integration test that asserts a session survives a TUI fork-then-quit cycle (see brief at `tickets/review-exit-handling-when-using-launch-d.md`). Orphan-daemon concern is addressed by `watchBinaryStaleness` recycling on next update.
+14. **Background daemon goroutines recover from panics; `handleConn` does NOT.** `broadcastEvents`, `watchBinaryStaleness`, and `watchSessionExit` wrap their bodies in `defer recover()` so a panic logs + exits the goroutine rather than crashing the whole process (which would take every live PTY with it). `handleConn` is deliberately *unwrapped*: a panic there indicates wire-format or session-map corruption that should surface — recovering would let the daemon limp on with inconsistent state. `watchSessionExit` additionally preserves the invariant that `removeSession()` + the "exited" emit always run, via a deferred-cleanup pattern with an inner recover around the emit.
+15. **SIGHUP is a clean-shutdown trigger alongside SIGINT/SIGTERM.** `cmd/daemon.go` registers all three via `signal.NotifyContext` so the daemon runs `cleanup()` on each. Go's default disposition for SIGHUP is process termination (exit 129); for a daemon that owns live PTYs, that's the wrong default — orphaned children get SIGHUP'd to death without the per-session grace window.
+16. **Plist `ExitTimeOut=30` is sized for the sequential `cleanup()` kill loop.** Both `cleanup()` and `handleShutdown` kill sessions sequentially with `shutdownGraceSeconds=3` each, so worst-case wall clock is `s.wg.Wait() + 3N + overhead`. 30s covers ~8 concurrent sessions. If `shutdownGraceSeconds` changes, recompute the plist budget or parallelize the kill loop — the two values must move together. launchd's default is 20s; we override explicitly so a future contributor can't silently change either.
+17. **`OPENKANBAN_DAEMON_SOURCE` env var tags every daemon's origin.** Set to `tui-fork` at both fork sites and to `launchd` via plist `EnvironmentVariables`. The daemon logs it on startup (`persistent=true source=launchd` etc.) so postmortems on session-loss events can identify *which* daemon was the victim. Three valid values: `tui-fork`, `launchd`, anything-else-reported-as `manual`.
 
 ### What is *not* supported
 
@@ -662,6 +667,32 @@ Once the status file holds `completed`, a subsequent `status set idle`
 `Stop` hook from clobbering the completion signal during the SIGTERM
 grace window that follows `openkanban ticket done`.
 
+#### PTY-activity override (`waiting` → `working`)
+
+The hook-driven file is authoritative for "what state did the agent
+just enter", but it has a known gap: between Claude Code's
+`Notification` hook (permission prompt → file=`waiting`) and the
+eventual `PostToolUse` hook (tool done → file=`working`), no hook
+fires. A long-running tool that the user has already approved leaves
+the file pinned at `waiting` for the whole duration — even though the
+agent's spinner is animating and tool output is streaming.
+
+To close that gap, the daemon timestamps every non-empty `vt.Write` on
+a session's pane (`Pane.LastActivity()`), and a 2-second ticker emits
+`SessionEvent{Event: "activity", LastActivityAt: ...}` whenever the
+timestamp advances. The same value rides on lifecycle events
+(`started`, `attached`, `detached`, `exited`) so subscribers get a
+baseline before the first heartbeat lands. The status detector layers
+an override on top of `DetectStatusWithPort`: when the file says
+`waiting` but `LastActivityAt` is within `WaitingActivityTTL` (60s),
+report `working` instead. The override is intentionally narrow —
+other file states pass through untouched, and zero `LastActivityAt`
+(no daemon report yet) also passes through.
+
+The cost is bounded by the activity broadcaster's "only emit when
+advanced" check: an idle session generates zero traffic. Spinner-
+animating sessions emit one event per tick.
+
 ### `openkanban ticket done`
 
 The agent-side "/quit equivalent." Marks the current session's ticket
@@ -701,6 +732,41 @@ command does NOT signal the daemon — `AgentStatus` is left untouched
 and the live PTY keeps running. Use it when a session needs to flag
 itself as actively working (e.g. an agent resuming from a paused
 state and wanting the board to reflect that).
+
+## Claude approval persistence across tickets
+
+Each new openkanban ticket gets a clean worktree, and the new-session policy in `prepareSpawnWith` forces `--permission-mode plan` (so the user reviews the proposed approach before any tree mutation). The combination produced significant repeat-approval friction: a user who clicked **"Yes, and don't ask again"** for `Bash(go test *)` in one ticket would be re-prompted in the next, because Claude Code persists approvals to `./.claude/settings.local.json` — a path that, inside a worktree, dies with the worktree.
+
+The fork wires Claude's local-settings file into the ticket lifecycle so approvals persist per-source-repo without giving up the per-ticket trust isolation:
+
+### Seed on worktree create
+
+After every successful `CreateWorktree` (`setupWorktree` for in-progress-on-demand, the closure inside `prepareSpawnWith` for spawn-time creation), the UI calls `agent.SeedClaudeSettings(worktreePath, proj.RepoPath)`. The helper merges `<repo>/.claude/settings.local.json` into `<worktree>/.claude/settings.local.json` — source-repo entries land in the worktree, worktree-local entries are preserved. The ticket's first Claude session opens with every approval the user has ever promoted for that source repo already in place.
+
+A defensive `<repo>/.claude/.gitignore` (containing `settings.local.json`) is created when the repo's existing ignore stack — root `.gitignore`, nested ignores, global excludesFile — doesn't already cover `.claude/`. The local settings file holds user-specific approvals and must never be committed; the inner gitignore is a belt-and-suspenders guarantee.
+
+### Promote on `→ in_review` / `→ done`
+
+`project.TicketStore.Move` is the single funnel for UI-driven status transitions (drag-drop, `space` quick-move, `backspace` quick-move-back). After delegating to `SetStatus`, it calls `agent.PromoteClaudeSettingsOnTransition(t.WorktreePath, s.repoPath, oldStatus, newStatus)`. The transition gate fires only when `newStatus ∈ {in_review, done}` and `oldStatus != newStatus` — moves into `in_progress` or `backlog` are explicit no-ops. The CLI path `wrapUpSessionTicketAt` (used by `openkanban ticket in-review` and `ticket done`) routes through `store.Move` rather than `ticket.SetStatus` directly so the same promotion fires for in-session self-completion.
+
+The newly-promoted entries surface as a UI status-bar toast — `Moved to in_review · promoted 2 approvals to repo defaults` — so silent trust escalation isn't possible. The CLI prints the equivalent line to stderr (`openkanban: promoted N claude approval(s) to repo defaults`).
+
+### Trust boundary
+
+Approvals collected in a ticket only escape its worktree if the user **consciously advances the ticket to in_review or done**. Tickets abandoned, archived, or deleted from the backlog never promote — exploratory `Bash(curl ...)` approvals granted during an ill-fated investigation stay confined to the throwaway worktree. The human-mediated review gate is the trust boundary, not the act of approving.
+
+### Merge semantics
+
+`agent.mergeSettingsLocal` is a pure additive merge over the `permissions.{allow,ask,deny}` arrays. No deletes, no reorders, no duplicates. Every other top-level key in the destination file is untouched, and unknown keys in the source are ignored. This means future Claude Code settings keys round-trip safely as long as they don't share the `permissions` name. All three helpers (`Seed`, `Promote`, `PromoteOnTransition`) are idempotent: running them twice in a row is a no-op on the second call.
+
+### What is not changing
+
+- `--permission-mode plan` stays forced for new sessions — design intent is unchanged.
+- User-level `~/.claude/settings.json` and the openkanban-installed hook entries are not touched.
+- Committed `<repo>/.claude/settings.json` is not touched.
+- Errors at any layer are non-fatal: a settings-write failure logs and degrades to today's per-worktree allowlist behavior, it never blocks a spawn or a status transition.
+
+See `internal/agent/claude_settings.go` (helpers + 28 subtests covering merge, seed, promote, transition-gate, round-trip).
 
 ## Adding New Agents
 

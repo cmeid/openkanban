@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	xvt "github.com/charmbracelet/x/vt"
@@ -208,6 +209,63 @@ func TestPaneOscTitleCapture(t *testing.T) {
 	p.vt.Write([]byte("\x1b]0;next-title\x1b\\"))
 	if got := p.Title(); got != "next-title" {
 		t.Errorf("after OSC 0, Title = %q, want %q", got, "next-title")
+	}
+}
+
+// TestPaneLastActivity_AdvancesOnHandleOutput pins the daemon-side
+// half of the activity-override feature: any non-empty handleOutput
+// call must advance LastActivity, and the timestamp must be readable
+// without taking p.mu (it's the daemon broadcaster's lock-free path).
+// An empty Pane reports the zero time.
+func TestPaneLastActivity_AdvancesOnHandleOutput(t *testing.T) {
+	p := New("test", 80, 24, 1000)
+	p.vt = xvt.NewSafeEmulator(80, 24)
+
+	if !p.LastActivity().IsZero() {
+		t.Fatalf("LastActivity before any output = %v, want zero", p.LastActivity())
+	}
+
+	before := time.Now()
+	p.handleOutput([]byte("hello"))
+	first := p.LastActivity()
+	if first.IsZero() {
+		t.Fatalf("LastActivity after handleOutput is still zero")
+	}
+	if first.Before(before) {
+		t.Errorf("LastActivity %v is before the call site time %v", first, before)
+	}
+
+	// Second write must advance the timestamp strictly forward. Sleep
+	// past the nanosecond clock's resolution to avoid a flaky equal.
+	time.Sleep(time.Millisecond)
+	p.handleOutput([]byte("world"))
+	second := p.LastActivity()
+	if !second.After(first) {
+		t.Errorf("second LastActivity %v did not advance past first %v", second, first)
+	}
+}
+
+// TestPaneLastActivity_EmptyDataDoesNotStamp guards against a class of
+// false-positive activity: an internal caller invoking handleOutput
+// with no bytes (e.g. an empty pty.Read or a guard call) must not
+// advance the timestamp, or idle sessions would look "active" to the
+// override.
+func TestPaneLastActivity_EmptyDataDoesNotStamp(t *testing.T) {
+	p := New("test", 80, 24, 1000)
+	p.vt = xvt.NewSafeEmulator(80, 24)
+
+	p.handleOutput([]byte("seed"))
+	seeded := p.LastActivity()
+	if seeded.IsZero() {
+		t.Fatalf("seed write didn't stamp activity")
+	}
+
+	time.Sleep(time.Millisecond)
+	p.handleOutput(nil)
+	p.handleOutput([]byte{})
+	after := p.LastActivity()
+	if !after.Equal(seeded) {
+		t.Errorf("empty handleOutput moved LastActivity from %v to %v", seeded, after)
 	}
 }
 

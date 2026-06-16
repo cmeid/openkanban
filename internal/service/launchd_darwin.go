@@ -27,6 +27,20 @@ const Label = "dev.openkanban.daemon"
 // hand rather than via encoding/xml because Apple's plist dialect has
 // subtle escaping rules (CDATA, integer vs string vs bool tags) that
 // are easier to audit as a literal template than as marshaller calls.
+//
+// ExitTimeOut budget: cleanup() and handleShutdown in internal/daemon
+// kill sessions sequentially with shutdownGraceSeconds=3 each (see
+// internal/daemon/server.go). Worst-case wall clock for a clean
+// shutdown is wg.Wait() + 3N seconds + cleanup overhead, where N is
+// the live session count. We pick 30s as the launchd hard-kill
+// budget: covers ~8 concurrent sessions plus wg.Wait() overhead and
+// signals that the daemon's clean-shutdown path is the load-bearing
+// one. If shutdownGraceSeconds or the kill loop's concurrency changes,
+// recompute this budget — the two values must move together.
+//
+// OPENKANBAN_DAEMON_SOURCE=launchd lets the daemon log line at startup
+// announce who spawned it (vs tui-fork / manual), which is the
+// diagnostic we wished we had when the lifecycle bug was discovered.
 const plistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -50,6 +64,8 @@ const plistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
     <string>Interactive</string>
     <key>ThrottleInterval</key>
     <integer>10</integer>
+    <key>ExitTimeOut</key>
+    <integer>30</integer>
     <key>StandardOutPath</key>
     <string>{{.LogPath}}</string>
     <key>StandardErrorPath</key>
@@ -62,6 +78,8 @@ const plistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
         <string>{{.Home}}</string>
         <key>PATH</key>
         <string>{{.Path}}</string>
+        <key>OPENKANBAN_DAEMON_SOURCE</key>
+        <string>launchd</string>
     </dict>
 </dict>
 </plist>

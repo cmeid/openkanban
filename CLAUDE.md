@@ -9,10 +9,21 @@ Go 1.21+, BubbleTea (TUI), creack/pty, charmbracelet/x/vt (terminal emulation; s
 ## Development
 
 ```bash
-go build ./...    # Build
-go test ./...     # Test
-go run .          # Run
+go build ./...        # Build (in-place; doesn't touch installed binary)
+go test ./...         # Test
+go run .              # Run (carries no install-time ldflags — fine for ad-hoc iteration)
+
+./scripts/install.sh  # INSTALL — always use this; never bare `go install .`
+openkanban update     # Update an existing install (pull + rebuild via the same path)
 ```
+
+`scripts/install.sh` and `openkanban update` inject the `BuildMarker=official` ldflag that
+`cmd/build_guard.go` requires. Bare `go install .` skips it and produces a stub that refuses
+every command except `version` — and the guard fires at *invoke* time, not *build* time, so
+an agent that runs `go install .` to verify a sibling change never sees the failure it
+caused. It surfaces hours later in someone else's Stop hook. If you genuinely need a
+quick install equivalent without the script, replicate the ldflags it sets (`SourcePath`,
+`Commit`, `BuildMarker`) — see `scripts/install.sh`.
 
 ## Where to Look
 
