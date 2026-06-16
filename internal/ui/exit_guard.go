@@ -42,6 +42,11 @@ type daemonGuardAPI interface {
 	// pattern in tests covers both the exit-guard surface and the
 	// resync paths without standing up a real daemon.
 	List(ctx context.Context) (daemon.ListResp, error)
+	// Spawn forwards the spawn RPC. Used by prepareSpawnWith so the
+	// closure can route the daemon-side fork through the same testable
+	// seam as Owns / TicketDone — letting an Owns fast-path test assert
+	// that no Spawn was issued without standing up a real daemon.
+	Spawn(ctx context.Context, req daemon.SpawnReq) (daemon.SpawnResp, error)
 }
 
 // confirmExitState carries the modal's transient bookkeeping. Lives on

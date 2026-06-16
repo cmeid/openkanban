@@ -810,6 +810,12 @@ func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 			)
 
 		case spawnErrorMsg:
+			// Mid-spawn error path: clear the ModeSpawning bookkeeping
+			// and toast. Kept inside this block (rather than relying on
+			// the top-level handler) because the ModeSpawning switch
+			// ends with `return m, nil` for unhandled cases, which would
+			// otherwise swallow the message before it ever reached the
+			// top-level handler below.
 			if msg.ticketID == m.spawningTicketID {
 				m.mode = ModeNormal
 				m.spawningTicketID = ""
@@ -880,6 +886,28 @@ func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
+
+	case spawnErrorMsg:
+		// Surface attach/spawn errors arriving outside ModeSpawning. The
+		// ModeSpawning case is handled in the block above (since that
+		// block's trailing `return m, nil` would otherwise swallow this
+		// message before it reached here). What's left to handle is
+		// every OTHER caller of attachExisting — the Unattached and
+		// Detached arms of spawnAgent (B6) flip to ModeAgentView before
+		// kicking off the attach, and AttachFirstMsg / cycleAttachPrompt
+		// never enter ModeSpawning at all. Before the fix those attach
+		// failures had no handler at any level and dropped silently,
+		// parking the user with a dead pane.
+		//
+		// Choice rationale (option a from review): dropping the
+		// ticketID gate is safer than coupling the attach-from-attach
+		// path to the spawn state machine via m.spawningTicketID —
+		// that coupling would be load-bearing-but-misleading. Spawn
+		// errors are always worth surfacing; if a future flow returns
+		// spawnErrorMsg and does NOT want a toast, it can introduce a
+		// separate message type.
+		m.notify(msg.err)
+		return m, nil
 
 	case QuitRequestedMsg:
 		return m.handleQuitRequested()
@@ -3757,9 +3785,33 @@ func (m *Model) spawnAgent() (tea.Model, tea.Cmd) {
 			existing.SetSize(m.width, m.height-2)
 			cmd := m.attachExisting(ticket.ID, existing)
 			return m, tea.Batch(cmd, m.maybeSetWindowTitle())
+		case daemonclient.PaneViewDetached:
+			// Local view lost its binary stream, but the daemon may
+			// still own the session. Try to re-attach before spawning
+			// — historically this branch fell through to spawn, which
+			// PR #34's idempotent Spawn made harmless but still wasted
+			// an RPC roundtrip and a daemon-side fork attempt. If the
+			// pane has a SessionID we can target, kick off an
+			// attachExisting cmd; the async attach result will either
+			// land us in ModeAgentView cleanly or surface a
+			// spawnErrorMsg ("attach failed: ...") the user can react
+			// to manually. Falling through to spawn on attach failure
+			// would be the older, more aggressive behaviour; we
+			// deliberately don't, because the daemon may genuinely own
+			// the session and a fresh Spawn (even idempotent) would be
+			// surprising.
+			//
+			// If the pane has no SessionID (purely synthetic, no daemon
+			// session ever existed for it), there is nothing to attach
+			// to — fall through to the spawn path.
+			if existing.SessionID() != "" {
+				m.mode = ModeAgentView
+				m.focusedPane = ticket.ID
+				existing.SetSize(m.width, m.height-2)
+				cmd := m.attachExisting(ticket.ID, existing)
+				return m, tea.Batch(cmd, m.maybeSetWindowTitle())
+			}
 		}
-		// PaneViewDetached falls through to the spawn path so a stale
-		// view (daemon vanished, etc.) gets refreshed.
 	}
 
 	// From here on we are spawning fresh, which requires the ticket to
@@ -4159,8 +4211,53 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 	mgr := m.worktreeMgrs[proj.ID]
 	cfg := m.config
 	daemonClient := m.daemonClient
+	// Capture guardAPI by value so the closure routes Spawn/Owns through
+	// the same testable seam as the exit-guard and TicketDone paths.
+	// nil in two cases the closure must tolerate:
+	//   1. daemon never reachable at startup (m.guardAPI = nil)
+	//   2. tests that exercise non-daemon branches
+	// The daemonClient nil-check below covers (1); the fast-path Owns
+	// call also nil-checks before dereferencing.
+	guardAPI := m.guardAPI
 
 	return func() tea.Msg {
+		// Fast path (B4): if the daemon already owns the agent UUID this
+		// ticket would resume into, skip the Spawn RPC entirely and
+		// build a PaneView against the existing daemon-side session.
+		// Idempotent Spawn (PR #34) would handle the duplicate at the
+		// daemon level, but that still costs an RPC roundtrip and forces
+		// the daemon to walk the dedupe table. Symmetric with the
+		// spawn-gate Owns check in shouldCleanupDeadSession; see also
+		// the documentation block at the top of that helper.
+		//
+		// Runs BEFORE the mgr nil-check so the fast path doesn't need a
+		// worktree manager: a daemon-owned session already has its
+		// worktree set up from the original spawn, so re-fetching mgr
+		// is wasted work in the resume case. (cwd already locked in by
+		// the running PTY — local Workdir is decorative.)
+		//
+		// Guarded on ticket.AgentSessionID being set: tickets that have
+		// never had a session linked to them have no UUID to query, so
+		// the fast path is meaningless.
+		if guardAPI != nil && ticket.AgentSessionID != "" {
+			ownsCtx, ownsCancel := context.WithTimeout(context.Background(), ownsProbeTimeout)
+			ownsResp, ownsErr := guardAPI.Owns(ownsCtx, ticket.AgentSessionID)
+			ownsCancel()
+			if ownsErr == nil && ownsResp.Owned && ownsResp.SessionID != "" {
+				return attachExistingFastPath(
+					ticketID,
+					ownsResp.SessionID,
+					sessionNameFor(ticket, branchName),
+					worktreePath,
+					branchName,
+					baseBranch,
+					width,
+					height,
+					daemonClient,
+				)
+			}
+		}
+
 		if mgr == nil {
 			return spawnErrorMsg{ticketID: ticketID, err: "worktree manager not found"}
 		}
@@ -4307,7 +4404,15 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 			forwardNotifications: cfg.Behavior.ForwardAgentNotifications,
 		})
 		spawnCtx, spawnCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		resp, err := daemonClient.Spawn(spawnCtx, req)
+		var (
+			resp daemon.SpawnResp
+			err  error
+		)
+		if guardAPI != nil {
+			resp, err = guardAPI.Spawn(spawnCtx, req)
+		} else {
+			resp, err = daemonClient.Spawn(spawnCtx, req)
+		}
 		spawnCancel()
 		if err != nil {
 			return spawnErrorMsg{ticketID: ticketID, err: "spawn failed: " + err.Error()}
@@ -4318,20 +4423,27 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 		pv.SetSessionName(sessionName)
 		pv.SetSize(width, height)
 
-		attachCtx, attachCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		attachErr := pv.Attach(attachCtx)
-		attachCancel()
+		// B7: retry attach after spawn with backoff. The daemon-side
+		// session is alive once Spawn returns; a local Attach failure
+		// (timeout reading the hello, transient connect issue, etc.)
+		// shouldn't strand the user into spawning a duplicate next
+		// time. attachWithRetry returns the LAST attach error (or nil
+		// on success) so we can decide whether to surface a notice.
+		attachErr := attachWithRetry(pv)
 		if attachErr != nil {
-			log.Printf("openkanban model: attach failed after spawn ticket=%s session=%s err=%v", ticketID, resp.SessionID, attachErr)
+			log.Printf("openkanban model: attach failed after spawn+retry ticket=%s session=%s err=%v",
+				ticketID, resp.SessionID, attachErr)
 			// Spawn succeeded but we couldn't get a binary channel.
 			// Keep the PaneView so the user can retry attach; surface
-			// the error.
+			// the error so the user knows the spawn itself worked and
+			// pressing Enter again is reasonable.
 			return spawnReadyMsg{
 				ticketID:     ticketID,
 				pane:         pv,
 				worktreePath: worktreePath,
 				branchName:   branchName,
 				baseBranch:   baseBranch,
+				notice:       "Spawned but attach failed — press Enter to retry",
 			}
 		}
 
@@ -4343,6 +4455,138 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 			baseBranch:   baseBranch,
 			notice:       readyNotice,
 		}
+	}
+}
+
+// attachWithRetry calls pv.Attach() up to spawnAttachMaxRetries+1
+// times with linear backoff between tries. Returns nil on success or
+// the final error if every attempt failed. See spawnAttachRetrySchedule
+// for the exact timeouts/sleeps; the backoff is short because the
+// failure modes we care about — transient socket-level hiccup, brief
+// daemon goroutine contention — resolve quickly; longer waits would
+// just punish the user.
+func attachWithRetry(pv *daemonclient.PaneView) error {
+	return retryAttach(func(ctx context.Context) error { return pv.Attach(ctx) })
+}
+
+// retryStep is one entry in the post-Spawn attach retry schedule. sleep
+// is taken before this attempt fires (so the first step's sleep is the
+// gap between the initial attempt and the first retry); timeout is the
+// context bound for the attach call on this step.
+type retryStep struct {
+	sleep   time.Duration
+	timeout time.Duration
+}
+
+// spawnAttachRetrySchedule is the post-Spawn attach retry schedule.
+// Worst-case wall clock on full failure:
+//
+//	initial(5s) + 200ms + retry1(1.5s) + 400ms + retry2(1.5s) ≈ 8.6s
+//
+// Previously the retry timeouts were 3s each, giving a ~11.6s ceiling
+// under a misleading "Spawning…" splash. The splash work is queued as
+// a separate ticket (ui-spinner-for-long-running-daemon-ops); for now
+// we just tighten the budget. Pulled into a named variable so future
+// tuning (or unit testing of the schedule itself) is straightforward.
+var spawnAttachRetrySchedule = []retryStep{
+	{sleep: 200 * time.Millisecond, timeout: 1500 * time.Millisecond},
+	{sleep: 400 * time.Millisecond, timeout: 1500 * time.Millisecond},
+}
+
+// retryAttach is the testable core of attachWithRetry — same retry
+// schedule, but takes the attach call as a function so tests can drop
+// in a fake without standing up a real daemon socket. The error of the
+// last attempt is returned; nil means at least one call succeeded.
+func retryAttach(attach func(ctx context.Context) error) error {
+	attachCtx, attachCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	attachErr := attach(attachCtx)
+	attachCancel()
+	if attachErr == nil {
+		return nil
+	}
+	for _, step := range spawnAttachRetrySchedule {
+		if attachErr == nil {
+			break
+		}
+		time.Sleep(step.sleep)
+		retryCtx, retryCancel := context.WithTimeout(context.Background(), step.timeout)
+		attachErr = attach(retryCtx)
+		retryCancel()
+	}
+	return attachErr
+}
+
+// spawnAttachMaxRetries is the cap on post-Spawn attach retry attempts
+// (additional tries beyond the initial one). Kept in sync with
+// len(spawnAttachRetrySchedule) so callers and tests that count
+// attempts have a single named constant to anchor on.
+const spawnAttachMaxRetries = 2
+
+// sessionNameFor mirrors the priority used inside the prepareSpawnWith
+// closure (AgentSessionID > branchName > ticketID) so the Owns
+// fast-path constructs a PaneView with the same identity the regular
+// spawn path would. Exposed as a helper so the fast-path closure
+// branch and the spawn-path closure branch agree.
+func sessionNameFor(ticket *board.Ticket, branchName string) string {
+	name := string(ticket.ID)
+	if branchName != "" {
+		name = branchName
+	}
+	if ticket.AgentSessionID != "" {
+		name = ticket.AgentSessionID
+	}
+	return name
+}
+
+// attachExistingFastPath builds a PaneView pointing at the daemon-owned
+// session that Owns reported and tries to attach to it (with retry,
+// matching the regular spawn path). Returned as a tea.Msg so the
+// prepareSpawnWith closure can `return attachExistingFastPath(...)` —
+// the result is structurally identical to the post-Spawn spawnReadyMsg
+// the Update loop already knows how to consume.
+//
+// Cross-cuts:
+//   - The constructed PaneView shares the closure's worktreePath /
+//     branchName / baseBranch so the Update loop's onSpawnReady seam
+//     stamps the ticket exactly as the regular path would.
+//   - The notice field carries the attach-retry diagnostic (see B7)
+//     so the user can tell a fast-path-attach-failure apart from a
+//     true daemon-unreachable state.
+func attachExistingFastPath(
+	ticketID board.TicketID,
+	sessionID string,
+	sessionName string,
+	worktreePath string,
+	branchName string,
+	baseBranch string,
+	width int,
+	height int,
+	daemonClient *daemonclient.Client,
+) tea.Msg {
+	pv := daemonclient.NewPaneView(daemonClient, string(ticketID), sessionID, nil)
+	pv.SetWorkdir(worktreePath)
+	pv.SetSessionName(sessionName)
+	pv.SetSize(width, height)
+
+	attachErr := attachWithRetry(pv)
+	if attachErr != nil {
+		log.Printf("openkanban model: fast-path attach failed ticket=%s session=%s err=%v",
+			ticketID, sessionID, attachErr)
+		return spawnReadyMsg{
+			ticketID:     ticketID,
+			pane:         pv,
+			worktreePath: worktreePath,
+			branchName:   branchName,
+			baseBranch:   baseBranch,
+			notice:       "Attached to existing session but stream failed — press Enter to retry",
+		}
+	}
+	return spawnReadyMsg{
+		ticketID:     ticketID,
+		pane:         pv,
+		worktreePath: worktreePath,
+		branchName:   branchName,
+		baseBranch:   baseBranch,
 	}
 }
 

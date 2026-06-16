@@ -112,12 +112,10 @@ func (f *fakeGuardAPI) List(_ context.Context) (daemon.ListResp, error) {
 	return daemon.ListResp{}, nil
 }
 
-// Spawn is a no-op stub. The exit-guard tests don't exercise spawn,
-// but daemonGuardAPI gains a Spawn method in the sibling
-// fix/client-spawn-discipline PR; pre-adding the stub here keeps PR 4
-// and PR 3 from breaking each other at merge time regardless of
-// merge order. Once both have landed this stays as a harmless
-// inert helper.
+// Spawn is unused by the exit-guard tests but required to satisfy
+// daemonGuardAPI (prepareSpawnWith routes Spawn through this seam so
+// the Owns fast-path test can assert no Spawn was issued). Returns
+// an empty response so any accidental invocation resolves cleanly.
 func (f *fakeGuardAPI) Spawn(_ context.Context, _ daemon.SpawnReq) (daemon.SpawnResp, error) {
 	return daemon.SpawnResp{}, nil
 }
