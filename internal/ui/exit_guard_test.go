@@ -96,6 +96,14 @@ func (f *fakeGuardAPI) Owns(_ context.Context, _ string) (daemon.OwnsResp, error
 	return daemon.OwnsResp{Owned: false}, nil
 }
 
+// TicketDone is unused by the exit-guard tests but required to satisfy
+// daemonGuardAPI (the board-promotion wrap-up calls it — see
+// wrapUpSessionForTicket in model.go). Returns Killed=false so any
+// accidental invocation resolves cleanly without faking a kill.
+func (f *fakeGuardAPI) TicketDone(_ context.Context, _ string) (daemon.TicketDoneResp, error) {
+	return daemon.TicketDoneResp{Killed: false}, nil
+}
+
 func (f *fakeGuardAPI) killCallsCopy() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()

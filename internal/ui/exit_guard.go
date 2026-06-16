@@ -29,6 +29,11 @@ type daemonGuardAPI interface {
 	Kill(ctx context.Context, sessionID string, grace time.Duration) error
 	ClientID() uint16
 	Owns(ctx context.Context, sessionUUID string) (daemon.OwnsResp, error)
+	// TicketDone informs the daemon that a ticket is wrapping up so it
+	// can terminate the live PTY for that ticket and broadcast an
+	// Expected=true SessionEvent. Used by the TUI's board-promotion
+	// wrap-up to mirror the CLI's `openkanban ticket done` path.
+	TicketDone(ctx context.Context, ticketID string) (daemon.TicketDoneResp, error)
 }
 
 // confirmExitState carries the modal's transient bookkeeping. Lives on

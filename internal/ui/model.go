@@ -1625,6 +1625,9 @@ func (m *Model) dropTicket() (tea.Model, tea.Cmd) {
 		}
 	}
 
+	// Wrap up any live session BEFORE Move (see quickMoveTicket).
+	m.wrapUpSessionForTicket(ticket, targetStatus)
+
 	promoted, _ := m.globalStore.Move(ticket.ID, targetStatus)
 	m.refreshColumnTickets()
 	m.saveTicket(ticket)
@@ -3380,6 +3383,11 @@ func (m *Model) quickMoveTicket() (tea.Model, tea.Cmd) {
 		}
 	}
 
+	// Wrap up any live session BEFORE Move mutates ticket.Status —
+	// the helper's pre-move-status check is what gates the teardown.
+	// No-op when the ticket isn't leaving in_progress for a terminal.
+	m.wrapUpSessionForTicket(ticket, nextStatus)
+
 	promoted, _ := m.globalStore.Move(ticket.ID, nextStatus)
 	m.refreshColumnTickets()
 	m.selectTicketByID(ticket.ID)
@@ -3545,6 +3553,14 @@ func (m *Model) quickMoveTicketBackward() (tea.Model, tea.Cmd) {
 	if prevStatus == ticket.Status {
 		return m, nil
 	}
+
+	// Symmetric with the forward path: if the user is demoting back
+	// through a terminal (rare — only fires from done→in_review since
+	// previousStatus(in_review) is in_progress, not "leaving" it), the
+	// helper's pre-condition keeps this a no-op. The call is harmless
+	// here but kept for parity with quickMoveTicket so a future change
+	// to status ordering doesn't silently introduce an asymmetry.
+	m.wrapUpSessionForTicket(ticket, prevStatus)
 
 	promoted, _ := m.globalStore.Move(ticket.ID, prevStatus)
 	m.refreshColumnTickets()
@@ -4332,6 +4348,60 @@ func (m *Model) stopAgent() (tea.Model, tea.Cmd) {
 	m.saveTicket(ticket)
 	m.notify("Agent stopped")
 	return m, nil
+}
+
+// wrapUpSessionForTicket performs the TUI-side equivalent of the CLI's
+// wrapUpSessionTicketAt (cmd/ticket_done.go): when the ticket is leaving
+// in_progress for a terminal status (in_review or done) and has a live
+// daemon session, stop the local pane, ask the daemon to kill the
+// session via TicketDone, and stamp AgentStatus=Completed so the card
+// renders correctly even before the daemon's "exited" event lands.
+//
+// Safe to call when no daemon session exists for the ticket — the pane-
+// teardown and daemon RPC are both no-ops in that case. Must be called
+// BEFORE m.globalStore.Move so the ticket.Status check ("are we leaving
+// in_progress?") runs against the pre-move status; Move's SetStatus
+// mutates ticket.Status in place.
+func (m *Model) wrapUpSessionForTicket(ticket *board.Ticket, newStatus board.TicketStatus) {
+	if ticket == nil {
+		return
+	}
+	// Only wrap up when crossing OUT of in_progress to a terminal
+	// status. Backlog→in_progress and other transitions don't have a
+	// session to tear down (or shouldn't tear it down if they do).
+	if ticket.Status != board.StatusInProgress {
+		return
+	}
+	if newStatus != board.StatusInReview && newStatus != board.StatusDone {
+		return
+	}
+
+	// Local pane teardown. Mirrors stopAgent above.
+	if pane, ok := m.panes[ticket.ID]; ok {
+		pane.Stop()
+		delete(m.panes, ticket.ID)
+	}
+	if m.focusedPane == ticket.ID {
+		m.mode = ModeNormal
+		m.focusedPane = ""
+	}
+
+	// Tell the daemon (best-effort; failures are not fatal — same
+	// contract as cmd/ticket_done.go:notifyDaemonTicketDone). Routed
+	// through m.guardAPI so tests can substitute a fake.
+	if m.guardAPI != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if _, err := m.guardAPI.TicketDone(ctx, string(ticket.ID)); err != nil {
+			log.Printf("openkanban: TicketDone(%s) on board promotion: %v", ticket.ID, err)
+		}
+	}
+
+	// AgentStatus discipline. SetAgentStatus stamps StatusChangedAt;
+	// use it, don't assign directly (see Ticket.SetAgentStatus in
+	// internal/board/board.go and the SetAgentStatus memory note).
+	// The caller's saveTicket call after Move will persist this.
+	ticket.SetAgentStatus(board.AgentCompleted)
 }
 
 func (m *Model) selectedTicket() *board.Ticket {

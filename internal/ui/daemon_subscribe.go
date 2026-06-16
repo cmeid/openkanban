@@ -152,18 +152,39 @@ func (m *Model) handleDaemonSessionEvent(msg daemonSessionEventMsg) (tea.Model, 
 				delete(m.lastPTYActivity, ticketID)
 				// Expected=true means the daemon initiated the kill via
 				// handleTicketDone (i.e. the agent invoked `openkanban
-				// ticket done`). Preserve AgentCompleted so the card
-				// renders as done rather than getting reset to AgentNone.
-				// Expected=false is a natural exit / plain Kill — reset
-				// to AgentNone as before.
+				// ticket done`, or the TUI's board-promotion wrap-up
+				// sent a TicketDone RPC). Preserve AgentCompleted so the
+				// card renders as done rather than getting reset to
+				// AgentNone. Expected=false is a natural exit / plain
+				// Kill — reset to AgentNone as before.
+				stateChanged := false
 				if ev.Expected {
-					if ticket.SetAgentStatus(board.AgentCompleted) {
-						m.saveTicket(ticket)
-					}
+					stateChanged = ticket.SetAgentStatus(board.AgentCompleted)
 				} else {
-					if ticket.SetAgentStatus(board.AgentNone) {
-						m.saveTicket(ticket)
+					stateChanged = ticket.SetAgentStatus(board.AgentNone)
+				}
+				// On an EXPECTED exit, clear the on-disk session
+				// linkage so a later resume doesn't pick up the dead
+				// UUID. The clean wrap-up signal (handleTicketDone) is
+				// our certainty that the session is truly gone — the
+				// JSONL has been finalised by the agent's /quit motion.
+				//
+				// On UNEXPECTED exits we deliberately preserve the
+				// linkage. A daemon crash or transient PTY tear-down
+				// can fire an "exited" event while the JSONL is still
+				// on disk and resumable; clearing here would lose the
+				// user's link to a session that's coming right back.
+				// See commit c718699 — the UUID persistence is what
+				// makes --resume work.
+				if ev.Expected {
+					if ticket.AgentSessionID != "" || ticket.AgentSpawnedAt != nil {
+						ticket.AgentSessionID = ""
+						ticket.AgentSpawnedAt = nil
+						stateChanged = true
 					}
+				}
+				if stateChanged {
+					m.saveTicket(ticket)
 				}
 				if pv, ok := m.panes[ticketID]; ok {
 					_ = pv.Close()
