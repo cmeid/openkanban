@@ -378,3 +378,164 @@ func TestToggleAlwaysShowWorking_CursorSurvivesToggleOff(t *testing.T) {
 		t.Errorf("cursor out of bounds after toggle: activeTicket=%d, column len=%d", m.activeTicket, len(m.columnTickets[0]))
 	}
 }
+
+// makeBacklogTickets returns n idle backlog tickets. Used by the
+// compactColumnOffsets regression tests below to populate columns with
+// enough cards to require scrolling. Daemon ownership and waiting status
+// are wired by the caller after model creation.
+func makeBacklogTickets(n int) []*board.Ticket {
+	out := make([]*board.Ticket, n)
+	for i := 0; i < n; i++ {
+		out[i] = &board.Ticket{
+			ID:          board.NewTicketID(),
+			Title:       "card-" + string(rune('a'+i%26)),
+			Status:      board.StatusBacklog,
+			AgentStatus: board.AgentIdle,
+			CreatedAt:   time.Now().Add(time.Duration(i) * time.Second),
+		}
+	}
+	return out
+}
+
+func TestCompactColumnOffsets_FilterShrinksColumn_OffsetResets(t *testing.T) {
+	// 20 backlog tickets, only 3 daemon-owned. User has scrolled deep into
+	// the backlog (offset=15). Pressing 'w' filters to Open — only the 3
+	// daemon-owned tickets remain. All 3 fit easily in any reasonable
+	// column budget, so offset must drop to 0.
+	all := makeBacklogTickets(20)
+	live := all[2:5] // pick three to be daemon-owned
+	for _, tk := range live {
+		tk.AgentStatus = board.AgentWaiting
+	}
+
+	m := makePrioritySortModel(t, all)
+	m.daemonOwned = map[board.TicketID]struct{}{
+		live[0].ID: {}, live[1].ID: {}, live[2].ID: {},
+	}
+	m.refreshColumnTickets()
+
+	if got := len(m.columnTickets[0]); got != 20 {
+		t.Fatalf("baseline: backlog has %d tickets, want 20", got)
+	}
+	m.columnOffsets[0] = 15
+
+	// First 'w' → SessionFilterOpen. Backlog shrinks to 3 daemon-owned.
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	if got := len(m.columnTickets[0]); got != 3 {
+		t.Fatalf("after 'w': backlog has %d tickets, want 3", got)
+	}
+	if got := m.columnOffsets[0]; got != 0 {
+		t.Errorf("after 'w' on shrunk column: offset = %d, want 0 (all 3 cards fit)", got)
+	}
+}
+
+func TestCompactColumnOffsets_TailPreserved_WhenNotAllFit(t *testing.T) {
+	// 20 tickets — none filtered away (no daemon owners, sessionFilter=All).
+	// Set offset to a high value within bounds. After refresh, offset must
+	// reduce to the SMALLEST value such that the tail (ticket n-1) is still
+	// the last visible card — i.e., offset = smallest j s.t. cards [j..n-1]
+	// plus the ▲ indicator (if j > 0) fit in m.columnContentHeight().
+	all := makeBacklogTickets(20)
+	m := makePrioritySortModel(t, all)
+	m.refreshColumnTickets()
+	if got := len(m.columnTickets[0]); got != 20 {
+		t.Fatalf("baseline: backlog has %d tickets, want 20", got)
+	}
+	m.columnOffsets[0] = 18
+
+	// Compute the expected target the same way the production code does,
+	// so this test survives layout changes (header height, padding, etc.).
+	budget := m.columnContentHeight()
+	n := 20
+	wantTarget := 0
+	used := 0
+	for j := n - 1; j >= 0; j-- {
+		cost := ticketHeight
+		reserve := 0
+		if j > 0 {
+			reserve = 1
+		}
+		if used+cost+reserve > budget {
+			wantTarget = j + 1
+			break
+		}
+		used += cost
+	}
+
+	// Sanity: this test is meaningful only if not everything fits AND the
+	// expected target is below the seeded offset of 18. If the test scaffold
+	// is ever rebuilt with a much taller window, this guards against the
+	// assertion becoming vacuous.
+	if wantTarget == 0 {
+		t.Skipf("test fixture too tall: budget=%d fits all 20 cards; nothing to compact", budget)
+	}
+	if wantTarget >= 18 {
+		t.Skipf("test fixture too short: wantTarget=%d >= seeded offset 18; nothing to reduce", wantTarget)
+	}
+
+	m.refreshColumnTickets()
+	if got := m.columnOffsets[0]; got != wantTarget {
+		t.Errorf("offset compaction: got %d, want %d (budget=%d, n=20, ticketHeight=%d)", got, wantTarget, budget, ticketHeight)
+	}
+}
+
+func TestCompactColumnOffsets_NeverIncreasesOffset(t *testing.T) {
+	// Start with offset=0 on a fully-populated column. After refresh, offset
+	// must stay 0 — the "only reduce" invariant means we never push the
+	// user away from the top of a column.
+	all := makeBacklogTickets(20)
+	m := makePrioritySortModel(t, all)
+	m.refreshColumnTickets()
+	m.columnOffsets[0] = 0
+
+	m.refreshColumnTickets()
+	if got := m.columnOffsets[0]; got != 0 {
+		t.Errorf("never-increase invariant: offset went from 0 to %d, want 0", got)
+	}
+}
+
+func TestCompactColumnOffsets_EmptyColumn(t *testing.T) {
+	// Filter to zero matches in a column. Offset must be 0 and no panic.
+	all := makeBacklogTickets(5)
+	m := makePrioritySortModel(t, all)
+	m.refreshColumnTickets()
+	m.columnOffsets[0] = 3
+
+	// Apply a text filter that matches nothing.
+	m.filterQuery = "zzz-no-match-anywhere"
+	m.refreshColumnTickets()
+
+	if got := len(m.columnTickets[0]); got != 0 {
+		t.Fatalf("expected empty backlog after no-match filter, got %d tickets", got)
+	}
+	if got := m.columnOffsets[0]; got != 0 {
+		t.Errorf("empty column offset = %d, want 0", got)
+	}
+}
+
+func TestCompactColumnOffsets_TinyTerminal_NoPanic(t *testing.T) {
+	// Pre-WindowSizeMsg or sub-card-height terminal: columnContentHeight()
+	// is <= 0. compactColumnOffsets must early-return and leave offsets
+	// untouched — clamping to n-1 in this case would hide everything above
+	// the tail, which is worse than the bug we're fixing.
+	all := makeBacklogTickets(10)
+	m := makePrioritySortModel(t, all)
+	m.refreshColumnTickets()
+	m.columnOffsets[0] = 5
+
+	m.height = 0
+	if budget := m.columnContentHeight(); budget > 0 {
+		t.Fatalf("test setup invariant: expected non-positive budget at height=0, got %d", budget)
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("panic at height=0: %v", r)
+		}
+	}()
+	m.refreshColumnTickets()
+
+	if got := m.columnOffsets[0]; got != 5 {
+		t.Errorf("tiny-terminal offset = %d, want 5 (unchanged via early return)", got)
+	}
+}
