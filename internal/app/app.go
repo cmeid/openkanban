@@ -157,8 +157,10 @@ func Run(cfg *config.Config, filterPath, version string, autostartDaemon bool) e
 // hot-reload in that case.
 //
 // Note: projects added or removed mid-session are not retroactively
-// watched. Users adding a project externally need to quit + relaunch
-// to pick up its tickets.
+// watched by fsnotify. The 1s board resync tick
+// (internal/ui/board_resync.go) covers this gap — newly-added
+// projects and their tickets surface within ~1s without a restart,
+// just slower than the sub-second fsnotify fast path.
 func startFileWatcher(registry *project.ProjectRegistry, program *tea.Program) *watch.Watcher {
 	configDir, err := config.ConfigDir()
 	if err != nil {
