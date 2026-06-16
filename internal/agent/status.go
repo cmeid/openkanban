@@ -64,16 +64,22 @@ func (d *StatusDetector) DetectStatusWithPath(agentType, sessionID, worktreePath
 }
 
 func (d *StatusDetector) DetectStatusWithPort(agentType, sessionID, worktreePath string, port int, processRunning bool, terminalContent string) board.AgentStatus {
+	// Read the status file first so terminal markers (completed/error)
+	// survive a process exit. Transient states like "working" still
+	// require the process to be running, otherwise they're stale.
+	fileStatus := d.readStatusFile(sessionID)
+	if fileStatus != board.AgentNone {
+		if processRunning || fileStatus == board.AgentCompleted || fileStatus == board.AgentError {
+			return fileStatus
+		}
+	}
+
 	if !processRunning {
 		return board.AgentNone
 	}
 
-	if status := d.readStatusFile(sessionID); status != board.AgentNone {
-		return status
-	}
-
 	if agentType == "opencode" && port > 0 {
-		return d.queryOpencodeAPIOnPort(port)
+		return d.queryOpencodeAPIOnPort(sessionID, port)
 	}
 
 	if terminalContent != "" {
@@ -292,8 +298,8 @@ func (d *StatusDetector) queryOpencodeAPI(sessionID string) board.AgentStatus {
 	return status
 }
 
-func (d *StatusDetector) queryOpencodeAPIOnPort(port int) board.AgentStatus {
-	cacheKey := fmt.Sprintf("opencode-port:%d", port)
+func (d *StatusDetector) queryOpencodeAPIOnPort(sessionID string, port int) board.AgentStatus {
+	cacheKey := fmt.Sprintf("opencode-port:%d:%s", port, sessionID)
 
 	d.statusCacheMu.RLock()
 	cached, exists := d.statusCache[cacheKey]
@@ -319,38 +325,26 @@ func (d *StatusDetector) queryOpencodeAPIOnPort(port int) board.AgentStatus {
 		return board.AgentNone
 	}
 
-	// OpenCode's /session/status only contains BUSY sessions.
-	// Empty response {} means all sessions are idle.
-	// If any session is busy, return working.
-	for _, sessionStatus := range statusResp {
-		if sessionStatus.Type == "busy" {
-			d.statusCacheMu.Lock()
-			d.statusCache[cacheKey] = cachedStatus{
-				status:    board.AgentWorking,
-				timestamp: time.Now(),
-			}
-			d.statusCacheMu.Unlock()
-			return board.AgentWorking
-		}
-		if sessionStatus.Type == "retry" {
-			d.statusCacheMu.Lock()
-			d.statusCache[cacheKey] = cachedStatus{
-				status:    board.AgentError,
-				timestamp: time.Now(),
-			}
-			d.statusCacheMu.Unlock()
-			return board.AgentError
+	// OpenCode's /session/status only contains BUSY (and retry) sessions.
+	// Look up just this session's entry — a missing entry in an otherwise
+	// successful response means this session is idle, regardless of what
+	// any other sessions on the same shared port are doing.
+	status := board.AgentNone
+	if sessionID != "" {
+		if sessionStatus, found := statusResp[sessionID]; found {
+			status = d.mapOpencodeStatus(sessionStatus)
+		} else {
+			status = board.AgentIdle
 		}
 	}
 
-	// Server responded but no busy sessions = idle
 	d.statusCacheMu.Lock()
 	d.statusCache[cacheKey] = cachedStatus{
-		status:    board.AgentIdle,
+		status:    status,
 		timestamp: time.Now(),
 	}
 	d.statusCacheMu.Unlock()
-	return board.AgentIdle
+	return status
 }
 
 func (d *StatusDetector) mapOpencodeStatus(s opencodeSessionStatus) board.AgentStatus {
@@ -470,9 +464,19 @@ func (d *StatusDetector) InvalidateCache(sessionName string) {
 
 	if sessionName == "" {
 		d.statusCache = make(map[string]cachedStatus)
-	} else {
-		delete(d.statusCache, "file:"+sessionName)
-		delete(d.statusCache, "opencode:"+sessionName)
+		return
+	}
+
+	delete(d.statusCache, "file:"+sessionName)
+	delete(d.statusCache, "opencode:"+sessionName)
+
+	// Port-scoped keys are formatted "opencode-port:<port>:<sessionID>".
+	// Clear every entry that belongs to this session, regardless of port.
+	suffix := ":" + sessionName
+	for key := range d.statusCache {
+		if strings.HasPrefix(key, "opencode-port:") && strings.HasSuffix(key, suffix) {
+			delete(d.statusCache, key)
+		}
 	}
 }
 

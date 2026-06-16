@@ -644,6 +644,55 @@ func TestGlobalTicketStore_RemoveProjectArchivesWholeDir(t *testing.T) {
 	}
 }
 
+// TestGlobalTicketStore_RemoveProject_ClearsAllTickets is the
+// regression test for the orphaned-tickets bug: RemoveProject used
+// to drop the project from g.projects and g.ticketStores but leave
+// every ticket of that project in g.allTickets, so All() / Count() /
+// GetByStatus() kept returning ghosts of the removed project.
+func TestGlobalTicketStore_RemoveProject_ClearsAllTickets(t *testing.T) {
+	setupTmpConfigDir(t)
+	repoDir := filepath.Join(t.TempDir(), "repo")
+	os.MkdirAll(repoDir, 0o755)
+
+	registry := newRegistry()
+	p := &Project{ID: "project-clear", Name: "Clear", RepoPath: repoDir}
+	if err := registry.Add(p); err != nil {
+		t.Fatalf("registry.Add: %v", err)
+	}
+
+	globalStore := NewGlobalTicketStore(registry)
+	globalStore.AddProject(p)
+
+	tk := board.NewTicket("Ghost candidate", p.ID)
+	if err := globalStore.Add(tk); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := globalStore.Save(tk); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	if globalStore.Count() == 0 {
+		t.Fatal("precondition: global store should report > 0 tickets before remove")
+	}
+
+	if err := globalStore.RemoveProject(p.ID); err != nil {
+		t.Fatalf("RemoveProject: %v", err)
+	}
+
+	if got := globalStore.Count(); got != 0 {
+		t.Errorf("Count() after RemoveProject = %d; want 0 (orphaned tickets!)", got)
+	}
+	if all := globalStore.All(); len(all) != 0 {
+		t.Errorf("All() after RemoveProject returned %d tickets; want 0", len(all))
+	}
+	if _, err := globalStore.Get(tk.ID); err != board.ErrTicketNotFound {
+		t.Errorf("Get(removed ticket) error = %v; want ErrTicketNotFound", err)
+	}
+	if got := globalStore.GetByStatus(board.StatusBacklog); len(got) != 0 {
+		t.Errorf("GetByStatus(backlog) returned %d orphaned tickets; want 0", len(got))
+	}
+}
+
 // TestGlobalTicketStore_MoveProject covers the happy path: a ticket
 // in project src is moved to project dst, the source .md is removed,
 // a new .md appears in the destination dir, and a fresh load of each

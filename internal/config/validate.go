@@ -206,7 +206,7 @@ func (c *Config) validateUI(r *ValidationResult) {
 
 // validateOpencode validates the opencode server settings
 func (c *Config) validateOpencode(r *ValidationResult) {
-	if c.Opencode.ServerPort < 0 || c.Opencode.ServerPort > 65535 {
+	if c.Opencode.ServerPort <= 0 || c.Opencode.ServerPort > 65535 {
 		r.AddError("opencode", "server_port",
 			"must be between 1 and 65535",
 			c.Opencode.ServerPort)

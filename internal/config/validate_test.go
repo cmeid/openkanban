@@ -292,6 +292,7 @@ func TestValidate_InvalidServerPort(t *testing.T) {
 		name string
 		port int
 	}{
+		{"zero port", 0},
 		{"negative port", -1},
 		{"port too high", 70000},
 	}
