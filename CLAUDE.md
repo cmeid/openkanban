@@ -54,8 +54,15 @@ internal/
 
 ## Key Flows
 
-**Ticket → Agent spawn:**
-ui.spawnAgent() → terminal.New() → pty.Start() → agent process
+**Ticket → Agent spawn:** the TUI does **not** fork the agent directly. It sends a `Spawn` RPC to `openkanbankd`, which owns the PTY for the agent's lifetime; the TUI attaches via the daemon's binary stream. This is what lets a TUI restart without killing in-progress agents.
+
+```
+ui.spawnAgent() → m.daemon.Spawn (RPC) → openkanbankd handleSpawn → pty.Start → agent
+                ↓
+                m.daemon.Attach (binary stream) → PaneView → TUI rendering
+```
+
+`Spawn` is **idempotent per TicketID** — a second Spawn for an already-owned ticket returns the existing SessionID instead of creating a duplicate. This enforces the 1:1 ticket↔session invariant at the daemon. The TUI's quick-move / drag promotion out of `in_progress` mirrors the same invariant by sending `TicketDone` to the daemon so the session is wound down rather than orphaned. See `internal/daemon/CLAUDE.md` for the two-phase lock pattern and `internal/ui/CLAUDE.md` "Status-mutation wrap-up" for the TUI-side teardown.
 
 **Settings cascade:**
 ticket.Field → project.Settings.Field → config.Defaults.Field
@@ -68,7 +75,8 @@ Scout finds → Librarian reads → You plan → Worker implements → Validator
 
 Context-specific guidance lives in nested CLAUDE.md files:
 - internal/CLAUDE.md - Go patterns, imports, testing
-- internal/ui/CLAUDE.md - BubbleTea patterns
+- internal/ui/CLAUDE.md - BubbleTea patterns, status-mutation wrap-up, daemonAPI shape
+- internal/daemon/CLAUDE.md - openkanbankd internals, Spawn idempotency invariant
 - internal/agent/CLAUDE.md - Agent integration
 - internal/terminal/CLAUDE.md - PTY/terminal handling
 
