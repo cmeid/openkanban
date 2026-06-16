@@ -314,6 +314,71 @@ func TestPaneView_View_UnattachedReturnsBlankGrid(t *testing.T) {
 	}
 }
 
+// TestPaneView_View_AttachFailureOverlay pins the overlay path: when
+// the spawn-time attach exhausts retries and SetLastAttachErr is
+// called, View() returns the actionable failure panel (not the blank
+// grid). The chrome composition above the pane assumes each row is
+// exactly `cols` cells wide — the overlay must respect that contract
+// or the title-bar/status-bar lines shift.
+func TestPaneView_View_AttachFailureOverlay(t *testing.T) {
+	pv := NewPaneView(nil, "T-PV-FAIL", "", nil)
+	defer pv.Close()
+	pv.SetSize(80, 24)
+	pv.SetLastAttachErr(fmt.Errorf("dial failed: connection refused"))
+
+	got := pv.View()
+	if got == "" {
+		t.Fatal("View() with lastAttachErr set returned empty; want overlay grid")
+	}
+
+	lines := strings.Split(got, "\n")
+	if len(lines) != 24 {
+		t.Errorf("row count: got %d want 24", len(lines))
+	}
+	for i, line := range lines {
+		if len(line) != 80 {
+			t.Errorf("row %d: visible width got %d want 80 (line=%q)", i, len(line), line)
+		}
+	}
+
+	wantSubstrings := []string{
+		"Attach failed",
+		"connection refused",
+		"Enter retries",
+		"Ctrl+g back",
+	}
+	for _, want := range wantSubstrings {
+		if !strings.Contains(got, want) {
+			t.Errorf("overlay missing substring %q\nfull view:\n%s", want, got)
+		}
+	}
+}
+
+// TestPaneView_View_AttachFailureCleared pins the inverse: clearing
+// lastAttachErr (via SetLastAttachErr(nil) — the same path successful
+// attach takes) drops the overlay and restores the blank grid for the
+// in-flight case. Without this, a successful Enter-to-retry would
+// still show "Attach failed" until the next render cycle replaced the
+// pane.
+func TestPaneView_View_AttachFailureCleared(t *testing.T) {
+	pv := NewPaneView(nil, "T-PV-CLEAR", "", nil)
+	defer pv.Close()
+	pv.SetSize(80, 24)
+	pv.SetLastAttachErr(fmt.Errorf("transient"))
+	if !strings.Contains(pv.View(), "Attach failed") {
+		t.Fatalf("setup: expected overlay before clear; view=%q", pv.View())
+	}
+
+	pv.SetLastAttachErr(nil)
+	got := pv.View()
+	if strings.Contains(got, "Attach failed") {
+		t.Errorf("overlay still rendered after SetLastAttachErr(nil)\nview:\n%s", got)
+	}
+	if strings.TrimSpace(got) != "" {
+		t.Errorf("after clear, expected blank grid; got non-empty content\nview:\n%s", got)
+	}
+}
+
 // TestBlankPaneView_Dimensions covers the degenerate inputs.
 func TestBlankPaneView_Dimensions(t *testing.T) {
 	tests := []struct {

@@ -185,7 +185,20 @@ type PaneView struct {
 	// gated to fire once per PaneView so a teardown bug never gets
 	// silently rendered as a blank pane.
 	viewLoggedNil bool
+
+	// lastAttachErr surfaces the most recent post-spawn Attach failure
+	// to View() so the user sees an actionable overlay instead of a
+	// blank pane. Stored as atomic.Pointer so it can be set and cleared
+	// without taking p.mu (which Attach/View both hold at various
+	// points). The UI's "Enter to retry" handler keys off LastAttachErr
+	// != nil; a successful attach() clears it back to nil.
+	lastAttachErr atomic.Pointer[attachErrBox]
 }
+
+// attachErrBox wraps an error so atomic.Pointer can carry both "no
+// failure" (nil pointer) and "failure with error X" without nil/typed-
+// nil-interface ambiguity.
+type attachErrBox struct{ err error }
 
 // NewPaneView constructs a fresh PaneView for the daemon-owned session
 // identified by sessionID. info may be nil — in that case the view
@@ -235,6 +248,29 @@ func (p *PaneView) State() PaneViewState {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.state
+}
+
+// SetLastAttachErr records (or clears) the most recent Attach failure.
+// Passing nil clears the failure state. Called by the spawn closure
+// when attachWithRetry has exhausted its retries, and cleared inside
+// attach() on a successful state transition to PaneViewAttached.
+func (p *PaneView) SetLastAttachErr(err error) {
+	if err == nil {
+		p.lastAttachErr.Store(nil)
+		return
+	}
+	p.lastAttachErr.Store(&attachErrBox{err: err})
+}
+
+// LastAttachErr returns the most recent Attach failure, or nil if the
+// last Attach succeeded (or has never been attempted). The UI uses this
+// in conjunction with vt==nil to decide between the in-flight blank
+// pane and the actionable failure overlay.
+func (p *PaneView) LastAttachErr() error {
+	if box := p.lastAttachErr.Load(); box != nil {
+		return box.err
+	}
+	return nil
 }
 
 // SetPaneStateForTest forces the view's state field, bypassing the
@@ -663,6 +699,10 @@ func (p *PaneView) attach(ctx context.Context, takeover bool) error {
 	p.attachR = r
 	p.dirty = true
 	p.cachedView = ""
+	// Successful attach wipes any prior failure record so the next
+	// View() drops the failure overlay; safe to do here because we
+	// hold p.mu and a paired SetLastAttachErr is atomic.
+	p.lastAttachErr.Store(nil)
 	// detachCh might have been closed on a prior attach; refresh it.
 	select {
 	case <-p.detachCh:
@@ -1314,6 +1354,16 @@ func (p *PaneView) View() string {
 			log.Printf("openkanban paneview: View() vt is nil session=%s", p.sessionID)
 			p.viewLoggedNil = true
 		}
+		// If we KNOW attach failed (post-spawn retries exhausted),
+		// render an actionable overlay instead of blank spaces — the
+		// user is otherwise stuck in ModeAgentView with no signal
+		// about why nothing is happening. Two-pred guard: vt==nil
+		// alone is also true mid-flight on a successful attach
+		// (snapshot hasn't landed yet); the LastAttachErr() check
+		// keeps the overlay out of that path.
+		if err := p.LastAttachErr(); err != nil {
+			return attachFailureOverlay(p.width, p.height, err)
+		}
 		// Return a properly-sized blank rather than "". The model
 		// flips to ModeAgentView synchronously on the PaneViewUnattached
 		// re-attach branch (see Model.spawnAgent), so renderAgentView
@@ -1354,6 +1404,98 @@ func blankPaneView(cols, rows int) string {
 			b.WriteByte('\n')
 		}
 		b.WriteString(line)
+	}
+	return b.String()
+}
+
+// attachFailureOverlay returns a cols × rows grid (same dimensional
+// contract as blankPaneView, so chrome composition above doesn't shift)
+// with a centered ASCII box reporting the attach failure and the retry
+// hint. Pure ASCII so byte count == display cell count — no surprises
+// for the standardRenderer that downstream chrome alignment depends on.
+//
+// On panes too narrow for a useful box, falls back to blankPaneView
+// (the failure is logged elsewhere; we never want a half-rendered
+// overlay that shifts the chrome).
+func attachFailureOverlay(cols, rows int, err error) string {
+	if cols <= 0 || rows <= 0 {
+		return ""
+	}
+	msg := "(unknown error)"
+	if err != nil {
+		msg = err.Error()
+	}
+	const (
+		title  = "Attach failed"
+		footer = "Enter retries / Ctrl+g back"
+	)
+
+	boxW := 52
+	if boxW > cols-2 {
+		boxW = cols - 2
+	}
+	const minBoxW = 30
+	if boxW < minBoxW {
+		return blankPaneView(cols, rows)
+	}
+	innerW := boxW - 4 // "| " + text + " |"
+	if len(msg) > innerW {
+		msg = msg[:innerW-1] + "."
+	}
+
+	centered := func(s string) string {
+		if len(s) > innerW {
+			s = s[:innerW]
+		}
+		leftP := (innerW - len(s)) / 2
+		rightP := innerW - len(s) - leftP
+		return "| " + strings.Repeat(" ", leftP) + s + strings.Repeat(" ", rightP) + " |"
+	}
+	border := "+" + strings.Repeat("-", boxW-2) + "+"
+	blankRow := "|" + strings.Repeat(" ", boxW-2) + "|"
+
+	boxRows := []string{
+		border,
+		centered(title),
+		blankRow,
+		centered(msg),
+		blankRow,
+		centered(footer),
+		border,
+	}
+	if rows < len(boxRows) {
+		// pane too short for the full box — collapse the breathing rows
+		boxRows = []string{
+			border,
+			centered(title),
+			centered(msg),
+			centered(footer),
+			border,
+		}
+		if rows < len(boxRows) {
+			return blankPaneView(cols, rows)
+		}
+	}
+
+	leftPad := (cols - boxW) / 2
+	rightPad := cols - boxW - leftPad
+	leftS := strings.Repeat(" ", leftPad)
+	rightS := strings.Repeat(" ", rightPad)
+	fullBlank := strings.Repeat(" ", cols)
+	topBlanks := (rows - len(boxRows)) / 2
+
+	var b strings.Builder
+	b.Grow((cols + 1) * rows)
+	for i := 0; i < rows; i++ {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		boxIdx := i - topBlanks
+		if boxIdx >= 0 && boxIdx < len(boxRows) {
+			b.WriteString(leftS + boxRows[boxIdx] + rightS)
+		} else {
+			b.WriteString(fullBlank)
+		}
 	}
 	return b.String()
 }
