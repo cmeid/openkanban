@@ -14,6 +14,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/techdufus/openkanban/internal/agent"
+	"github.com/techdufus/openkanban/internal/board"
 	"github.com/techdufus/openkanban/internal/config"
 	"github.com/techdufus/openkanban/internal/daemon"
 	"github.com/techdufus/openkanban/internal/daemonclient"
@@ -265,12 +266,94 @@ func DeleteProject(nameOrID string) error {
 		return fmt.Errorf("project not found: %s", nameOrID)
 	}
 
+	// Daemon-cleanup pass BEFORE the registry delete: any live daemon
+	// session whose TicketID belongs to this project must be wound down
+	// so we don't orphan sessions whose backing tickets are about to
+	// disappear from disk. We load the project's ticket store to build
+	// the set of TicketIDs we own, then ask the daemon to TicketDone
+	// each one that's currently live.
+	//
+	// Failure-tolerance contract:
+	//   - ticket-store load failure → log + skip the daemon pass and
+	//     proceed with the registry delete. Better to let the user
+	//     finish removing a corrupted project than wedge them on a
+	//     parser error.
+	//   - daemon not running → no sessions to clean up; proceed.
+	//   - daemon up but TicketDone for an individual ticket fails →
+	//     log and continue with the rest; the daemon's own
+	//     handleTicketDone is idempotent and a future restart will
+	//     reap stragglers, so a transient RPC error must not block
+	//     the user-visible delete.
+	cleanupDaemonSessionsForProject(target)
+
 	if err := registry.Delete(target.ID); err != nil {
 		return fmt.Errorf("failed to delete project: %w", err)
 	}
 
 	fmt.Printf("Deleted project '%s' (%s)\n", target.Name, target.RepoPath)
 	return nil
+}
+
+// cleanupDaemonSessionsForProject is the daemon half of DeleteProject.
+// Split out so the failure-tolerance is centralised: every failure
+// inside this function is logged and swallowed — the caller continues
+// with the registry delete regardless.
+func cleanupDaemonSessionsForProject(target *project.Project) {
+	store, err := project.LoadTicketStore(target)
+	if err != nil {
+		log.Printf("openkanban: skipping daemon cleanup for project %s: load ticket store: %v",
+			target.ID, err)
+		return
+	}
+
+	owned := make(map[board.TicketID]struct{}, len(store.Tickets))
+	for id := range store.Tickets {
+		owned[id] = struct{}{}
+	}
+	if len(owned) == 0 {
+		return
+	}
+
+	dialCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client, err := daemonclient.NewNoAutostart(dialCtx)
+	if err != nil {
+		// Daemon not running is the expected fallback path — nothing
+		// to clean up, no problem. Any other error gets logged but is
+		// still swallowed so the registry delete can proceed.
+		if !errors.Is(err, daemonclient.ErrDaemonUnavailable) {
+			log.Printf("openkanban: skipping daemon cleanup for project %s: dial daemon: %v",
+				target.ID, err)
+		}
+		return
+	}
+	defer client.Close()
+
+	listCtx, listCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer listCancel()
+	list, err := client.List(listCtx)
+	if err != nil {
+		log.Printf("openkanban: skipping daemon cleanup for project %s: list sessions: %v",
+			target.ID, err)
+		return
+	}
+
+	for _, info := range list.Sessions {
+		tid := board.TicketID(info.TicketID)
+		if tid == "" {
+			continue
+		}
+		if _, ok := owned[tid]; !ok {
+			continue
+		}
+		doneCtx, doneCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, derr := client.TicketDone(doneCtx, info.TicketID)
+		doneCancel()
+		if derr != nil {
+			log.Printf("openkanban: daemon TicketDone for %s (project %s) failed: %v",
+				info.TicketID, target.ID, derr)
+		}
+	}
 }
 
 // redirectTUILog points the default log package at a file under
