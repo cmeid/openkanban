@@ -383,10 +383,22 @@ type OwnsReq struct {
 }
 
 // OwnsResp answers an OwnsReq. If Owned is true, SessionID is the
-// daemon-internal handle the client may Attach to.
+// daemon-internal handle the client may Attach to, and SessionName is
+// the OPENKANBAN_SESSION value the daemon stamped into the agent's
+// env at spawn time. SessionName is the canonical key for the status
+// file the hook is writing to — the Owns fast-path must use this
+// instead of recomputing locally, otherwise a session spawned by a
+// pre-fix binary (which baked the Claude UUID into the env) will
+// have its file lookup diverge from the live hook's write path.
+//
+// SessionName is omitempty for backwards compat: an older daemon
+// returns "" here, and the client falls back to its local
+// sessionNameFor() computation — same behavior as before this field
+// existed.
 type OwnsResp struct {
-	Owned     bool   `json:"owned"`
-	SessionID string `json:"session_id"`
+	Owned       bool   `json:"owned"`
+	SessionID   string `json:"session_id"`
+	SessionName string `json:"session_name,omitempty"`
 }
 
 // AttachReq requests that the connection upgrade to binary mode and

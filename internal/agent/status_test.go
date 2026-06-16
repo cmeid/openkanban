@@ -438,7 +438,7 @@ func TestDetectStatusWithActivity_OverridesWaiting(t *testing.T) {
 			// Invalidate the 500ms cache between subtests so each call
 			// re-reads the (unchanged) file rather than serving a hit.
 			d.InvalidateCache("sess")
-			got := d.DetectStatusWithActivity("claude", "sess", "", 0, true, "", tt.lastActivity)
+			got := d.DetectStatusWithActivity("claude", "sess", "sess", "", 0, true, "", tt.lastActivity)
 			if got != tt.want {
 				t.Errorf("got %q, want %q", got, tt.want)
 			}
@@ -474,7 +474,7 @@ func TestDetectStatusWithActivity_NoDowngrade(t *testing.T) {
 			d.InvalidateCache("sess")
 			// Recent activity is present; the override must NOT touch
 			// non-waiting verdicts.
-			got := d.DetectStatusWithActivity("claude", "sess", "", 0, true, "", time.Now())
+			got := d.DetectStatusWithActivity("claude", "sess", "sess", "", 0, true, "", time.Now())
 			if got != tt.want {
 				t.Errorf("got %q, want %q", got, tt.want)
 			}
@@ -488,8 +488,50 @@ func TestDetectStatusWithActivity_NoDowngrade(t *testing.T) {
 // AgentNone and the override must respect that.
 func TestDetectStatusWithActivity_ProcessNotRunning(t *testing.T) {
 	d := NewStatusDetector()
-	got := d.DetectStatusWithActivity("claude", "sess", "", 0, false, "", time.Now())
+	got := d.DetectStatusWithActivity("claude", "sess", "", "", 0, false, "", time.Now())
 	if got != board.AgentNone {
 		t.Errorf("got %q, want AgentNone when process not running", got)
+	}
+}
+
+// TestDetectStatusWithActivity_FileKeyVsAPIKey pins the fix for the
+// bug where the file-lookup key drifted from OPENKANBAN_SESSION after
+// the Claude UUID back-fill in pollAgentStatusesAsync. The hook writes
+// to ~/.cache/openkanban-status/<OPENKANBAN_SESSION>.status (baked at
+// spawn — usually the branch name). The detector must look up the
+// same file regardless of any UUID we may also be tracking for
+// --resume / opencode HTTP. Pre-fix, the poll passed the UUID as
+// sessionID, the file was missing under that key, and the detector
+// fell through to terminal-content scraping, which misclassifies
+// Claude's input-prompt border (━) as "working".
+func TestDetectStatusWithActivity_FileKeyVsAPIKey(t *testing.T) {
+	tmpDir := t.TempDir()
+	d := NewStatusDetector()
+	d.statusDirs = []string{tmpDir}
+
+	// Hook wrote the truth under the branch-keyed name (what
+	// OPENKANBAN_SESSION carries in the live agent's env).
+	branchKey := "feat/x"
+	if err := os.MkdirAll(filepath.Join(tmpDir, "feat"), 0755); err != nil {
+		t.Fatalf("mkdir feat: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, branchKey+".status"), []byte("idle"), 0644); err != nil {
+		t.Fatalf("write idle: %v", err)
+	}
+
+	// Terminal content is the noisy fallback that mis-classifies an
+	// idle Claude prompt as "working" via the ━ border heuristic.
+	// Including it asserts the detector REACHED the file (skipping
+	// the fallback) rather than coincidentally returning idle.
+	terminalContent := "tools: read, write, bash\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n> "
+
+	// API session ID (the Claude UUID back-filled by FindClaudeSession)
+	// is DIFFERENT from the file key. The detector must not use it
+	// to look up the file.
+	apiSessionID := "11111111-2222-3333-4444-555555555555"
+
+	got := d.DetectStatusWithActivity("claude", branchKey, apiSessionID, "", 0, true, terminalContent, time.Now())
+	if got != board.AgentIdle {
+		t.Errorf("got %q, want AgentIdle (file lookup must use the branch-keyed name, not the API UUID)", got)
 	}
 }

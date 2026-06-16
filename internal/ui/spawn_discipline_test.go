@@ -446,9 +446,14 @@ func TestPrepareSpawnWith_OwnsFastPath_NoAgentSessionID_Skips(t *testing.T) {
 }
 
 // TestSessionNameFor mirrors the priority used inside prepareSpawnWith
-// (AgentSessionID > branchName > ticket.ID) so the fast-path and
-// regular-path PaneViews agree on identity. Pinned as a unit test so
-// future refactors of either branch can't drift apart silently.
+// (branchName > ticket.ID) so the fast-path and regular-path PaneViews
+// agree on identity. Pinned as a unit test so future refactors of
+// either branch can't drift apart silently.
+//
+// AgentSessionID is deliberately NOT in the priority chain — see the
+// docstring on sessionNameFor and the field comments in
+// pollAgentStatusesAsync.paneInfo for the bug a UUID-priority created
+// (file-key vs OPENKANBAN_SESSION mid-session divergence).
 func TestSessionNameFor(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -457,10 +462,10 @@ func TestSessionNameFor(t *testing.T) {
 		want       string
 	}{
 		{
-			name:       "uuid present wins",
+			name:       "branch name wins even when UUID is set",
 			ticket:     &board.Ticket{ID: "T-1", AgentSessionID: "uuid-1"},
 			branchName: "feat/x",
-			want:       "uuid-1",
+			want:       "feat/x",
 		},
 		{
 			name:       "branch name when no uuid",
@@ -469,10 +474,16 @@ func TestSessionNameFor(t *testing.T) {
 			want:       "feat/y",
 		},
 		{
-			name:       "ticket id when neither set",
-			ticket:     &board.Ticket{ID: "T-3"},
+			name:       "ticket id when no branch (UUID present but ignored)",
+			ticket:     &board.Ticket{ID: "T-3", AgentSessionID: "uuid-3"},
 			branchName: "",
 			want:       "T-3",
+		},
+		{
+			name:       "ticket id when neither set",
+			ticket:     &board.Ticket{ID: "T-4"},
+			branchName: "",
+			want:       "T-4",
 		},
 	}
 	for _, tt := range tests {
@@ -481,6 +492,151 @@ func TestSessionNameFor(t *testing.T) {
 				t.Errorf("sessionNameFor = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestPrepareSpawnWith_OwnsFastPath_UsesDaemonSessionName pins the
+// fix for the file-key/env-key divergence bug — but specifically for
+// the Owns fast-path. The fast-path used to call
+// sessionNameFor(ticket, branchName) locally to set
+// PaneView.SessionName, which would silently differ from the daemon's
+// stored value (and therefore from OPENKANBAN_SESSION in the live
+// agent's env) for sessions originally spawned by a pre-fix binary
+// that used the UUID-priority chain. After the fix, OwnsResp carries
+// SessionName and the fast-path uses it. This test guards that
+// invariant.
+//
+// Mechanics: stub Owns with a SessionName that DIFFERS from what
+// sessionNameFor would compute locally. Assert PaneView.SessionName()
+// reports the daemon's value, not the local guess.
+func TestPrepareSpawnWith_OwnsFastPath_UsesDaemonSessionName(t *testing.T) {
+	t.Setenv("OPENKANBAN_CONFIG_DIR", t.TempDir())
+	t.Setenv("OPENKANBAN_DAEMON_SOCK", t.TempDir()+"/missing.sock")
+	t.Setenv("OPENKANBAN_DAEMON_BINARY", "/usr/bin/true")
+
+	proj := &project.Project{ID: "test", RepoPath: t.TempDir()}
+	globalStore := project.NewGlobalTicketStore(nil)
+	globalStore.AddProject(proj)
+
+	const wantUUID = "deadbeef-cafe-babe-1234-567890abcdef"
+	const wantDaemonSID = "sid-prefix-daemon"
+	// Daemon stored sessionName (= OPENKANBAN_SESSION in the live
+	// hook's env). Pre-fix sessions baked the Claude UUID here; the
+	// fast-path must surface this value verbatim instead of
+	// recomputing branchName locally.
+	const daemonSessionName = "legacy-uuid-from-prefix-binary"
+	ticket := &board.Ticket{
+		ID:             "T-OWNS-DAEMON-NAME",
+		Title:          "fast-path SessionName preference",
+		ProjectID:      proj.ID,
+		Status:         board.StatusInProgress,
+		AgentSessionID: wantUUID,
+		BranchName:     "task/some-branch",
+	}
+	if err := globalStore.Add(ticket); err != nil {
+		t.Fatalf("Add ticket: %v", err)
+	}
+
+	stub := &spawnDisciplineStubAPI{
+		ownsResp: daemon.OwnsResp{
+			Owned:       true,
+			SessionID:   wantDaemonSID,
+			SessionName: daemonSessionName,
+		},
+	}
+
+	m := &Model{
+		globalStore:  globalStore,
+		daemon:       stub,
+		panes:        map[board.TicketID]*daemonclient.PaneView{},
+		daemonClient: nil,
+		width:        120,
+		height:       40,
+		config:       &config.Config{Behavior: config.BehaviorSettings{}, Agents: map[string]config.AgentConfig{}},
+		worktreeMgrs: nil,
+	}
+
+	agentCfg := config.AgentConfig{Command: "claude"}
+	cmd := m.prepareSpawnWith(ticket, proj, agentCfg, spawnPlan{})
+	if cmd == nil {
+		t.Fatal("prepareSpawnWith returned nil cmd")
+	}
+	msg := cmd()
+
+	ready, ok := msg.(spawnReadyMsg)
+	if !ok {
+		t.Fatalf("msg type = %T, want spawnReadyMsg; msg = %#v", msg, msg)
+	}
+	if got := ready.pane.SessionName(); got != daemonSessionName {
+		t.Errorf("pane.SessionName() = %q, want %q (fast-path must prefer daemon's stored SessionName over local recompute)",
+			got, daemonSessionName)
+	}
+}
+
+// TestPrepareSpawnWith_OwnsFastPath_EmptyDaemonName_FallsBack covers
+// the older-daemon compat path: an older `openkanbankd` that doesn't
+// know about the new SessionName field returns "" for it. The
+// fast-path must fall back to local sessionNameFor() instead of
+// silently propagating an empty string to the PaneView.
+func TestPrepareSpawnWith_OwnsFastPath_EmptyDaemonName_FallsBack(t *testing.T) {
+	t.Setenv("OPENKANBAN_CONFIG_DIR", t.TempDir())
+	t.Setenv("OPENKANBAN_DAEMON_SOCK", t.TempDir()+"/missing.sock")
+	t.Setenv("OPENKANBAN_DAEMON_BINARY", "/usr/bin/true")
+
+	proj := &project.Project{ID: "test", RepoPath: t.TempDir()}
+	globalStore := project.NewGlobalTicketStore(nil)
+	globalStore.AddProject(proj)
+
+	const wantUUID = "11111111-aaaa-bbbb-cccc-222222222222"
+	const wantDaemonSID = "sid-old-daemon"
+	const branchName = "task/older-daemon"
+	ticket := &board.Ticket{
+		ID:             "T-OWNS-OLD-DAEMON",
+		Title:          "older-daemon SessionName=empty fallback",
+		ProjectID:      proj.ID,
+		Status:         board.StatusInProgress,
+		AgentSessionID: wantUUID,
+		BranchName:     branchName,
+	}
+	if err := globalStore.Add(ticket); err != nil {
+		t.Fatalf("Add ticket: %v", err)
+	}
+
+	stub := &spawnDisciplineStubAPI{
+		ownsResp: daemon.OwnsResp{
+			Owned:     true,
+			SessionID: wantDaemonSID,
+			// SessionName intentionally empty — emulates older daemon
+		},
+	}
+
+	m := &Model{
+		globalStore:  globalStore,
+		daemon:       stub,
+		panes:        map[board.TicketID]*daemonclient.PaneView{},
+		daemonClient: nil,
+		width:        120,
+		height:       40,
+		config:       &config.Config{Behavior: config.BehaviorSettings{}, Agents: map[string]config.AgentConfig{}},
+		worktreeMgrs: nil,
+	}
+
+	agentCfg := config.AgentConfig{Command: "claude"}
+	cmd := m.prepareSpawnWith(ticket, proj, agentCfg, spawnPlan{})
+	if cmd == nil {
+		t.Fatal("prepareSpawnWith returned nil cmd")
+	}
+	msg := cmd()
+
+	ready, ok := msg.(spawnReadyMsg)
+	if !ok {
+		t.Fatalf("msg type = %T, want spawnReadyMsg; msg = %#v", msg, msg)
+	}
+	// With daemon returning empty, fall back to sessionNameFor — which
+	// is branchName when set, per the new priority.
+	if got := ready.pane.SessionName(); got != branchName {
+		t.Errorf("pane.SessionName() = %q, want %q (empty daemon SessionName must fall back to sessionNameFor)",
+			got, branchName)
 	}
 }
 

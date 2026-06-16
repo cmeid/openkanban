@@ -55,19 +55,43 @@ func NewStatusDetector() *StatusDetector {
 	}
 }
 
-func (d *StatusDetector) DetectStatus(agentType, sessionID string, processRunning bool, terminalContent string) board.AgentStatus {
-	return d.DetectStatusWithPort(agentType, sessionID, "", 0, processRunning, terminalContent)
+// DetectStatus / DetectStatusWithPath / DetectStatusWithPort take a
+// `sessionName` whose meaning is **the OPENKANBAN_SESSION env var
+// baked into the agent at spawn time** — i.e. the name the status
+// hook (`openkanban status set`) uses to choose its file path. For
+// agents with a separate API-side identity (opencode's HTTP
+// session.id), use the longer DetectStatusWithPortAPI form so the
+// file lookup and the API lookup don't collide.
+//
+// The shorthand wrappers below pass `sessionName` for both — fine for
+// the common case where the env var and the API id are the same
+// string. The dedicated production caller (pollAgentStatusesAsync)
+// keeps them separate because Claude's UUID back-fill (commit
+// c718699) makes ticket.AgentSessionID diverge from the env var
+// mid-session.
+func (d *StatusDetector) DetectStatus(agentType, sessionName string, processRunning bool, terminalContent string) board.AgentStatus {
+	return d.DetectStatusWithPortAPI(agentType, sessionName, sessionName, "", 0, processRunning, terminalContent)
 }
 
-func (d *StatusDetector) DetectStatusWithPath(agentType, sessionID, worktreePath string, processRunning bool, terminalContent string) board.AgentStatus {
-	return d.DetectStatusWithPort(agentType, sessionID, worktreePath, 0, processRunning, terminalContent)
+func (d *StatusDetector) DetectStatusWithPath(agentType, sessionName, worktreePath string, processRunning bool, terminalContent string) board.AgentStatus {
+	return d.DetectStatusWithPortAPI(agentType, sessionName, sessionName, worktreePath, 0, processRunning, terminalContent)
 }
 
-func (d *StatusDetector) DetectStatusWithPort(agentType, sessionID, worktreePath string, port int, processRunning bool, terminalContent string) board.AgentStatus {
+func (d *StatusDetector) DetectStatusWithPort(agentType, sessionName, worktreePath string, port int, processRunning bool, terminalContent string) board.AgentStatus {
+	return d.DetectStatusWithPortAPI(agentType, sessionName, sessionName, worktreePath, port, processRunning, terminalContent)
+}
+
+// DetectStatusWithPortAPI separates the file-lookup key from the
+// API-lookup key. `fileSessionName` matches the OPENKANBAN_SESSION
+// env var (what the status hook wrote with). `apiSessionID` is the
+// opencode HTTP session id (typically a UUID, distinct from the env
+// var). Pass the same string for both when they're not separately
+// tracked — see the wrappers above.
+func (d *StatusDetector) DetectStatusWithPortAPI(agentType, fileSessionName, apiSessionID, worktreePath string, port int, processRunning bool, terminalContent string) board.AgentStatus {
 	// Read the status file first so terminal markers (completed/error)
 	// survive a process exit. Transient states like "working" still
 	// require the process to be running, otherwise they're stale.
-	fileStatus := d.readStatusFile(sessionID)
+	fileStatus := d.readStatusFile(fileSessionName)
 	if fileStatus != board.AgentNone {
 		if processRunning || fileStatus == board.AgentCompleted || fileStatus == board.AgentError {
 			return fileStatus
@@ -79,7 +103,11 @@ func (d *StatusDetector) DetectStatusWithPort(agentType, sessionID, worktreePath
 	}
 
 	if agentType == "opencode" && port > 0 {
-		return d.queryOpencodeAPIOnPort(sessionID, port)
+		apiKey := apiSessionID
+		if apiKey == "" {
+			apiKey = fileSessionName
+		}
+		return d.queryOpencodeAPIOnPort(apiKey, port)
 	}
 
 	if terminalContent != "" {
@@ -103,21 +131,28 @@ func (d *StatusDetector) DetectStatusWithPort(agentType, sessionID, worktreePath
 const WaitingActivityTTL = 60 * time.Second
 
 // DetectStatusWithActivity layers a PTY-activity override on top of
-// DetectStatusWithPort to close the Claude Code hook gap: Notification
-// fires (permission prompt) → file = "waiting" → user approves → tool
-// runs (no hook for the duration) → PostToolUse finally fires. During
-// the gap, a long-running tool leaves status pinned at "waiting" even
-// though the agent's spinner / output is actively streaming bytes
-// through the PTY. When the file says "waiting" but lastActivity is
-// within WaitingActivityTTL, override to "working".
+// DetectStatusWithPortAPI to close the Claude Code hook gap:
+// Notification fires (permission prompt) → file = "waiting" → user
+// approves → tool runs (no hook for the duration) → PostToolUse
+// finally fires. During the gap, a long-running tool leaves status
+// pinned at "waiting" even though the agent's spinner / output is
+// actively streaming bytes through the PTY. When the file says
+// "waiting" but lastActivity is within WaitingActivityTTL, override
+// to "working".
 //
 // The override is intentionally narrow: only "waiting" → "working".
 // Other states ("working", "idle", "completed", "error") and the
 // file's absence (AgentNone) pass through untouched. lastActivity
 // of zero (no daemon report yet) also passes through — the file is
 // authoritative until the daemon has spoken.
-func (d *StatusDetector) DetectStatusWithActivity(agentType, sessionID, worktreePath string, port int, processRunning bool, terminalContent string, lastActivity time.Time) board.AgentStatus {
-	status := d.DetectStatusWithPort(agentType, sessionID, worktreePath, port, processRunning, terminalContent)
+//
+// `fileSessionName` and `apiSessionID` are separated for the same
+// reason DetectStatusWithPortAPI separates them: pollAgentStatusesAsync
+// needs to look up the hook's file under OPENKANBAN_SESSION (often
+// the branch name) while still using the back-filled UUID for the
+// opencode HTTP API call.
+func (d *StatusDetector) DetectStatusWithActivity(agentType, fileSessionName, apiSessionID, worktreePath string, port int, processRunning bool, terminalContent string, lastActivity time.Time) board.AgentStatus {
+	status := d.DetectStatusWithPortAPI(agentType, fileSessionName, apiSessionID, worktreePath, port, processRunning, terminalContent)
 	if status != board.AgentWaiting {
 		return status
 	}
