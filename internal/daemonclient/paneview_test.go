@@ -511,9 +511,10 @@ func TestTranslateKey_EnterAndShiftEnter(t *testing.T) {
 			want: []byte{27, '\r'},
 		},
 	}
+	pv := &PaneView{}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := translateKey(tt.msg)
+			got := pv.translateKey(tt.msg)
 			if !bytes.Equal(got, tt.want) {
 				t.Errorf("translateKey(%v) = %q, want %q", tt.msg, got, tt.want)
 			}

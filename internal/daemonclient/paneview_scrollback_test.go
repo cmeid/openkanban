@@ -1,8 +1,11 @@
 package daemonclient
 
 import (
+	"bytes"
 	"fmt"
 	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/techdufus/openkanban/internal/daemon"
 	"github.com/techdufus/openkanban/internal/terminal"
@@ -112,6 +115,84 @@ func TestPaneView_SnapshotApply_AltScreenRedrawSkipsScrollback(t *testing.T) {
 	pv.mu.Unlock()
 	if got != 0 {
 		t.Fatalf("scrollback.Len() = %d during alt-screen apply, want 0", got)
+	}
+}
+
+// TestPaneView_TranslateKey_DECCKM verifies the client-side mirror of
+// the application-cursor-keys branch. Arrow keys must encode as SS3
+// (ESC O A/B/C/D) when DECCKM is set, CSI otherwise. Without this,
+// Claude Code (which runs with DECCKM set) treats openkanban's arrows
+// as generic cursor-up keystrokes in a text input, mutating its visible
+// chat view instead of navigating prompt history.
+func TestPaneView_TranslateKey_DECCKM(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  tea.KeyMsg
+		on   []byte
+		off  []byte
+	}{
+		{name: "Up", msg: tea.KeyMsg{Type: tea.KeyUp}, on: []byte("\x1bOA"), off: []byte("\x1b[A")},
+		{name: "Down", msg: tea.KeyMsg{Type: tea.KeyDown}, on: []byte("\x1bOB"), off: []byte("\x1b[B")},
+		{name: "Right", msg: tea.KeyMsg{Type: tea.KeyRight}, on: []byte("\x1bOC"), off: []byte("\x1b[C")},
+		{name: "Left", msg: tea.KeyMsg{Type: tea.KeyLeft}, on: []byte("\x1bOD"), off: []byte("\x1b[D")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name+"/off", func(t *testing.T) {
+			pv := &PaneView{}
+			got := pv.translateKey(tt.msg)
+			if !bytes.Equal(got, tt.off) {
+				t.Errorf("DECCKM off: translateKey(%v) = %q, want %q", tt.msg, got, tt.off)
+			}
+		})
+		t.Run(tt.name+"/on", func(t *testing.T) {
+			pv := &PaneView{}
+			pv.cursorAppMode.Store(true)
+			got := pv.translateKey(tt.msg)
+			if !bytes.Equal(got, tt.on) {
+				t.Errorf("DECCKM on: translateKey(%v) = %q, want %q", tt.msg, got, tt.on)
+			}
+		})
+	}
+}
+
+// TestPaneView_CursorAppMode_TracksDECCKMBytes exercises the full
+// integration: feed ESC[?1h / ESC[?1l through the local emulator via
+// applyOutput, verify the EnableMode/DisableMode callbacks fire and
+// translateKey sees the updated flag. Mirrors
+// internal/terminal.TestPaneCursorAppModeCallback for the client path.
+func TestPaneView_CursorAppMode_TracksDECCKMBytes(t *testing.T) {
+	pv := &PaneView{width: 80, height: 24}
+	pv.mu.Lock()
+	pv.initEmulatorLocked()
+	pv.mu.Unlock()
+	t.Cleanup(func() {
+		pv.mu.Lock()
+		pv.teardownEmulatorLocked()
+		pv.mu.Unlock()
+	})
+
+	if pv.cursorAppMode.Load() {
+		t.Fatalf("cursorAppMode before any DECCKM byte = true, want false")
+	}
+	if got := pv.translateKey(tea.KeyMsg{Type: tea.KeyUp}); !bytes.Equal(got, []byte("\x1b[A")) {
+		t.Fatalf("baseline Up encoding = %q, want %q", got, "\x1b[A")
+	}
+
+	pv.applyOutput([]byte("\x1b[?1h"))
+	if !pv.cursorAppMode.Load() {
+		t.Fatalf("after ESC[?1h, cursorAppMode = false, want true")
+	}
+	if got := pv.translateKey(tea.KeyMsg{Type: tea.KeyUp}); !bytes.Equal(got, []byte("\x1bOA")) {
+		t.Errorf("DECCKM-on Up encoding = %q, want %q", got, "\x1bOA")
+	}
+
+	pv.applyOutput([]byte("\x1b[?1l"))
+	if pv.cursorAppMode.Load() {
+		t.Fatalf("after ESC[?1l, cursorAppMode = true, want false")
+	}
+	if got := pv.translateKey(tea.KeyMsg{Type: tea.KeyUp}); !bytes.Equal(got, []byte("\x1b[A")) {
+		t.Errorf("post-reset Up encoding = %q, want %q", got, "\x1b[A")
 	}
 }
 

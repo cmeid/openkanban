@@ -15,6 +15,7 @@ import (
 
 	"github.com/atotto/clipboard"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 	xvt "github.com/charmbracelet/x/vt"
 	"github.com/creack/pty"
 
@@ -123,6 +124,14 @@ type Pane struct {
 	// via the Callbacks.CursorVisibility hook. Atomic so the goroutine
 	// that drives the callback can safely write while renderers read.
 	cursorHidden atomic.Bool
+
+	// cursorAppMode tracks DECCKM (application cursor keys mode). When
+	// the inner agent enables it via ESC[?1h, arrow keys must be encoded
+	// as SS3 (ESC O A/B/C/D) instead of CSI (ESC [ A/B/C/D). Maintained
+	// via the EnableMode/DisableMode callbacks below, which fire
+	// SYNCHRONOUSLY inside vt.Write — must stay lock-free re: p.mu, hence
+	// the atomic.
+	cursorAppMode atomic.Bool
 
 	// forwardNotifications gates the OSC 9 handler. When true, an OSC 9
 	// sequence emitted by the agent is forwarded to notify.Send (which
@@ -447,8 +456,19 @@ func (p *Pane) Start(command string, args ...string) tea.Cmd {
 					})
 				}
 			},
+			EnableMode: func(mode ansi.Mode) {
+				if mode == ansi.ModeCursorKeys {
+					p.cursorAppMode.Store(true)
+				}
+			},
+			DisableMode: func(mode ansi.Mode) {
+				if mode == ansi.ModeCursorKeys {
+					p.cursorAppMode.Store(false)
+				}
+			},
 		})
 		p.cursorHidden.Store(false)
+		p.cursorAppMode.Store(false)
 		p.registerTitleHandlersUnlocked()
 		p.startDrainUnlocked()
 
@@ -518,8 +538,19 @@ func (p *Pane) StartHeadless(command string, args []string, extraEnv []string) e
 				})
 			}
 		},
+		EnableMode: func(mode ansi.Mode) {
+			if mode == ansi.ModeCursorKeys {
+				p.cursorAppMode.Store(true)
+			}
+		},
+		DisableMode: func(mode ansi.Mode) {
+			if mode == ansi.ModeCursorKeys {
+				p.cursorAppMode.Store(false)
+			}
+		},
 	})
 	p.cursorHidden.Store(false)
+	p.cursorAppMode.Store(false)
 	p.registerTitleHandlersUnlocked()
 	p.startDrainUnlocked()
 
@@ -1492,7 +1523,14 @@ func (p *Pane) scrollDown(lines int) {
 	p.dirty = true
 }
 
-// translateKey converts Bubbletea KeyMsg to PTY byte sequences
+// translateKey converts Bubbletea KeyMsg to PTY byte sequences.
+//
+// Cursor/arrow keys honor DECCKM (application cursor keys mode): when
+// the inner emulator has it set (CC and most modern TUIs enable it via
+// ESC[?1h), we emit SS3 sequences (ESC O A/B/C/D) instead of CSI
+// (ESC [ A/B/C/D). This matches iTerm2 / xterm / charm/x/vt's own
+// SendKey behavior; without it, arrows fall into whatever default the
+// inner app applies to a "normal-mode" arrow keystroke.
 func (p *Pane) translateKey(msg tea.KeyMsg) []byte {
 	key := msg.String()
 
@@ -1506,6 +1544,8 @@ func (p *Pane) translateKey(msg tea.KeyMsg) []byte {
 	case len(key) == 5 && key[:4] == "alt+" && key[4] >= 'a' && key[4] <= 'z':
 		return []byte{27, key[4]}
 	}
+
+	appCursor := p.cursorAppMode.Load()
 
 	// Handle special keys
 	switch msg.Type {
@@ -1526,12 +1566,24 @@ func (p *Pane) translateKey(msg tea.KeyMsg) []byte {
 	case tea.KeyShiftTab:
 		return []byte("\x1b[Z")
 	case tea.KeyUp:
+		if appCursor {
+			return []byte("\x1bOA")
+		}
 		return []byte("\x1b[A")
 	case tea.KeyDown:
+		if appCursor {
+			return []byte("\x1bOB")
+		}
 		return []byte("\x1b[B")
 	case tea.KeyRight:
+		if appCursor {
+			return []byte("\x1bOC")
+		}
 		return []byte("\x1b[C")
 	case tea.KeyLeft:
+		if appCursor {
+			return []byte("\x1bOD")
+		}
 		return []byte("\x1b[D")
 	case tea.KeyEscape:
 		return []byte{27}
