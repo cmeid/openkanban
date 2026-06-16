@@ -4215,6 +4215,59 @@ func (m *Model) refreshColumnTickets() {
 	if len(m.columnTicketHeights) != len(m.columns) {
 		m.columnTicketHeights = make([][]int, len(m.columns))
 	}
+	m.compactColumnOffsets()
+}
+
+// compactColumnOffsets reduces each column's vertical scroll offset to the
+// smallest value that still keeps the tail card visible inside the current
+// column budget. After a filter shrinks a column, this guarantees the user
+// sees as many post-filter cards as the screen has room for — never less.
+//
+// Offsets only decrease; an in-range offset that already fits its tail
+// stays put. Uses the ticketHeight fallback (not the columnTicketHeights
+// cache) because the cache is keyed to the pre-refresh ticket order — a
+// post-refresh index may point at a different card.
+func (m *Model) compactColumnOffsets() {
+	budget := m.columnContentHeight()
+	if budget <= 0 {
+		// Pre-WindowSizeMsg or terminal too small. Leave offsets alone;
+		// the next render will be clipped by MaxHeight anyway.
+		return
+	}
+	for i := range m.columnTickets {
+		if i >= len(m.columnOffsets) {
+			break
+		}
+		n := len(m.columnTickets[i])
+		if n == 0 {
+			m.columnOffsets[i] = 0
+			continue
+		}
+		// Find the smallest offset such that the tail [target..n-1] fits
+		// in budget. Walk backward from n-1, accumulating ticketHeight
+		// per card; reserve the ▲ row whenever there's still anything
+		// above the candidate offset (j > 0). The reserve participates
+		// in the fit check only — it's one shared row above the visible
+		// window, not one row per card.
+		target := 0
+		used := 0
+		for j := n - 1; j >= 0; j-- {
+			cost := ticketHeight
+			reserve := 0
+			if j > 0 {
+				reserve = 1
+			}
+			if used+cost+reserve > budget {
+				target = j + 1
+				break
+			}
+			used += cost
+		}
+		if target > m.columnOffsets[i] {
+			continue // never push the user down
+		}
+		m.columnOffsets[i] = target
+	}
 }
 
 // sortTickets reorders the slice in place per the given mode. Priority 0
