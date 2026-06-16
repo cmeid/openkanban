@@ -766,9 +766,20 @@ func (p *PaneView) detach(sendFrame bool) error {
 	// blocked inline, which froze the BubbleTea Update loop on every
 	// pv.Close() / Detach() in the session-end cleanup paths. The
 	// attach loop normally drains within a few ms of conn.Close() via
-	// io.EOF or a daemon-side TypeDetach frame; the 30s watchdog
-	// catches the wedge case (daemon never publishes ExitEvent) so the
-	// goroutine can't leak indefinitely without logging.
+	// io.EOF or a daemon-side TypeDetach frame.
+	//
+	// Tiered logging: a 5s warning fires for slow-but-not-wedged daemons
+	// so the next person debugging "feels sluggish" has a tripwire
+	// before the 30s emergency tier; the 30s tier emits
+	// PaneDetachedMsg anyway so the model isn't wedged on a truly
+	// stuck daemon.
+	//
+	// attachLoopWG is reused across attach/detach cycles. If a
+	// re-Attach happens between conn.Close() and the old loop's Done,
+	// the inner Wait will block until BOTH loops drain — the watchdog's
+	// PaneDetachedMsg then arrives late w.r.t. the OLD attach, but
+	// handleAttachExit has already emitted its own when the old loop
+	// exited, and the model handler is idempotent. Acceptable.
 	paneID := p.id
 	sessID := p.sessionID
 	go func() {
@@ -778,17 +789,25 @@ func (p *PaneView) detach(sendFrame bool) error {
 			p.attachLoopWG.Wait()
 			close(done)
 		}()
-		select {
-		case <-done:
-			log.Printf("openkanban paneview: detach drained session=%s in %s", sessID, time.Since(t0))
-		case <-time.After(30 * time.Second):
-			log.Printf("openkanban paneview: detach attachLoopWG.Wait stuck after 30s session=%s; emitting PaneDetachedMsg anyway", sessID)
+		warn := time.NewTimer(5 * time.Second)
+		deadline := time.NewTimer(30 * time.Second)
+		defer warn.Stop()
+		defer deadline.Stop()
+		for {
+			select {
+			case <-done:
+				log.Printf("openkanban paneview: detach drained session=%s in %s", sessID, time.Since(t0))
+				p.emitTeaMsg(PaneDetachedMsg{PaneID: paneID})
+				return
+			case <-warn.C:
+				log.Printf("openkanban paneview: detach attachLoopWG.Wait slow (>5s) session=%s; still waiting", sessID)
+				// no return — fall through to wait for done or deadline
+			case <-deadline.C:
+				log.Printf("openkanban paneview: detach attachLoopWG.Wait stuck after 30s session=%s; emitting PaneDetachedMsg anyway (inner Wait leaks until loop drains)", sessID)
+				p.emitTeaMsg(PaneDetachedMsg{PaneID: paneID})
+				return
+			}
 		}
-		// Emit for parity with prior synchronous semantics.
-		// handleAttachExit may already have emitted one during the
-		// normal-path teardown; the model's PaneDetachedMsg handler is
-		// idempotent (second arrival sees focusedPane already cleared).
-		p.emitTeaMsg(PaneDetachedMsg{PaneID: paneID})
 	}()
 
 	return nil
@@ -1639,16 +1658,19 @@ func (p *PaneView) readNextMsg() tea.Cmd {
 // because the bytes were already written to vt via applyOutput).
 func (p *PaneView) emitTeaMsg(msg tea.Msg) {
 	if p.teaClosed.Load() {
+		log.Printf("openkanban paneview: dropped %T session=%s (teaMsgs already closed)", msg, p.sessionID)
 		return
 	}
 	p.teaMu.Lock()
 	defer p.teaMu.Unlock()
 	if p.teaClosed.Load() {
+		log.Printf("openkanban paneview: dropped %T session=%s (teaMsgs closed under teaMu)", msg, p.sessionID)
 		return
 	}
 	select {
 	case p.teaMsgs <- msg:
 	default:
+		log.Printf("openkanban paneview: dropped %T session=%s (teaMsgs buffer full)", msg, p.sessionID)
 	}
 }
 

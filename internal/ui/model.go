@@ -4820,6 +4820,12 @@ func (m *Model) wrapUpSessionForTicket(ticket *board.Ticket, newStatus board.Tic
 		t0 := time.Now()
 		if capturedPane != nil {
 			_ = capturedPane.Stop()
+			// Close after Stop so teaMsgs is drained and the PaneView
+			// goroutines (drainWG, detach watchdog) can wind down
+			// instead of lingering until GC. The model has already
+			// removed this pane from m.panes synchronously, so no
+			// in-flight handler will dispatch new messages to it.
+			_ = capturedPane.Close()
 		}
 		if api != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

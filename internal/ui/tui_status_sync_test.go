@@ -280,7 +280,13 @@ func TestWrapUpSessionForTicket_NilDaemonAPI_DoesNotPanic(t *testing.T) {
 	m, ticket, _ := newWrapUpModel(t, board.StatusInProgress)
 	m.daemon = nil
 
-	m.wrapUpSessionForTicket(ticket, board.StatusInReview)
+	cmd := m.wrapUpSessionForTicket(ticket, board.StatusInReview)
+	if cmd != nil {
+		// Invoke the Cmd to also exercise pane.Stop()/Close() under
+		// a nil daemon API — the closure must skip the TicketDone
+		// branch but still drain the pane handle without panicking.
+		_ = cmd()
+	}
 
 	if _, ok := m.panes[ticket.ID]; ok {
 		t.Errorf("panes[%s] still present after wrap-up with nil m.daemon", ticket.ID)
