@@ -28,6 +28,7 @@ tea "github.com/charmbracelet/bubbletea"
 - String constants: `const StatusBacklog TicketStatus = "backlog"`
 - Constructor functions: `NewTicket()`, `NewPane()`
 - Touch pattern: `t.Touch()` updates `UpdatedAt`
+- SetAgentStatus pattern: `t.SetAgentStatus(as) bool` returns true on real change; mirrors `SetStatus` for the agent dimension and stamps `StatusChangedAt`. Never assign `t.AgentStatus =` directly outside `internal/board`.
 
 ## Testing
 
