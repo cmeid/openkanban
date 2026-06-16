@@ -55,15 +55,16 @@ const (
 type SortMode string
 
 const (
-	SortDefault  SortMode = ""
-	SortName     SortMode = "name"
-	SortAge      SortMode = "age"
-	SortPriority SortMode = "priority"
+	SortDefault      SortMode = ""
+	SortName         SortMode = "name"
+	SortAge          SortMode = "age"
+	SortStatusChange SortMode = "status_change"
+	SortPriority     SortMode = "priority"
 )
 
 // sortModes is the cycle order the `o` keybinding walks. Kept here so
 // the cycle and the label/help text stay in sync.
-var sortModes = []SortMode{SortDefault, SortName, SortAge, SortPriority}
+var sortModes = []SortMode{SortDefault, SortName, SortAge, SortStatusChange, SortPriority}
 
 func nextSortMode(s SortMode) SortMode {
 	for i, m := range sortModes {
@@ -80,6 +81,8 @@ func sortModeLabel(s SortMode) string {
 		return "name (A→Z)"
 	case SortAge:
 		return "age (newest first)"
+	case SortStatusChange:
+		return "status change (newest first)"
 	case SortPriority:
 		return "priority (highest first)"
 	default:
@@ -4412,6 +4415,15 @@ func sortTickets(tickets []*board.Ticket, mode SortMode) {
 		sort.SliceStable(tickets, func(i, j int) bool {
 			return tickets[i].CreatedAt.After(tickets[j].CreatedAt)
 		})
+	case SortStatusChange:
+		sort.SliceStable(tickets, func(i, j int) bool {
+			ai := statusChangedAtOrFallback(tickets[i])
+			aj := statusChangedAtOrFallback(tickets[j])
+			if !ai.Equal(aj) {
+				return ai.After(aj)
+			}
+			return tickets[i].CreatedAt.After(tickets[j].CreatedAt)
+		})
 	case SortPriority:
 		sort.SliceStable(tickets, func(i, j int) bool {
 			a := effectivePriority(tickets[i].Priority)
@@ -4429,6 +4441,17 @@ func effectivePriority(p int) int {
 		return 3
 	}
 	return p
+}
+
+// statusChangedAtOrFallback returns the ticket's StatusChangedAt or
+// falls back to UpdatedAt when nil. Backfill in validateFrontmatter
+// guarantees non-nil after load, so the fallback only matters for
+// in-memory tickets constructed outside NewTicket (e.g. tests).
+func statusChangedAtOrFallback(t *board.Ticket) time.Time {
+	if t.StatusChangedAt != nil {
+		return *t.StatusChangedAt
+	}
+	return t.UpdatedAt
 }
 
 func (m *Model) ticketMatchesFilter(t *board.Ticket) bool {
