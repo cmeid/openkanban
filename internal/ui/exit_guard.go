@@ -13,41 +13,10 @@ import (
 	"github.com/techdufus/openkanban/internal/daemon"
 )
 
-// daemonGuardAPI is the subset of *daemonclient.Client used by the TUI
-// exit-guard AND the spawn-path dead-session gate. Held as an interface
-// (rather than a concrete type) so tests can swap in a fake without
-// bringing up a real daemon. The real daemonclient.Client satisfies
-// this interface by virtue of its PrepareExit / Kill / ClientID / Owns
-// methods.
-//
-// Owns is used by spawnAgent to short-circuit the on-disk JSONL
-// dead-session check when the daemon already has a live PTY for the
-// session UUID — see internal/ui/model.go's spawnAgent.
-type daemonGuardAPI interface {
-	PrepareExit(ctx context.Context) (daemon.PrepareExitResp, error)
-	CancelExit(ctx context.Context) error
-	Kill(ctx context.Context, sessionID string, grace time.Duration) error
-	ClientID() uint16
-	Owns(ctx context.Context, sessionUUID string) (daemon.OwnsResp, error)
-	// TicketDone informs the daemon that a ticket is wrapping up so it
-	// can terminate the live PTY for that ticket and broadcast an
-	// Expected=true SessionEvent. Used by the TUI's board-promotion
-	// wrap-up to mirror the CLI's `openkanban ticket done` path.
-	TicketDone(ctx context.Context, ticketID string) (daemon.TicketDoneResp, error)
-	// List returns the daemon's current set of sessions. Used by the
-	// startup reconcile (with retry/backoff) and the periodic 30s resync
-	// to keep m.panes / m.daemonOwned aligned with the daemon's
-	// authoritative view. Lives on the guard surface (rather than being
-	// called via daemonClient.List directly) so the fake-guardAPI
-	// pattern in tests covers both the exit-guard surface and the
-	// resync paths without standing up a real daemon.
-	List(ctx context.Context) (daemon.ListResp, error)
-	// Spawn forwards the spawn RPC. Used by prepareSpawnWith so the
-	// closure can route the daemon-side fork through the same testable
-	// seam as Owns / TicketDone — letting an Owns fast-path test assert
-	// that no Spawn was issued without standing up a real daemon.
-	Spawn(ctx context.Context, req daemon.SpawnReq) (daemon.SpawnResp, error)
-}
+// The daemonAPI interface (and its sub-interfaces) lives in
+// daemon_api.go. This file only depends on the daemonExitGuard subset
+// indirectly: m.daemon is the composite, and the exit-guard handlers
+// below read PrepareExit / CancelExit / Kill / ClientID off it.
 
 // confirmExitState carries the modal's transient bookkeeping. Lives on
 // the Model so the View() render is a pure read.
@@ -133,10 +102,10 @@ type sessionKillFailedMsg struct {
 // When the guard API is nil (daemon never reachable), we exit
 // immediately — the user must not be trapped.
 func (m *Model) handleQuitRequested() (tea.Model, tea.Cmd) {
-	if m.guardAPI == nil {
+	if m.daemon == nil {
 		return m, tea.Quit
 	}
-	api := m.guardAPI
+	api := m.daemon
 	return m, func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -390,10 +359,10 @@ func (m *Model) killAllSessions() tea.Cmd {
 // (handler just flips a bool under clientsMu) and bounds the goroutine
 // lifetime if the daemon is gone.
 func (m *Model) cancelExitCmd() tea.Cmd {
-	if m.guardAPI == nil {
+	if m.daemon == nil {
 		return nil
 	}
-	api := m.guardAPI
+	api := m.daemon
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		defer cancel()
@@ -408,7 +377,7 @@ func (m *Model) cancelExitCmd() tea.Cmd {
 // against the daemon. The grace period is the standard SIGTERM window
 // the daemon enforces before SIGKILL — see daemon.KillReq.GraceSeconds.
 func (m *Model) killSessionCmd(sessionID string) tea.Cmd {
-	if m.guardAPI == nil {
+	if m.daemon == nil {
 		return func() tea.Msg {
 			return sessionKillFailedMsg{
 				SessionID: sessionID,
@@ -416,7 +385,7 @@ func (m *Model) killSessionCmd(sessionID string) tea.Cmd {
 			}
 		}
 	}
-	api := m.guardAPI
+	api := m.daemon
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), killGracePeriod+2*time.Second)
 		defer cancel()

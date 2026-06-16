@@ -16,11 +16,14 @@ import (
 	"github.com/techdufus/openkanban/internal/project"
 )
 
-// spawnDisciplineStubAPI is a daemonGuardAPI fake purpose-built for the
-// client-side spawn-discipline tests. It records Owns / Spawn invocation
-// counts so tests can prove that the Owns fast-path skipped Spawn (B4),
-// and lets the test set canned Owns responses.
+// spawnDisciplineStubAPI is a daemonAPI fake purpose-built for the
+// client-side spawn-discipline tests. It records Owns / Spawn
+// invocation counts so tests can prove that the Owns fast-path skipped
+// Spawn (B4), and lets the test set canned Owns responses. Every other
+// method on daemonAPI falls through to daemonAPINoop.
 type spawnDisciplineStubAPI struct {
+	daemonAPINoop
+
 	ownsCalls  atomic.Int32
 	spawnCalls atomic.Int32
 
@@ -28,31 +31,13 @@ type spawnDisciplineStubAPI struct {
 	ownsErr  error
 }
 
-func (s *spawnDisciplineStubAPI) PrepareExit(_ context.Context) (daemon.PrepareExitResp, error) {
-	return daemon.PrepareExitResp{}, nil
-}
-func (s *spawnDisciplineStubAPI) CancelExit(_ context.Context) error { return nil }
-func (s *spawnDisciplineStubAPI) Kill(_ context.Context, _ string, _ time.Duration) error {
-	return nil
-}
-func (s *spawnDisciplineStubAPI) ClientID() uint16 { return 1 }
 func (s *spawnDisciplineStubAPI) Owns(_ context.Context, _ string) (daemon.OwnsResp, error) {
 	s.ownsCalls.Add(1)
 	return s.ownsResp, s.ownsErr
 }
-func (s *spawnDisciplineStubAPI) TicketDone(_ context.Context, _ string) (daemon.TicketDoneResp, error) {
-	return daemon.TicketDoneResp{}, nil
-}
 func (s *spawnDisciplineStubAPI) Spawn(_ context.Context, _ daemon.SpawnReq) (daemon.SpawnResp, error) {
 	s.spawnCalls.Add(1)
 	return daemon.SpawnResp{SessionID: "sid-from-spawn"}, nil
-}
-
-// List is a no-op stub kept here so this fake stays compatible with
-// the sibling fix/startup-resync PR, which extends daemonGuardAPI with
-// List for its startup-reconcile / 30s-resync paths.
-func (s *spawnDisciplineStubAPI) List(_ context.Context) (daemon.ListResp, error) {
-	return daemon.ListResp{}, nil
 }
 
 // makeDetachedPane constructs a PaneView in PaneViewDetached state with
@@ -257,7 +242,7 @@ func TestRetryAttach_GivesUpAfterCap(t *testing.T) {
 // Owns-first pattern: confirm ownership, skip the fork.
 //
 // Test mechanics:
-//   - m.guardAPI is the stub; its Owns returns Owned=true.
+//   - m.daemon is the stub; its Owns returns Owned=true.
 //   - m.daemonClient is nil. If the fast path WERE NOT taken, the
 //     closure would either issue Spawn (which would record a call on
 //     the stub) or fall into the "daemon unreachable" branch
@@ -301,7 +286,7 @@ func TestPrepareSpawnWith_OwnsFastPathSkipsSpawn(t *testing.T) {
 
 	m := &Model{
 		globalStore:  globalStore,
-		guardAPI:     stub,
+		daemon:       stub,
 		panes:        map[board.TicketID]*daemonclient.PaneView{},
 		daemonClient: nil, // FORCE fast-path: any non-fast-path branch needs daemonClient
 		width:        120,
@@ -375,7 +360,7 @@ func TestPrepareSpawnWith_OwnsFastPath_NotOwned_FallsThrough(t *testing.T) {
 
 	m := &Model{
 		globalStore:  globalStore,
-		guardAPI:     stub,
+		daemon:       stub,
 		panes:        map[board.TicketID]*daemonclient.PaneView{},
 		daemonClient: nil,
 		width:        120,
@@ -440,7 +425,7 @@ func TestPrepareSpawnWith_OwnsFastPath_NoAgentSessionID_Skips(t *testing.T) {
 
 	m := &Model{
 		globalStore:  globalStore,
-		guardAPI:     stub,
+		daemon:       stub,
 		panes:        map[board.TicketID]*daemonclient.PaneView{},
 		daemonClient: nil,
 		width:        120,

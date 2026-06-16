@@ -15,11 +15,13 @@ import (
 	"github.com/techdufus/openkanban/internal/daemon"
 )
 
-// ownsStubAPI is a minimal daemonGuardAPI stand-in for the spawn-path
-// gate. Only Owns is exercised; the exit-guard surface (PrepareExit /
-// Kill / ClientID) returns zero values because shouldCleanupDeadSession
+// ownsStubAPI is a minimal daemonAPI stand-in for the spawn-path
+// gate. Only Owns is exercised; everything else falls through to
+// daemonAPINoop's zero-value returns because shouldCleanupDeadSession
 // never touches it.
 type ownsStubAPI struct {
+	daemonAPINoop
+
 	resp  daemon.OwnsResp
 	err   error
 	delay time.Duration
@@ -32,43 +34,6 @@ type ownsStubAPI struct {
 	// can assert the gate passed through the ticket's AgentSessionID
 	// unmodified.
 	lastUUID atomic.Value // string
-}
-
-func (s *ownsStubAPI) PrepareExit(_ context.Context) (daemon.PrepareExitResp, error) {
-	return daemon.PrepareExitResp{}, nil
-}
-
-func (s *ownsStubAPI) CancelExit(_ context.Context) error {
-	return nil
-}
-
-func (s *ownsStubAPI) Kill(_ context.Context, _ string, _ time.Duration) error {
-	return nil
-}
-
-func (s *ownsStubAPI) ClientID() uint16 { return 1 }
-
-// TicketDone is unused by the dead-session gate tests but required to
-// satisfy daemonGuardAPI (wrapUpSessionForTicket calls it on board
-// promotion). Returns Killed=false so any accidental invocation
-// resolves cleanly.
-func (s *ownsStubAPI) TicketDone(_ context.Context, _ string) (daemon.TicketDoneResp, error) {
-	return daemon.TicketDoneResp{Killed: false}, nil
-}
-
-// List is unused by the dead-session gate tests but required to
-// satisfy daemonGuardAPI (the startup reconcile + periodic resync
-// route through it). Returns an empty session list so any accidental
-// call resolves to a no-op reconcile.
-func (s *ownsStubAPI) List(_ context.Context) (daemon.ListResp, error) {
-	return daemon.ListResp{}, nil
-}
-
-// Spawn is unused by the dead-session gate tests but required to satisfy
-// daemonGuardAPI (prepareSpawnWith routes Spawn through this seam).
-// Returns an empty response so any accidental invocation resolves cleanly.
-func (s *ownsStubAPI) Spawn(_ context.Context, _ daemon.SpawnReq) (daemon.SpawnResp, error) {
-	return daemon.SpawnResp{}, nil
 }
 
 func (s *ownsStubAPI) Owns(ctx context.Context, sessionUUID string) (daemon.OwnsResp, error) {
@@ -148,7 +113,7 @@ func TestSpawnGate_OwnsTrueSkipsDeadCheck(t *testing.T) {
 	jsonl := writeDeadJSONL(t, home, worktree, uuid)
 
 	stub := &ownsStubAPI{resp: daemon.OwnsResp{Owned: true}}
-	m := &Model{guardAPI: stub}
+	m := &Model{daemon: stub}
 	now := time.Now()
 	ticket := &board.Ticket{
 		WorktreePath:    worktree,
@@ -189,7 +154,7 @@ func TestSpawnGate_OwnsFalseFiresDeadCheck(t *testing.T) {
 	jsonl := writeDeadJSONL(t, home, worktree, uuid)
 
 	stub := &ownsStubAPI{resp: daemon.OwnsResp{Owned: false}}
-	m := &Model{guardAPI: stub}
+	m := &Model{daemon: stub}
 	now := time.Now()
 	ticket := &board.Ticket{
 		WorktreePath:    worktree,
@@ -222,7 +187,7 @@ func TestSpawnGate_OwnsErrorFallsThrough(t *testing.T) {
 	jsonl := writeDeadJSONL(t, home, worktree, uuid)
 
 	stub := &ownsStubAPI{err: errors.New("daemon unreachable")}
-	m := &Model{guardAPI: stub}
+	m := &Model{daemon: stub}
 	now := time.Now()
 	ticket := &board.Ticket{
 		WorktreePath:    worktree,
@@ -240,7 +205,7 @@ func TestSpawnGate_OwnsErrorFallsThrough(t *testing.T) {
 }
 
 // TestSpawnGate_NoGuardAPIFallsThrough covers the daemon-less startup
-// path: when m.guardAPI is nil (TUI started before the daemon was up),
+// path: when m.daemon is nil (TUI started before the daemon was up),
 // the gate must still work — fall through to the on-disk check
 // without dereferencing the nil interface.
 func TestSpawnGate_NoGuardAPIFallsThrough(t *testing.T) {
@@ -251,7 +216,7 @@ func TestSpawnGate_NoGuardAPIFallsThrough(t *testing.T) {
 	uuid := "44444444-5555-6666-7777-888888888888"
 	jsonl := writeDeadJSONL(t, home, worktree, uuid)
 
-	m := &Model{guardAPI: nil}
+	m := &Model{daemon: nil}
 	now := time.Now()
 	ticket := &board.Ticket{
 		WorktreePath:    worktree,
@@ -280,7 +245,7 @@ func TestSpawnGate_EmptySessionIDFallsThrough(t *testing.T) {
 	jsonl := writeDeadJSONL(t, home, worktree, "55555555-6666-7777-8888-999999999999")
 
 	stub := &ownsStubAPI{resp: daemon.OwnsResp{Owned: true}} // would lie if asked
-	m := &Model{guardAPI: stub}
+	m := &Model{daemon: stub}
 	now := time.Now()
 	ticket := &board.Ticket{
 		WorktreePath:   worktree,
