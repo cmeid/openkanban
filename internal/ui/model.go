@@ -1804,6 +1804,24 @@ func (m *Model) cleanupAsync() tea.Cmd {
 	}
 }
 
+// shouldRetryAttachOnEnter is the predicate handleAgentViewMode uses
+// to decide whether to intercept Enter for an attach retry vs. forward
+// it to the PTY child. The two conditions together capture exactly the
+// "stuck post-spawn" state PaneView.View() renders the failure overlay
+// for: there's a recorded attach error AND the local view hasn't
+// transitioned to Attached (which would clear lastAttachErr anyway).
+//
+// Extracted as a free function so the keystroke-routing decision can
+// be exercised in tests without standing up a real daemonClient (the
+// rest of handleAgentViewMode threads through attachExisting, which
+// requires a live Client to do anything observable).
+func shouldRetryAttachOnEnter(pane *daemonclient.PaneView) bool {
+	if pane == nil {
+		return false
+	}
+	return pane.LastAttachErr() != nil && pane.State() != daemonclient.PaneViewAttached
+}
+
 func (m *Model) handleAgentViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// The cycle-attach modal swallows all keys until the user resolves
 	// it (Enter attaches, Esc returns to the board, Ctrl+\ / Ctrl+]
@@ -1830,6 +1848,19 @@ func (m *Model) handleAgentViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.cycleUnattachedSession(1)
 	case "ctrl+\\":
 		return m.cycleUnattachedSession(-1)
+	case "enter":
+		// Pane stuck in post-spawn attach-failure state — Enter
+		// retries attach, matching the overlay's footer hint. Gated
+		// on the exact same predicate PaneView.View() uses to render
+		// the overlay, so a normally-attached pane still forwards
+		// Enter to the PTY child. attach() clears lastAttachErr on
+		// success, which pops the overlay back to the live emulator
+		// on the next View() pass. The predicate is factored out so
+		// it can be unit-tested without a live daemon.
+		if shouldRetryAttachOnEnter(pane) {
+			cmd := m.attachExisting(m.focusedPane, pane)
+			return m, tea.Batch(cmd, m.maybeSetWindowTitle())
+		}
 	}
 
 	if result := pane.HandleKey(msg); result != nil {
@@ -3991,11 +4022,28 @@ func (m *Model) spawnAgent() (tea.Model, tea.Cmd) {
 
 		if offerChooser {
 			_, _, wouldChange, _, _ := agent.PreviewBriefMerge(ticket, ticket.WorktreePath)
-			if wouldChange {
+			// pulledBack catches the explicit "user reopened a card
+			// from in_review/done back to in_progress" gesture: the
+			// most recent status transition happened AFTER the prior
+			// session was spawned. That's exactly when "resume the
+			// prior session, or start fresh?" is the question worth
+			// surfacing — even (especially) when the brief itself is
+			// unchanged. On a routine re-attach (Ctrl+g → re-enter)
+			// StatusChangedAt is unchanged, so this stays false and
+			// the chooser doesn't fire spuriously.
+			pulledBack := ticket.AgentSpawnedAt != nil && ticket.StatusChangedAt.After(*ticket.AgentSpawnedAt)
+			if wouldChange || pulledBack {
 				// Capture ticket/proj/agentCfg into each callback. Each option
 				// sets its own plan and proceeds with the existing tea.Batch.
 				m.showChoice = true
-				m.choiceMsg = "Brief was updated since this session started. What should I do?"
+				switch {
+				case pulledBack && wouldChange:
+					m.choiceMsg = "Ticket was pulled back and the brief changed. What should I do?"
+				case pulledBack:
+					m.choiceMsg = "Ticket was pulled back into in_progress. Resume prior session or start fresh?"
+				default:
+					m.choiceMsg = "Brief was updated since this session started. What should I do?"
+				}
 				ticketCopy := ticket // pointer — fine, the closures don't outlive the ticket
 				projCopy := proj
 				cfgCopy := agentCfg
@@ -4518,9 +4566,13 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 			log.Printf("openkanban model: attach failed after spawn+retry ticket=%s session=%s err=%v",
 				ticketID, resp.SessionID, attachErr)
 			// Spawn succeeded but we couldn't get a binary channel.
-			// Keep the PaneView so the user can retry attach; surface
-			// the error so the user knows the spawn itself worked and
-			// pressing Enter again is reasonable.
+			// Keep the PaneView so the user can retry attach; publish
+			// the error to the pane so View() renders the failure
+			// overlay (rather than the blank grid that left users
+			// stranded in ModeAgentView with no signal). The notice
+			// stays as a redundant toast hint — the overlay is the
+			// primary surface.
+			pv.SetLastAttachErr(attachErr)
 			return spawnReadyMsg{
 				ticketID:     ticketID,
 				pane:         pv,
@@ -4656,6 +4708,7 @@ func attachExistingFastPath(
 	if attachErr != nil {
 		log.Printf("openkanban model: fast-path attach failed ticket=%s session=%s err=%v",
 			ticketID, sessionID, attachErr)
+		pv.SetLastAttachErr(attachErr)
 		return spawnReadyMsg{
 			ticketID:     ticketID,
 			pane:         pv,

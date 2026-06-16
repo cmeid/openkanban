@@ -34,9 +34,10 @@ Vim-style navigation:
 - `Enter` - select/confirm
 - `Esc` - cancel/back
 
-Inside ModeAgentView, two keys are intercepted before the PTY child (claude, etc.) sees them:
+Inside ModeAgentView, these keys are intercepted before the PTY child (claude, etc.) sees them:
 - `Ctrl+]` / `Ctrl+\` - cycle focus to next / prev open, unattached session
 - `Ctrl+g` - exit back to the board
+- `Enter` - **conditionally** intercepted via `shouldRetryAttachOnEnter`: only when the focused pane has `LastAttachErr() != nil` AND `State() != PaneViewAttached`. In that state Enter retries `attachExisting`; otherwise it falls through to the PTY child as normal. The predicate is gated the same way as `PaneView.View()`'s failure-overlay branch — keep them locked together, otherwise the user sees the "Enter retries" hint but pressing Enter does nothing.
 
 `Ctrl+[` cannot be used: in bubbletea v1.3.x (no Kitty keyboard protocol enabled here) it is bytewise indistinguishable from `Esc`. Any new ctrl-combo binding should be verified against `~/golang/pkg/mod/github.com/charmbracelet/bubbletea@<ver>/key.go` before promising it.
 
@@ -78,6 +79,21 @@ Card-height arithmetic in any path that runs *inside or after* `refreshColumnTic
 `panes map[board.TicketID]*daemonclient.PaneView` — one per spawned agent.
 
 PaneView is the client-side handle; the PTY itself lives in openkanbankd. Lifecycle is daemon-driven: `Spawn` happens server-side at construction time, `Attach` / `Detach` swap which TUI is the one attached client, and `daemonclient.PaneViewAttached` vs `PaneViewUnattached` describe what this TUI sees, not whether the agent is alive (the agent can be alive in the daemon while every TUI is `Unattached`). Methods preserve the old `*terminal.Pane` surface — see `internal/daemonclient/paneview.go` for the full 13-method shape and the unattached-state behavior table.
+
+### Attach-failure overlay
+
+When `attachWithRetry` (post-spawn or B4 fast-path) exhausts its retries, the closure calls `pv.SetLastAttachErr(err)` before returning the `spawnReadyMsg`. `PaneView.View()` then renders an actionable overlay instead of `blankPaneView` — same `cols × rows` contract so the chrome composition doesn't shift, pure ASCII so byte count == display cell count. Successful `Attach()` clears `lastAttachErr` automatically, so the overlay disappears on the next View() pass. The `shouldRetryAttachOnEnter` predicate (see Key Bindings above) gates Enter-retry on the SAME state pair, so the overlay's "Enter retries" hint is actually wired up.
+
+## Pull-back chooser
+
+The brief-chooser modal in `spawnAgent` fires on TWO signals (gate is `wouldChange || pulledBack`):
+
+1. `wouldChange == true` (existing trigger) — the openkanban card's Description has diverged from the on-disk `<worktree>/tickets/<slug>.md` managed block.
+2. `pulledBack == true` (new) — `ticket.StatusChangedAt.After(*ticket.AgentSpawnedAt)`. The user explicitly moved the card back into `in_progress` AFTER the prior session ran, e.g. drag-back from `in_review` or `done`. The message is context-sensitive: "pulled back" vs "brief was updated" vs combined.
+
+Why the second signal exists: a shipped, pulled-back ticket typically has an empty Description (work is done) and no in-repo brief file, so `wouldChange=false`. Without the `pulledBack` arm, launching it silently `--resume`s the prior (often `/exit`-ed) JSONL with no agency over resume-vs-fresh. Routine re-attach (Ctrl+g → re-enter on the same in_progress card) doesn't trip this because `StatusChangedAt` is unchanged in that flow — confirmed by the negative-control test.
+
+The three choice closures (`d`/`u`/`n` → `spawnPlan{ForceFresh}`/`{InjectResumeNotice}`/`{SkipMerge}`) are unchanged; only the trigger condition and the modal message vary.
 
 ## Status-mutation wrap-up
 
