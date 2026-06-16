@@ -45,6 +45,9 @@ func (s *ticketDoneStubAPI) TicketDone(_ context.Context, ticketID string) (daem
 	}
 	return daemon.TicketDoneResp{Killed: true}, nil
 }
+func (s *ticketDoneStubAPI) List(_ context.Context) (daemon.ListResp, error) {
+	return daemon.ListResp{}, nil
+}
 
 // newWrapUpModel builds a minimal Model wired with the column stack,
 // pane map, and global store needed to exercise the board-promotion

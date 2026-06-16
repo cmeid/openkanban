@@ -56,6 +56,14 @@ func (s *ownsStubAPI) TicketDone(_ context.Context, _ string) (daemon.TicketDone
 	return daemon.TicketDoneResp{Killed: false}, nil
 }
 
+// List is unused by the dead-session gate tests but required to
+// satisfy daemonGuardAPI (the startup reconcile + periodic resync
+// route through it). Returns an empty session list so any accidental
+// call resolves to a no-op reconcile.
+func (s *ownsStubAPI) List(_ context.Context) (daemon.ListResp, error) {
+	return daemon.ListResp{}, nil
+}
+
 func (s *ownsStubAPI) Owns(ctx context.Context, sessionUUID string) (daemon.OwnsResp, error) {
 	s.calls.Add(1)
 	s.lastUUID.Store(sessionUUID)

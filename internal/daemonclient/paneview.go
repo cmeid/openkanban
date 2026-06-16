@@ -237,6 +237,19 @@ func (p *PaneView) State() PaneViewState {
 	return p.state
 }
 
+// SetStateForTest is a test-only setter that bypasses the normal
+// Attach / DetachRPC state machine. Production code MUST NOT call
+// this — the real state machine takes responsibility for the binary
+// stream lifecycle, and skipping it leaves the view in an inconsistent
+// shape (e.g. Attached without a live conn). Used by tests that need
+// to exercise behavior keyed on a specific PaneView state without
+// standing up a daemon.
+func (p *PaneView) SetStateForTest(s PaneViewState) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.state = s
+}
+
 // SetWorkdir caches a workdir locally. Informational — Spawn carries
 // the real workdir to the daemon. The model still calls this after a
 // successful spawn so GetWorkdir returns the expected value.

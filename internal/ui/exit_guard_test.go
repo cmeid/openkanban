@@ -104,6 +104,14 @@ func (f *fakeGuardAPI) TicketDone(_ context.Context, _ string) (daemon.TicketDon
 	return daemon.TicketDoneResp{Killed: false}, nil
 }
 
+// List is unused by the exit-guard tests but required to satisfy
+// daemonGuardAPI (the startup reconcile + periodic resync route
+// through it). Returns an empty session list so any accidental call
+// resolves to a no-op reconcile.
+func (f *fakeGuardAPI) List(_ context.Context) (daemon.ListResp, error) {
+	return daemon.ListResp{}, nil
+}
+
 func (f *fakeGuardAPI) killCallsCopy() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
