@@ -1,8 +1,10 @@
 package ui
 
 import (
+	"strings"
 	"testing"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/techdufus/openkanban/internal/board"
@@ -266,6 +268,65 @@ func TestHandleCycleAttachPromptKey_SwallowsOtherKeys(t *testing.T) {
 	}
 	if cmd != nil {
 		t.Errorf("cmd = non-nil for swallowed key, want nil")
+	}
+}
+
+// TestRenderAgentViewWithCycleModal_StacksModalOverAgentView verifies
+// that when cycleAttachPrompt is true, View() emits a composite render
+// containing BOTH the modal text ("▶ Switch session") and the agent
+// view chrome (the focused ticket's title). Pre-fix the modal replaced
+// the agent view entirely, leaving the user with no state context.
+func TestRenderAgentViewWithCycleModal_StacksModalOverAgentView(t *testing.T) {
+	t.Setenv("OPENKANBAN_CONFIG_DIR", t.TempDir())
+
+	proj := &project.Project{ID: "test-proj", Name: "TestProj", RepoPath: t.TempDir()}
+	globalStore := project.NewGlobalTicketStore(nil)
+	globalStore.AddProject(proj)
+
+	target := &board.Ticket{
+		ID:        "T-focus",
+		Title:     "RescueWindowSize",
+		Status:    board.StatusInProgress,
+		ProjectID: proj.ID,
+	}
+	if err := globalStore.Add(target); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	sp := spinner.New()
+	sp.Spinner = spinner.Dot
+
+	info := &daemon.SessionInfo{
+		SessionID: "sid-T-focus", TicketID: "T-focus",
+		Running: true, Cols: 80, Rows: 24,
+	}
+	pv := daemonclient.NewPaneView(nil, "T-focus", info.SessionID, info)
+
+	m := &Model{
+		globalStore:   globalStore,
+		panes:         map[board.TicketID]*daemonclient.PaneView{"T-focus": pv},
+		daemonViewing: map[board.TicketID]int{},
+		columns:       board.DefaultColumns(),
+		columnTickets: [][]*board.Ticket{{target}, {}, {}, {}},
+		columnOffsets: []int{0, 0, 0, 0},
+		spinner:       sp,
+		width:         120,
+		height:        40,
+		mode:          ModeAgentView,
+		focusedPane:   "T-focus",
+		config:        &config.Config{Agents: map[string]config.AgentConfig{}},
+		colors:        newUIColors(config.DefaultConfig().GetTheme()),
+	}
+	m.cycleAttachPrompt = true
+
+	got := m.View()
+
+	if !strings.Contains(got, "Switch session") {
+		t.Errorf("View() missing modal title; got:\n%s", got)
+	}
+	if !strings.Contains(got, target.Title) {
+		t.Errorf("View() missing focused ticket title %q (agent view chrome should render below modal); got:\n%s",
+			target.Title, got)
 	}
 }
 

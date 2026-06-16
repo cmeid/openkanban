@@ -35,7 +35,7 @@ func (m *Model) View() string {
 
 	if m.mode == ModeAgentView && m.focusedPane != "" {
 		if m.cycleAttachPrompt {
-			return m.renderWithOverlay(m.renderCycleAttachModal())
+			return m.renderAgentViewWithCycleModal()
 		}
 		return m.renderAgentView()
 	}
@@ -936,6 +936,35 @@ func (m *Model) renderCycleAttachModal() string {
 		BorderForeground(m.colors.primary).
 		Padding(1, 2).
 		Render(content)
+}
+
+// renderAgentViewWithCycleModal stacks the cycle-attach modal as a
+// horizontal band at the top of the screen, with the focused pane's
+// agent view rendered below it. This gives the user a peek at the
+// session's current state (chrome: title, status pill, duration, deps)
+// while the modal is open so they can decide whether to commit
+// (Enter) or keep cycling (Ctrl+] / Ctrl+\). For unattached panes the
+// pane content area renders blank because the local emulator's vt is
+// nil until Attach completes — the chrome above it still carries the
+// daemon-pushed AgentStatus, which is the highest-signal "what is this
+// session doing" indicator a non-attached client can show.
+//
+// The agent view is rendered at full height. The modal is composed
+// on top; the bottom rows of the pane are clipped by the terminal,
+// which costs at most modalHeight rows of pane visibility. Resizing
+// the pane to fit the smaller area would also force a daemon-side PTY
+// resize and an agent redraw on every cycle, which is more disruptive
+// than the clip.
+func (m *Model) renderAgentViewWithCycleModal() string {
+	modal := m.renderCycleAttachModal()
+	modalCentered := lipgloss.Place(
+		m.width, lipgloss.Height(modal),
+		lipgloss.Center, lipgloss.Top,
+		modal,
+		lipgloss.WithWhitespaceChars(" "),
+		lipgloss.WithWhitespaceForeground(m.colors.base),
+	)
+	return lipgloss.JoinVertical(lipgloss.Left, modalCentered, m.renderAgentView())
 }
 
 func (m *Model) renderShuttingDown() string {
