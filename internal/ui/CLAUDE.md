@@ -43,6 +43,15 @@ Inside ModeAgentView, these keys are intercepted before the PTY child (claude, e
 
 The cycle-attach modal renders OVER the focused pane's agent view (chrome stays visible behind), via `renderAgentViewWithCycleModal`. Do not switch it back to `renderWithOverlay`, which uses a blank background and hides the state needed to make the cycle decision. `cycleUnattachedSession` auto-attaches the target peer if it's Unattached so the modal backdrop shows live PTY content (not just chrome); the cycle iterates ALL open peers, not just Unattached ones.
 
+### Keep both doc surfaces synced
+
+Every keybinding has **two doc surfaces** in `view.go`:
+
+1. `contextualHints()` — the mode-aware footer line that's always visible. Surfaces the most relevant keys for the current mode/state, packed as wide as the terminal allows.
+2. `renderHelp()` — the `?` modal, the canonical "every shortcut" reference. Must list every binding.
+
+When you add, remove, or rebind a key, update **both** functions in the same change. The modal must stay complete; the footer must surface the key in any mode where it's relevant. They live ~50 lines apart on purpose — see one, edit the other.
+
 ## View Composition
 
 Separate render methods composed in `View()`:
