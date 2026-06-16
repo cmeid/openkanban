@@ -1594,7 +1594,7 @@ func (m *Model) dropTicket() (tea.Model, tea.Cmd) {
 		}
 	}
 
-	m.globalStore.Move(ticket.ID, targetStatus)
+	promoted, _ := m.globalStore.Move(ticket.ID, targetStatus)
 	m.refreshColumnTickets()
 	m.saveTicket(ticket)
 
@@ -1603,7 +1603,7 @@ func (m *Model) dropTicket() (tea.Model, tea.Cmd) {
 	m.ensureColumnVisible()
 	m.ensureTicketVisible()
 
-	m.notify("Moved to " + string(targetStatus))
+	m.notify(moveAndPromoteMsg(targetStatus, promoted))
 	m.dragging = false
 	m.dragTargetColumn = 0
 
@@ -3300,11 +3300,11 @@ func (m *Model) quickMoveTicket() (tea.Model, tea.Cmd) {
 		}
 	}
 
-	m.globalStore.Move(ticket.ID, nextStatus)
+	promoted, _ := m.globalStore.Move(ticket.ID, nextStatus)
 	m.refreshColumnTickets()
 	m.selectTicketByID(ticket.ID)
 	m.saveTicket(ticket)
-	m.notify("Moved to " + string(nextStatus))
+	m.notify(moveAndPromoteMsg(nextStatus, promoted))
 
 	return m, nil
 }
@@ -3402,11 +3402,11 @@ func (m *Model) quickMoveTicketBackward() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	m.globalStore.Move(ticket.ID, prevStatus)
+	promoted, _ := m.globalStore.Move(ticket.ID, prevStatus)
 	m.refreshColumnTickets()
 	m.selectTicketByID(ticket.ID)
 	m.saveTicket(ticket)
-	m.notify("Moved to " + string(prevStatus))
+	m.notify(moveAndPromoteMsg(prevStatus, promoted))
 
 	return m, nil
 }
@@ -3428,6 +3428,10 @@ func (m *Model) setupWorktree(ticket *board.Ticket) error {
 	path, err := mgr.CreateWorktree(branchName, baseBranch)
 	if err != nil {
 		return err
+	}
+
+	if err := agent.SeedClaudeSettings(path, proj.RepoPath); err != nil {
+		log.Printf("openkanban: seed claude settings (%s): %v", path, err)
 	}
 
 	ticket.WorktreePath = path
@@ -3962,6 +3966,9 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 				if err != nil {
 					return spawnErrorMsg{ticketID: ticketID, err: "worktree failed: " + err.Error()}
 				}
+				if err := agent.SeedClaudeSettings(path, proj.RepoPath); err != nil {
+					log.Printf("openkanban: seed claude settings (%s): %v", path, err)
+				}
 				worktreePath = path
 			}
 		} else {
@@ -4305,6 +4312,23 @@ func (m *Model) previousStatus(current board.TicketStatus) board.TicketStatus {
 	default:
 		return current
 	}
+}
+
+// moveAndPromoteMsg formats the post-Move status-bar toast. When the
+// transition into in_review/done promoted N claude-code approvals from
+// the worktree into the source repo's settings.local.json, it appends a
+// "promoted N approval(s)" suffix so the user sees what just went
+// global. Empty promoted → only the "Moved to <status>" core message.
+func moveAndPromoteMsg(target board.TicketStatus, promoted []string) string {
+	msg := "Moved to " + string(target)
+	switch n := len(promoted); n {
+	case 0:
+	case 1:
+		msg += " · promoted 1 approval to repo defaults"
+	default:
+		msg += fmt.Sprintf(" · promoted %d approvals to repo defaults", n)
+	}
+	return msg
 }
 
 func (m *Model) notify(msg string) {

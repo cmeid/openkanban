@@ -60,6 +60,23 @@ Lifecycle management for opencode:
 - `waitForReady()` with timeout
 - HTTP client queries status API
 
+## Claude Settings Persistence
+
+`claude_settings.go` carries the seed-on-spawn / promote-on-review machinery that makes Claude Code's `"yes, and don't ask again"` approvals survive a ticket's worktree lifecycle.
+
+- `SeedClaudeSettings(worktreePath, repoPath)` — called at every successful `CreateWorktree`. Merges `<repo>/.claude/settings.local.json` into the new `<worktree>/.claude/settings.local.json` (additively, worktree-local entries preserved). Writes a defensive `<repo>/.claude/.gitignore` if the repo's ignore stack doesn't already cover `.claude/`.
+- `PromoteClaudeSettings(worktreePath, repoPath)` — reverse merge. Returns the slice of entries newly promoted into the repo file.
+- `PromoteClaudeSettingsOnTransition(worktreePath, repoPath, oldStatus, newStatus)` — the policy gate. No-op unless `newStatus ∈ {in_review, done}` and `oldStatus != newStatus`. This is the **only** function status-mutating call sites should reach for.
+
+Callers — keep them in sync if you add a new transition path:
+
+- `project.TicketStore.Move` (single funnel for UI drag/drop, quickMove, quickMoveBackward via `GlobalTicketStore.Move`).
+- `cmd.wrapUpSessionTicketAt` (CLI `ticket in-review` / `ticket done` — routes through `store.Move` rather than `ticket.SetStatus` directly so promotion fires).
+
+Pure JSON-level merges — the helpers only touch `permissions.{allow,ask,deny}` and leave every other top-level key untouched. They do NOT claim to validate Claude Code's full settings schema; new top-level keys Claude adds in the future round-trip safely as long as they aren't named `permissions`.
+
+Errors are non-fatal at all call sites: a settings-write failure logs and degrades to today's behavior (per-worktree allowlist), it never blocks a spawn or a status transition.
+
 ## Thread Safety
 
 Use `sync.RWMutex` for cache access in StatusDetector.
