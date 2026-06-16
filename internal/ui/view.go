@@ -34,6 +34,9 @@ func (m *Model) View() string {
 	}
 
 	if m.mode == ModeAgentView && m.focusedPane != "" {
+		if m.cycleAttachPrompt {
+			return m.renderWithOverlay(m.renderCycleAttachModal())
+		}
 		return m.renderAgentView()
 	}
 
@@ -808,7 +811,8 @@ func (m *Model) renderHelp() string {
 		"  " + keyStyle.Render("[") + descStyle.Render("     Toggle sidebar        ") + keyStyle.Render("s/Enter") + descStyle.Render(" Open agent") + "\n" +
 		"  " + keyStyle.Render("h") + descStyle.Render("     Enter sidebar         ") + keyStyle.Render("S") + descStyle.Render("       Stop agent") + "\n" +
 		"  " + keyStyle.Render("l") + descStyle.Render("     Exit sidebar          ") + keyStyle.Render("Ctrl+g") + descStyle.Render("  Exit agent view") + "\n" +
-		"  " + keyStyle.Render("j/k") + descStyle.Render("   Navigate projects") + "\n\n" +
+		"  " + keyStyle.Render("j/k") + descStyle.Render("   Navigate projects       ") + keyStyle.Render("Ctrl+]") + descStyle.Render("  Next session (in view)") + "\n" +
+		"  " + keyStyle.Render(" ") + descStyle.Render("                            ") + keyStyle.Render("Ctrl+\\") + descStyle.Render("  Prev session (in view)") + "\n\n" +
 		sep + "\n" +
 		sectionStyle.Render("  👁 View") + "\n" +
 		sep + "\n" +
@@ -881,6 +885,57 @@ func (m *Model) renderChoiceDialog() string {
 		BorderForeground(m.colors.err).
 		Padding(1, 2).
 		Render(b.String())
+}
+
+// renderCycleAttachModal is the "press Enter to attach" prompt shown
+// after the user has cycled focus to a peer session via Ctrl+] /
+// Ctrl+\. The modal exists to absorb the next keystroke so it doesn't
+// get eaten by the daemonclient AttachFirstMsg handshake — the user
+// explicitly confirms the attach with Enter instead of typing into a
+// detached pane and losing the first character.
+func (m *Model) renderCycleAttachModal() string {
+	titleStyle := lipgloss.NewStyle().
+		Foreground(m.colors.primary).
+		Bold(true)
+
+	target := "(unknown)"
+	projectName := ""
+	if ticket, _ := m.globalStore.Get(m.focusedPane); ticket != nil {
+		target = ticket.Title
+		if proj := m.globalStore.GetProjectForTicket(ticket); proj != nil {
+			projectName = proj.Name
+		}
+	}
+
+	keyStyle := lipgloss.NewStyle().Foreground(m.colors.info).Bold(true)
+	dimStyle := m.dimStyle()
+	textStyle := lipgloss.NewStyle().Foreground(m.colors.text)
+
+	header := titleStyle.Render("▶ Switch session")
+	body := textStyle.Render(target)
+	if projectName != "" {
+		projBadge := lipgloss.NewStyle().
+			Foreground(m.colors.base).
+			Background(m.colors.info).
+			Padding(0, 1).
+			Render(projectName)
+		body = projBadge + "  " + body
+	}
+
+	keys := keyStyle.Render("[Enter]") + dimStyle.Render(" Attach   ") +
+		keyStyle.Render("[Ctrl+\\]") + dimStyle.Render(" Prev   ") +
+		keyStyle.Render("[Ctrl+]]") + dimStyle.Render(" Next   ") +
+		keyStyle.Render("[Esc]") + dimStyle.Render(" Cancel")
+
+	content := header + "\n\n" +
+		"  " + body + "\n\n" +
+		"  " + keys
+
+	return lipgloss.NewStyle().
+		Border(columnBorder).
+		BorderForeground(m.colors.primary).
+		Padding(1, 2).
+		Render(content)
 }
 
 func (m *Model) renderShuttingDown() string {
@@ -1605,6 +1660,7 @@ func (m *Model) renderAgentView() string {
 
 	keyStyle := lipgloss.NewStyle().Foreground(m.colors.info)
 	hints := scrollIndicator + paneIndicator + "  " +
+		keyStyle.Render("Ctrl+\\/]") + m.dimStyle().Render(" Cycle  ") +
 		keyStyle.Render("Ctrl+g") + m.dimStyle().Render(" Board")
 
 	spacing := m.width - lipgloss.Width(header) - lipgloss.Width(hints)

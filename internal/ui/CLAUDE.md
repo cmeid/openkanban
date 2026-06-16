@@ -34,6 +34,12 @@ Vim-style navigation:
 - `Enter` - select/confirm
 - `Esc` - cancel/back
 
+Inside ModeAgentView, two keys are intercepted before the PTY child (claude, etc.) sees them:
+- `Ctrl+]` / `Ctrl+\` - cycle focus to next / prev open, unattached session
+- `Ctrl+g` - exit back to the board
+
+`Ctrl+[` cannot be used: in bubbletea v1.3.x (no Kitty keyboard protocol enabled here) it is bytewise indistinguishable from `Esc`. Any new ctrl-combo binding should be verified against `~/golang/pkg/mod/github.com/charmbracelet/bubbletea@<ver>/key.go` before promising it.
+
 ## View Composition
 
 Separate render methods composed in `View()`:
