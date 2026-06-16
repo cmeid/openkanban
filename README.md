@@ -74,6 +74,8 @@ Upstream's CLI was effectively project-management only (`new` / `list` / `delete
 | `openkanban config {validate,generate,path}` | Config tooling, including a validator that warns when an agent's `init_prompt` restates rules already in `~/.claude/CLAUDE.md`. |
 | `openkanban update` | Self-update from the source clone; `origin/main` check, `ff-only` pull, `go install` with `SourcePath` preserved. Also ff-fast-forwards local `main` toward `origin/main` even when run from a feature-branch worktree, so the next branch you cut doesn't start from a stale base. Diverged local `main` (has commits not on `origin/main`) is left untouched. Refuses with an actionable message when the source clone is on a non-`main` branch, detached HEAD, a linked git worktree, or not a git repo at all — and on a non-`main` branch offers an opt-in "switch to main & update" prompt rather than silently building from the wrong tree. |
 | `openkanban uninstall` | Removes install artifacts only: the running binary, the openkanban Claude Code hook entries, and the legacy `~/.local/bin/update-openkanban` script if present. Data dirs (`~/.config/openkanban`, `~/.cache/openkanban`, `~/.cache/openkanban-status`) are listed in the summary but never touched, so a reinstall finds projects and config where they were. `--dry-run` previews; `-y` skips the confirmation. |
+| `openkanban backup` | Snapshot all openkanban config (everything under `~/.config/openkanban/`) plus each registered project's `<RepoPath>/tickets/` directory into a timestamped zip. Default output `~/backup/openkanban/openkanban-<ts>.zip`; `--output` accepts a directory or a `.zip` path. `--dry-run` previews; `-y` skips the confirmation. Warns if `config.json` contains non-empty `agents.*.env` (potential plaintext secrets in the archive). |
+| `openkanban restore <archive>` | Apply a backup zip. Per-file diff-and-prompt for conflicts; identical files are skipped without touching mtime. `--on-conflict=skip\|overwrite\|prompt` (default `prompt`); `-y` skips the initial confirmation only. Path-traversal-safe (zip-slip defended). When a project's `RepoPath` is missing on this machine, prompts to abort or skip — `projects.json` is restored verbatim either way. |
 
 See [`cmd/`](cmd/).
 
@@ -219,6 +221,40 @@ openkanban daemon stop      # clean shutdown
 Override the socket path with `OPENKANBAN_DAEMON_SOCK` if you need to.
 
 The daemon will **never** outlive the TUI as a tmux-style detached session. If you want kanban state to persist across reboots, the on-disk `.md` files are the source of truth — relaunch the TUI and respawn the agents.
+
+## Backup & restore
+
+`openkanban backup` produces a single zip containing everything you'd need to reconstruct an openkanban setup on a fresh machine (modulo `go install` of the binary itself):
+
+- `~/.config/openkanban/` in full — `config.json`, `projects.json`, every per-ticket `.md`, archived tickets, anything else you've left under that directory.
+- For each registered project, `<RepoPath>/tickets/` — the canonical, committed-or-uncommitted ticket briefs that live alongside the repo (see [`feedback_openkanban_store_volatile`](https://github.com/cmeid/openkanban) for why these matter — the volatile store is operational state, not canonical).
+
+What it deliberately does **not** capture: the openkanban binary itself (reinstall via the source clone), Claude Code hook entries in `~/.claude/settings.json` (`openkanban hooks install` recreates them), the launchd plist if you ran `openkanban daemon install-service` (host-specific paths; restore reminds you to re-run that), and the ephemeral cache dirs under `~/.cache/openkanban*` (sockets, pidfiles, logs — all recreated on next launch).
+
+```bash
+openkanban backup                    # writes ~/backup/openkanban/openkanban-<ts>.zip
+openkanban backup --dry-run          # preview, no archive written
+openkanban backup --output ~/snap/   # alternate directory, auto-named inside
+openkanban backup --output /tmp/foo.zip  # exact path
+```
+
+The archive contains real paths and your project list — if that's sensitive, pipe through `gpg` (no built-in encryption by design).
+
+`openkanban restore <archive>` is symmetric and safe-by-default: every conflict is surfaced before bytes are written.
+
+```bash
+openkanban restore ~/backup/openkanban/openkanban-20260616-094530.zip
+```
+
+Per-file conflict handling:
+
+- **Identical files** (byte-for-byte match with the archive entry) — skipped silently, mtime preserved.
+- **Different files** — interactive `git add -p`-style prompt: `y` restore this one, `n` skip, `d` show a unified diff (shells out to `diff -u` if available), `a` yes-to-all-remaining, `A` no-to-all-remaining.
+- `--on-conflict=skip` or `--on-conflict=overwrite` skips the prompt entirely. `-y` only suppresses the initial "about to extract N files, proceed?" confirmation — it does NOT pick a conflict policy.
+
+Cross-machine recovery: when a project in the archive references a `RepoPath` that doesn't exist on this machine, restore stops and asks whether to abort (so you can clone the repo and retry) or skip that repo's `tickets/` extraction. Either way, `projects.json` is restored verbatim — the registry entry survives so you can fix the path inside openkanban after the fact.
+
+Restore writes to a small, explicit allowlist of roots (`~/.config/openkanban/` and each existing `<RepoPath>/tickets/`) and rejects any archive entry whose cleaned destination falls outside them — a defense against zip-slip-style malicious archives.
 
 ## Keybindings
 
