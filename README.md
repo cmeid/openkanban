@@ -305,7 +305,7 @@ Restore writes to a small, explicit allowlist of roots (`~/.config/openkanban/` 
 | `s` | Spawn agent |
 | `enter` | Attach to agent |
 | `o` | Cycle sort order (default → name → age → priority) |
-| `w` | Cycle session filter (all → open → waiting) |
+| `w` | Toggle session filter (all ⇄ open) |
 | `?` | Full help |
 
 ## Configuration
