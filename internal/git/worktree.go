@@ -38,6 +38,14 @@ func (m *WorktreeManager) CreateWorktree(branchName, baseBranch string) (string,
 
 	if _, err := os.Stat(worktreePath); err == nil {
 		if m.isValidWorktree(worktreePath) {
+			branch, err := m.branchForWorktree(worktreePath)
+			if err != nil {
+				return "", err
+			}
+			expectedBranch := strings.TrimPrefix(branchName, "refs/heads/")
+			if branch != expectedBranch {
+				return "", fmt.Errorf("worktree path %s is already used by branch %q, not %q", worktreePath, branch, expectedBranch)
+			}
 			return worktreePath, nil
 		}
 		os.RemoveAll(worktreePath)
@@ -69,6 +77,38 @@ func (m *WorktreeManager) isValidWorktree(path string) bool {
 	}
 	// Worktrees have a .git file (not directory) pointing to the main repo
 	return !info.IsDir()
+}
+
+// branchForWorktree returns the branch checked out at the given worktree path,
+// as reported by `git worktree list --porcelain`. The returned name has the
+// refs/heads/ prefix stripped so callers can compare against the user-facing
+// branch name directly.
+//
+// Paths are compared after symlink resolution because git canonicalizes the
+// paths it stores (on macOS, `/var/...` becomes `/private/var/...`), and a
+// naive string compare would miss the same on-disk location.
+func (m *WorktreeManager) branchForWorktree(path string) (string, error) {
+	worktrees, err := m.ListWorktrees()
+	if err != nil {
+		return "", err
+	}
+	target := canonicalPath(path)
+	for _, wt := range worktrees {
+		if canonicalPath(wt.Path) == target {
+			return strings.TrimPrefix(wt.Branch, "refs/heads/"), nil
+		}
+	}
+	return "", fmt.Errorf("worktree %s not found in git worktree list", path)
+}
+
+// canonicalPath returns a cleaned, symlink-resolved absolute path for
+// comparison. If symlink resolution fails (e.g. the path doesn't exist), it
+// falls back to filepath.Clean so callers still get a deterministic key.
+func canonicalPath(path string) string {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return filepath.Clean(resolved)
+	}
+	return filepath.Clean(path)
 }
 
 func (m *WorktreeManager) RemoveWorktree(worktreePath string) error {

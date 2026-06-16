@@ -2,7 +2,9 @@ package git
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -235,5 +237,107 @@ func TestNewWorktreeManagerFromPaths(t *testing.T) {
 	}
 	if mgr.baseDir != "/worktrees/path" {
 		t.Errorf("baseDir = %q; want %q", mgr.baseDir, "/worktrees/path")
+	}
+}
+
+// initTestRepo creates a fresh git repo with a single initial commit on the
+// default branch (forced to "main" for determinism) and returns its path.
+func initTestRepo(t *testing.T) string {
+	t.Helper()
+	repoPath := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(repoPath, 0755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+
+	runGit := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoPath
+		// Isolate from the user's global git config so signing / hooks /
+		// templates can't break the test on contributor machines.
+		cmd.Env = append(os.Environ(),
+			"GIT_CONFIG_GLOBAL=/dev/null",
+			"GIT_CONFIG_SYSTEM=/dev/null",
+			"GIT_AUTHOR_NAME=test",
+			"GIT_AUTHOR_EMAIL=test@example.com",
+			"GIT_COMMITTER_NAME=test",
+			"GIT_COMMITTER_EMAIL=test@example.com",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, string(out))
+		}
+	}
+
+	runGit("init", "--initial-branch=main", repoPath)
+	// Seed a commit so HEAD resolves and `git worktree add` has something to base on.
+	if err := os.WriteFile(filepath.Join(repoPath, "README.md"), []byte("seed\n"), 0644); err != nil {
+		t.Fatalf("write seed file: %v", err)
+	}
+	runGit("add", "README.md")
+	runGit("commit", "-m", "init")
+
+	return repoPath
+}
+
+func TestCreateWorktree_BranchMismatchOnPathReuse(t *testing.T) {
+	repoPath := initTestRepo(t)
+	baseDir := filepath.Join(t.TempDir(), "worktrees")
+
+	mgr := NewWorktreeManagerFromPaths(repoPath, baseDir)
+
+	// First call: create worktree on branch "feature-x" from main.
+	wtPath, err := mgr.CreateWorktree("feature-x", "main")
+	if err != nil {
+		t.Fatalf("initial CreateWorktree: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(wtPath, ".git")); err != nil {
+		t.Fatalf("expected worktree .git file at %s: %v", wtPath, err)
+	}
+
+	// Second call with the same branch should be a no-op reuse.
+	wtPath2, err := mgr.CreateWorktree("feature-x", "main")
+	if err != nil {
+		t.Fatalf("reuse CreateWorktree: %v", err)
+	}
+	if wtPath2 != wtPath {
+		t.Errorf("reused worktree path = %q; want %q", wtPath2, wtPath)
+	}
+
+	// Third call: a different branch name that sanitizes to the SAME path
+	// ("feature/feature-x" -> "feature-x"). The path is occupied by branch
+	// feature-x, so we must refuse rather than silently hand back a
+	// contaminated worktree.
+	_, err = mgr.CreateWorktree("feature/feature-x", "main")
+	if err == nil {
+		t.Fatalf("expected error for branch-mismatch path collision, got nil")
+	}
+	if !strings.Contains(err.Error(), "is already used by branch") {
+		t.Errorf("error %q does not mention branch reuse", err.Error())
+	}
+	if !strings.Contains(err.Error(), `"feature-x"`) {
+		t.Errorf("error %q does not name the occupying branch", err.Error())
+	}
+}
+
+func TestBranchForWorktree(t *testing.T) {
+	repoPath := initTestRepo(t)
+	baseDir := filepath.Join(t.TempDir(), "worktrees")
+
+	mgr := NewWorktreeManagerFromPaths(repoPath, baseDir)
+
+	wtPath, err := mgr.CreateWorktree("branch-probe", "main")
+	if err != nil {
+		t.Fatalf("CreateWorktree: %v", err)
+	}
+
+	branch, err := mgr.branchForWorktree(wtPath)
+	if err != nil {
+		t.Fatalf("branchForWorktree: %v", err)
+	}
+	if branch != "branch-probe" {
+		t.Errorf("branchForWorktree = %q; want %q", branch, "branch-probe")
+	}
+
+	if _, err := mgr.branchForWorktree(filepath.Join(baseDir, "does-not-exist")); err == nil {
+		t.Errorf("expected error for unknown path, got nil")
 	}
 }
