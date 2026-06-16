@@ -1699,8 +1699,11 @@ func (m *Model) dropTicket() (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// Wrap up any live session BEFORE Move (see quickMoveTicket).
-	m.wrapUpSessionForTicket(ticket, targetStatus)
+	// Wrap up any live session BEFORE Move (see quickMoveTicket). The
+	// returned Cmd performs the daemon-side Stop + TicketDone in a
+	// background goroutine — must not be dropped or the Update loop
+	// freezes for up to ~7s on the daemon RPCs.
+	wrapUpCmd := m.wrapUpSessionForTicket(ticket, targetStatus)
 
 	promoted, _ := m.globalStore.Move(ticket.ID, targetStatus)
 	m.refreshColumnTickets()
@@ -1715,7 +1718,7 @@ func (m *Model) dropTicket() (tea.Model, tea.Cmd) {
 	m.dragging = false
 	m.dragTargetColumn = 0
 
-	return m, nil
+	return m, wrapUpCmd
 }
 
 func (m *Model) handleCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -3514,7 +3517,8 @@ func (m *Model) quickMoveTicket() (tea.Model, tea.Cmd) {
 	// Wrap up any live session BEFORE Move mutates ticket.Status —
 	// the helper's pre-move-status check is what gates the teardown.
 	// No-op when the ticket isn't leaving in_progress for a terminal.
-	m.wrapUpSessionForTicket(ticket, nextStatus)
+	// The returned Cmd runs the daemon RPCs off the Update loop.
+	wrapUpCmd := m.wrapUpSessionForTicket(ticket, nextStatus)
 
 	promoted, _ := m.globalStore.Move(ticket.ID, nextStatus)
 	m.refreshColumnTickets()
@@ -3522,7 +3526,7 @@ func (m *Model) quickMoveTicket() (tea.Model, tea.Cmd) {
 	m.saveTicket(ticket)
 	m.notify(moveAndPromoteMsg(nextStatus, promoted))
 
-	return m, nil
+	return m, wrapUpCmd
 }
 
 // adjustPriority shifts the active ticket's priority by delta (negative
@@ -3733,7 +3737,7 @@ func (m *Model) quickMoveTicketBackward() (tea.Model, tea.Cmd) {
 	// helper's pre-condition keeps this a no-op. The call is harmless
 	// here but kept for parity with quickMoveTicket so a future change
 	// to status ordering doesn't silently introduce an asymmetry.
-	m.wrapUpSessionForTicket(ticket, prevStatus)
+	wrapUpCmd := m.wrapUpSessionForTicket(ticket, prevStatus)
 
 	promoted, _ := m.globalStore.Move(ticket.ID, prevStatus)
 	m.refreshColumnTickets()
@@ -3741,7 +3745,7 @@ func (m *Model) quickMoveTicketBackward() (tea.Model, tea.Cmd) {
 	m.saveTicket(ticket)
 	m.notify(moveAndPromoteMsg(prevStatus, promoted))
 
-	return m, nil
+	return m, wrapUpCmd
 }
 
 func (m *Model) setupWorktree(ticket *board.Ticket) error {
@@ -4792,28 +4796,42 @@ func (m *Model) stopAgent() (tea.Model, tea.Cmd) {
 // session via TicketDone, and stamp AgentStatus=Completed so the card
 // renders correctly even before the daemon's "exited" event lands.
 //
-// Safe to call when no daemon session exists for the ticket — the pane-
-// teardown and daemon RPC are both no-ops in that case. Must be called
-// BEFORE m.globalStore.Move so the ticket.Status check ("are we leaving
-// in_progress?") runs against the pre-move status; Move's SetStatus
-// mutates ticket.Status in place.
-func (m *Model) wrapUpSessionForTicket(ticket *board.Ticket, newStatus board.TicketStatus) {
+// Returns a tea.Cmd that performs the daemon-side teardown (Stop +
+// TicketDone) in a background goroutine. The Update loop must not block
+// on these RPCs — together they have a worst-case ~7s timeout (5s Kill
+// + 2s TicketDone), which is what the multi-second freeze on session
+// exit was actually about. Local state mutations (pane map delete,
+// focus clear, AgentStatus stamp) stay synchronous so the next render
+// reflects the wrap-up immediately.
+//
+// Safe to call when no daemon session exists for the ticket — returns
+// nil in that case. Must be called BEFORE m.globalStore.Move so the
+// ticket.Status check ("are we leaving in_progress?") runs against the
+// pre-move status; Move's SetStatus mutates ticket.Status in place.
+//
+// The returned Cmd's closure captures the pane handle and daemon API
+// into locals BEFORE the goroutine runs, per the "tea.Cmd goroutines
+// must not touch shared Model state" discipline in internal/ui/CLAUDE.md.
+func (m *Model) wrapUpSessionForTicket(ticket *board.Ticket, newStatus board.TicketStatus) tea.Cmd {
 	if ticket == nil {
-		return
+		return nil
 	}
 	// Only wrap up when crossing OUT of in_progress to a terminal
 	// status. Backlog→in_progress and other transitions don't have a
 	// session to tear down (or shouldn't tear it down if they do).
 	if ticket.Status != board.StatusInProgress {
-		return
+		return nil
 	}
 	if newStatus != board.StatusInReview && newStatus != board.StatusDone {
-		return
+		return nil
 	}
 
-	// Local pane teardown. Mirrors stopAgent above.
+	// Capture the local pane handle and remove it from m.panes so
+	// subsequent Update ticks don't see a stale entry. The goroutine
+	// below stops the captured handle off-loop.
+	var capturedPane *daemonclient.PaneView
 	if pane, ok := m.panes[ticket.ID]; ok {
-		pane.Stop()
+		capturedPane = pane
 		delete(m.panes, ticket.ID)
 	}
 	if m.focusedPane == ticket.ID {
@@ -4821,22 +4839,41 @@ func (m *Model) wrapUpSessionForTicket(ticket *board.Ticket, newStatus board.Tic
 		m.focusedPane = ""
 	}
 
-	// Tell the daemon (best-effort; failures are not fatal — same
-	// contract as cmd/ticket_done.go:notifyDaemonTicketDone). Routed
-	// through m.daemon so tests can substitute a fake.
-	if m.daemon != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		if _, err := m.daemon.TicketDone(ctx, string(ticket.ID)); err != nil {
-			log.Printf("openkanban: TicketDone(%s) on board promotion: %v", ticket.ID, err)
-		}
-	}
-
 	// AgentStatus discipline. SetAgentStatus stamps StatusChangedAt;
 	// use it, don't assign directly (see Ticket.SetAgentStatus in
 	// internal/board/board.go and the SetAgentStatus memory note).
 	// The caller's saveTicket call after Move will persist this.
 	ticket.SetAgentStatus(board.AgentCompleted)
+
+	// Capture daemon API + ticket ID into locals so the goroutine has
+	// no dependency on m.*.
+	api := m.daemon
+	ticketID := string(ticket.ID)
+	if capturedPane == nil && api == nil {
+		return nil
+	}
+
+	return func() tea.Msg {
+		t0 := time.Now()
+		if capturedPane != nil {
+			_ = capturedPane.Stop()
+			// Close after Stop so teaMsgs is drained and the PaneView
+			// goroutines (drainWG, detach watchdog) can wind down
+			// instead of lingering until GC. The model has already
+			// removed this pane from m.panes synchronously, so no
+			// in-flight handler will dispatch new messages to it.
+			_ = capturedPane.Close()
+		}
+		if api != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if _, err := api.TicketDone(ctx, ticketID); err != nil {
+				log.Printf("openkanban: TicketDone(%s) on board promotion: %v", ticketID, err)
+			}
+		}
+		log.Printf("openkanban: wrapUpSessionForTicket(%s) daemon teardown took %s", ticketID, time.Since(t0))
+		return nil
+	}
 }
 
 func (m *Model) selectedTicket() *board.Ticket {

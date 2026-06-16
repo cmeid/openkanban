@@ -108,7 +108,14 @@ func newWrapUpModel(t *testing.T, status board.TicketStatus) (*Model, *board.Tic
 func TestWrapUpSessionForTicket_InProgressToInReview_StopsPaneAndNotifiesDaemon(t *testing.T) {
 	m, ticket, stub := newWrapUpModel(t, board.StatusInProgress)
 
-	m.wrapUpSessionForTicket(ticket, board.StatusInReview)
+	// wrapUpSessionForTicket now returns a tea.Cmd that performs the
+	// daemon-side teardown (pane.Stop + TicketDone) in a goroutine —
+	// keeping the Update loop unblocked on session-end. The tests drive
+	// it inline to assert on the daemon-fake call counts.
+	cmd := m.wrapUpSessionForTicket(ticket, board.StatusInReview)
+	if cmd != nil {
+		_ = cmd()
+	}
 
 	if _, ok := m.panes[ticket.ID]; ok {
 		t.Errorf("panes[%s] still present after wrap-up", ticket.ID)
@@ -130,6 +137,55 @@ func TestWrapUpSessionForTicket_InProgressToInReview_StopsPaneAndNotifiesDaemon(
 	}
 }
 
+// TestWrapUpSessionForTicket_LocalSyncDaemonAsync pins the sync-vs-async
+// split that the multi-second-freeze fix introduced. Local state
+// mutations (panes map, AgentStatus, focusedPane, mode) MUST happen
+// synchronously in wrapUpSessionForTicket so the next render reflects
+// the wrap-up. The daemon-side RPCs (pane.Stop + TicketDone), which
+// previously blocked the BubbleTea Update loop for up to ~7s, MUST be
+// deferred to the returned tea.Cmd so the loop returns immediately.
+// This test asserts BOTH halves of that split.
+func TestWrapUpSessionForTicket_LocalSyncDaemonAsync(t *testing.T) {
+	m, ticket, stub := newWrapUpModel(t, board.StatusInProgress)
+
+	cmd := m.wrapUpSessionForTicket(ticket, board.StatusInReview)
+
+	// BEFORE running the Cmd: local state mutations must already be
+	// visible. If any of these asserts fail, the helper has regressed
+	// into doing local work inside the goroutine — that breaks the
+	// "card renders correctly immediately" contract.
+	if _, ok := m.panes[ticket.ID]; ok {
+		t.Errorf("panes[%s] still present BEFORE Cmd ran — should be removed synchronously", ticket.ID)
+	}
+	if ticket.AgentStatus != board.AgentCompleted {
+		t.Errorf("AgentStatus BEFORE Cmd ran = %v, want %v (must be set synchronously)", ticket.AgentStatus, board.AgentCompleted)
+	}
+	if m.focusedPane != "" {
+		t.Errorf("focusedPane BEFORE Cmd ran = %q, want \"\" (must unwind synchronously)", m.focusedPane)
+	}
+	if m.mode != ModeNormal {
+		t.Errorf("mode BEFORE Cmd ran = %v, want %v (must unwind synchronously)", m.mode, ModeNormal)
+	}
+
+	// BEFORE running the Cmd: the daemon RPC must NOT have fired. If
+	// it has, wrapUpSessionForTicket has regressed into blocking the
+	// Update loop on the RPC, which is the original bug.
+	if calls := stub.calls.Load(); calls != 0 {
+		t.Errorf("TicketDone calls BEFORE Cmd ran = %d, want 0 (daemon RPC must be deferred to the Cmd)", calls)
+	}
+
+	// Now run the Cmd. The daemon RPC fires here, on whatever
+	// goroutine tea picks — for the test, the same goroutine.
+	if cmd == nil {
+		t.Fatal("wrapUpSessionForTicket returned nil Cmd despite a live pane + daemon")
+	}
+	_ = cmd()
+
+	if calls := stub.calls.Load(); calls != 1 {
+		t.Errorf("TicketDone calls AFTER Cmd ran = %d, want 1", calls)
+	}
+}
+
 // TestWrapUpSessionForTicket_InProgressToDone covers the second
 // "leaving in_progress for a terminal" transition. Behaviour matches
 // the in_review case exactly — both go through TicketDone with
@@ -137,7 +193,10 @@ func TestWrapUpSessionForTicket_InProgressToInReview_StopsPaneAndNotifiesDaemon(
 func TestWrapUpSessionForTicket_InProgressToDone(t *testing.T) {
 	m, ticket, stub := newWrapUpModel(t, board.StatusInProgress)
 
-	m.wrapUpSessionForTicket(ticket, board.StatusDone)
+	cmd := m.wrapUpSessionForTicket(ticket, board.StatusDone)
+	if cmd != nil {
+		_ = cmd()
+	}
 
 	if _, ok := m.panes[ticket.ID]; ok {
 		t.Errorf("panes[%s] still present after wrap-up", ticket.ID)
@@ -200,7 +259,10 @@ func TestWrapUpSessionForTicket_NoLivePane_StillNotifiesDaemon(t *testing.T) {
 	m.focusedPane = ""
 	m.mode = ModeNormal
 
-	m.wrapUpSessionForTicket(ticket, board.StatusInReview)
+	cmd := m.wrapUpSessionForTicket(ticket, board.StatusInReview)
+	if cmd != nil {
+		_ = cmd()
+	}
 
 	if stub.calls.Load() != 1 {
 		t.Errorf("TicketDone calls = %d, want 1 (daemon must still be told)", stub.calls.Load())
@@ -218,7 +280,13 @@ func TestWrapUpSessionForTicket_NilDaemonAPI_DoesNotPanic(t *testing.T) {
 	m, ticket, _ := newWrapUpModel(t, board.StatusInProgress)
 	m.daemon = nil
 
-	m.wrapUpSessionForTicket(ticket, board.StatusInReview)
+	cmd := m.wrapUpSessionForTicket(ticket, board.StatusInReview)
+	if cmd != nil {
+		// Invoke the Cmd to also exercise pane.Stop()/Close() under
+		// a nil daemon API — the closure must skip the TicketDone
+		// branch but still drain the pane handle without panicking.
+		_ = cmd()
+	}
 
 	if _, ok := m.panes[ticket.ID]; ok {
 		t.Errorf("panes[%s] still present after wrap-up with nil m.daemon", ticket.ID)
@@ -236,7 +304,10 @@ func TestWrapUpSessionForTicket_NilDaemonAPI_DoesNotPanic(t *testing.T) {
 func TestQuickMoveTicket_InProgressToInReview_WrapsUp(t *testing.T) {
 	m, ticket, stub := newWrapUpModel(t, board.StatusInProgress)
 
-	_, _ = m.quickMoveTicket()
+	_, cmd := m.quickMoveTicket()
+	if cmd != nil {
+		_ = cmd()
+	}
 
 	// Move went through.
 	if ticket.Status != board.StatusInReview {
@@ -286,7 +357,10 @@ func TestDropTicket_InProgressToInReview_WrapsUp(t *testing.T) {
 	}
 	m.dragging = true
 
-	_, _ = m.dropTicket()
+	_, cmd := m.dropTicket()
+	if cmd != nil {
+		_ = cmd()
+	}
 
 	if ticket.Status != board.StatusInReview {
 		t.Errorf("Status = %v, want %v", ticket.Status, board.StatusInReview)

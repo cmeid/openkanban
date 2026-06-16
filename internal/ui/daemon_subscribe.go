@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"log"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -147,6 +148,17 @@ func (m *Model) handleDaemonSessionEvent(msg daemonSessionEventMsg) (tea.Model, 
 					m.saveTicket(ticket)
 				}
 			case "exited":
+				// Instrument the "exited" handler body so we can spot
+				// regressions if the saveTicket disk write, the pv.Close
+				// (now non-blocking after the Task 1 refactor in
+				// internal/daemonclient/paneview.go), or anything else in
+				// this branch starts taking real wall-clock. Anything
+				// over ~100ms is a follow-up.
+				t0 := time.Now()
+				defer func() {
+					log.Printf("openkanban: handleDaemonSessionEvent.exited(%s expected=%v) took %s",
+						ticketID, ev.Expected, time.Since(t0))
+				}()
 				delete(m.daemonOwned, ticketID)
 				delete(m.daemonViewing, ticketID)
 				delete(m.lastPTYActivity, ticketID)

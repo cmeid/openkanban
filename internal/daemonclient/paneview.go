@@ -188,6 +188,13 @@ type PaneView struct {
 	// signals, not data.
 	teaMsgs   chan tea.Msg
 	teaClosed atomic.Bool
+	// teaMu serialises send (emitTeaMsg) vs close (Close) on teaMsgs.
+	// teaClosed.Load() is a fast-path read; the actual send/close
+	// transaction is gated by this mutex. Without it, an attach
+	// goroutine emit can race with Close()'s close(teaMsgs) once
+	// detach() returns before the attach loop has drained (the
+	// non-blocking-detach refactor).
+	teaMu sync.Mutex
 
 	// One-shot diagnostic flag: keep the "View() vt is nil" warning
 	// gated to fire once per PaneView so a teardown bug never gets
@@ -755,6 +762,16 @@ func (p *PaneView) detach(sendFrame bool) error {
 	}
 	p.attachConn = nil
 	p.attachR = nil
+	// Eagerly mark Unattached and tear down the emulator so callers'
+	// state assumptions hold on return. The same mutations may run
+	// concurrently inside handleAttachExit when the attach loop sees the
+	// conn close; both paths take p.mu, close the *current* detachCh
+	// and swap to a fresh one, and teardownEmulatorLocked is idempotent
+	// (drainStop is nil-guarded, vt nil-safe).
+	p.state = PaneViewUnattached
+	p.teardownEmulatorLocked()
+	close(p.detachCh)
+	p.detachCh = make(chan struct{})
 	p.mu.Unlock()
 
 	if sendFrame {
@@ -764,16 +781,54 @@ func (p *PaneView) detach(sendFrame bool) error {
 	}
 	_ = conn.Close()
 
-	p.attachLoopWG.Wait()
+	// attachLoopWG.Wait OFF the caller's hot path. Previously this wait
+	// blocked inline, which froze the BubbleTea Update loop on every
+	// pv.Close() / Detach() in the session-end cleanup paths. The
+	// attach loop normally drains within a few ms of conn.Close() via
+	// io.EOF or a daemon-side TypeDetach frame.
+	//
+	// Tiered logging: a 5s warning fires for slow-but-not-wedged daemons
+	// so the next person debugging "feels sluggish" has a tripwire
+	// before the 30s emergency tier; the 30s tier emits
+	// PaneDetachedMsg anyway so the model isn't wedged on a truly
+	// stuck daemon.
+	//
+	// attachLoopWG is reused across attach/detach cycles. If a
+	// re-Attach happens between conn.Close() and the old loop's Done,
+	// the inner Wait will block until BOTH loops drain — the watchdog's
+	// PaneDetachedMsg then arrives late w.r.t. the OLD attach, but
+	// handleAttachExit has already emitted its own when the old loop
+	// exited, and the model handler is idempotent. Acceptable.
+	paneID := p.id
+	sessID := p.sessionID
+	go func() {
+		t0 := time.Now()
+		done := make(chan struct{})
+		go func() {
+			p.attachLoopWG.Wait()
+			close(done)
+		}()
+		warn := time.NewTimer(5 * time.Second)
+		deadline := time.NewTimer(30 * time.Second)
+		defer warn.Stop()
+		defer deadline.Stop()
+		for {
+			select {
+			case <-done:
+				log.Printf("openkanban paneview: detach drained session=%s in %s", sessID, time.Since(t0))
+				p.emitTeaMsg(PaneDetachedMsg{PaneID: paneID})
+				return
+			case <-warn.C:
+				log.Printf("openkanban paneview: detach attachLoopWG.Wait slow (>5s) session=%s; still waiting", sessID)
+				// no return — fall through to wait for done or deadline
+			case <-deadline.C:
+				log.Printf("openkanban paneview: detach attachLoopWG.Wait stuck after 30s session=%s; emitting PaneDetachedMsg anyway (inner Wait leaks until loop drains)", sessID)
+				p.emitTeaMsg(PaneDetachedMsg{PaneID: paneID})
+				return
+			}
+		}
+	}()
 
-	p.mu.Lock()
-	p.state = PaneViewUnattached
-	p.teardownEmulatorLocked()
-	close(p.detachCh)
-	p.detachCh = make(chan struct{})
-	p.mu.Unlock()
-
-	p.emitTeaMsg(PaneDetachedMsg{PaneID: p.id})
 	return nil
 }
 
@@ -1045,6 +1100,8 @@ func (p *PaneView) stop(timeout time.Duration) error {
 // underlying agent.
 func (p *PaneView) Close() error {
 	_ = p.detach(false)
+	p.teaMu.Lock()
+	defer p.teaMu.Unlock()
 	if p.teaClosed.CompareAndSwap(false, true) {
 		close(p.teaMsgs)
 	}
@@ -1620,11 +1677,19 @@ func (p *PaneView) readNextMsg() tea.Cmd {
 // because the bytes were already written to vt via applyOutput).
 func (p *PaneView) emitTeaMsg(msg tea.Msg) {
 	if p.teaClosed.Load() {
+		log.Printf("openkanban paneview: dropped %T session=%s (teaMsgs already closed)", msg, p.sessionID)
+		return
+	}
+	p.teaMu.Lock()
+	defer p.teaMu.Unlock()
+	if p.teaClosed.Load() {
+		log.Printf("openkanban paneview: dropped %T session=%s (teaMsgs closed under teaMu)", msg, p.sessionID)
 		return
 	}
 	select {
 	case p.teaMsgs <- msg:
 	default:
+		log.Printf("openkanban paneview: dropped %T session=%s (teaMsgs buffer full)", msg, p.sessionID)
 	}
 }
 
