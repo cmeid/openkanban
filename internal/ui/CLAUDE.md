@@ -89,6 +89,8 @@ Card-height arithmetic in any path that runs *inside or after* `refreshColumnTic
 
 PaneView is the client-side handle; the PTY itself lives in openkanbankd. Lifecycle is daemon-driven: `Spawn` happens server-side at construction time, `Attach` / `Detach` swap which TUI is the one attached client, and `daemonclient.PaneViewAttached` vs `PaneViewUnattached` describe what this TUI sees, not whether the agent is alive (the agent can be alive in the daemon while every TUI is `Unattached`). Methods preserve the old `*terminal.Pane` surface — see `internal/daemonclient/paneview.go` for the full 13-method shape and the unattached-state behavior table.
 
+`Detach()` and `Close()` are non-blocking as of 2026-06-16. State mutations (state=Unattached, emulator teardown, detachCh swap) happen eagerly under `p.mu`; the underlying `attachLoopWG.Wait` runs in a goroutine with a 5s warning / 30s deadline watchdog. `PaneDetachedMsg` arrives whenever the read loop actually drains (not synchronously with the caller). `emitTeaMsg` and `Close` are serialised by a `teaMu sync.Mutex` so the goroutine can't send on a closed `teaMsgs` channel. Required reading before any teardown edit: memory [[reference_openkanban_paneview_detach_concurrency]].
+
 ### Attach-failure overlay
 
 When `attachWithRetry` (post-spawn or B4 fast-path) exhausts its retries, the closure calls `pv.SetLastAttachErr(err)` before returning the `spawnReadyMsg`. `PaneView.View()` then renders an actionable overlay instead of `blankPaneView` — same `cols × rows` contract so the chrome composition doesn't shift, pure ASCII so byte count == display cell count. Successful `Attach()` clears `lastAttachErr` automatically, so the overlay disappears on the next View() pass. The `shouldRetryAttachOnEnter` predicate (see Key Bindings above) gates Enter-retry on the SAME state pair, so the overlay's "Enter retries" hint is actually wired up.
@@ -106,7 +108,11 @@ The three choice closures (`d`/`u`/`n` → `spawnPlan{ForceFresh}`/`{InjectResum
 
 ## Status-mutation wrap-up
 
-When the user moves a ticket OUT of `in_progress` to a terminal status (`in_review` or `done`) via the **board** (quick-move keys or drag), `wrapUpSessionForTicket` runs BEFORE `m.globalStore.Move(...)`. It mirrors the CLI's `cmd/ticket_done.go:wrapUpSessionTicketAt`: stops the local pane, sends `TicketDone` to the daemon to terminate the live PTY, and stamps `AgentStatus=Completed` via `SetAgentStatus`. The pre-Move ordering matters — the helper's gate ("is the ticket leaving in_progress?") reads the **current** status, which `Move`'s call to `SetStatus` mutates in place.
+When the user moves a ticket OUT of `in_progress` to a terminal status (`in_review` or `done`) via the **board** (quick-move keys or drag), `wrapUpSessionForTicket` runs BEFORE `m.globalStore.Move(...)`. The pre-Move ordering matters — the helper's gate ("is the ticket leaving in_progress?") reads the **current** status, which `Move`'s call to `SetStatus` mutates in place.
+
+`wrapUpSessionForTicket` returns a `tea.Cmd`. **Local state mutations stay synchronous** in the helper (pane map delete, focus unwind, `SetAgentStatus(AgentCompleted)`) so the next render reflects the wrap-up immediately. **Daemon-side work** — `pane.Stop()`, `pane.Close()`, `TicketDone(ctx, ticketID)` — runs in the returned Cmd's goroutine, off the Update loop. Pre-2026-06-16 these were inline with 5s + 2s context timeouts, which was the multi-second freeze users saw on `/quit` and `openkanban ticket done`. Callers (drag-drop, forward and backward quick-move) thread the returned Cmd into their `(model, cmd)` return value; tests that assert daemon-side effects capture and invoke the Cmd inline. Memory: [[reference_openkanban_wrap_up_returns_cmd]].
+
+The Cmd's closure captures pane handle, daemon API, and ticket ID into locals before launching — per the "tea.Cmd goroutines must not touch shared Model state" rule below. The underlying primitive that makes this cheap is `PaneView.detach()`'s own non-blocking refactor: memory [[reference_openkanban_paneview_detach_concurrency]].
 
 This closes the historical asymmetry where the CLI tore down sessions on transition but the TUI didn't — leaving a live daemon PTY whose ticket's status no longer matched.
 
