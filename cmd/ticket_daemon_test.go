@@ -12,6 +12,7 @@ import (
 	"github.com/techdufus/openkanban/internal/board"
 	"github.com/techdufus/openkanban/internal/daemon"
 	"github.com/techdufus/openkanban/internal/daemonclient"
+	"github.com/techdufus/openkanban/internal/project"
 )
 
 // --- Scaffolding -----------------------------------------------------------
@@ -518,5 +519,241 @@ func TestTicketDelete_DaemonDown_NoOp(t *testing.T) {
 	}
 	if owns {
 		t.Errorf("daemonOwns = true, want false")
+	}
+}
+
+// --- B2: end-to-end ticket delete drives the TicketDone fallback ---------
+//
+// These exercise the cobra RunE on ticketDeleteCmd against a real
+// daemon.Server plus an on-disk project registry + ticket store. The
+// load-bearing assertion is the new TicketID-keyed TicketDone layer:
+// it must sweep daemon sessions for tickets whose AgentSessionID
+// hasn't been back-filled yet (the freshly-spawned race window).
+
+// setupTmpConfigDirCmd is the cmd-package equivalent of
+// project.setupTmpConfigDir. Points OPENKANBAN_CONFIG_DIR at a
+// per-test tmpdir and seeds the tickets/ subdir.
+func setupTmpConfigDirCmd(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv("OPENKANBAN_CONFIG_DIR", dir)
+	if err := os.MkdirAll(filepath.Join(dir, "tickets"), 0o755); err != nil {
+		t.Fatalf("mkdir tickets: %v", err)
+	}
+	return dir
+}
+
+// seedProjectWithTicket registers a project (via the on-disk
+// projects.json) and writes a single ticket .md inside its per-project
+// directory. Returns the project and ticket so callers can drive the
+// CLI flags against them.
+func seedProjectWithTicket(t *testing.T, projectName string, agentSessionID string) (*project.Project, *board.Ticket) {
+	t.Helper()
+
+	repoDir := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatalf("mkdir repoDir: %v", err)
+	}
+
+	registry, err := project.LoadRegistry()
+	if err != nil {
+		t.Fatalf("LoadRegistry: %v", err)
+	}
+	proj := project.NewProject(projectName, repoDir)
+	if err := registry.Add(proj); err != nil {
+		t.Fatalf("registry.Add: %v", err)
+	}
+
+	store := project.NewTicketStore(proj.ID, repoDir)
+	ticket := board.NewTicket("delete-me", proj.ID)
+	ticket.AgentSessionID = agentSessionID
+	store.Add(ticket)
+	if err := store.SaveTicket(ticket); err != nil {
+		t.Fatalf("SaveTicket: %v", err)
+	}
+	return proj, ticket
+}
+
+// runTicketDelete invokes the ticketDeleteCmd RunE with the given flags
+// set, then restores the previous values. Returns the RunE error.
+func runTicketDelete(t *testing.T, projectArg, ticketID string) error {
+	t.Helper()
+	prevProj, prevID := ticketDeleteProject, ticketDeleteID
+	t.Cleanup(func() {
+		ticketDeleteProject = prevProj
+		ticketDeleteID = prevID
+	})
+	ticketDeleteProject = projectArg
+	ticketDeleteID = ticketID
+	return ticketDeleteCmd.RunE(ticketDeleteCmd, nil)
+}
+
+// daemonHasSessionForTicket asks the daemon how many live sessions
+// match the given TicketID. Used by tests to confirm the second-layer
+// TicketDone RPC actually cleaned up.
+func daemonHasSessionForTicket(t *testing.T, ticketID string) bool {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	c, err := daemonclient.New(ctx)
+	if err != nil {
+		t.Fatalf("daemonclient.New: %v", err)
+	}
+	defer c.Close()
+	list, err := c.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	for _, s := range list.Sessions {
+		if s.TicketID == ticketID {
+			return true
+		}
+	}
+	return false
+}
+
+// TestTicketDelete_KillsDaemonSessionWithoutBackfilledUUID is the load-
+// bearing test for B2: a freshly-spawned daemon session whose owning
+// ticket has AgentSessionID="" (UUID not yet back-filled) must still
+// be terminated by `openkanban ticket delete`. Pre-B2, the delete
+// handler only fired the UUID-keyed Owns/Kill RPC when
+// t.AgentSessionID != "", so this exact race-window scenario leaked
+// daemon sessions.
+func TestTicketDelete_KillsDaemonSessionWithoutBackfilledUUID(t *testing.T) {
+	sock, _ := daemonTestEnv(t)
+	setupTmpConfigDirCmd(t)
+	startDaemonServer(t, sock)
+
+	// AgentSessionID intentionally empty: this is the back-fill race
+	// window the new TicketDone layer is here to close.
+	proj, ticket := seedProjectWithTicket(t, "proj-b2", "")
+
+	// Spawn a daemon session keyed only by the TicketID. Use a fake
+	// (but well-formed) UUID for AgentSessionUUID so the Spawn req
+	// passes validation, but the *ticket's* AgentSessionID stays
+	// empty — that's the bug scenario.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	holder, err := daemonclient.New(ctx)
+	if err != nil {
+		t.Fatalf("daemonclient.New: %v", err)
+	}
+	t.Cleanup(func() { holder.Close() })
+
+	_, err = holder.Spawn(ctx, daemon.SpawnReq{
+		TicketID:         string(ticket.ID),
+		SessionName:      "test-session",
+		Command:          "/bin/cat",
+		Cols:             80,
+		Rows:             24,
+		Scrollback:       1000,
+		AgentSessionUUID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+
+	if !daemonHasSessionForTicket(t, string(ticket.ID)) {
+		t.Fatalf("pre-delete: expected daemon to own a session for %s", ticket.ID)
+	}
+
+	if err := runTicketDelete(t, proj.Name, string(ticket.ID)); err != nil {
+		t.Fatalf("ticket delete RunE: %v", err)
+	}
+
+	// Allow the daemon's kill goroutine a brief moment to drop the
+	// session from its bookkeeping. List below short-circuits well
+	// before this deadline once the session is gone.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !daemonHasSessionForTicket(t, string(ticket.ID)) {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if daemonHasSessionForTicket(t, string(ticket.ID)) {
+		t.Errorf("post-delete: daemon still owns a session for %s; "+
+			"TicketDone fallback failed to fire", ticket.ID)
+	}
+}
+
+// TestTicketDelete_BothLayersFireCleanly covers the case where the
+// UUID-keyed Owns/Kill path AND the TicketID-keyed TicketDone path are
+// both eligible (AgentSessionID IS set, AND a live daemon session
+// matches). The first layer kills the session; the second layer is a
+// no-op on miss, and that must not error.
+func TestTicketDelete_BothLayersFireCleanly(t *testing.T) {
+	sock, home := daemonTestEnv(t)
+	setupTmpConfigDirCmd(t)
+	startDaemonServer(t, sock)
+
+	uuid := "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+	writeFakeSessionFile(t, home, uuid)
+
+	proj, ticket := seedProjectWithTicket(t, "proj-b2-both", uuid)
+
+	// Spawn the daemon session tagged with BOTH the matching TicketID
+	// and the matching UUID — the first delete layer should find it
+	// via Owns/Kill.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	holder, err := daemonclient.New(ctx)
+	if err != nil {
+		t.Fatalf("daemonclient.New: %v", err)
+	}
+	t.Cleanup(func() { holder.Close() })
+
+	_, err = holder.Spawn(ctx, daemon.SpawnReq{
+		TicketID:         string(ticket.ID),
+		SessionName:      "test-session",
+		Command:          "/bin/cat",
+		Cols:             80,
+		Rows:             24,
+		Scrollback:       1000,
+		AgentSessionUUID: uuid,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+
+	if err := runTicketDelete(t, proj.Name, string(ticket.ID)); err != nil {
+		t.Fatalf("ticket delete RunE: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !daemonHasSessionForTicket(t, string(ticket.ID)) {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if daemonHasSessionForTicket(t, string(ticket.ID)) {
+		t.Errorf("post-delete: daemon still owns a session for %s", ticket.ID)
+	}
+}
+
+// TestTicketDelete_DaemonDown_StillDeletesTicket asserts the
+// no-autostart, daemon-down contract on the new TicketDone layer: when
+// openkanbankd isn't running, `ticket delete` must complete cleanly
+// (the .md unlink is authoritative; a missing daemon means there are
+// no sessions to clean up anyway).
+func TestTicketDelete_DaemonDown_StillDeletesTicket(t *testing.T) {
+	daemonTestEnv(t)
+	setupTmpConfigDirCmd(t)
+	// NOT starting the daemon.
+
+	proj, ticket := seedProjectWithTicket(t, "proj-b2-down", "")
+
+	if err := runTicketDelete(t, proj.Name, string(ticket.ID)); err != nil {
+		t.Fatalf("ticket delete RunE with daemon down: %v", err)
+	}
+
+	// .md should be gone from the project directory.
+	store, err := project.LoadTicketStore(proj)
+	if err != nil {
+		t.Fatalf("LoadTicketStore: %v", err)
+	}
+	if store.Count() != 0 {
+		t.Errorf("ticket store count = %d, want 0 (delete should have removed the .md)", store.Count())
 	}
 }
