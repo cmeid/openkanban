@@ -253,7 +253,7 @@ Worktrees and branches are preserved on `done`. Only `openkanban ticket delete` 
 openkanban daemon list      # what sessions are alive
 openkanban daemon log       # tail the daemon log
 openkanban daemon restart   # restart (prompts before killing live sessions; --force to skip)
-openkanban daemon stop      # clean shutdown
+openkanban daemon stop      # clean shutdown (prompts before killing live sessions; --force to skip)
 ```
 
 Override the socket path with `OPENKANBAN_DAEMON_SOCK` if you need to.

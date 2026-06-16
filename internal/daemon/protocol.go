@@ -518,9 +518,11 @@ type PrepareExitReq struct{}
 // Two peer-count fields answer different questions:
 //
 //   - OtherTUIClients counts TUI-named connections OTHER than the
-//     asking client, used by `daemon stop` / `daemon restart` to
-//     decide whether a shutdown would orphan live sessions with no
-//     TUI watching.
+//     asking client. The TUI's exit-guard uses it to differentiate
+//     "I'm the last one out" from "another TUI is still watching."
+//     (`daemon stop` / `daemon restart` deliberately do NOT use this
+//     for their kill-confirm prompt — a watching TUI is not implicit
+//     consent to destroy in-flight agent work.)
 //   - OtherActiveClients counts peer connections (any name) that
 //     have NOT also called PrepareExit, used by the TUI exit-guard
 //     to silent-quit when a peer will keep the daemon alive.
@@ -535,11 +537,13 @@ type PrepareExitResp struct {
 	ClientCount int `json:"client_count"`
 
 	// OtherTUIClients counts TUI-named connections OTHER than the
-	// asking client. Used by `daemon stop` / `daemon restart` to
-	// decide whether a shutdown would orphan live sessions with no
-	// TUI watching. Does NOT filter on the exiting flag (a TUI in
-	// the middle of dismissing its exit modal is still "watching"
-	// from the CLI's perspective).
+	// asking client. The TUI's exit-guard uses it to differentiate
+	// "I'm the last one out" from "another TUI is still watching."
+	// Does NOT filter on the exiting flag (a TUI in the middle of
+	// dismissing its exit modal is still "watching"). Deliberately
+	// NOT consulted by `daemon stop` / `daemon restart` — those gate
+	// their kill-confirm prompt on live-session count alone, since a
+	// watching TUI does not represent consent to terminate sessions.
 	OtherTUIClients int `json:"other_tui_clients"`
 
 	// OtherActiveClients is the count of peer clients that are still

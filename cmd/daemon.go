@@ -142,12 +142,12 @@ var daemonStopFlagForce bool
 // reports how many it killed) before exiting.
 //
 // Safety (matches daemon restart's pattern): if live sessions exist
-// AND no other TUI is currently connected (so no human would notice
-// the orphan) AND stderr is a TTY AND --force is NOT set, prompt
-// interactively before tearing them down. This is most useful in
-// persistent / launchd-managed mode where the daemon outlives any
-// single TUI — a casual `daemon stop` from a script would otherwise
-// silently kill in-flight agent work.
+// AND stderr is a TTY AND --force is NOT set, prompt interactively
+// before tearing them down. A watching TUI is NOT a substitute for
+// explicit consent here — a stop invoked from a separate shell
+// (e.g. `scripts/install.sh` reaching for the pidlock) would
+// otherwise silently kill in-flight agent work the human never
+// consented to. Pass --force to skip the prompt for scripting.
 var daemonStopCmd = &cobra.Command{
 	Use:           "stop",
 	Short:         "Ask the running daemon to shut down",
@@ -181,12 +181,12 @@ var daemonStopCmd = &cobra.Command{
 		}
 
 		liveSessions := len(prep.Sessions)
-		// Prompt only when sessions would orphan: live sessions AND
-		// no other TUI is connected to watch them. If a TUI IS
-		// watching, the user already knows the state and can react
-		// (e.g. exit-guard in the TUI itself).
-		if liveSessions > 0 && prep.OtherTUIClients == 0 && !daemonStopFlagForce && stderrIsTTY() {
-			fmt.Fprintf(os.Stderr, "daemon stop will terminate %d live agent session(s) with no TUI watching. Continue? [y/N] ", liveSessions)
+		// Any live session is enough to prompt — a watching TUI is
+		// not a substitute for explicit consent, since the human
+		// running `daemon stop` (or scripts/install.sh) may not even
+		// realize a TUI is attached in another shell.
+		if liveSessions > 0 && !daemonStopFlagForce && stderrIsTTY() {
+			fmt.Fprintf(os.Stderr, "daemon stop will terminate %d live agent session(s). Continue? [y/N] ", liveSessions)
 			line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
 			ans := strings.TrimSpace(line)
 			if ans != "y" && ans != "Y" {
