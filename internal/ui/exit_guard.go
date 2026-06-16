@@ -34,6 +34,14 @@ type daemonGuardAPI interface {
 	// Expected=true SessionEvent. Used by the TUI's board-promotion
 	// wrap-up to mirror the CLI's `openkanban ticket done` path.
 	TicketDone(ctx context.Context, ticketID string) (daemon.TicketDoneResp, error)
+	// List returns the daemon's current set of sessions. Used by the
+	// startup reconcile (with retry/backoff) and the periodic 30s resync
+	// to keep m.panes / m.daemonOwned aligned with the daemon's
+	// authoritative view. Lives on the guard surface (rather than being
+	// called via daemonClient.List directly) so the fake-guardAPI
+	// pattern in tests covers both the exit-guard surface and the
+	// resync paths without standing up a real daemon.
+	List(ctx context.Context) (daemon.ListResp, error)
 }
 
 // confirmExitState carries the modal's transient bookkeeping. Lives on

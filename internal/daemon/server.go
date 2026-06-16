@@ -919,6 +919,20 @@ func (s *Server) watchSessionExit(sess *Session) {
 				delete(s.sessions, sessID)
 				log.Printf("openkanbankd: session %s (ticket=%s) exited; removed from registry", sessID, ticketID)
 			}
+			// Defense-in-depth: with the per-TicketID dedup in
+			// handleSpawn (PR #34) no other session should ever share
+			// this TicketID. If one does, it's an invariant violation
+			// — log loudly so the regression is visible, but don't
+			// auto-kill (that would silently change cleanup
+			// semantics). This is purely observability for a path
+			// that should never fire post-dedup; if it ever does we
+			// want a breadcrumb in the daemon log pointing at it.
+			if ticketID != "" {
+				if other := s.findSessionForTicketLocked(ticketID); other != nil {
+					log.Printf("WARN: openkanbankd: after removing session %s, another session %s still references ticket %s — invariant violation",
+						sessID, other.ID(), ticketID)
+				}
+			}
 			s.sessionsMu.Unlock()
 		}
 		emit := func() {

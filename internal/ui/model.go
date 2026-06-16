@@ -508,28 +508,33 @@ func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projec
 	//
 	// Algorithm:
 	//   1. If we have a daemon client, ask it for the current set of
-	//      sessions. For every ticket whose ID matches a live session,
-	//      construct a PaneView in Unattached state and keep any status
-	//      we can read from the on-disk marker (until PR9 wires push
-	//      events). For every ticket NOT owned by the daemon, wipe any
-	//      stale "working/waiting/etc" status as before.
-	//   2. If the daemon is unreachable, fall back to the legacy wipe
-	//      so the UI doesn't show ghost-working statuses.
+	//      sessions via listSessionsWithRetry — up to 3 attempts with
+	//      linear backoff, each bounded by a 10s context. The retry
+	//      budget is the price of NOT silently showing every existing
+	//      session as gone when the daemon is slow at startup.
+	//   2. For every ticket whose ID matches a live session, construct
+	//      a PaneView in Unattached state and keep any status we can
+	//      read from the on-disk marker. For every ticket NOT owned by
+	//      the daemon, wipe any stale "working/waiting/etc" status.
+	//   3. If every retry failed, surface a toast and proceed with an
+	//      empty owned-set; the periodic resync (armed in Init) will
+	//      pick up state the next time the daemon answers.
 	ownedByDaemon := map[board.TicketID]daemon.SessionInfo{}
-	if daemonClient != nil {
-		listCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		resp, err := daemonClient.List(listCtx)
-		cancel()
-		if err == nil {
-			for _, s := range resp.Sessions {
-				ownedByDaemon[board.TicketID(s.TicketID)] = s
-				m.daemonOwned[board.TicketID(s.TicketID)] = struct{}{}
+	if m.guardAPI != nil {
+		got, err := listSessionsWithRetry(m.guardAPI,
+			startupReconcileAttempts, startupReconcileTimeout, startupReconcileBackoff)
+		if err != nil {
+			log.Printf("openkanban: startup reconcile failed after %d retries: %v",
+				startupReconcileAttempts, err)
+			m.notify(startupReconcileFailureMsg)
+		} else {
+			ownedByDaemon = got
+			for tid, s := range got {
+				m.daemonOwned[tid] = struct{}{}
 				if s.ViewerCount > 0 {
-					m.daemonViewing[board.TicketID(s.TicketID)] = s.ViewerCount
+					m.daemonViewing[tid] = s.ViewerCount
 				}
 			}
-		} else {
-			log.Printf("openkanban: daemon list failed at startup: %v", err)
 		}
 	}
 
@@ -589,6 +594,14 @@ func (m *Model) Init() tea.Cmd {
 	}
 	if m.daemonEvents != nil {
 		cmds = append(cmds, readNextDaemonEvent(m.daemonEvents))
+	}
+	// Arm the periodic daemon-state resync. NewModel's synchronous
+	// startup reconcile populated m.panes / m.daemonOwned from the
+	// initial List; this tick keeps that view in sync as the daemon's
+	// session set drifts (sibling TUI spawns, daemon restart, external
+	// kills). Returns nil when guardAPI is missing — batch absorbs it.
+	if cmd := m.scheduleDaemonResync(); cmd != nil {
+		cmds = append(cmds, cmd)
 	}
 	return tea.Batch(cmds...)
 }
@@ -728,6 +741,10 @@ func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleDaemonSubscribeFailed(msg)
 	case daemonSubscribeEndedMsg:
 		return m.handleDaemonSubscribeEnded(msg)
+	case daemonResyncTickMsg:
+		return m.handleDaemonResyncTick()
+	case daemonResyncMsg:
+		return m.handleDaemonResyncMsg(msg)
 	}
 
 	if m.mode == ModeShuttingDown {

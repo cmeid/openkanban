@@ -45,6 +45,16 @@ func (s *ticketDoneStubAPI) TicketDone(_ context.Context, ticketID string) (daem
 	}
 	return daemon.TicketDoneResp{Killed: true}, nil
 }
+func (s *ticketDoneStubAPI) List(_ context.Context) (daemon.ListResp, error) {
+	return daemon.ListResp{}, nil
+}
+
+// Spawn is a no-op stub pre-added so this fake stays compatible with
+// the sibling fix/client-spawn-discipline PR (which widens
+// daemonGuardAPI with Spawn). Not exercised by any wrap-up test.
+func (s *ticketDoneStubAPI) Spawn(_ context.Context, _ daemon.SpawnReq) (daemon.SpawnResp, error) {
+	return daemon.SpawnResp{}, nil
+}
 
 // newWrapUpModel builds a minimal Model wired with the column stack,
 // pane map, and global store needed to exercise the board-promotion

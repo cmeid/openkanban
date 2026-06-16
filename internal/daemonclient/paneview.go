@@ -237,6 +237,25 @@ func (p *PaneView) State() PaneViewState {
 	return p.state
 }
 
+// SetPaneStateForTest forces the view's state field, bypassing the
+// normal Attach / Detach state machine. Used by cross-package tests
+// (notably internal/ui's resync tests) that need to drive a PaneView
+// into a specific state without standing up a real daemon.
+//
+// PRODUCTION CODE MUST NOT CALL THIS. The real state machine takes
+// responsibility for the binary stream lifecycle; skipping it leaves
+// the view in an inconsistent shape (e.g. Attached without a live
+// conn). The "ForTest" suffix is the only enforcement Go offers here
+// — we'd prefer this to live in export_test.go, but that file is only
+// visible to same-package tests and the only caller is in
+// internal/ui, a different package. Linters / reviewers should grep
+// for "ForTest" calls outside of *_test.go files.
+func (p *PaneView) SetPaneStateForTest(s PaneViewState) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.state = s
+}
+
 // SetWorkdir caches a workdir locally. Informational — Spawn carries
 // the real workdir to the daemon. The model still calls this after a
 // successful spawn so GetWorkdir returns the expected value.
