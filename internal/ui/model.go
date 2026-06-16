@@ -543,15 +543,13 @@ func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projec
 			// Best-effort status read from the existing on-disk marker.
 			// PR9 will replace this with push events.
 			if st := agent.ReadAgentStatus(info.SessionName); st != board.AgentNone {
-				if ticket.AgentStatus != st {
-					ticket.AgentStatus = st
+				if ticket.SetAgentStatus(st) {
 					globalStore.Save(ticket)
 				}
 			}
 			continue
 		}
-		if ticket.AgentStatus != board.AgentNone {
-			ticket.AgentStatus = board.AgentNone
+		if ticket.SetAgentStatus(board.AgentNone) {
 			globalStore.Save(ticket)
 		}
 	}
@@ -963,8 +961,9 @@ func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// session-event may have raced ahead and set Completed,
 			// in which case we must not clobber it.
 			if ticket.AgentStatus != board.AgentCompleted {
-				ticket.AgentStatus = board.AgentNone
-				m.saveTicket(ticket)
+				if ticket.SetAgentStatus(board.AgentNone) {
+					m.saveTicket(ticket)
+				}
 			}
 		}
 		if m.focusedPane == ticketID {
@@ -1068,7 +1067,12 @@ func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 				status != board.AgentError {
 				continue
 			}
-			ticket.AgentStatus = status
+			// In-memory only — this poll loop refreshes AgentStatus for
+			// visibility and intentionally does not persist (see comment
+			// block above). SetAgentStatus is used so StatusChangedAt is
+			// stamped alongside; it will land on disk on the next save
+			// from any other path.
+			ticket.SetAgentStatus(status)
 
 			// T2 of the integration plan removed the edge-triggered
 			// auto-stop on AgentCompleted: ticket-done now flows
@@ -4274,7 +4278,7 @@ func (m *Model) stopAgent() (tea.Model, tea.Cmd) {
 	// Preserve AgentCompleted on a Done ticket — manually stopping the
 	// pane after the agent reported completion shouldn't wipe the badge.
 	if ticket.Status != board.StatusDone {
-		ticket.AgentStatus = board.AgentNone
+		ticket.SetAgentStatus(board.AgentNone)
 	}
 	m.saveTicket(ticket)
 	m.notify("Agent stopped")
@@ -4570,7 +4574,7 @@ func (m *Model) resetSpawnState(ticketID board.TicketID) {
 		ticket.AgentSpawnedAt = nil
 		// Same rule as stopAgent: a Done ticket keeps its completed badge.
 		if ticket.Status != board.StatusDone {
-			ticket.AgentStatus = board.AgentNone
+			ticket.SetAgentStatus(board.AgentNone)
 		}
 		m.saveTicket(ticket)
 	}

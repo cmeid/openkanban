@@ -143,8 +143,7 @@ func (m *Model) handleDaemonSessionEvent(msg daemonSessionEventMsg) (tea.Model, 
 			switch ev.Event {
 			case "started":
 				m.daemonOwned[ticketID] = struct{}{}
-				if ticket.AgentStatus != board.AgentWorking {
-					ticket.AgentStatus = board.AgentWorking
+				if ticket.SetAgentStatus(board.AgentWorking) {
 					m.saveTicket(ticket)
 				}
 			case "exited":
@@ -158,13 +157,11 @@ func (m *Model) handleDaemonSessionEvent(msg daemonSessionEventMsg) (tea.Model, 
 				// Expected=false is a natural exit / plain Kill — reset
 				// to AgentNone as before.
 				if ev.Expected {
-					if ticket.AgentStatus != board.AgentCompleted {
-						ticket.AgentStatus = board.AgentCompleted
+					if ticket.SetAgentStatus(board.AgentCompleted) {
 						m.saveTicket(ticket)
 					}
 				} else {
-					if ticket.AgentStatus != board.AgentNone {
-						ticket.AgentStatus = board.AgentNone
+					if ticket.SetAgentStatus(board.AgentNone) {
 						m.saveTicket(ticket)
 					}
 				}

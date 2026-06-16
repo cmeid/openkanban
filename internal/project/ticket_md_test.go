@@ -86,6 +86,11 @@ func TestMarshalEmptyCollectionsRoundTrip(t *testing.T) {
 	// Lock timestamps so DeepEqual doesn't trip on time.Now().
 	orig.CreatedAt = mustParseTime(t, "2026-06-12T00:00:00Z")
 	orig.UpdatedAt = orig.CreatedAt
+	// NewTicket stamps StatusChangedAt to time.Now() (with monotonic clock).
+	// Strip monotonic and lock to a fixed value so YAML round-trip preserves
+	// equality under DeepEqual.
+	statusChanged := orig.CreatedAt
+	orig.StatusChangedAt = &statusChanged
 	// Post-load convention: BlockedBy is non-nil empty (matches Labels/Meta).
 	// We normalise here so the pre/post comparison is fair; the on-disk
 	// shape unconditionally produces []board.TicketID{} on Unmarshal.
