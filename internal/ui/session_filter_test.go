@@ -13,12 +13,11 @@ import (
 )
 
 func TestNextSessionFilter(t *testing.T) {
-	// Cycle must reach every filter and return to all — guards against
-	// silently dropping a mode if the slice is reordered.
+	// Toggle must round-trip in two presses — guards against silently
+	// changing the cycle if the slice is reordered or extended.
 	cycle := []SessionFilter{
 		SessionFilterAll,
 		SessionFilterOpen,
-		SessionFilterWaiting,
 		SessionFilterAll,
 	}
 	cur := SessionFilterAll
@@ -37,7 +36,6 @@ func TestSessionFilterLabel(t *testing.T) {
 	}{
 		{SessionFilterAll, "all"},
 		{SessionFilterOpen, "open sessions"},
-		{SessionFilterWaiting, "waiting sessions"},
 	}
 	for _, tt := range tests {
 		if got := sessionFilterLabel(tt.filter); got != tt.want {
@@ -93,37 +91,12 @@ func TestTicketMatchesFilter_SessionFilter(t *testing.T) {
 			t.Error("Open: no-session must NOT match")
 		}
 	})
-
-	t.Run("Waiting matches daemon-owned + AgentWaiting only", func(t *testing.T) {
-		m.sessionFilter = SessionFilterWaiting
-		if !m.ticketMatchesFilter(waiting) {
-			t.Error("Waiting: live-waiting should match")
-		}
-		if m.ticketMatchesFilter(working) {
-			t.Error("Waiting: live-working must NOT match (status=working)")
-		}
-		if m.ticketMatchesFilter(dormant) {
-			t.Error("Waiting: no-session must NOT match (no daemon entry)")
-		}
-	})
-
-	t.Run("Waiting without daemon session does not match", func(t *testing.T) {
-		// Defensive: AgentStatus may still read "waiting" on a ticket
-		// whose session has already exited (stale on-disk status).
-		// Without a live daemon entry, the filter must hide it — the
-		// whole point of the filter is "what sessions need me now."
-		stale := mk("t-stale", "stale-waiting", board.AgentWaiting)
-		m.sessionFilter = SessionFilterWaiting
-		if m.ticketMatchesFilter(stale) {
-			t.Error("Waiting: ticket with AgentWaiting but no daemon entry must NOT match")
-		}
-	})
 }
 
 func TestCycleSessionFilter_KeybindingW(t *testing.T) {
 	// Two tickets in backlog: one with a live daemon session, one without.
-	// Pressing 'w' should cycle Filter and hide the no-session ticket on the
-	// first press (→ open), then keep hiding it on the second press (→ waiting).
+	// Pressing 'w' toggles between all and open — first press hides the
+	// no-session ticket, second press restores it.
 	live := &board.Ticket{
 		ID:          board.NewTicketID(),
 		Title:       "live-session",
@@ -157,19 +130,10 @@ func TestCycleSessionFilter_KeybindingW(t *testing.T) {
 		t.Errorf("after 'w' (open): visible ticket = %s, want %s", m.columnTickets[0][0].Title, live.Title)
 	}
 
-	// Second 'w' → SessionFilterWaiting. live (status=waiting) still matches.
-	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
-	if m.sessionFilter != SessionFilterWaiting {
-		t.Fatalf("after second 'w', sessionFilter = %q, want %q", m.sessionFilter, SessionFilterWaiting)
-	}
-	if got := len(m.columnTickets[0]); got != 1 {
-		t.Errorf("after 'w' (waiting): backlog has %d tickets, want 1", got)
-	}
-
-	// Third 'w' → SessionFilterAll. Both tickets visible again.
+	// Second 'w' → SessionFilterAll. Both tickets visible again.
 	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
 	if m.sessionFilter != SessionFilterAll {
-		t.Fatalf("after third 'w', sessionFilter = %q, want %q", m.sessionFilter, SessionFilterAll)
+		t.Fatalf("after second 'w', sessionFilter = %q, want %q", m.sessionFilter, SessionFilterAll)
 	}
 	if got := len(m.columnTickets[0]); got != 2 {
 		t.Errorf("after 'w' (all): backlog has %d tickets, want 2", got)
@@ -243,18 +207,6 @@ func TestTicketMatchesFilter_AlwaysShowWorking(t *testing.T) {
 		m.filterQuery = "@foo"
 		if !m.ticketMatchesFilter(barOpen) {
 			t.Error("expected daemon-owned ticket in 'bar' to match despite typed @foo scope")
-		}
-	})
-
-	t.Run("Session filter still applies", func(t *testing.T) {
-		// alwaysShowWorking bypasses project + query but NOT the session
-		// filter. With sessionFilter=Waiting, a working-status open
-		// session must remain hidden.
-		m := newModel()
-		m.alwaysShowWorking = true
-		m.sessionFilter = SessionFilterWaiting
-		if m.ticketMatchesFilter(barOpen) {
-			t.Error("expected open-but-working ticket to remain hidden when sessionFilter=Waiting")
 		}
 	})
 

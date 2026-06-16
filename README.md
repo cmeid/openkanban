@@ -241,7 +241,7 @@ The daemon will **never** outlive the TUI as a tmux-style detached session. If y
 | `s` | Spawn agent |
 | `enter` | Attach to agent |
 | `o` | Cycle sort order (default → name → age → priority) |
-| `w` | Cycle session filter (all → open → waiting) |
+| `w` | Toggle session filter (all ⇄ open) |
 | `?` | Full help |
 
 ## Configuration
