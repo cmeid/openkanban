@@ -87,6 +87,43 @@ func (d *StatusDetector) DetectStatusWithPort(agentType, sessionID, worktreePath
 	return board.AgentNone
 }
 
+// WaitingActivityTTL is how recent the last PTY-output timestamp must
+// be for DetectStatusWithActivity to override file-based "waiting"
+// back to "working". 60s is intentionally generous: Claude's spinner
+// animation produces bytes ~10x/sec while a tool is running, so even
+// a single recent sample suffices; the long horizon covers brief
+// quiet stretches (model thinking between tool batches) without
+// snapping the card back to "waiting" and confusing the user.
+const WaitingActivityTTL = 60 * time.Second
+
+// DetectStatusWithActivity layers a PTY-activity override on top of
+// DetectStatusWithPort to close the Claude Code hook gap: Notification
+// fires (permission prompt) → file = "waiting" → user approves → tool
+// runs (no hook for the duration) → PostToolUse finally fires. During
+// the gap, a long-running tool leaves status pinned at "waiting" even
+// though the agent's spinner / output is actively streaming bytes
+// through the PTY. When the file says "waiting" but lastActivity is
+// within WaitingActivityTTL, override to "working".
+//
+// The override is intentionally narrow: only "waiting" → "working".
+// Other states ("working", "idle", "completed", "error") and the
+// file's absence (AgentNone) pass through untouched. lastActivity
+// of zero (no daemon report yet) also passes through — the file is
+// authoritative until the daemon has spoken.
+func (d *StatusDetector) DetectStatusWithActivity(agentType, sessionID, worktreePath string, port int, processRunning bool, terminalContent string, lastActivity time.Time) board.AgentStatus {
+	status := d.DetectStatusWithPort(agentType, sessionID, worktreePath, port, processRunning, terminalContent)
+	if status != board.AgentWaiting {
+		return status
+	}
+	if lastActivity.IsZero() {
+		return status
+	}
+	if time.Since(lastActivity) < WaitingActivityTTL {
+		return board.AgentWorking
+	}
+	return status
+}
+
 func (d *StatusDetector) detectFromTerminalContent(agentType, content string) board.AgentStatus {
 	contentLower := strings.ToLower(content)
 	lines := strings.Split(content, "\n")

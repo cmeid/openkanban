@@ -310,6 +310,17 @@ type Model struct {
 	// daemon disconnect.
 	daemonViewing map[board.TicketID]int
 
+	// lastPTYActivity tracks the most recent PTY-output timestamp per
+	// ticket, populated from SessionEvent.LastActivityAt on every event
+	// the daemon emits. The status detector consults this to override a
+	// stale file-based "waiting" → "working": Claude Code emits no hook
+	// between Notification (permission granted) and PostToolUse (tool
+	// finished), so during a long-running tool the file says "waiting"
+	// for the whole duration even though the agent is producing output.
+	// Cleared on "exited" so the map can't grow unboundedly across the
+	// TUI's lifetime.
+	lastPTYActivity map[board.TicketID]time.Time
+
 	// viewingSessionID is the daemon SessionID this TUI most recently
 	// told the daemon it was viewing (via SetViewing(true)). Used by
 	// reconcileViewing to emit SetViewing(prev,false) / SetViewing(new,
@@ -464,6 +475,7 @@ func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projec
 		panes:              make(map[board.TicketID]*daemonclient.PaneView),
 		daemonOwned:        make(map[board.TicketID]struct{}),
 		daemonViewing:      make(map[board.TicketID]int),
+		lastPTYActivity:    make(map[board.TicketID]time.Time),
 		statusDetector:     agent.NewStatusDetector(),
 		selectedProject:    selectedProject,
 		sidebarVisible:     cfg.UI.SidebarVisible,
@@ -4498,6 +4510,7 @@ func (m *Model) pollAgentStatusesAsync() tea.Cmd {
 		agentSessionID  string
 		running         bool
 		terminalContent string
+		lastActivity    time.Time
 	}
 
 	var panes []paneInfo
@@ -4519,6 +4532,7 @@ func (m *Model) pollAgentStatusesAsync() tea.Cmd {
 			agentSessionID:  ticket.AgentSessionID,
 			running:         pane.Running(),
 			terminalContent: pane.GetContent(),
+			lastActivity:    m.lastPTYActivity[ticketID],
 		})
 	}
 
@@ -4550,7 +4564,7 @@ func (m *Model) pollAgentStatusesAsync() tea.Cmd {
 				sessionID = string(p.ticketID)
 			}
 
-			status := detector.DetectStatusWithPort(p.agentType, sessionID, p.worktreePath, p.agentPort, true, p.terminalContent)
+			status := detector.DetectStatusWithActivity(p.agentType, sessionID, p.worktreePath, p.agentPort, true, p.terminalContent, p.lastActivity)
 			results[p.ticketID] = status
 		}
 		return results

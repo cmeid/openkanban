@@ -244,6 +244,15 @@ func (s *Server) Serve(ctx context.Context) error {
 	// the shutdown channel closes.
 	go s.broadcastEvents()
 
+	// Emit "activity" SessionEvents whenever a session's pane produces
+	// new PTY output. The UI uses this to override a stale "waiting"
+	// status (Claude Code's Notification hook → file = waiting) back to
+	// "working" when bytes are still flowing — closing the permission-
+	// granted-but-tool-still-running gap. NOT tracked on s.wg (same
+	// rationale as watchSessionExit): tied to daemon lifetime, not to
+	// any client conn.
+	go s.broadcastActivity()
+
 	// Watch the daemon's own binary for replacement (go install /
 	// openkanban update from another shell). When the on-disk binary
 	// is newer than this process, flip pendingRestart and exit cleanly
@@ -449,6 +458,75 @@ func (s *Server) emitEvent(ev SessionEvent) {
 	case s.events <- ev:
 	default:
 		log.Printf("openkanbankd: dropped session event %q for session %s (broadcaster busy)", ev.Event, ev.SessionID)
+	}
+}
+
+// activityTickInterval is how often broadcastActivity wakes up to scan
+// session LastActivity timestamps. 2s is a balance: short enough that
+// the UI override fires within one poll cycle of a Notification hook,
+// long enough that idle sessions don't flood the events channel.
+const activityTickInterval = 2 * time.Second
+
+// broadcastActivity wakes periodically and emits an "activity"
+// SessionEvent for every running session whose pane LastActivity()
+// advanced since the last tick. Idle sessions are skipped — the event
+// stream stays quiet when nothing's happening. Stamped LastActivityAt
+// is what subscribers actually consume; the Event field exists so the
+// dispatch can route it specifically.
+//
+// Lifetime: tied to the daemon, not to any client. Exits on shutdown.
+// Skipping s.wg by design — see Serve's go-broadcastActivity comment.
+func (s *Server) broadcastActivity() {
+	ticker := time.NewTicker(activityTickInterval)
+	defer ticker.Stop()
+
+	// Per-session memo of the last LastActivity we emitted, so we don't
+	// re-broadcast the same timestamp every tick. Keyed by session ID.
+	// Cleared lazily as sessions disappear — bounded by max concurrent
+	// sessions, no leak hazard.
+	lastSeen := make(map[string]time.Time)
+
+	for {
+		select {
+		case <-s.shutdown:
+			return
+		case <-ticker.C:
+		}
+
+		// Snapshot the session set under lock, then operate on the
+		// copy. Sessions can be added/removed concurrently and we don't
+		// want to hold the lock while emitting (which takes
+		// s.events / s.clientsMu under broadcaster goroutines).
+		s.sessionsMu.RLock()
+		alive := make(map[string]*Session, len(s.sessions))
+		for id, sess := range s.sessions {
+			alive[id] = sess
+		}
+		s.sessionsMu.RUnlock()
+
+		// Drop memo entries for sessions that vanished.
+		for id := range lastSeen {
+			if _, ok := alive[id]; !ok {
+				delete(lastSeen, id)
+			}
+		}
+
+		for id, sess := range alive {
+			la := sess.LastActivity()
+			if la.IsZero() {
+				continue
+			}
+			if prev, ok := lastSeen[id]; ok && !la.After(prev) {
+				continue
+			}
+			lastSeen[id] = la
+			s.emitEvent(SessionEvent{
+				Event:          "activity",
+				SessionID:      id,
+				TicketID:       sess.TicketID(),
+				LastActivityAt: la,
+			})
+		}
 	}
 }
 
@@ -714,7 +792,7 @@ func (s *Server) handleSpawn(c *clientConn, req SpawnReq) (SpawnResp, error) {
 	// publishes its final ExitEvent.
 	s.watchSessionExit(sess)
 
-	s.emitEvent(SessionEvent{Event: "started", SessionID: sess.ID(), TicketID: sess.TicketID(), Status: "working"})
+	s.emitEvent(SessionEvent{Event: "started", SessionID: sess.ID(), TicketID: sess.TicketID(), Status: "working", LastActivityAt: sess.LastActivity()})
 
 	return SpawnResp{SessionID: sess.ID(), PID: sess.pane.PID()}, nil
 }
@@ -774,11 +852,12 @@ func (s *Server) watchSessionExit(sess *Session) {
 				reason = "ticket_done"
 			}
 			ev := SessionEvent{
-				Event:     "exited",
-				SessionID: sessID,
-				TicketID:  ticketID,
-				Expected:  expected,
-				Reason:    reason,
+				Event:          "exited",
+				SessionID:      sessID,
+				TicketID:       ticketID,
+				Expected:       expected,
+				Reason:         reason,
+				LastActivityAt: sess.LastActivity(),
 			}
 			if fn := s.emitSessionExitFn; fn != nil {
 				fn(ev)

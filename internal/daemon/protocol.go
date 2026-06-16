@@ -434,10 +434,10 @@ type SubscribeResp struct{}
 
 // SessionEvent is a server-push update about a session. Event is one
 // of "started", "exited", "attached", "detached", "viewing",
-// "unviewing", "status". The "viewing" / "unviewing" pair tracks the
-// SetViewing RPC (which client is currently focused in agent view) —
-// distinct from "attached" / "detached" which track the binary PTY
-// stream owner.
+// "unviewing", "status", "activity". The "viewing" / "unviewing" pair
+// tracks the SetViewing RPC (which client is currently focused in
+// agent view) — distinct from "attached" / "detached" which track the
+// binary PTY stream owner.
 //
 // Expected is only meaningful when Event == "exited". It is true when
 // the daemon initiated the kill via handleTicketDone (i.e. the agent
@@ -456,13 +456,27 @@ type SubscribeResp struct{}
 //
 // Subscribers should treat unknown Reason values as informational only —
 // the load-bearing signal is Expected.
+//
+// LastActivityAt carries the timestamp of the most recent PTY output
+// observed for this session's pane. It's set on every "activity"
+// heartbeat (emitted by the daemon while a session is producing bytes)
+// and also seeded onto lifecycle events ("started", "attached",
+// "detached") so subscribers get a baseline before the first heartbeat
+// arrives. Clients use it as an override: when the local status file
+// says "waiting" (Notification hook fired, permission prompt) but
+// LastActivityAt is recent, the agent is actively working — Claude
+// Code emits no hook between permission grant and PostToolUse, so the
+// file is stale during long-running tools but the PTY isn't.
+// omitempty for backward compatibility with daemons/clients predating
+// the field.
 type SessionEvent struct {
-	Event     string `json:"event"`
-	SessionID string `json:"session_id"`
-	TicketID  string `json:"ticket_id"`
-	Status    string `json:"status"`
-	Expected  bool   `json:"expected,omitempty"`
-	Reason    string `json:"reason,omitempty"`
+	Event          string    `json:"event"`
+	SessionID      string    `json:"session_id"`
+	TicketID       string    `json:"ticket_id"`
+	Status         string    `json:"status"`
+	Expected       bool      `json:"expected,omitempty"`
+	Reason         string    `json:"reason,omitempty"`
+	LastActivityAt time.Time `json:"last_activity_at,omitempty"`
 }
 
 // PrepareExitReq is sent by a TUI client that is about to quit. The

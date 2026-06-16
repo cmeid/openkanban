@@ -232,3 +232,106 @@ func TestReadStatusFile_FromDisk(t *testing.T) {
 		t.Errorf("readStatusFile should return AgentWorking; got %q", result)
 	}
 }
+
+// TestDetectStatusWithActivity_OverridesWaiting pins the core override
+// behavior. The file-based detector returns AgentWaiting (Notification
+// hook fired); when the daemon-reported PTY activity is recent, the
+// override flips it to AgentWorking. Stale or absent activity leaves
+// the file's verdict alone.
+func TestDetectStatusWithActivity_OverridesWaiting(t *testing.T) {
+	tmpDir := t.TempDir()
+	d := NewStatusDetector()
+	d.statusDirs = []string{tmpDir}
+
+	statusFile := filepath.Join(tmpDir, "sess.status")
+	if err := os.WriteFile(statusFile, []byte("waiting"), 0644); err != nil {
+		t.Fatalf("write status: %v", err)
+	}
+
+	tests := []struct {
+		name         string
+		lastActivity time.Time
+		want         board.AgentStatus
+	}{
+		{
+			name:         "recent activity overrides waiting",
+			lastActivity: time.Now().Add(-2 * time.Second),
+			want:         board.AgentWorking,
+		},
+		{
+			name:         "activity past TTL boundary is stale",
+			lastActivity: time.Now().Add(-(WaitingActivityTTL + time.Second)),
+			want:         board.AgentWaiting,
+		},
+		{
+			name:         "stale activity leaves waiting",
+			lastActivity: time.Now().Add(-5 * time.Minute),
+			want:         board.AgentWaiting,
+		},
+		{
+			name:         "zero activity (no daemon report) leaves waiting",
+			lastActivity: time.Time{},
+			want:         board.AgentWaiting,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Invalidate the 500ms cache between subtests so each call
+			// re-reads the (unchanged) file rather than serving a hit.
+			d.InvalidateCache("sess")
+			got := d.DetectStatusWithActivity("claude", "sess", "", 0, true, "", tt.lastActivity)
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestDetectStatusWithActivity_NoDowngrade ensures the override never
+// downgrades a non-waiting status. Even when activity is present, a
+// file saying "working" / "idle" / "completed" passes through.
+func TestDetectStatusWithActivity_NoDowngrade(t *testing.T) {
+	tmpDir := t.TempDir()
+	d := NewStatusDetector()
+	d.statusDirs = []string{tmpDir}
+	statusFile := filepath.Join(tmpDir, "sess.status")
+
+	tests := []struct {
+		name     string
+		fileBody string
+		want     board.AgentStatus
+	}{
+		{"working file is preserved", "working", board.AgentWorking},
+		{"idle file is preserved", "idle", board.AgentIdle},
+		{"completed file is preserved", "completed", board.AgentCompleted},
+		{"error file is preserved", "error", board.AgentError},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := os.WriteFile(statusFile, []byte(tt.fileBody), 0644); err != nil {
+				t.Fatalf("write status: %v", err)
+			}
+			d.InvalidateCache("sess")
+			// Recent activity is present; the override must NOT touch
+			// non-waiting verdicts.
+			got := d.DetectStatusWithActivity("claude", "sess", "", 0, true, "", time.Now())
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestDetectStatusWithActivity_ProcessNotRunning confirms the
+// activity override doesn't paper over a dead pane — when
+// processRunning is false, DetectStatusWithPort short-circuits to
+// AgentNone and the override must respect that.
+func TestDetectStatusWithActivity_ProcessNotRunning(t *testing.T) {
+	d := NewStatusDetector()
+	got := d.DetectStatusWithActivity("claude", "sess", "", 0, false, "", time.Now())
+	if got != board.AgentNone {
+		t.Errorf("got %q, want AgentNone when process not running", got)
+	}
+}

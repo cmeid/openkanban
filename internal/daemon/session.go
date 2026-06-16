@@ -286,6 +286,18 @@ func (s *Session) Running() bool {
 	return s.pane.Running()
 }
 
+// LastActivity returns the timestamp of the most recent PTY output
+// for this session's pane, or the zero time if the pane has produced
+// no output yet. Used by the activity broadcaster to push "activity"
+// SessionEvents that let UI clients distinguish a stuck-waiting state
+// from active autonomous work — see SessionEvent.LastActivityAt.
+func (s *Session) LastActivity() time.Time {
+	if s == nil || s.pane == nil {
+		return time.Time{}
+	}
+	return s.pane.LastActivity()
+}
+
 // Info returns a wire-shaped snapshot of the session's state for
 // inclusion in ListResp / PrepareExitResp.
 func (s *Session) Info() SessionInfo {

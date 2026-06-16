@@ -667,6 +667,32 @@ Once the status file holds `completed`, a subsequent `status set idle`
 `Stop` hook from clobbering the completion signal during the SIGTERM
 grace window that follows `openkanban ticket done`.
 
+#### PTY-activity override (`waiting` → `working`)
+
+The hook-driven file is authoritative for "what state did the agent
+just enter", but it has a known gap: between Claude Code's
+`Notification` hook (permission prompt → file=`waiting`) and the
+eventual `PostToolUse` hook (tool done → file=`working`), no hook
+fires. A long-running tool that the user has already approved leaves
+the file pinned at `waiting` for the whole duration — even though the
+agent's spinner is animating and tool output is streaming.
+
+To close that gap, the daemon timestamps every non-empty `vt.Write` on
+a session's pane (`Pane.LastActivity()`), and a 2-second ticker emits
+`SessionEvent{Event: "activity", LastActivityAt: ...}` whenever the
+timestamp advances. The same value rides on lifecycle events
+(`started`, `attached`, `detached`, `exited`) so subscribers get a
+baseline before the first heartbeat lands. The status detector layers
+an override on top of `DetectStatusWithPort`: when the file says
+`waiting` but `LastActivityAt` is within `WaitingActivityTTL` (60s),
+report `working` instead. The override is intentionally narrow —
+other file states pass through untouched, and zero `LastActivityAt`
+(no daemon report yet) also passes through.
+
+The cost is bounded by the activity broadcaster's "only emit when
+advanced" check: an idle session generates zero traffic. Spinner-
+animating sessions emit one event per tick.
+
 ### `openkanban ticket done`
 
 The agent-side "/quit equivalent." Marks the current session's ticket
