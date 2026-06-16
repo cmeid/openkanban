@@ -77,9 +77,16 @@ func TestRenderPlist(t *testing.T) {
 		`<false/>`,
 		`<key>ThrottleInterval</key>`,
 		`<integer>10</integer>`,
+		// ExitTimeOut: clean-shutdown budget; must accommodate sequential
+		// sess.Kill(shutdownGraceSeconds=3) for realistic N. See plist comment.
+		`<key>ExitTimeOut</key>`,
+		`<integer>30</integer>`,
 		`<string>/Users/test/.cache/openkanban/daemon.log</string>`,
 		`<key>HOME</key>`,
 		`<string>/usr/local/bin:/usr/bin</string>`,
+		// Source-tagging env var: lets the daemon log who spawned it.
+		`<key>OPENKANBAN_DAEMON_SOURCE</key>`,
+		`<string>launchd</string>`,
 	}
 	for _, want := range required {
 		if !strings.Contains(s, want) {

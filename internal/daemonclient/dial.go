@@ -174,10 +174,19 @@ func DialOrStart(ctx context.Context) (net.Conn, error) {
 	return nil, fmt.Errorf("%w: forked daemon did not bind %s within %s", ErrDaemonUnavailable, sock, startWait)
 }
 
-// forkDaemon execs the daemon binary detached in a new session, with stdio
-// redirected to the daemon log. Binary lookup is delegated to
-// daemon.ResolveBinary, which prefers the OpenKanban.app bundle so the daemon
-// inherits the bundle's identity (required for macOS notifications).
+// forkDaemon execs the daemon binary with `--persistent` detached in a
+// new session, with stdio redirected to the daemon log. Binary lookup
+// is delegated to daemon.ResolveBinary, which prefers the
+// OpenKanban.app bundle so the daemon inherits the bundle's identity
+// (required for macOS notifications).
+//
+// --persistent is load-bearing: without it, a TUI-forked daemon exits
+// when the last client disconnects, killing every live agent session
+// it owned. The whole point of the daemon is to outlive any one TUI
+// process, so fork sites MUST pass --persistent.
+//
+// OPENKANBAN_DAEMON_SOURCE=tui-fork lets the daemon log announce who
+// spawned it (vs launchd / manual) for postmortem diagnosis.
 func forkDaemon() error {
 	if err := ensureRuntimeDir(); err != nil {
 		return err
@@ -198,10 +207,11 @@ func forkDaemon() error {
 		return fmt.Errorf("daemonclient: open log %s: %w", logFile, err)
 	}
 
-	cmd := exec.Command(exe, "daemon")
+	cmd := exec.Command(exe, "daemon", "--persistent")
 	cmd.Stdout = logF
 	cmd.Stderr = logF
 	cmd.Stdin = nil
+	cmd.Env = append(os.Environ(), "OPENKANBAN_DAEMON_SOURCE=tui-fork")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
 	if err := cmd.Start(); err != nil {

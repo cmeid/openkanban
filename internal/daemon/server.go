@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"syscall"
 	"time"
@@ -90,6 +91,15 @@ type Server struct {
 	// race detector quiet across the two goroutines.
 	stalenessMu    sync.Mutex
 	pendingRestart bool
+
+	// emitSessionExitFn is the seam watchSessionExit uses to publish
+	// the "exited" SessionEvent. Production leaves this nil and the
+	// goroutine falls back to s.emitEvent. Tests inject a panicking
+	// override via setEmitSessionExitFnForTest to verify the
+	// goroutine's panic-recovery + invariant-preserving cleanup.
+	// Only read once at goroutine start; no mutex needed because
+	// tests set it before triggering the event.
+	emitSessionExitFn func(SessionEvent)
 }
 
 // clientConn tracks one open connection's per-client state.
@@ -194,12 +204,29 @@ func NewServerWithOptions(sock, pidpath string, opts Options) (*Server, error) {
 // location.
 func (s *Server) SocketPath() string { return s.sock }
 
+// daemonSource reads OPENKANBAN_DAEMON_SOURCE to identify who spawned
+// this daemon. Both fork sites in internal/daemon/autostart.go and
+// internal/daemonclient/dial.go set it to "tui-fork"; the launchd
+// plist sets it to "launchd" via EnvironmentVariables. Anything else
+// (including unset / unknown values) reports as "manual" — direct
+// invocation from a shell. This is the only signal in the startup
+// log that lets a postmortem tell apart a TUI-forked daemon dying
+// on TUI close from a launchd-managed one dying for another reason.
+func daemonSource() string {
+	switch v := os.Getenv("OPENKANBAN_DAEMON_SOURCE"); v {
+	case "tui-fork", "launchd":
+		return v
+	default:
+		return "manual"
+	}
+}
+
 // Serve runs the accept loop until ctx is cancelled, the shutdown
 // channel is closed (via initiateShutdown), or a fatal accept error
 // occurs. On return the listener is closed, the pidfile is released,
 // and any remaining sessions have been torn down. Safe to call once.
 func (s *Server) Serve(ctx context.Context) error {
-	log.Printf("openkanbankd: listening on %s (pid %d)", s.sock, os.Getpid())
+	log.Printf("openkanbankd: listening on %s (pid %d persistent=%v source=%s)", s.sock, os.Getpid(), s.persistent, daemonSource())
 
 	// Watch ctx in a goroutine that triggers the same shutdown path
 	// the last-client-disconnect handler uses, so both initiations
@@ -268,6 +295,13 @@ func (s *Server) Serve(ctx context.Context) error {
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
+			// Intentionally NO panic recovery here. A panic in
+			// handleConn signals protocol / wire-state corruption,
+			// not a transient telemetry hiccup like the background
+			// goroutines. Recovering would let the daemon limp on
+			// with inconsistent state visible to other clients;
+			// crashing surfaces the bug and lets launchd respawn
+			// cleanly. See docs/AGENT_INTEGRATION.md.
 			s.handleConn(c)
 		}()
 	}
@@ -295,7 +329,16 @@ func (s *Server) Serve(ctx context.Context) error {
 //
 // We deliberately don't kill live sessions to "force" a restart —
 // that would surprise the user and orphan in-progress agent work.
+//
+// Panic recovery: same rationale as broadcastEvents — a panic here used
+// to crash the whole daemon and every PTY with it. We log + exit the
+// goroutine; binary-staleness checks resume on next daemon start.
 func (s *Server) watchBinaryStaleness() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("openkanbankd: panic in watchBinaryStaleness: %v\n%s", r, debug.Stack())
+		}
+	}()
 	ticker := time.NewTicker(update.BinaryStaleCheckInterval)
 	defer ticker.Stop()
 	for {
@@ -341,7 +384,19 @@ func (s *Server) watchBinaryStaleness() {
 // the client is logged and skipped — broadcastEvents must never block
 // on a single bad client, otherwise an emit-site (handleSpawn / Kill /
 // attach) would back up behind it.
+//
+// Panics in dispatchSessionEvent are recovered to a log line: a
+// background-loop crash brought down the whole daemon (and every live
+// PTY with it) before this defer was added. The recover is at the loop
+// boundary, not inside; if dispatch panics on the same event repeatedly
+// the loop would re-panic immediately, so we exit the goroutine on first
+// panic and rely on the next reconcile (List poll) to repair state.
 func (s *Server) broadcastEvents() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("openkanbankd: panic in broadcastEvents: %v\n%s", r, debug.Stack())
+		}
+	}()
 	for {
 		select {
 		case <-s.shutdown:
@@ -684,6 +739,13 @@ func (s *Server) handleSpawn(c *clientConn, req SpawnReq) (SpawnResp, error) {
 // comes AFTER Wait. The watcher is fundamentally tied to the pane
 // lifetime, not the connection lifetime; letting it run to completion
 // in the background after Serve returns is correct.
+//
+// Panic-safety invariant: removeSession() + the "exited" emit MUST
+// always run, even if a panic occurs in the subscription loop or in
+// emit itself. We register a single outer-recover defer that handles
+// any panic from the loop body, then runs removeSession + emit with
+// an inner recover so a panic IN emit can't skip the registry
+// cleanup or leave the goroutine in an undefined state.
 func (s *Server) watchSessionExit(sess *Session) {
 	if sess == nil || sess.pane == nil {
 		return
@@ -693,26 +755,10 @@ func (s *Server) watchSessionExit(sess *Session) {
 		defer unsub()
 		sessID := sess.ID()
 		ticketID := sess.TicketID()
-		emit := func() {
-			expected := sess.ExpectedCompletion()
-			reason := "natural_exit"
-			if expected {
-				reason = "ticket_done"
-			}
-			s.emitEvent(SessionEvent{
-				Event:     "exited",
-				SessionID: sessID,
-				TicketID:  ticketID,
-				Expected:  expected,
-				Reason:    reason,
-			})
-		}
 		// removeSession deletes sess from the registry if (and only if)
 		// it's still the entry under sessID. handleKill / handleTicketDone
 		// may have already removed it via the explicit path; both paths
-		// must be safe to run concurrently. We do this BEFORE the emit
-		// so subscribers that List() in response to "exited" don't see
-		// the stale session.
+		// must be safe to run concurrently.
 		removeSession := func() {
 			s.sessionsMu.Lock()
 			if cur, ok := s.sessions[sessID]; ok && cur == sess {
@@ -721,18 +767,48 @@ func (s *Server) watchSessionExit(sess *Session) {
 			}
 			s.sessionsMu.Unlock()
 		}
+		emit := func() {
+			expected := sess.ExpectedCompletion()
+			reason := "natural_exit"
+			if expected {
+				reason = "ticket_done"
+			}
+			ev := SessionEvent{
+				Event:     "exited",
+				SessionID: sessID,
+				TicketID:  ticketID,
+				Expected:  expected,
+				Reason:    reason,
+			}
+			if fn := s.emitSessionExitFn; fn != nil {
+				fn(ev)
+				return
+			}
+			s.emitEvent(ev)
+		}
+		defer func() {
+			// Catches any panic from the loop body. Then runs cleanup
+			// with an inner recover so a panic in emit doesn't skip
+			// removeSession from another invocation path.
+			if r := recover(); r != nil {
+				log.Printf("openkanbankd: panic in watchSessionExit(%s): %v\n%s", sessID, r, debug.Stack())
+			}
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("openkanbankd: panic in watchSessionExit cleanup emit(%s): %v\n%s", sessID, r, debug.Stack())
+				}
+			}()
+			removeSession()
+			emit()
+		}()
 		for ev := range ch {
 			if _, ok := ev.(terminal.ExitEvent); ok {
-				removeSession()
-				emit()
-				return
+				return // defer runs removeSession + emit
 			}
 		}
 		// Channel closed without ExitEvent (e.g. Stop tore the loop
-		// down before the read returned). Emit anyway so subscribers
-		// learn the session is gone.
-		removeSession()
-		emit()
+		// down before the read returned). The defer still runs
+		// removeSession + emit so subscribers learn the session is gone.
 	}()
 }
 
