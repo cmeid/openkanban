@@ -222,17 +222,32 @@ if [ "$(uname -s)" = "Darwin" ]; then
     read -r reply
     case "${reply:-n}" in
       y|Y|yes|YES)
-        if "$INSTALLED_BIN" daemon install-service; then
-          say  ""
-          say  "  To prevent the TUI from also forking its own daemon, add the following"
-          say  "  to ~/.config/openkanban/config.json (top-level key):"
-          say  ""
-          say  '      "daemon": { "autostart": false }'
-          say  ""
-          say  "  Or pass --no-launch-daemon when invoking openkanban."
-        else
-          warn "openkanban daemon install-service failed. You can re-run it later with:"
-          say  "      openkanban daemon install-service"
+        # `daemon install-service` refuses if any daemon is currently
+        # bound to the socket — the new service would race it for the
+        # pidlock. User already said yes; stop the running daemon for
+        # them instead of failing with "run `daemon stop` first".
+        proceed=1
+        if "$INSTALLED_BIN" daemon list >/dev/null 2>&1; then
+          say "  openkanbankd is already running. Stopping it so the launchd service can take over..."
+          if ! "$INSTALLED_BIN" daemon stop; then
+            warn "openkanban daemon stop failed or was declined. Skipping launchd install."
+            say  "      Stop the daemon yourself, then run: openkanban daemon install-service"
+            proceed=0
+          fi
+        fi
+        if [ "$proceed" = "1" ]; then
+          if "$INSTALLED_BIN" daemon install-service; then
+            say  ""
+            say  "  To prevent the TUI from also forking its own daemon, add the following"
+            say  "  to ~/.config/openkanban/config.json (top-level key):"
+            say  ""
+            say  '      "daemon": { "autostart": false }'
+            say  ""
+            say  "  Or pass --no-launch-daemon when invoking openkanban."
+          else
+            warn "openkanban daemon install-service failed. You can re-run it later with:"
+            say  "      openkanban daemon install-service"
+          fi
         fi
         ;;
       *)
@@ -266,8 +281,15 @@ Day-to-day:
   openkanban update --check        # just print update status
   openkanban update                # pull + rebuild + reinstall from $REPO_ROOT
 
+EOF
+
+# Surface the legacy-shim cleanup hint only when the shim actually exists —
+# otherwise it reads as a confusing instruction to remove a missing file.
+if [ -e "$HOME/.local/bin/update-openkanban" ]; then
+  cat <<EOF
 Already have ~/.local/bin/update-openkanban from before? You can remove it:
     rm ~/.local/bin/update-openkanban
 \`openkanban update\` replaces it.
 
 EOF
+fi
