@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/json"
 	"log"
 	"strings"
@@ -10,6 +9,8 @@ import (
 	"testing"
 	"time"
 )
+
+// syncBuffer is defined in integration_test.go — reuse it.
 
 // TestWatchSessionExit_PanicSafety asserts that a panic inside the
 // "exited" emit step does NOT crash the daemon and does NOT leave
@@ -24,7 +25,10 @@ import (
 // live agent PTY with it.
 func TestWatchSessionExit_PanicSafety(t *testing.T) {
 	// Redirect log output so we can assert the panic was logged.
-	var logBuf bytes.Buffer
+	// syncBuffer is goroutine-safe so the daemon's handleConn log
+	// writes (on client connect/disconnect) don't race with the
+	// test's reads at the end.
+	var logBuf syncBuffer
 	origWriter := log.Writer()
 	log.SetOutput(&logBuf)
 	t.Cleanup(func() { log.SetOutput(origWriter) })
@@ -44,13 +48,18 @@ func TestWatchSessionExit_PanicSafety(t *testing.T) {
 	r := bufio.NewReader(conn)
 	helloAndUnpack(t, conn, r)
 
-	// Spawn /bin/true — exits almost immediately so the pane
-	// publishes ExitEvent and the watcher's deferred cleanup
-	// runs (removeSession then panicking emit).
+	// Spawn /bin/sleep 0.2 — gives the watcher goroutine time to
+	// subscribe to the pane before the child exits (sub-second is
+	// fine; /usr/bin/true exits so fast that under -race the child
+	// can finish before watchSessionExit's Subscribe is wired up,
+	// dropping the ExitEvent on the floor). 0.2s exit then triggers
+	// the watcher's deferred cleanup (removeSession then panicking
+	// emit).
 	writeReq(t, conn, MsgSpawnReq, SpawnReq{
 		TicketID:    "PANIC-1",
 		SessionName: "panic-safety",
-		Command:     "/usr/bin/true",
+		Command:     "/bin/sleep",
+		Args:        []string{"0.2"},
 		Cols:        80,
 		Rows:        24,
 		Scrollback:  100,
