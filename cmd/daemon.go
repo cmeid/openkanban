@@ -71,7 +71,14 @@ func runDaemonForeground(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// SIGHUP is treated as a clean-shutdown trigger alongside SIGINT
+	// and SIGTERM. macOS launchd does not typically send SIGHUP to
+	// GUI-domain LaunchAgents on logout, but the cost of handling it
+	// is one signal entry and Go's default disposition (terminate
+	// with exit 129) is the wrong default for a daemon that owns
+	// live PTYs — exit 129 would orphan sessions instead of running
+	// cleanup() with its 3s SIGTERM-then-SIGKILL grace per session.
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer cancel()
 
 	return srv.Serve(ctx)
