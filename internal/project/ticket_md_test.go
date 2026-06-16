@@ -28,6 +28,7 @@ func fixtureTicket(t *testing.T) *board.Ticket {
 	updated := mustParseTime(t, "2026-06-12T11:42:00Z")
 	started := mustParseTime(t, "2026-06-11T10:00:00Z")
 	spawned := mustParseTime(t, "2026-06-12T11:30:00Z")
+	statusChanged := mustParseTime(t, "2026-06-12T11:42:00Z")
 
 	return &board.Ticket{
 		ID:             "7f3a9b2c-1d8e-4a5b-9c3d-2f1e0a8b9c4d",
@@ -48,11 +49,12 @@ func fixtureTicket(t *testing.T) *board.Ticket {
 		AgentSessionID:   "sess-42",
 		SessionOwned:     true,
 		CreatedBySession: "demo-session-2026-06-13",
-		CreatedAt:      created,
-		UpdatedAt:      updated,
-		StartedAt:      ptrTime(started),
-		CompletedAt:    nil,
-		Labels:         []string{"storage", "tui"},
+		CreatedAt:       created,
+		UpdatedAt:       updated,
+		StartedAt:       ptrTime(started),
+		CompletedAt:     nil,
+		StatusChangedAt: ptrTime(statusChanged),
+		Labels:          []string{"storage", "tui"},
 		Priority:       2,
 		Meta:           map[string]string{"epic": "hot-reload", "owner": "chris"},
 		BlockedBy:      []board.TicketID{"a1b2c3d4-...."},
@@ -163,6 +165,61 @@ func TestMarshalDeterministicFieldOrder(t *testing.T) {
 
 	if string(a) != string(b) {
 		t.Errorf("output not deterministic across calls\n a:\n%s\n b:\n%s", a, b)
+	}
+}
+
+// TestUnmarshalBackfillsStatusChangedAt verifies that a pre-existing
+// ticket .md file lacking status_changed_at (the field was added later)
+// loads with StatusChangedAt populated from UpdatedAt. The on-disk file
+// is not rewritten by the backfill, but Marshal-then-Unmarshal of the
+// result is stable.
+func TestUnmarshalBackfillsStatusChangedAt(t *testing.T) {
+	const legacyTicket = `---
+id: 7f3a9b2c-1d8e-4a5b-9c3d-2f1e0a8b9c4d
+project_id: proj-abc
+title: Legacy ticket
+status: in_progress
+priority: 3
+labels: []
+created_at: 2026-06-10T09:00:00Z
+updated_at: 2026-06-12T11:42:00Z
+use_worktree: true
+agent_status: working
+blocked_by: []
+meta: {}
+---
+
+Legacy body.
+`
+
+	got, err := UnmarshalTicket([]byte(legacyTicket))
+	if err != nil {
+		t.Fatalf("UnmarshalTicket: %v", err)
+	}
+
+	if got.StatusChangedAt == nil {
+		t.Fatal("StatusChangedAt should be backfilled, got nil")
+	}
+	if !got.StatusChangedAt.Equal(got.UpdatedAt) {
+		t.Errorf("StatusChangedAt = %v; want UpdatedAt = %v",
+			*got.StatusChangedAt, got.UpdatedAt)
+	}
+
+	// Round-trip: Marshal then Unmarshal must preserve the backfilled value.
+	data, err := MarshalTicket(got)
+	if err != nil {
+		t.Fatalf("MarshalTicket: %v", err)
+	}
+	got2, err := UnmarshalTicket(data)
+	if err != nil {
+		t.Fatalf("UnmarshalTicket round-trip: %v", err)
+	}
+	if got2.StatusChangedAt == nil {
+		t.Fatal("StatusChangedAt nil after round-trip")
+	}
+	if !got2.StatusChangedAt.Equal(*got.StatusChangedAt) {
+		t.Errorf("round-trip StatusChangedAt drift: got %v, want %v",
+			*got2.StatusChangedAt, *got.StatusChangedAt)
 	}
 }
 

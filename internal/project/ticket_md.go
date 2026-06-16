@@ -280,6 +280,14 @@ func validateFrontmatter(fm *ticketFrontmatter) error {
 		fm.UpdatedAt = now
 	}
 
+	// Pre-StatusChangedAt files lack the field; fall back to UpdatedAt
+	// so the new "status change" sort has a meaningful value. In-memory
+	// only — the file stays byte-identical until a real mutation flushes.
+	if fm.StatusChangedAt == nil {
+		ts := fm.UpdatedAt
+		fm.StatusChangedAt = &ts
+	}
+
 	if fm.Priority == 0 {
 		fm.Priority = 3
 	}
