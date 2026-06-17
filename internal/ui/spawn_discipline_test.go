@@ -260,6 +260,9 @@ func TestPrepareSpawnWith_OwnsFastPathSkipsSpawn(t *testing.T) {
 	// from a unit test).
 	t.Setenv("OPENKANBAN_DAEMON_SOCK", t.TempDir()+"/missing.sock")
 	t.Setenv("OPENKANBAN_DAEMON_BINARY", "/usr/bin/true")
+	// The autostart path opens the daemon log before it bails; redirect
+	// it off the real ~/.cache/openkanban so the write-guard doesn't fire.
+	t.Setenv("OPENKANBAN_DAEMON_LOG", t.TempDir()+"/daemon.log")
 
 	proj := &project.Project{ID: "test", RepoPath: t.TempDir()}
 	globalStore := project.NewGlobalTicketStore(nil)
@@ -514,6 +517,9 @@ func TestPrepareSpawnWith_OwnsFastPath_UsesDaemonSessionName(t *testing.T) {
 	t.Setenv("OPENKANBAN_CONFIG_DIR", t.TempDir())
 	t.Setenv("OPENKANBAN_DAEMON_SOCK", t.TempDir()+"/missing.sock")
 	t.Setenv("OPENKANBAN_DAEMON_BINARY", "/usr/bin/true")
+	// The autostart path opens the daemon log before it bails; redirect
+	// it off the real ~/.cache/openkanban so the write-guard doesn't fire.
+	t.Setenv("OPENKANBAN_DAEMON_LOG", t.TempDir()+"/daemon.log")
 
 	proj := &project.Project{ID: "test", RepoPath: t.TempDir()}
 	globalStore := project.NewGlobalTicketStore(nil)
@@ -583,6 +589,9 @@ func TestPrepareSpawnWith_OwnsFastPath_EmptyDaemonName_FallsBack(t *testing.T) {
 	t.Setenv("OPENKANBAN_CONFIG_DIR", t.TempDir())
 	t.Setenv("OPENKANBAN_DAEMON_SOCK", t.TempDir()+"/missing.sock")
 	t.Setenv("OPENKANBAN_DAEMON_BINARY", "/usr/bin/true")
+	// The autostart path opens the daemon log before it bails; redirect
+	// it off the real ~/.cache/openkanban so the write-guard doesn't fire.
+	t.Setenv("OPENKANBAN_DAEMON_LOG", t.TempDir()+"/daemon.log")
 
 	proj := &project.Project{ID: "test", RepoPath: t.TempDir()}
 	globalStore := project.NewGlobalTicketStore(nil)

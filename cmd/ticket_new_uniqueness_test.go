@@ -23,6 +23,7 @@ type linkSessionTestEnv struct {
 
 func newLinkSessionTestEnv(t *testing.T, projectID string) *linkSessionTestEnv {
 	t.Helper()
+	t.Setenv("OPENKANBAN_CONFIG_DIR", t.TempDir())
 	registry := &project.ProjectRegistry{Projects: make(map[string]*project.Project)}
 	proj := &project.Project{
 		ID:       projectID,

@@ -12,6 +12,7 @@ import (
 // can actually scan and Save.
 func backfillTestEnv(t *testing.T, projectID string, seed ...*board.Ticket) *project.GlobalTicketStore {
 	t.Helper()
+	t.Setenv("OPENKANBAN_CONFIG_DIR", t.TempDir())
 	registry := &project.ProjectRegistry{Projects: make(map[string]*project.Project)}
 	proj := &project.Project{
 		ID:       projectID,
