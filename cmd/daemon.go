@@ -206,7 +206,10 @@ var daemonStopCmd = &cobra.Command{
 		// Fresh deadline for the shutdown RPC: the interactive prompt
 		// above may have burned the original budget waiting on the human,
 		// which must not be misread as the daemon being unresponsive.
-		sctx, scancel := context.WithTimeout(cmd.Context(), rpcTimeout)
+		// handleShutdown kills every live session (up to shutdownGraceSeconds
+		// each) BEFORE replying, so the budget scales with the count or a
+		// healthy multi-session shutdown trips the deadline.
+		sctx, scancel := context.WithTimeout(cmd.Context(), graceTimeout(liveSessions, daemonCloseDefaultGrace))
 		defer scancel()
 		raw, err = exchange(sctx, conn, r, daemon.MsgShutdownReq, daemon.ShutdownReq{Force: false})
 		if err != nil {
@@ -283,8 +286,10 @@ var daemonRestartCmd = &cobra.Command{
 		}
 
 		// Fresh deadline for the shutdown RPC (see daemon stop): the
-		// prompt may have outlasted the original budget.
-		sctx, scancel := context.WithTimeout(cmd.Context(), rpcTimeout)
+		// prompt may have outlasted the original budget, and the budget
+		// scales with the live-session count the daemon kills before it
+		// replies.
+		sctx, scancel := context.WithTimeout(cmd.Context(), graceTimeout(liveSessions, daemonCloseDefaultGrace))
 		defer scancel()
 		raw, err = exchange(sctx, conn, r, daemon.MsgShutdownReq, daemon.ShutdownReq{Force: false})
 		if err != nil {
@@ -353,7 +358,13 @@ func daemonCloseRun(ctx context.Context, arg string, grace time.Duration, execut
 	defer conn.Close()
 
 	r := bufio.NewReader(conn)
-	if _, err := exchange(ctx, conn, r, daemon.MsgHelloReq, daemon.HelloReq{
+
+	// hello + list are fast (no session teardown) — bound by rpcTimeout.
+	// The kill/ticket_done RPCs below get a grace-scaled budget instead,
+	// since their daemon handlers block on session kills before replying.
+	fastCtx, cancelFast := context.WithTimeout(ctx, rpcTimeout)
+	defer cancelFast()
+	if _, err := exchange(fastCtx, conn, r, daemon.MsgHelloReq, daemon.HelloReq{
 		ProtocolVersion: daemon.ProtocolVersion,
 		BinaryVersion:   Version,
 		ClientName:      daemon.ClientNameCLI,
@@ -361,7 +372,7 @@ func daemonCloseRun(ctx context.Context, arg string, grace time.Duration, execut
 		return daemonClosePlan{}, fmt.Errorf("hello: %w", err)
 	}
 
-	raw, err := exchange(ctx, conn, r, daemon.MsgListReq, daemon.ListReq{})
+	raw, err := exchange(fastCtx, conn, r, daemon.MsgListReq, daemon.ListReq{})
 	if err != nil {
 		return daemonClosePlan{}, fmt.Errorf("list: %w", err)
 	}
@@ -381,8 +392,11 @@ func daemonCloseRun(ctx context.Context, arg string, grace time.Duration, execut
 
 	switch plan.Kind {
 	case "kill":
+		// handleKill blocks on sess.Kill(grace) before replying.
+		killCtx, cancelKill := context.WithTimeout(ctx, graceTimeout(1, grace))
+		defer cancelKill()
 		s := plan.Sessions[0]
-		raw, err := exchange(ctx, conn, r, daemon.MsgKillReq, daemon.KillReq{
+		raw, err := exchange(killCtx, conn, r, daemon.MsgKillReq, daemon.KillReq{
 			SessionID:    s.SessionID,
 			GraceSeconds: int(grace / time.Second),
 		})
@@ -395,7 +409,12 @@ func daemonCloseRun(ctx context.Context, arg string, grace time.Duration, execut
 		}
 		return plan, nil
 	case "ticket_done":
-		raw, err := exchange(ctx, conn, r, daemon.MsgTicketDoneReq, daemon.TicketDoneReq{
+		// handleTicketDone kills ALL matched sessions (defense-in-depth
+		// against pre-dedup duplicates), each with the daemon's
+		// shutdownGraceSeconds, before replying.
+		tdCtx, cancelTD := context.WithTimeout(ctx, graceTimeout(len(plan.Sessions), daemonCloseDefaultGrace))
+		defer cancelTD()
+		raw, err := exchange(tdCtx, conn, r, daemon.MsgTicketDoneReq, daemon.TicketDoneReq{
 			TicketID: plan.TicketID,
 		})
 		if err != nil {
@@ -499,9 +518,10 @@ var daemonCloseCmd = &cobra.Command{
 
 		// First pass: resolve only — don't execute yet, so we can show
 		// the plan and ask for confirmation before pulling the trigger.
-		rctx, rcancel := context.WithTimeout(cmd.Context(), rpcTimeout)
-		plan, err := daemonCloseRun(rctx, args[0], daemonCloseFlagGrace, false)
-		rcancel()
+		// daemonCloseRun owns its own per-phase deadlines (fast for
+		// hello/list, grace-scaled for the kill/ticket_done), so the
+		// unbounded cmd.Context() is the right parent here.
+		plan, err := daemonCloseRun(cmd.Context(), args[0], daemonCloseFlagGrace, false)
 		if err != nil {
 			return err
 		}
@@ -527,11 +547,10 @@ var daemonCloseCmd = &cobra.Command{
 		// first call's defer has already closed it) and re-run the
 		// resolution — the live session set MAY have changed between
 		// prompt and confirmation; refusing to assume a stale plan is
-		// still valid is the safer move. A fresh deadline too: the
-		// confirmation prompt may have outlasted the first pass's budget.
-		ectx, ecancel := context.WithTimeout(cmd.Context(), rpcTimeout)
-		defer ecancel()
-		plan, err = daemonCloseRun(ectx, args[0], daemonCloseFlagGrace, true)
+		// still valid is the safer move. daemonCloseRun re-derives its
+		// deadlines from cmd.Context() each call, so a long confirmation
+		// pause can't poison the execute pass.
+		plan, err = daemonCloseRun(cmd.Context(), args[0], daemonCloseFlagGrace, true)
 		if err != nil {
 			return err
 		}
@@ -602,13 +621,32 @@ var daemonLogCmd = &cobra.Command{
 	},
 }
 
-// rpcTimeout bounds each daemon-subcommand RPC round-trip. The dial is
-// already capped at 1s (internal/daemon dialTimeout); this covers the
-// frame I/O after a successful dial so a wedged daemon — alive and
-// accepting connections but not replying — can't hang the CLI. Matches
-// the TUI's 5s connect budget (internal/app/app.go) and is generous for
-// a legitimate PrepareExit/Shutdown reply.
-const rpcTimeout = 5 * time.Second
+// rpcTimeout bounds each FAST daemon-subcommand RPC round-trip (hello,
+// list, prepare_exit). The dial is already capped at 1s (internal/daemon
+// dialTimeout); this covers the frame I/O after a successful dial so a
+// wedged daemon — alive and accepting connections but not replying —
+// can't hang the CLI. Matches the TUI's 5s connect budget
+// (internal/app/app.go). A var (not const) so tests can shrink it.
+// Slow-by-design RPCs (shutdown/kill/ticket_done) use graceTimeout.
+var rpcTimeout = 5 * time.Second
+
+// graceTimeout budgets an RPC whose daemon-side handler synchronously
+// kills n sessions BEFORE replying, each waiting up to `grace` for a
+// SIGTERM→SIGKILL exit (handleShutdown/handleKill/handleTicketDone in
+// internal/daemon/server.go). A flat rpcTimeout would misreport such a
+// legitimately-slow shutdown as ErrDaemonUnresponsive; this scales the
+// deadline to the known work. n<1 collapses to rpcTimeout, preserving
+// fast-fail against a truly wedged daemon. The +1s/session is slack over
+// the kill's own grace window; the result exceeds the serial GRACE drain
+// (n*grace). A pathological post-SIGKILL teardown hang (ticket 6fc0fdbd)
+// is intentionally NOT covered — that's a genuinely-stuck daemon and the
+// deadline should surface it as unresponsive.
+func graceTimeout(n int, grace time.Duration) time.Duration {
+	if n < 1 {
+		return rpcTimeout
+	}
+	return rpcTimeout + time.Duration(n)*(grace+time.Second)
+}
 
 // mapDaemonErr rewrites a daemon.ErrDaemonUnresponsive (raised when an
 // RPC's deadline fires) into a user-facing message with a remediation
@@ -617,7 +655,10 @@ const rpcTimeout = 5 * time.Second
 // point without threading wrapping through the happy path.
 func mapDaemonErr(err error) error {
 	if errors.Is(err, daemon.ErrDaemonUnresponsive) {
-		return fmt.Errorf("openkanbankd is unresponsive (no reply after %s) — try: openkanban daemon restart", rpcTimeout)
+		// No fixed duration in the message: the deadline that fired varies
+		// by RPC (rpcTimeout for the fast ones, a larger grace-scaled
+		// budget for shutdown/kill/ticket_done), so naming one would lie.
+		return errors.New("openkanbankd is unresponsive — try: openkanban daemon restart")
 	}
 	return err
 }
