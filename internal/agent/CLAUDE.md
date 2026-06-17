@@ -61,6 +61,12 @@ Use `NewContextData(ticket, briefRelPath, hasBrief, isExternalResume) ContextDat
 
 `HasBrief` / `BriefPath` are populated by `MergeTicketBrief` at spawn time. The brief lives at `<worktree>/tickets/<slug>.md` and contains a managed block (`<!-- openkanban:card-notes ... -->`) carrying the openkanban card's Description.
 
+### Brief concurrency contract
+
+- The **store** `ticket.Description` is the source of truth; the brief is a **one-way generated view** (store → brief, never brief → store).
+- `MergeTicketBrief` rewrites **only** the managed-block fences (`upsertManagedBlock`). Content outside the block is agent-authored, preserved verbatim, and **worktree-only** — the store has no copy, so it is lost if the worktree is removed.
+- The brief write is **atomic (temp+rename, mirroring `TicketStore.SaveTicket`)** so concurrent readers (the spawned agent, a second TUI) always see a complete brief, never a torn one. Keep `PreviewBriefMerge` strictly read-only; only `MergeTicketBrief` writes.
+
 Template in config: `"init_prompt": "Work on: {{.Title}}"`
 
 ## Status Detection
