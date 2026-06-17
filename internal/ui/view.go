@@ -655,7 +655,6 @@ func (m *Model) renderStatusBar() string {
 	modeConfigs := map[Mode]modeConfig{
 		ModeNormal:        {"◆", m.colors.primary},
 		ModeInsert:        {"✎", m.colors.success},
-		ModeCommand:       {":", m.colors.secondary},
 		ModeCreateTicket:  {"+", m.colors.success},
 		ModeEditTicket:    {"✎", m.colors.warning},
 		ModeAgentView:     {"▶", m.colors.info},
