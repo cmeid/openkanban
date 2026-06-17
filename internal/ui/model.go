@@ -300,6 +300,19 @@ type Model struct {
 	// multi-TUI footgun. See oldestWaitingPeer.
 	autoAttach bool
 
+	// takeoverPrompt is set when an attach probe was rejected because the
+	// session is currently attached in ANOTHER openkanban TUI. View()
+	// renders a confirm-default-cancel warning over the agent view;
+	// handleAgentViewMode routes keys to handleTakeoverPromptKey until the
+	// user confirms (Enter/y → take over) or cancels (Esc/anything →
+	// board). takeoverPending carries the target so the confirm path can
+	// re-issue the attach with Takeover forced (no re-probe).
+	takeoverPrompt  bool
+	takeoverPending struct {
+		ticketID board.TicketID
+		pv       *daemonclient.PaneView
+	}
+
 	// daemonClient is the long-lived control connection to openkanbankd.
 	// nil when the daemon couldn't be reached at startup — every call
 	// site MUST nil-check before use (the TUI degrades to a no-spawn
@@ -890,6 +903,17 @@ func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 
+		case attachConflictMsg:
+			// Owns cold-start fast path probed a session that's attached in
+			// another TUI. Leave the spawning splash and raise the takeover
+			// warning instead of silently retrying then failing.
+			if msg.ticketID == m.spawningTicketID {
+				m.spawningTicketID = ""
+				m.spawningAgent = ""
+			}
+			m.armTakeoverPrompt(msg)
+			return m, m.maybeSetWindowTitle()
+
 		case daemonclient.PaneOutputMsg:
 			// Pane started producing output while we're still showing
 			// the "Spawning…" splash (rare — Spawn usually returns
@@ -998,6 +1022,18 @@ func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// spawnErrorMsg and does NOT want a toast, it can introduce a
 		// separate message type.
 		m.notify(msg.err)
+		return m, nil
+
+	case attachConflictMsg:
+		// A plain attach probe was rejected — the session is attached in
+		// another TUI instance. Warn before taking over (P1 paths, which
+		// are already in ModeAgentView).
+		m.armTakeoverPrompt(msg)
+		return m, m.maybeSetWindowTitle()
+
+	case cyclePeekedMsg:
+		// A cycle Peek finished; processing this message is enough to
+		// re-render the backdrop. Nothing else to do.
 		return m, nil
 
 	case QuitRequestedMsg:
@@ -1921,6 +1957,13 @@ func (m *Model) exitToBoard() {
 }
 
 func (m *Model) handleAgentViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// The takeover warning modal swallows all keys until the user
+	// resolves it (Enter/y take over, anything else cancels). Checked
+	// before the cycle modal and any pane dispatch so the PTY never sees
+	// these keys and so it wins if both flags are somehow set.
+	if m.takeoverPrompt {
+		return m.handleTakeoverPromptKey(msg)
+	}
 	// The cycle-attach modal swallows all keys until the user resolves
 	// it (Enter attaches, Esc returns to the board, Ctrl+\ / Ctrl+]
 	// continue cycling). Handled before any pane dispatch so the PTY
@@ -2031,6 +2074,59 @@ func (m *Model) handleCycleAttachPromptKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) 
 		return m.cycleUnattachedSession(-1)
 	}
 	return m, nil
+}
+
+// armTakeoverPrompt switches to the agent view and raises the takeover
+// warning modal for a session attached in another TUI. It registers the
+// pane when the conflict came from the Owns cold-start fast path (P2),
+// which builds a PaneView not yet in m.panes; P1 callers already have
+// the pane registered and we reuse it.
+func (m *Model) armTakeoverPrompt(msg attachConflictMsg) {
+	pv := m.panes[msg.ticketID]
+	if pv == nil {
+		pv = msg.pv
+	}
+	if pv != nil {
+		m.panes[msg.ticketID] = pv
+		// The session genuinely exists daemon-side (it rejected us
+		// because someone else holds it), so record ownership now rather
+		// than waiting for the next resync.
+		m.daemonOwned[msg.ticketID] = struct{}{}
+	}
+	m.takeoverPending.ticketID = msg.ticketID
+	m.takeoverPending.pv = pv
+	m.takeoverPrompt = true
+	m.focusedPane = msg.ticketID
+	m.mode = ModeAgentView
+}
+
+// handleTakeoverPromptKey resolves the warning modal raised when an
+// attach probe found the session attached in another TUI. Enter / y
+// take over (forced Takeover, no re-probe — re-probing would loop back
+// into this prompt); Esc or any other key cancels back to the board
+// without disturbing the other window.
+func (m *Model) handleTakeoverPromptKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter", "y", "Y":
+		pending := m.takeoverPending
+		m.takeoverPrompt = false
+		m.takeoverPending.ticketID = ""
+		m.takeoverPending.pv = nil
+		return m, tea.Batch(
+			m.doAttach(pending.ticketID, pending.pv, true),
+			m.maybeSetWindowTitle(),
+		)
+	default:
+		// Esc / n / anything else: cancel. Default-to-cancel is the safe
+		// choice — we never displace the other TUI without explicit
+		// confirmation.
+		m.takeoverPrompt = false
+		m.takeoverPending.ticketID = ""
+		m.takeoverPending.pv = nil
+		m.mode = ModeNormal
+		m.focusedPane = ""
+		return m, m.maybeSetWindowTitle()
+	}
 }
 
 func (m *Model) handleAgentViewMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
@@ -3417,34 +3513,41 @@ func (m *Model) attachExisting(ticketID board.TicketID, pv *daemonclient.PaneVie
 }
 
 // attachExistingSnap is attachExisting with an optional pre-fetched session
-// list. When sessions is non-nil it is used to decide attach-vs-takeover and
-// to Refresh the pane, avoiding a redundant List — Auto mode passes the same
-// snapshot it already fetched for its attached-elsewhere filter, so the jump
-// does one List rather than two. When sessions is nil, a single List is done
-// here (the original behavior for every other caller). takeover displaces any
-// other client holding the binary stream (the desired no-prompt UX).
+// list, used ONLY to Refresh the pane's SessionInfo without a redundant List
+// (Auto mode passes the same snapshot it already fetched for its attached-
+// elsewhere filter). The attach-vs-takeover decision is NOT made from the
+// snapshot anymore — doAttach probes the daemon, which rejects an already-
+// attached session (peer untouched) so we can warn before displacing it.
+// Auto mode already skips attached-elsewhere sessions, so its probe normally
+// succeeds; a race that lost the skip surfaces the warning, which is correct.
 func (m *Model) attachExistingSnap(ticketID board.TicketID, pv *daemonclient.PaneView, sessions []daemon.SessionInfo) tea.Cmd {
 	if pv == nil || m.daemonClient == nil {
 		return nil
 	}
-	if sessions == nil {
-		listCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-		resp, err := m.daemonClient.List(listCtx)
-		cancel()
-		if err == nil {
-			sessions = resp.Sessions
+	for _, s := range sessions {
+		if s.SessionID == pv.SessionID() {
+			pv.Refresh(s)
+			break
 		}
 	}
-	takeover := false
-	for _, s := range sessions {
-		if s.SessionID != pv.SessionID() {
-			continue
-		}
-		if s.AttachedClient != 0 && s.AttachedClient != m.daemonClient.ClientID() {
-			takeover = true
-		}
-		pv.Refresh(s)
-		break
+	// Probe gently: a plain Attach. If another TUI holds the binary
+	// stream the daemon rejects it (leaving that peer untouched) and
+	// doAttach surfaces attachConflictMsg so we can warn before
+	// displacing the other window.
+	return m.doAttach(ticketID, pv, false)
+}
+
+// doAttach attaches pv to its daemon session. With takeover=false it
+// probes gently — the daemon rejects an already-attached session with
+// ErrAlreadyAttached (the existing attacher is NOT disturbed) and we
+// return attachConflictMsg so the caller can warn the user before
+// taking over. With takeover=true it unconditionally displaces the
+// current attacher; this is used only after the user confirms the
+// warning, so it must NOT re-probe (that would loop back into the
+// prompt). Returns nil when there's nothing to attach.
+func (m *Model) doAttach(ticketID board.TicketID, pv *daemonclient.PaneView, takeover bool) tea.Cmd {
+	if pv == nil || m.daemonClient == nil {
+		return nil
 	}
 	id := ticketID
 	return func() tea.Msg {
@@ -3457,6 +3560,9 @@ func (m *Model) attachExistingSnap(ticketID board.TicketID, pv *daemonclient.Pan
 			err = pv.Attach(ctx)
 		}
 		if err != nil {
+			if !takeover && errors.Is(err, daemonclient.ErrAlreadyAttached) {
+				return attachConflictMsg{ticketID: id, pv: pv}
+			}
 			return spawnErrorMsg{ticketID: id, err: "attach failed: " + err.Error()}
 		}
 		// Drain one message from the pane's tea channel so the update
@@ -3974,13 +4080,32 @@ func (m *Model) focusAndPromptAttachSnap(target board.TicketID, sessions []daemo
 	pv.SetSize(m.width, m.height-2)
 	m.cycleAttachPrompt = true
 
-	// Auto-attach if the target is Unattached so the modal backdrop shows
-	// live content. Already-Attached peers already have a populated vt.
-	var attachCmd tea.Cmd
+	// Peek the target so the modal backdrop shows its live content WITHOUT
+	// attaching. Cycling / Auto-mode preview is not a commitment — a plain
+	// attach here would silently take the session over from another TUI just
+	// to render a backdrop, which the takeover-warning work prevents. The
+	// user commits explicitly with Enter, which routes through attachExisting
+	// → the takeover warning if the session is held elsewhere. Already-
+	// Attached peers already have a live vt; only Peek the unattached ones.
+	// (sessions is no longer threaded into the attach — Peek needs only the
+	// pane; Auto mode still uses its snapshot for the attached-elsewhere skip.)
+	_ = sessions
+	var backdropCmd tea.Cmd
 	if pv.State() == daemonclient.PaneViewUnattached {
-		attachCmd = m.attachExistingSnap(target, pv, sessions)
+		peekPV := pv
+		backdropCmd = func() tea.Msg {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := peekPV.Peek(ctx); err != nil {
+				log.Printf("openkanban model: cycle peek failed session=%s: %v", peekPV.SessionID(), err)
+			}
+			// Trigger a re-render so the freshly-peeked vt is shown. A
+			// dedicated no-op message (not PaneOutputMsg) so we don't arm
+			// a pane-message listener on an unattached pane.
+			return cyclePeekedMsg{}
+		}
 	}
-	return tea.Batch(attachCmd, m.maybeSetWindowTitle())
+	return tea.Batch(backdropCmd, m.maybeSetWindowTitle())
 }
 
 // oldestWaitingPeer returns the open peer session that has been WAITING the
@@ -5180,6 +5305,13 @@ func retryAttach(attach func(ctx context.Context) error) error {
 	if attachErr == nil {
 		return nil
 	}
+	// An "already attached" rejection is deterministic — the session is
+	// held by another TUI and retrying won't change that. Bail out
+	// immediately so the caller can warn instead of burning the full
+	// backoff schedule (~8.6s) before surfacing a misleading failure.
+	if errors.Is(attachErr, daemonclient.ErrAlreadyAttached) {
+		return attachErr
+	}
 	for _, step := range spawnAttachRetrySchedule {
 		if attachErr == nil {
 			break
@@ -5188,6 +5320,9 @@ func retryAttach(attach func(ctx context.Context) error) error {
 		retryCtx, retryCancel := context.WithTimeout(context.Background(), step.timeout)
 		attachErr = attach(retryCtx)
 		retryCancel()
+		if errors.Is(attachErr, daemonclient.ErrAlreadyAttached) {
+			break
+		}
 	}
 	return attachErr
 }
@@ -5276,6 +5411,13 @@ func attachExistingFastPath(
 
 	attachErr := attachWithRetry(pv)
 	if attachErr != nil {
+		// The session is alive and attached in another TUI — warn before
+		// taking it over instead of showing a misleading "stream failed"
+		// notice. Carry the freshly-built pv so the Update handler can
+		// register it (it isn't in m.panes yet) and arm the modal.
+		if errors.Is(attachErr, daemonclient.ErrAlreadyAttached) {
+			return attachConflictMsg{ticketID: ticketID, pv: pv}
+		}
 		log.Printf("openkanban model: fast-path attach failed ticket=%s session=%s err=%v",
 			ticketID, sessionID, attachErr)
 		pv.SetLastAttachErr(attachErr)
@@ -6046,6 +6188,20 @@ type spawnUnattachedReadyMsg struct {
 	branchName   string
 	baseBranch   string
 }
+
+// attachConflictMsg is emitted when an attach probe is rejected because
+// the session is attached in another TUI instance. It carries the pv so
+// the Update handler can register the pane (the Owns cold-start fast
+// path builds a pane not yet in m.panes) and arm the takeover warning.
+type attachConflictMsg struct {
+	ticketID board.TicketID
+	pv       *daemonclient.PaneView
+}
+
+// cyclePeekedMsg is a no-op signal returned after a cycle Peek completes,
+// purely to trigger a View() re-render so the freshly-peeked backdrop
+// shows. It carries no pane ID so it doesn't arm a pane-message listener.
+type cyclePeekedMsg struct{}
 
 func tickAgentStatus(d time.Duration) tea.Cmd {
 	return tea.Tick(d, func(t time.Time) tea.Msg {

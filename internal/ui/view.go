@@ -34,6 +34,9 @@ func (m *Model) View() string {
 	}
 
 	if m.mode == ModeAgentView && m.focusedPane != "" {
+		if m.takeoverPrompt {
+			return m.renderAgentViewWithTakeoverModal()
+		}
 		if m.cycleAttachPrompt {
 			return m.renderAgentViewWithCycleModal()
 		}
@@ -1186,6 +1189,75 @@ func (m *Model) renderCycleAttachModal() string {
 // than the clip.
 func (m *Model) renderAgentViewWithCycleModal() string {
 	modal := m.renderCycleAttachModal()
+	modalCentered := lipgloss.Place(
+		m.width, lipgloss.Height(modal),
+		lipgloss.Center, lipgloss.Top,
+		modal,
+		lipgloss.WithWhitespaceChars(" "),
+		lipgloss.WithWhitespaceForeground(m.colors.base),
+	)
+	return lipgloss.JoinVertical(lipgloss.Left, modalCentered, m.renderAgentView())
+}
+
+// renderTakeoverModal is the confirm-default-cancel warning shown when
+// an attach probe found the session attached in another openkanban TUI.
+// It uses the error color (matching renderConfirmDialog) to signal the
+// destructive nature of taking over, and names the session so the user
+// knows what they'd displace. Default is cancel: only Enter / y commits.
+func (m *Model) renderTakeoverModal() string {
+	titleStyle := lipgloss.NewStyle().
+		Foreground(m.colors.err).
+		Bold(true)
+
+	target := "This session"
+	projectName := ""
+	if ticket, _ := m.globalStore.Get(m.focusedPane); ticket != nil {
+		if ticket.Title != "" {
+			target = ticket.Title
+		}
+		if proj := m.globalStore.GetProjectForTicket(ticket); proj != nil {
+			projectName = proj.Name
+		}
+	}
+
+	keyStyle := lipgloss.NewStyle().Foreground(m.colors.info).Bold(true)
+	dimStyle := m.dimStyle()
+	textStyle := lipgloss.NewStyle().Foreground(m.colors.text)
+
+	header := titleStyle.Render("⚠ Session open elsewhere")
+	name := textStyle.Render(target)
+	if projectName != "" {
+		projBadge := lipgloss.NewStyle().
+			Foreground(m.colors.base).
+			Background(m.colors.info).
+			Padding(0, 1).
+			Render(projectName)
+		name = projBadge + "  " + name
+	}
+	body := dimStyle.Render("is attached in another openkanban window.") + "\n" +
+		"  " + dimStyle.Render("Attaching here will detach it there.")
+
+	keys := keyStyle.Render("{Enter}") + dimStyle.Render(" Take over   ") +
+		keyStyle.Render("{Esc}") + dimStyle.Render(" Cancel")
+
+	content := header + "\n\n" +
+		"  " + name + "\n  " + body + "\n\n" +
+		"  " + keys
+
+	return lipgloss.NewStyle().
+		Border(columnBorder).
+		BorderForeground(m.colors.err).
+		Padding(1, 2).
+		Render(content)
+}
+
+// renderAgentViewWithTakeoverModal stacks the takeover warning over the
+// focused pane's agent view, same composition as the cycle modal — the
+// user sees the session they're about to displace behind the prompt
+// (the "decision modal renders state behind it" convention). Must not
+// use renderWithOverlay, which blanks the background.
+func (m *Model) renderAgentViewWithTakeoverModal() string {
+	modal := m.renderTakeoverModal()
 	modalCentered := lipgloss.Place(
 		m.width, lipgloss.Height(modal),
 		lipgloss.Center, lipgloss.Top,
