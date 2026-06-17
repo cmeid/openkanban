@@ -35,7 +35,6 @@ type Mode string
 const (
 	ModeNormal        Mode = "NORMAL"
 	ModeInsert        Mode = "INSERT"
-	ModeCommand       Mode = "COMMAND"
 	ModeHelp          Mode = "HELP"
 	ModeConfirm       Mode = "CONFIRM"
 	ModeConfirmExit   Mode = "CONFIRM_EXIT"
@@ -364,10 +363,11 @@ type Model struct {
 	filterInput textinput.Model
 	filterQuery string
 
-	sidebarVisible bool
-	sidebarFocused bool
-	sidebarIndex   int
-	sidebarWidth   int
+	sidebarVisible  bool
+	sidebarFocused  bool
+	sidebarIndex    int
+	sidebarWidth    int
+	sidebarOpenOnly bool // when true, sidebar counts exclude done+archived tickets
 
 	updateChecker *update.Checker
 
@@ -1254,8 +1254,6 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch m.mode {
 	case ModeNormal:
 		return m.handleNormalMode(msg)
-	case ModeCommand:
-		return m.handleCommandMode(msg)
 	case ModeCreateTicket:
 		return m.handleCreateTicketMode(msg)
 	case ModeEditTicket:
@@ -1357,9 +1355,6 @@ func (m *Model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "W":
 		return m.toggleAlwaysShowWorking()
 
-	case ":":
-		m.mode = ModeCommand
-
 	case "/":
 		m.filterInput.SetValue(m.filterQuery)
 		m.filterInput.Focus()
@@ -1453,11 +1448,30 @@ func (m *Model) handleSidebarNav(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.confirmDeleteProject(projects[m.sidebarIndex-1])
 		}
 		return m, nil
+	case "o":
+		m.sidebarOpenOnly = !m.sidebarOpenOnly
 	case "esc":
 		m.sidebarFocused = false
 	}
 
 	return m, nil
+}
+
+// sidebarTicketCount counts tickets for the sidebar. projectID=="" counts
+// across all projects. When sidebarOpenOnly is set, terminal-status tickets
+// (done, archived) are excluded so the count reflects open work only.
+func (m *Model) sidebarTicketCount(projectID string) int {
+	count := 0
+	for _, t := range m.globalStore.All() {
+		if projectID != "" && t.ProjectID != projectID {
+			continue
+		}
+		if m.sidebarOpenOnly && (t.Status == board.StatusDone || t.Status == board.StatusArchived) {
+			continue
+		}
+		count++
+	}
+	return count
 }
 
 func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
@@ -1724,16 +1738,6 @@ func (m *Model) dropTicket() (tea.Model, tea.Cmd) {
 	m.dragTargetColumn = 0
 
 	return m, wrapUpCmd
-}
-
-func (m *Model) handleCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "enter":
-		m.mode = ModeNormal
-	case "esc":
-		m.mode = ModeNormal
-	}
-	return m, nil
 }
 
 func (m *Model) handleConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {

@@ -34,6 +34,8 @@ Vim-style navigation:
 - `Enter` - select/confirm
 - `Esc` - cancel/back
 
+`:` is **intentionally unhandled** in normal mode — it falls through `handleNormalMode`'s switch to a no-op. It once entered a `ModeCommand` stub (a husk present since the initial commit whose only behaviors bounced straight back to `ModeNormal`), removed as dead code. The key is deliberately left free so a future command-palette feature (`:q`, `:w`, `:e <ticket>`, …) can claim it cleanly. Don't re-add a no-op handler or repurpose `:` for an unrelated binding.
+
 Inside ModeAgentView, these keys are intercepted before the PTY child (claude, etc.) sees them:
 - `Ctrl+]` / `Ctrl+\` - cycle focus to next / prev open, unattached session
 - `Ctrl+g` - exit back to the board
@@ -53,6 +55,8 @@ Every keybinding has **two doc surfaces** in `view.go`:
 2. `renderHelp()` — the `?` modal, the canonical "every shortcut" reference. Must list every binding.
 
 When you add, remove, or rebind a key, update **both** functions in the same change. The modal must stay complete; the footer must surface the key in any mode where it's relevant. They live ~50 lines apart on purpose — see one, edit the other.
+
+Keys that only apply while the **sidebar is focused** have a **third** surface: a hint line rendered directly inside `renderSidebar()` (e.g. `"  j/k ⏎toggle a/d o:open"`). It's width-budgeted to `m.sidebarWidth`, so keep tokens terse (`o:open`, not `o open only`). Sidebar-focused keys (handled in `handleSidebarNav`) must update all three: this in-sidebar line, the `contextualHints()` `sidebarFocused` branch, and the `renderHelp()` Sidebar section.
 
 ## View Composition
 
