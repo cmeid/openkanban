@@ -87,7 +87,7 @@ func TestTicketStore_Move(t *testing.T) {
 	ticket := board.NewTicket("Test", "project-1")
 	store.Add(ticket)
 
-	if _, err := store.Move(ticket.ID, board.StatusInProgress); err != nil {
+	if _, _, err := store.Move(ticket.ID, board.StatusInProgress); err != nil {
 		t.Fatalf("Move() error: %v", err)
 	}
 
@@ -139,7 +139,7 @@ func TestTicketStore_Move_PromotesClaudeApprovals(t *testing.T) {
 	ticket.Status = board.StatusInProgress
 	store.Add(ticket)
 
-	added, err := store.Move(ticket.ID, board.StatusInReview)
+	added, _, err := store.Move(ticket.ID, board.StatusInReview)
 	if err != nil {
 		t.Fatalf("Move: %v", err)
 	}
