@@ -247,6 +247,14 @@ type Model struct {
 	choiceMsg  string
 	choices    []choiceItem
 
+	// stuckActionPrompt gates the stuck-session recover/destroy modal.
+	// Shown via this bool while m.mode stays ModeNormal (the exit-guard
+	// / showChoice overlay pattern); routed in handleKey's global arms
+	// before the ModeNormal dispatch. stuckActionTicket is the ticket
+	// whose wedged session the modal acts on.
+	stuckActionPrompt bool
+	stuckActionTicket board.TicketID
+
 	titleInput         textinput.Model
 	descInput          textarea.Model
 	branchInput        textinput.Model
@@ -1323,6 +1331,12 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.showChoice {
 			return m.handleChoice(msg)
 		}
+		// Same overlay-routing rule for the stuck-action modal (also a
+		// bool flag with m.mode==ModeNormal). Route Esc to it before the
+		// reset arm so Esc dismisses it instead of being swallowed.
+		if m.stuckActionPrompt {
+			return m.handleStuckActionKey(msg)
+		}
 		if m.mode == ModeAgentView {
 			break
 		}
@@ -1350,6 +1364,12 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	if m.showChoice {
 		return m.handleChoice(msg)
+	}
+
+	// Stuck-action modal owns every non-global key while open (PR #70
+	// routing: the global arms above — esc/q/ctrl+c/? — already ran).
+	if m.stuckActionPrompt {
+		return m.handleStuckActionKey(msg)
 	}
 
 	if m.showConfirm {
@@ -1452,6 +1472,10 @@ func (m *Model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.quickMoveTicketBackward()
 	case "S":
 		return m.stopAgent()
+	case "r":
+		// Open the recover/destroy modal for a stuck session. No-op
+		// unless the selected card is AgentStuck.
+		return m.openStuckActionModal()
 
 	case "K":
 		return m.adjustPriority(-1)
