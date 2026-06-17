@@ -124,6 +124,8 @@ Why the second signal exists: a shipped, pulled-back ticket typically has an emp
 
 The three choice closures (`d`/`u`/`n` → `spawnPlan{ForceFresh}`/`{InjectResumeNotice}`/`{SkipMerge}`) are unchanged; only the trigger condition and the modal message vary.
 
+**Esc must be routed explicitly.** The chooser is shown via `m.showChoice = true` while `m.mode` stays `ModeNormal`. In `handleKey`, the global key arms (`esc`/`q`/`ctrl+c`/`?`) run BEFORE the `m.showChoice → handleChoice` dispatch. The `ModeNormal` `esc` arm resets `mode`/`showHelp`/`showConfirm` but NOT `showChoice`, so without an explicit `if m.showChoice { return m.handleChoice(msg) }` guard at the top of the `esc` case, Esc is swallowed and the modal stays stuck open. Any future overlay shown via a bool flag (not a `Mode`) while `mode==ModeNormal` must be routed the same way in every global key arm it should answer to.
+
 ## Status-file lookup key
 
 `pollAgentStatusesAsync` looks up `~/.cache/openkanban-status/<key>.status` using `pane.SessionName()` — the value the daemon stamped into the agent's `OPENKANBAN_SESSION` env var at spawn time, and what the status hook reads back when it calls `openkanban status set <state>`. The detector splits this from `apiSessionID` (the back-filled Claude/opencode UUID, used only for opencode's HTTP lookup) via `DetectStatusWithActivity(agentType, fileSessionName, apiSessionID, ...)`.

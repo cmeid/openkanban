@@ -1218,6 +1218,14 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.handleQuit()
 		}
 	case "esc":
+		// A choice modal (e.g. the pull-back chooser) is shown via
+		// m.showChoice while m.mode stays ModeNormal. Route Esc to its
+		// handler before the ModeNormal reset arm below — that arm
+		// clears mode/help/confirm but not showChoice, so it would
+		// otherwise swallow Esc and leave the modal stuck open.
+		if m.showChoice {
+			return m.handleChoice(msg)
+		}
 		if m.mode == ModeAgentView {
 			break
 		}

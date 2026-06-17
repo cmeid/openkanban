@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/techdufus/openkanban/internal/board"
 	"github.com/techdufus/openkanban/internal/config"
 	"github.com/techdufus/openkanban/internal/daemonclient"
@@ -137,6 +138,31 @@ func TestSpawnAgent_PulledBack_FiresChooser_EvenWithUnchangedBrief(t *testing.T)
 	}
 	if len(m.choices) != 3 {
 		t.Errorf("choices = %d, want 3 (d/u/n)", len(m.choices))
+	}
+}
+
+// TestPullBackChooser_EscDismisses pins that Esc cancels the pull-back
+// chooser modal. The modal is shown via m.showChoice while m.mode stays
+// ModeNormal, so the global Esc arm in handleKey (which runs before the
+// showChoice dispatch) must route to handleChoice rather than swallowing
+// the keystroke and leaving the modal up. Regression guard: previously
+// the ModeNormal Esc branch reset mode/help/confirm but never cleared
+// showChoice, so Esc looked dead while the chooser was open.
+func TestPullBackChooser_EscDismisses(t *testing.T) {
+	m, _, _ := pulledBackFixture(t, time.Hour)
+
+	if _, _ = m.spawnAgent(); !m.showChoice {
+		t.Fatalf("precondition: showChoice = false, want true (chooser must be open before Esc)")
+	}
+
+	if _, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyEsc}); m.showChoice {
+		t.Errorf("after Esc: showChoice = true, want false (Esc must dismiss the chooser)")
+	}
+	if m.choices != nil {
+		t.Errorf("after Esc: choices = %v, want nil", m.choices)
+	}
+	if m.choiceMsg != "" {
+		t.Errorf("after Esc: choiceMsg = %q, want empty", m.choiceMsg)
 	}
 }
 
