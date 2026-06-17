@@ -2,6 +2,37 @@
 
 Terminal-based kanban board with integrated AI agent spawning for ticket work.
 
+## ⚠️ Before you edit code: get your own worktree (top-level sessions)
+
+This clone — `/Users/cmeid/manifold/dev/openkanban` — is the **shared primary
+working tree**. Many concurrent Claude sessions touch it at once. Agents that
+openkanban spawns for a ticket already run in isolated worktrees; **any other
+session must isolate itself the same way before editing code.** A sibling can
+`git checkout`/`reset` this clone out from under you mid-task, and your commits
+will silently land on the wrong branch (this has happened — see memory
+`feedback_shared_clone_branch_hijack`).
+
+**If your current directory is this primary clone (i.e. NOT a
+`…/openkanban-worktrees/…` path), do this first — before any edit, build, or
+commit:**
+
+1. Create a ticket, which also provisions a dedicated worktree + branch:
+   ```bash
+   openkanban ticket new --project openkanban --title "<short task title>"
+   ```
+   Note the worktree path it reports (under `openkanban-worktrees/<slug>`), then
+   `cd` into it. If openkanban isn't tracking this repo as a project, or you just
+   need a branch fast, fall back to:
+   ```bash
+   git worktree add ../okwt-<slug> -b <branch> origin/main
+   ```
+2. Do **all** edits, builds, tests, commits, and the PR from that worktree.
+3. Treat the primary clone as read-only — `git status` / `git log` are fine;
+   `git checkout`, `git commit`, `git reset` are not.
+
+(Sessions already running inside a ticket worktree are isolated — this doesn't
+apply to you; carry on.)
+
 ## Stack
 
 Go 1.21+, BubbleTea (TUI), creack/pty, charmbracelet/x/vt (terminal emulation; see [Terminal Emulator](docs/AGENT_INTEGRATION.md#architecture-terminal-emulator))
