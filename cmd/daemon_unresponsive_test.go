@@ -61,6 +61,12 @@ func wedgedListener(t *testing.T) string {
 	t.Setenv("OPENKANBAN_DAEMON_SOCK", sock)
 	// Belt-and-suspenders: never autostart a real daemon during the test.
 	t.Setenv("OPENKANBAN_DAEMON_BINARY", "/usr/bin/true")
+	// Isolate the pidfile too: mapDaemonErr's UnresponsiveHint reads
+	// daemon.PidPath(), and without this the test would read the
+	// developer's real ~/.cache/openkanban/daemon.pid and embed a live
+	// PID in the message non-deterministically. Pointing at a path that
+	// does not exist yields the stable no-pid fallback hint.
+	t.Setenv("OPENKANBAN_DAEMON_PID", filepath.Join(dir, "nonexistent.pid"))
 	return sock
 }
 
@@ -115,8 +121,8 @@ func TestDaemonListCmd_Unresponsive(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected an error against a wedged daemon, got nil")
 		}
-		if !strings.Contains(err.Error(), "unresponsive") {
-			t.Fatalf("want the guided 'unresponsive' message, got %v", err)
+		if !strings.Contains(err.Error(), "openkanban daemon restart") {
+			t.Fatalf("want the guided remediation message, got %v", err)
 		}
 		if d := time.Since(start); d < rpcTimeout/2 {
 			t.Errorf("returned in %v (< rpcTimeout/2): looks like an early EOF, not the read deadline", d)
