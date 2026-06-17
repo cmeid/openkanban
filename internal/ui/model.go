@@ -619,22 +619,13 @@ func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projec
 
 	m.refreshColumnTickets()
 
-	// Subscribe to daemon push events so status changes that happen in
-	// OTHER TUIs (or via daemon-internal pane exits) reach this model.
-	// Subscribe in NewModel (rather than Init) so the channel is alive
-	// before the first Update tick — Init only emits the tea.Cmd that
-	// arms the listener.
-	if daemonClient != nil {
-		events, unsub, _ := subscribeDaemonEvents(daemonClient)
-		if events != nil {
-			m.daemonEvents = events
-			m.daemonUnsub = unsub
-			m.daemonConnected.Store(true)
-			log.Printf("openkanban model: daemon Subscribe ok; push channel armed")
-		} else {
-			log.Printf("openkanban model: daemon Subscribe returned nil channel; push events disabled")
-		}
-	}
+	// Subscribe to daemon push events is armed ASYNCHRONOUSLY from Init
+	// (subscribeDaemonEventsCmd), NOT here. The handshake used to run
+	// synchronously in NewModel under context.Background(); a wedged
+	// daemon never answered it and blocked startup forever, before the
+	// bubbletea loop began. daemonSubscribeReadyMsg installs the channel
+	// once the bounded handshake completes; until then the startup
+	// snapshot + periodic resync cover the brief gap.
 
 	// Diagnostic stall monitor — created here so Update/View stamping has
 	// a target, but the watchdog goroutine + SIGUSR2 handler are only
@@ -657,8 +648,11 @@ func (m *Model) Init() tea.Cmd {
 		m.maybeSetWindowTitle(),
 		checkBinaryStaleness(),
 	}
-	if m.daemonEvents != nil {
-		cmds = append(cmds, readNextDaemonEvent(m.daemonEvents))
+	// Arm the daemon Subscribe handshake asynchronously (bounded ctx, off
+	// the Update goroutine) so a wedged daemon can't block startup. The
+	// Ready handler installs the channel and arms readNextDaemonEvent.
+	if m.daemonClient != nil {
+		cmds = append(cmds, subscribeDaemonEventsCmd(m.daemonClient))
 	}
 	// Arm the periodic daemon-state resync. NewModel's synchronous
 	// startup reconcile populated m.panes / m.daemonOwned from the
@@ -812,6 +806,8 @@ func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case daemonSessionEventsMsg:
 		return m.handleDaemonSessionEvents(msg)
+	case daemonSubscribeReadyMsg:
+		return m.handleDaemonSubscribeReady(msg)
 	case daemonSubscribeFailedMsg:
 		return m.handleDaemonSubscribeFailed(msg)
 	case daemonSubscribeEndedMsg:

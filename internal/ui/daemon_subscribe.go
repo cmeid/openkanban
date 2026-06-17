@@ -52,28 +52,43 @@ type daemonSubscribeFailedMsg struct {
 // back to the status-file poll.
 type daemonSubscribeEndedMsg struct{}
 
-// subscribeDaemonEvents kicks off the subscribe and returns a tea.Cmd
-// that reads the first SessionEvent from the registered channel. The
-// returned channel is wired into the model's daemonSubscriptionCh so
-// subsequent calls to readNextDaemonEvent re-arm the listener.
+// daemonSubscribeReadyMsg carries a successful (bounded, async) Subscribe
+// handshake back to Update, which installs the push channel + cancel func
+// on the model and arms the first readNextDaemonEvent. The handshake runs
+// in a tea.Cmd goroutine — NOT synchronously in NewModel — so a wedged
+// daemon that never answers SubscribeReq can't block startup.
+type daemonSubscribeReadyMsg struct {
+	events <-chan daemon.SessionEvent
+	unsub  func()
+}
+
+// subscribeDaemonEventsCmd performs the daemon Subscribe handshake from a
+// tea.Cmd goroutine under a bounded context, then reports the outcome to
+// Update. This replaces the old synchronous subscribe in NewModel, which
+// called client.Subscribe(context.Background()) — a wedged daemon (accepts
+// the connection and completes hello, then never answers SubscribeReq)
+// blocked NewModel forever, before the bubbletea loop started, so the TUI
+// never painted and the stall watchdog never armed. The bounded context
+// makes the handshake fail with a deadline instead of hanging.
 //
-// On Subscribe failure the cmd resolves to daemonSubscribeFailedMsg.
-// On channel close it resolves to daemonSubscribeEndedMsg. Otherwise
-// it returns daemonSessionEventMsg and the caller must re-arm with
-// readNextDaemonEvent(ch).
-func subscribeDaemonEvents(client *daemonclient.Client) (<-chan daemon.SessionEvent, func(), tea.Cmd) {
-	if client == nil {
-		return nil, nil, func() tea.Msg {
+// Resolves to daemonSubscribeReadyMsg on success (the handler installs the
+// channel + cancel func and arms readNextDaemonEvent) or
+// daemonSubscribeFailedMsg on a nil client / deadline / handshake error
+// (the status-file poll continues to drive AgentStatus). The context only
+// bounds the handshake; the subscription, once established, outlives it.
+func subscribeDaemonEventsCmd(client *daemonclient.Client) tea.Cmd {
+	return func() tea.Msg {
+		if client == nil {
 			return daemonSubscribeFailedMsg{Err: errDaemonClientNil}
 		}
-	}
-	events, unsub, err := client.Subscribe(context.Background())
-	if err != nil {
-		return nil, nil, func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), startupSubscribeTimeout)
+		defer cancel()
+		events, unsub, err := client.Subscribe(ctx)
+		if err != nil {
 			return daemonSubscribeFailedMsg{Err: err}
 		}
+		return daemonSubscribeReadyMsg{events: events, unsub: unsub}
 	}
-	return events, unsub, readNextDaemonEvent(events)
 }
 
 // readNextDaemonEvent returns a tea.Cmd that blocks on the next read
@@ -340,6 +355,18 @@ func (m *Model) applyDaemonStatus(ticket *board.Ticket, raw string) bool {
 		return false
 	}
 	return ticket.SetAgentStatus(status)
+}
+
+// handleDaemonSubscribeReady installs the push channel from a successful
+// async Subscribe (subscribeDaemonEventsCmd) and arms the first event
+// read. This is the deferred counterpart to what NewModel used to do
+// synchronously; running it from Update keeps startup non-blocking.
+func (m *Model) handleDaemonSubscribeReady(msg daemonSubscribeReadyMsg) (tea.Model, tea.Cmd) {
+	m.daemonEvents = msg.events
+	m.daemonUnsub = msg.unsub
+	m.daemonConnected.Store(true)
+	log.Printf("openkanban model: daemon Subscribe ok; push channel armed")
+	return m, readNextDaemonEvent(msg.events)
 }
 
 // handleDaemonSubscribeFailed records a subscribe failure. We log and

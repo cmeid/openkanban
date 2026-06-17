@@ -41,6 +41,16 @@ const startupReconcileTimeout = 10 * time.Second
 // failure-surface to the user with more delay.
 const startupReconcileBackoff = 500 * time.Millisecond
 
+// startupSubscribeTimeout bounds the daemon Subscribe handshake, which is
+// armed asynchronously from Init (subscribeDaemonEventsCmd). The handshake
+// previously ran synchronously in NewModel under context.Background(): a
+// wedged daemon — one that accepts the connection and completes hello but
+// never answers SubscribeReq — blocked NewModel forever, before the
+// bubbletea loop started, so the TUI never painted. A few seconds is ample
+// for a healthy daemon's handshake; on a wedged one the deadline fires and
+// the status-file poll takes over via daemonSubscribeFailedMsg.
+const startupSubscribeTimeout = 5 * time.Second
+
 // daemonResyncRPCTimeout is the per-attempt context timeout for the
 // periodic 30s resync List RPC. Deliberately shorter than the
 // startup timeout: at this point the TUI is already running with a
