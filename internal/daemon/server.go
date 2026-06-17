@@ -92,6 +92,16 @@ type Server struct {
 	stalenessMu    sync.Mutex
 	pendingRestart bool
 
+	// drainMu guards drainPending, the single-in-flight guard for the
+	// default-mode deferred-shutdown watcher (awaitSessionDrain). When
+	// the last client disconnects with live sessions, default mode no
+	// longer force-kills them; it spawns awaitSessionDrain to keep the
+	// daemon alive until the registry drains, then shuts down. The flag
+	// ensures only one such watcher runs at a time across repeated
+	// connect/disconnect cycles.
+	drainMu      sync.Mutex
+	drainPending bool
+
 	// emitSessionExitFn is the seam watchSessionExit uses to publish
 	// the "exited" SessionEvent. Production leaves this nil and the
 	// goroutine falls back to s.emitEvent. Tests inject a panicking
@@ -336,9 +346,11 @@ func (s *Server) Serve(ctx context.Context) error {
 //     launch (default mode) — or launchd / systemd respawn (persistent
 //     mode) — picks up the new binary.
 //   - >0 sessions: log a loud warning and keep running.
-//     - Default mode: handleLastClientDisconnect will exit cleanly
-//       when the last client drops, and the next launch picks up the
-//       new binary.
+//     - Default mode: handleLastClientDisconnect defers shutdown when
+//       the last client drops with live sessions (it no longer kills
+//       them), so the daemon stays on the stale binary until sessions
+//       drain naturally and then exits cleanly — the next launch picks
+//       up the new binary.
 //     - Persistent mode: handleLastClientDisconnect no longer exits,
 //       so the daemon stays on the stale binary until sessions drain
 //       naturally and the user explicitly runs `openkanban daemon
@@ -388,6 +400,64 @@ func (s *Server) watchBinaryStaleness() {
 			}
 
 			log.Printf("WARN: openkanbankd binary on disk is newer than running process (%d live session(s) still attached); will exit when the last client disconnects so the next launch picks up the update", liveSessions)
+		}
+	}
+}
+
+// drainPollInterval is how often awaitSessionDrain wakes to re-check the
+// live session count. Per-tick cost is two cheap locked map-length
+// reads, so a 1s tick is fine; it bounds the post-drain shutdown latency
+// to ≤1s, which is harmless.
+const drainPollInterval = 1 * time.Second
+
+// awaitSessionDrain runs (default mode only) after the last client
+// disconnects while sessions are still live. Rather than force-kill that
+// in-progress agent work, the daemon stays alive until the registry
+// drains naturally, then initiates shutdown so it does not linger as an
+// orphan process.
+//
+// While live > 0 the watcher keeps waiting regardless of client count:
+// if a client re-attaches it owns the lifecycle again, and its eventual
+// disconnect re-enters handleLastClientDisconnect (which no-ops here
+// because drainPending is still set — this watcher keeps covering until
+// live == 0). Once the registry is empty, if no client is connected we
+// shut down; if a client IS connected, its disconnect drives the normal
+// (now-immediate, live==0) shutdown path, so we just exit the watcher.
+// Single-in-flight via drainPending, cleared on exit.
+//
+// Panic recovery mirrors the other background goroutines: log + exit the
+// goroutine rather than crash the daemon and every PTY with it.
+func (s *Server) awaitSessionDrain() {
+	defer func() {
+		s.drainMu.Lock()
+		s.drainPending = false
+		s.drainMu.Unlock()
+		if r := recover(); r != nil {
+			log.Printf("openkanbankd: panic in awaitSessionDrain: %v\n%s", r, debug.Stack())
+		}
+	}()
+	ticker := time.NewTicker(drainPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.shutdown:
+			return
+		case <-ticker.C:
+			s.sessionsMu.RLock()
+			live := len(s.sessions)
+			s.sessionsMu.RUnlock()
+			if live > 0 {
+				continue
+			}
+
+			s.clientsMu.Lock()
+			clients := len(s.clients)
+			s.clientsMu.Unlock()
+			if clients == 0 {
+				log.Printf("openkanbankd: deferred shutdown — live sessions drained after last client left")
+				s.initiateShutdown("live sessions drained")
+			}
+			return
 		}
 	}
 }
@@ -1279,15 +1349,18 @@ func (s *Server) handleShutdown(c *clientConn, req ShutdownReq) ShutdownResp {
 }
 
 // handleLastClientDisconnect is invoked when the clients map drops to
-// zero. In default mode, this triggers a shutdown (the daemon is not
-// supposed to outlive the last TUI). In persistent mode (launchd /
-// systemd integration), the daemon stays up and only logs; explicit
-// ShutdownReq or signals are the exit paths.
+// zero. In persistent mode (launchd / systemd integration), the daemon
+// stays up and only logs; explicit ShutdownReq or signals are the exit
+// paths.
 //
-// If sessions are still alive at that moment the exit-guard in the
-// TUI failed; we log loudly. In default mode we then kill them
-// defensively via initiateShutdown's cleanup; in persistent mode the
-// sessions stay attached to the daemon and a future TUI can re-attach.
+// In default mode the daemon is not supposed to outlive its TUI, so a
+// last-client-disconnect with no live sessions shuts down immediately.
+// But if sessions ARE still alive at that moment, the TUI's exit-guard
+// failed to capture user intent — and force-killing live agent work to
+// preserve the "daemon doesn't outlive the TUI" invariant compounds the
+// bug. Instead we DEFER: spawn awaitSessionDrain to keep the daemon
+// alive until the registry drains naturally, then shut down (so we don't
+// linger as an orphan). A future TUI may also re-attach in the meantime.
 func (s *Server) handleLastClientDisconnect() {
 	s.sessionsMu.RLock()
 	live := len(s.sessions)
@@ -1299,11 +1372,22 @@ func (s *Server) handleLastClientDisconnect() {
 	}
 
 	if live > 0 {
-		log.Printf("WARN: last client disconnected with %d live sessions; exit-guard was bypassed; terminating sessions", live)
-	} else {
-		log.Printf("openkanbankd: last client disconnected; shutting down")
+		s.drainMu.Lock()
+		start := !s.drainPending
+		if start {
+			s.drainPending = true
+		}
+		s.drainMu.Unlock()
+		if start {
+			log.Printf("openkanbankd: last client disconnected with %d live session(s); deferring shutdown until they exit (default mode no longer force-kills live work)", live)
+			go s.awaitSessionDrain()
+		}
+		// Do NOT initiateShutdown — sessions are work, not transient UI
+		// state. awaitSessionDrain owns the eventual shutdown.
+		return
 	}
 
+	log.Printf("openkanbankd: last client disconnected; shutting down")
 	s.initiateShutdown("last client disconnected")
 }
 

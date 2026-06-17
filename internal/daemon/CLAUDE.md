@@ -19,6 +19,31 @@ Helper: `findSessionForTicketLocked(ticketID string) *Session` — caller must h
 
 A daemon that ran on a pre-dedup binary may have ended up with two sessions sharing a TicketID. `handleSpawn` refuses to create such a duplicate going forward, but any inherited pair is cleaned up by the next ticket-done flow: `handleTicketDone` iterates ALL matches and kills each, logging a `WARN` if it finds more than one. The response carries the first match's `SessionID` for wire backward-compat; per-session `"exited"` SessionEvents surface the rest.
 
+## Last-client-disconnect lifecycle (default vs persistent)
+
+When the clients map drops to zero, `handleLastClientDisconnect` decides the
+daemon's fate:
+
+- **Persistent mode** (`--persistent`, launchd/systemd): stays up; only explicit
+  `ShutdownReq` / signals / stale-binary self-restart exit it.
+- **Default mode, zero live sessions**: shuts down immediately (the daemon must
+  not outlive its TUI).
+- **Default mode, >0 live sessions**: does **NOT** force-kill them. A last-client
+  disconnect with live sessions means the TUI's exit-guard failed to capture
+  user intent, and killing in-progress agent work to preserve the
+  "daemon-doesn't-outlive-TUI" invariant compounds the bug. Instead it spawns
+  `awaitSessionDrain` (poll-based, single-in-flight via `drainMu`/`drainPending`)
+  which keeps the daemon alive until the registry drains naturally, then calls
+  `initiateShutdown` so it doesn't linger as an orphan. A future TUI may re-attach
+  in the meantime.
+
+`cleanup()` (which kills any sessions still in the registry) is therefore reached
+only via *legitimate* shutdown signals — ctx-cancel, `ShutdownReq`, binary
+staleness, or drained-to-zero — never from the last-client-disconnect-with-live
+path. Don't reintroduce a force-kill there. This is orthogonal to the TUI-side
+exit-guard, which is about making the guard *fire reliably*; this is about what
+the daemon does *when* it doesn't.
+
 ## Session field immutability
 
 `Session.id` and `Session.ticketID` are de-facto immutable after `NewSession`. The pane-exit watcher (`watchSessionExit`) reads `sess.TicketID()` from a goroutine without taking `sessionsMu` — only safe because of this invariant. Don't mutate `s.ticketID` post-construction; if you need to "re-ticket" a session, kill it and spawn a new one.
