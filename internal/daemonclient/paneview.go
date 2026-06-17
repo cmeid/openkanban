@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -666,7 +667,25 @@ func (p *PaneView) Takeover(ctx context.Context) error {
 	return p.attach(ctx, true)
 }
 
-func (p *PaneView) attach(ctx context.Context, takeover bool) error {
+// attachHandshakeTimeout bounds the attach handshake (hello, attach
+// req/resp, snapshot drain) so a wedged daemon — one that accepts the
+// attach conn but never replies — can't strand the PaneView in the
+// attaching state forever. It deliberately covers only the handshake;
+// the deadline is cleared before attachLoop, which is an intentionally
+// unbounded stream (a healthy agent may be silent for minutes).
+const attachHandshakeTimeout = 5 * time.Second
+
+func (p *PaneView) attach(ctx context.Context, takeover bool) (err error) {
+	// Normalize a handshake deadline timeout into ErrDaemonUnresponsive so
+	// callers (and the UI failure overlay) can tell "wedged daemon" apart
+	// from other attach failures. Only handshake I/O sets a deadline, so
+	// this can't misfire on the early non-I/O returns below.
+	defer func() {
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			err = fmt.Errorf("%w: %w", daemon.ErrDaemonUnresponsive, err)
+		}
+	}()
+
 	p.mu.Lock()
 	if p.state == PaneViewAttached {
 		p.mu.Unlock()
@@ -693,6 +712,18 @@ func (p *PaneView) attach(ctx context.Context, takeover bool) error {
 		return err
 	}
 	r := bufio.NewReader(conn)
+
+	// Bound the handshake span (hello, attach req/resp, snapshot drain).
+	// Cleared just before attachLoop so the steady-state stream stays
+	// unbounded. On any handshake error the existing paths Close() the
+	// conn, so we don't separately reset the deadline on the failure exits.
+	// Cap at attachHandshakeTimeout but honor an earlier ctx deadline so
+	// the attach is also cancellable by the caller.
+	hsDeadline := time.Now().Add(attachHandshakeTimeout)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(hsDeadline) {
+		hsDeadline = dl
+	}
+	_ = conn.SetDeadline(hsDeadline)
 
 	// Hello on the new conn. We don't use Client.do here because that
 	// runs on Client.conn — the attach conn is brand new and the
@@ -786,6 +817,10 @@ func (p *PaneView) attach(ctx context.Context, takeover bool) error {
 			remaining = 0
 		}
 	}
+
+	// Handshake done — drop the deadline so the steady-state attachLoop,
+	// which blocks waiting for live PTY output, is not severed by it.
+	_ = conn.SetDeadline(time.Time{})
 
 	p.mu.Lock()
 	p.state = PaneViewAttached

@@ -91,15 +91,19 @@ var daemonListCmd = &cobra.Command{
 	Short:         "List sessions owned by the running daemon",
 	SilenceUsage:  true,
 	SilenceErrors: false,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := dialDaemon(cmd.Context())
+	RunE: func(cmd *cobra.Command, args []string) (err error) {
+		defer func() { err = mapDaemonErr(err) }()
+		ctx, cancel := context.WithTimeout(cmd.Context(), rpcTimeout)
+		defer cancel()
+
+		conn, err := dialDaemon(ctx)
 		if err != nil {
 			return err
 		}
 		defer conn.Close()
 
 		r := bufio.NewReader(conn)
-		if _, err := exchange(conn, r, daemon.MsgHelloReq, daemon.HelloReq{
+		if _, err := exchange(ctx, conn, r, daemon.MsgHelloReq, daemon.HelloReq{
 			ProtocolVersion: daemon.ProtocolVersion,
 			BinaryVersion:   Version,
 			ClientName:      daemon.ClientNameCLI,
@@ -107,7 +111,7 @@ var daemonListCmd = &cobra.Command{
 			return fmt.Errorf("hello: %w", err)
 		}
 
-		raw, err := exchange(conn, r, daemon.MsgListReq, daemon.ListReq{})
+		raw, err := exchange(ctx, conn, r, daemon.MsgListReq, daemon.ListReq{})
 		if err != nil {
 			return fmt.Errorf("list: %w", err)
 		}
@@ -153,15 +157,19 @@ var daemonStopCmd = &cobra.Command{
 	Short:         "Ask the running daemon to shut down",
 	SilenceUsage:  true,
 	SilenceErrors: false,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := dialDaemon(cmd.Context())
+	RunE: func(cmd *cobra.Command, args []string) (err error) {
+		defer func() { err = mapDaemonErr(err) }()
+		ctx, cancel := context.WithTimeout(cmd.Context(), rpcTimeout)
+		defer cancel()
+
+		conn, err := dialDaemon(ctx)
 		if err != nil {
 			return err
 		}
 		defer conn.Close()
 
 		r := bufio.NewReader(conn)
-		if _, err := exchange(conn, r, daemon.MsgHelloReq, daemon.HelloReq{
+		if _, err := exchange(ctx, conn, r, daemon.MsgHelloReq, daemon.HelloReq{
 			ProtocolVersion: daemon.ProtocolVersion,
 			BinaryVersion:   Version,
 			ClientName:      daemon.ClientNameCLI,
@@ -171,7 +179,7 @@ var daemonStopCmd = &cobra.Command{
 
 		// Learn the live-session count and whether any other TUI is
 		// watching before pulling the trigger.
-		raw, err := exchange(conn, r, daemon.MsgPrepareExitReq, daemon.PrepareExitReq{})
+		raw, err := exchange(ctx, conn, r, daemon.MsgPrepareExitReq, daemon.PrepareExitReq{})
 		if err != nil {
 			return fmt.Errorf("prepare_exit: %w", err)
 		}
@@ -195,7 +203,12 @@ var daemonStopCmd = &cobra.Command{
 			}
 		}
 
-		raw, err = exchange(conn, r, daemon.MsgShutdownReq, daemon.ShutdownReq{Force: false})
+		// Fresh deadline for the shutdown RPC: the interactive prompt
+		// above may have burned the original budget waiting on the human,
+		// which must not be misread as the daemon being unresponsive.
+		sctx, scancel := context.WithTimeout(cmd.Context(), rpcTimeout)
+		defer scancel()
+		raw, err = exchange(sctx, conn, r, daemon.MsgShutdownReq, daemon.ShutdownReq{Force: false})
 		if err != nil {
 			return fmt.Errorf("shutdown: %w", err)
 		}
@@ -228,15 +241,19 @@ var daemonRestartCmd = &cobra.Command{
 	Long:          "Asks the running openkanbankd to shut down. Any live agent PTYs it owns are killed. The next `openkanban` invocation will autostart a fresh daemon (typically built from a newer binary — that's the whole point). With sessions still alive, prompts on an interactive TTY; pass --force to skip the prompt.",
 	SilenceUsage:  true,
 	SilenceErrors: false,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := dialDaemon(cmd.Context())
+	RunE: func(cmd *cobra.Command, args []string) (err error) {
+		defer func() { err = mapDaemonErr(err) }()
+		ctx, cancel := context.WithTimeout(cmd.Context(), rpcTimeout)
+		defer cancel()
+
+		conn, err := dialDaemon(ctx)
 		if err != nil {
 			return err
 		}
 		defer conn.Close()
 
 		r := bufio.NewReader(conn)
-		if _, err := exchange(conn, r, daemon.MsgHelloReq, daemon.HelloReq{
+		if _, err := exchange(ctx, conn, r, daemon.MsgHelloReq, daemon.HelloReq{
 			ProtocolVersion: daemon.ProtocolVersion,
 			BinaryVersion:   Version,
 			ClientName:      daemon.ClientNameCLI,
@@ -245,7 +262,7 @@ var daemonRestartCmd = &cobra.Command{
 		}
 
 		// Learn the live-session count before pulling the trigger.
-		raw, err := exchange(conn, r, daemon.MsgPrepareExitReq, daemon.PrepareExitReq{})
+		raw, err := exchange(ctx, conn, r, daemon.MsgPrepareExitReq, daemon.PrepareExitReq{})
 		if err != nil {
 			return fmt.Errorf("prepare_exit: %w", err)
 		}
@@ -265,7 +282,11 @@ var daemonRestartCmd = &cobra.Command{
 			}
 		}
 
-		raw, err = exchange(conn, r, daemon.MsgShutdownReq, daemon.ShutdownReq{Force: false})
+		// Fresh deadline for the shutdown RPC (see daemon stop): the
+		// prompt may have outlasted the original budget.
+		sctx, scancel := context.WithTimeout(cmd.Context(), rpcTimeout)
+		defer scancel()
+		raw, err = exchange(sctx, conn, r, daemon.MsgShutdownReq, daemon.ShutdownReq{Force: false})
 		if err != nil {
 			return fmt.Errorf("shutdown: %w", err)
 		}
@@ -332,7 +353,7 @@ func daemonCloseRun(ctx context.Context, arg string, grace time.Duration, execut
 	defer conn.Close()
 
 	r := bufio.NewReader(conn)
-	if _, err := exchange(conn, r, daemon.MsgHelloReq, daemon.HelloReq{
+	if _, err := exchange(ctx, conn, r, daemon.MsgHelloReq, daemon.HelloReq{
 		ProtocolVersion: daemon.ProtocolVersion,
 		BinaryVersion:   Version,
 		ClientName:      daemon.ClientNameCLI,
@@ -340,7 +361,7 @@ func daemonCloseRun(ctx context.Context, arg string, grace time.Duration, execut
 		return daemonClosePlan{}, fmt.Errorf("hello: %w", err)
 	}
 
-	raw, err := exchange(conn, r, daemon.MsgListReq, daemon.ListReq{})
+	raw, err := exchange(ctx, conn, r, daemon.MsgListReq, daemon.ListReq{})
 	if err != nil {
 		return daemonClosePlan{}, fmt.Errorf("list: %w", err)
 	}
@@ -361,7 +382,7 @@ func daemonCloseRun(ctx context.Context, arg string, grace time.Duration, execut
 	switch plan.Kind {
 	case "kill":
 		s := plan.Sessions[0]
-		raw, err := exchange(conn, r, daemon.MsgKillReq, daemon.KillReq{
+		raw, err := exchange(ctx, conn, r, daemon.MsgKillReq, daemon.KillReq{
 			SessionID:    s.SessionID,
 			GraceSeconds: int(grace / time.Second),
 		})
@@ -374,7 +395,7 @@ func daemonCloseRun(ctx context.Context, arg string, grace time.Duration, execut
 		}
 		return plan, nil
 	case "ticket_done":
-		raw, err := exchange(conn, r, daemon.MsgTicketDoneReq, daemon.TicketDoneReq{
+		raw, err := exchange(ctx, conn, r, daemon.MsgTicketDoneReq, daemon.TicketDoneReq{
 			TicketID: plan.TicketID,
 		})
 		if err != nil {
@@ -473,10 +494,14 @@ var daemonCloseCmd = &cobra.Command{
 	Args:          cobra.ExactArgs(1),
 	SilenceUsage:  true,
 	SilenceErrors: false,
-	RunE: func(cmd *cobra.Command, args []string) error {
+	RunE: func(cmd *cobra.Command, args []string) (err error) {
+		defer func() { err = mapDaemonErr(err) }()
+
 		// First pass: resolve only — don't execute yet, so we can show
 		// the plan and ask for confirmation before pulling the trigger.
-		plan, err := daemonCloseRun(cmd.Context(), args[0], daemonCloseFlagGrace, false)
+		rctx, rcancel := context.WithTimeout(cmd.Context(), rpcTimeout)
+		plan, err := daemonCloseRun(rctx, args[0], daemonCloseFlagGrace, false)
+		rcancel()
 		if err != nil {
 			return err
 		}
@@ -502,8 +527,11 @@ var daemonCloseCmd = &cobra.Command{
 		// first call's defer has already closed it) and re-run the
 		// resolution — the live session set MAY have changed between
 		// prompt and confirmation; refusing to assume a stale plan is
-		// still valid is the safer move.
-		plan, err = daemonCloseRun(cmd.Context(), args[0], daemonCloseFlagGrace, true)
+		// still valid is the safer move. A fresh deadline too: the
+		// confirmation prompt may have outlasted the first pass's budget.
+		ectx, ecancel := context.WithTimeout(cmd.Context(), rpcTimeout)
+		defer ecancel()
+		plan, err = daemonCloseRun(ectx, args[0], daemonCloseFlagGrace, true)
 		if err != nil {
 			return err
 		}
@@ -574,6 +602,26 @@ var daemonLogCmd = &cobra.Command{
 	},
 }
 
+// rpcTimeout bounds each daemon-subcommand RPC round-trip. The dial is
+// already capped at 1s (internal/daemon dialTimeout); this covers the
+// frame I/O after a successful dial so a wedged daemon — alive and
+// accepting connections but not replying — can't hang the CLI. Matches
+// the TUI's 5s connect budget (internal/app/app.go) and is generous for
+// a legitimate PrepareExit/Shutdown reply.
+const rpcTimeout = 5 * time.Second
+
+// mapDaemonErr rewrites a daemon.ErrDaemonUnresponsive (raised when an
+// RPC's deadline fires) into a user-facing message with a remediation
+// hint. Other errors pass through unchanged. Applied at each RunE via a
+// deferred named-return rewrite so it catches every exchange() return
+// point without threading wrapping through the happy path.
+func mapDaemonErr(err error) error {
+	if errors.Is(err, daemon.ErrDaemonUnresponsive) {
+		return fmt.Errorf("openkanbankd is unresponsive (no reply after %s) — try: openkanban daemon restart", rpcTimeout)
+	}
+	return err
+}
+
 // dialDaemon connects to the running daemon's socket. Unlike the
 // autostart helper in internal/daemon, the CLI subcommands should NOT
 // silently fork a fresh daemon when the user runs `openkanban daemon
@@ -599,16 +647,19 @@ func dialDaemon(ctx context.Context) (net.Conn, error) {
 
 // exchange writes a JSONReq envelope and reads the next JSONResp,
 // returning the payload bytes for the caller to unmarshal into the
-// expected response type.
-func exchange(conn net.Conn, r *bufio.Reader, msgType string, payload any) (json.RawMessage, error) {
+// expected response type. The write and read are both bounded by ctx's
+// deadline (via daemon.WriteFrameCtx / ReadFrameCtx) so a wedged daemon —
+// one that accepts the connection but never replies — surfaces a clean
+// daemon.ErrDaemonUnresponsive instead of hanging the CLI forever.
+func exchange(ctx context.Context, conn net.Conn, r *bufio.Reader, msgType string, payload any) (json.RawMessage, error) {
 	raw, err := daemon.EncodeMsg(msgType, payload)
 	if err != nil {
 		return nil, err
 	}
-	if err := daemon.WriteFrame(conn, daemon.TypeJSONReq, raw); err != nil {
+	if err := daemon.WriteFrameCtx(ctx, conn, daemon.TypeJSONReq, raw); err != nil {
 		return nil, err
 	}
-	typ, frame, err := daemon.ReadFrame(r)
+	typ, frame, err := daemon.ReadFrameCtx(ctx, conn, r)
 	if err != nil {
 		if errors.Is(err, io.EOF) {
 			return nil, fmt.Errorf("daemon closed the connection")

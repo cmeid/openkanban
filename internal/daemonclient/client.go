@@ -383,14 +383,20 @@ func (c *Client) do(ctx context.Context, reqType string, req any, expectResp str
 	}()
 
 	c.writeMu.Lock()
-	werr := daemon.WriteFrame(c.conn, daemon.TypeJSONReq, payload)
+	werr := daemon.WriteFrameCtx(ctx, c.conn, daemon.TypeJSONReq, payload)
 	c.writeMu.Unlock()
 	if werr != nil {
+		// A write failure (deadline against a wedged daemon, EPIPE, etc.)
+		// leaves the conn poisoned — a half-written frame would desync
+		// the next RPC. Tear the client down so subsequent calls fail
+		// fast with ErrDaemonUnavailable instead of reusing it; mirrors
+		// readLoop's disconnect-on-error behavior. The wrapped error still
+		// carries daemon.ErrDaemonUnresponsive for errors.Is at the caller.
+		c.signalDisconnect(werr)
 		return fmt.Errorf("daemonclient: write %s: %w", reqType, werr)
 	}
 
-	select {
-	case r := <-pending:
+	handle := func(r rawResp) error {
 		if r.err != nil {
 			return r.err
 		}
@@ -411,9 +417,33 @@ func (c *Client) do(ctx context.Context, reqType string, req any, expectResp str
 			return fmt.Errorf("daemonclient: decode %s: %w", expectResp, err)
 		}
 		return nil
+	}
+
+	select {
+	case r := <-pending:
+		return handle(r)
 	case <-ctx.Done():
+		// A response delivered concurrently with cancellation still wins:
+		// the round-trip completed. select fires randomly when both are
+		// ready, so re-check pending non-blockingly before reporting the
+		// context error.
+		select {
+		case r := <-pending:
+			return handle(r)
+		default:
+		}
 		return ctx.Err()
 	case <-c.closeCh:
+		// Same for disconnect: the read loop delivers our response to the
+		// (buffered) pending channel before it can hit EOF and close
+		// closeCh, so a daemon that closes immediately after replying
+		// (e.g. the version-skew path) must not be reported as
+		// "unavailable" for an RPC that actually got its answer.
+		select {
+		case r := <-pending:
+			return handle(r)
+		default:
+		}
 		return ErrDaemonUnavailable
 	}
 }
