@@ -111,6 +111,10 @@ func Run(cfg *config.Config, filterPath, version string, autostartDaemon bool) e
 	updateChecker := update.NewChecker(version)
 	model := ui.NewModel(cfg, globalStore, registry, agentMgr, opencodeServer, filterProjectID, updateChecker, daemonClient)
 
+	// Arm the diagnostic stall watchdog for the real TUI (Cleanup stops
+	// it). Captures a goroutine dump if the Update/View loop freezes.
+	model.StartStallMonitor()
+
 	defer func() {
 		model.Cleanup()
 		if daemonClient != nil {
