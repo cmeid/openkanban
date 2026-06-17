@@ -541,6 +541,11 @@ func (p *Pane) Start(command string, args ...string) tea.Cmd {
 		p.pty = ptmx
 		p.running = true
 		p.exitErr = nil
+		// Wire the input-writer goroutine (which assigns inputCh) BEFORE
+		// stampStartedUnlocked publishes runningAtomic. WriteInput reads
+		// inputCh lock-free after an acquire-load of runningAtomic, so
+		// publishing running last gives that read its happens-before edge.
+		p.startInputWriterUnlocked()
 		// Stamp the lock-free mirrors so Running/PID/Size are accurate
 		// without p.mu the instant the pane becomes observable.
 		p.stampStartedUnlocked()
@@ -583,7 +588,6 @@ func (p *Pane) Start(command string, args ...string) tea.Cmd {
 		p.cursorAppMode.Store(false)
 		p.registerTitleHandlersUnlocked()
 		p.startDrainUnlocked()
-		p.startInputWriterUnlocked()
 
 		p.scrollback = NewScrollbackBuffer(p.scrollbackSize)
 		p.selection = NewSelectionState()
@@ -637,6 +641,11 @@ func (p *Pane) StartHeadless(command string, args []string, extraEnv []string) e
 	p.pty = ptmx
 	p.running = true
 	p.exitErr = nil
+	// Wire the input-writer goroutine (which assigns inputCh) BEFORE
+	// stampStartedUnlocked publishes runningAtomic. WriteInput reads
+	// inputCh lock-free after an acquire-load of runningAtomic, so
+	// publishing running last gives that read its happens-before edge.
+	p.startInputWriterUnlocked()
 	// Stamp the lock-free mirrors so Running/PID/Size are accurate
 	// without p.mu the instant the pane becomes observable.
 	p.stampStartedUnlocked()
@@ -669,7 +678,6 @@ func (p *Pane) StartHeadless(command string, args []string, extraEnv []string) e
 	p.cursorAppMode.Store(false)
 	p.registerTitleHandlersUnlocked()
 	p.startDrainUnlocked()
-	p.startInputWriterUnlocked()
 
 	p.scrollback = NewScrollbackBuffer(p.scrollbackSize)
 	p.selection = NewSelectionState()
@@ -868,9 +876,10 @@ const inputChanCapacity = 256
 // on a non-draining child; teardown's f.Close() unblocks it with EBADF.
 //
 // inputCh / inputStop are assigned exactly here, under p.mu, before the
-// pane is observable — they are never reassigned, so WriteInput's
-// lock-free reads of them are safe (happens-before via the StartHeadless
-// p.mu unlock plus the running atomic).
+// pane is observable, and never reassigned. Start/StartHeadless call this
+// BEFORE stampStartedUnlocked publishes runningAtomic, so WriteInput's
+// acquire-load of runningAtomic happens-after these assignments — its
+// lock-free reads of inputCh/inputStop are therefore race-free.
 func (p *Pane) startInputWriterUnlocked() {
 	p.inputCh = make(chan []byte, inputChanCapacity)
 	p.inputStop = make(chan struct{})
@@ -1097,7 +1106,8 @@ func (p *Pane) stopDrainUnlocked() {
 }
 
 // signalDrainStopUnlocked closes drainStop and wakes the drain
-// goroutine's blocked vt.Read with a sentinel byte, but does NOT Wait.
+// goroutine's blocked vt.Read by closing its pipe writer (io.EOF), but
+// does NOT Wait.
 // Must be called with p.mu held. The teardown sequence in Stop /
 // StopGraceful uses this to signal the drain to stop WITHOUT blocking
 // under p.mu; the bounded drainWG.Wait runs later, off p.mu and AFTER
@@ -1110,12 +1120,18 @@ func (p *Pane) signalDrainStopUnlocked() {
 	}
 	close(p.drainStop)
 	if p.vt != nil {
-		// One-byte wakeup. The byte itself is irrelevant — drain
-		// will write it to ptyFile (which is likely already closed,
-		// so the write errors and is ignored) and then re-enter the
-		// for-loop which sees the closed stop channel and returns.
-		if w := p.vt.Emulator.InputPipe(); w != nil {
-			_, _ = w.Write([]byte{0})
+		// Close the emulator's pipe writer with io.EOF to unblock the
+		// drain's vt.Read. A sentinel-byte wakeup DEADLOCKS: charm/x/vt is
+		// backed by a SYNCHRONOUS io.Pipe, so writing into it blocks forever
+		// whenever the drain already observed drainStop and stopped reading
+		// (no reader) — and since teardown's drainWG.Wait is bounded but the
+		// write isn't, that block would wedge the pane. CloseWithError never
+		// blocks, makes Read return (0, io.EOF) (no garbage PTY write), and
+		// touches no unsynchronized emulator state (unlike Emulator.Close,
+		// which races e.closed under -race). Ported from PR #97. Regression:
+		// TestPane_StopDrainDoesNotDeadlock.
+		if pw, ok := p.vt.Emulator.InputPipe().(*io.PipeWriter); ok {
+			_ = pw.CloseWithError(io.EOF)
 		}
 	}
 	p.drainStop = nil
@@ -1157,11 +1173,20 @@ const teardownWaitTimeout = 2 * time.Second
 // in stampStartedUnlocked.
 func (p *Pane) signalGroup(sig syscall.Signal) {
 	pgid := int(p.pgid.Load())
-	if pgid <= 0 || pgid == syscall.Getpgrp() || pgid == 1 {
-		log.Printf("openkanban pane %s: refusing to signal unsafe pgid %d", p.id, pgid)
+	if pgid > 0 && pgid != syscall.Getpgrp() && pgid != 1 {
+		_ = syscall.Kill(-pgid, sig)
 		return
 	}
-	_ = syscall.Kill(-pgid, sig)
+	// pgid is missing/unsafe (Getpgid failed at spawn, or the value would
+	// hit our own group or init). Fall back to signaling just the child
+	// pid — the guarantee the pre-rebase Stop had via proc.Kill() — so a
+	// child that ignores the PTY-close SIGHUP is still reaped. pid is the
+	// lock-free mirror, so this stays off p.mu.
+	if pid := int(p.pid.Load()); pid > 0 {
+		_ = syscall.Kill(pid, sig)
+		return
+	}
+	log.Printf("openkanban pane %s: no usable pgid/pid to signal (pgid=%d)", p.id, pgid)
 }
 
 // teardownUnlocked performs the load-bearing close-before-wait teardown
