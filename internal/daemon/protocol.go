@@ -31,17 +31,23 @@
 //	TypeResize    - either direction, a 6-byte encoded resize payload
 //	TypeDetach    - either direction, signals the binary session is done
 //
-// The package is pure encode/decode: it does no I/O of its own beyond
-// the io.Reader / io.Writer arguments to WriteFrame and ReadFrame, and
-// has no goroutines, channels, or networking.
+// The core codec is pure encode/decode: WriteFrame and ReadFrame do no
+// I/O of their own beyond their io.Writer / io.Reader arguments, and the
+// package has no goroutines or channels. The WriteFrameCtx / ReadFrameCtx
+// helpers are the one exception — they take a net.Conn so they can bound
+// a frame I/O by a context deadline, which is the only way to keep a
+// wedged daemon from blocking a client forever.
 package daemon
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"os"
 	"time"
 )
 
@@ -126,6 +132,57 @@ func ReadFrame(r io.Reader) (byte, []byte, error) {
 		return 0, nil, err
 	}
 	return body[0], body[1:], nil
+}
+
+// ErrDaemonUnresponsive is returned by WriteFrameCtx / ReadFrameCtx when
+// the daemon accepted the connection but did not complete the frame I/O
+// within the context deadline. It is distinct from
+// autostart.ErrDaemonNotRunning (socket absent or connection refused):
+// here the process is alive but wedged. Callers match it with errors.Is
+// to surface a "try restarting the daemon" message instead of hanging.
+var ErrDaemonUnresponsive = errors.New("daemon unresponsive")
+
+// WriteFrameCtx writes a frame to conn, bounding the write by ctx's
+// deadline when it has one. The pure WriteFrame codec operates on an
+// io.Writer and cannot impose a timeout itself, so this helper sets — and
+// always clears — a write deadline on the underlying net.Conn so a wedged
+// daemon cannot block the write indefinitely. A deadline-exceeded error
+// is normalized to ErrDaemonUnresponsive (wrapped, so the original
+// os.ErrDeadlineExceeded is still recoverable via errors.Is).
+//
+// If ctx carries no deadline the behavior is identical to WriteFrame, so
+// callers that pass an unbounded context are unaffected.
+func WriteFrameCtx(ctx context.Context, conn net.Conn, typ byte, payload []byte) error {
+	if dl, ok := ctx.Deadline(); ok {
+		_ = conn.SetWriteDeadline(dl)
+		// Cleared in a defer (not after the call) so an I/O error still
+		// clears the deadline — a stale deadline left on a shared,
+		// long-lived conn would poison the next write.
+		defer func() { _ = conn.SetWriteDeadline(time.Time{}) }()
+	}
+	err := WriteFrame(conn, typ, payload)
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return fmt.Errorf("%w: %w", ErrDaemonUnresponsive, err)
+	}
+	return err
+}
+
+// ReadFrameCtx reads a frame, bounding the read by ctx's deadline when it
+// has one. conn is the connection whose read deadline is set; r is the
+// reader actually consumed (typically a *bufio.Reader wrapping conn).
+// A deadline-exceeded error is normalized to ErrDaemonUnresponsive
+// (wrapped). Like WriteFrameCtx, an unbounded ctx makes this identical to
+// ReadFrame, and the deadline is always cleared on return.
+func ReadFrameCtx(ctx context.Context, conn net.Conn, r io.Reader) (byte, []byte, error) {
+	if dl, ok := ctx.Deadline(); ok {
+		_ = conn.SetReadDeadline(dl)
+		defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
+	}
+	typ, payload, err := ReadFrame(r)
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return typ, payload, fmt.Errorf("%w: %w", ErrDaemonUnresponsive, err)
+	}
+	return typ, payload, err
 }
 
 // EncodeResize encodes a resize event as 6 big-endian bytes:
