@@ -981,9 +981,28 @@ Source: `internal/daemon/server.go:272-279` registers `signal.Notify(sigChan, sy
 
 #### For the TUI (`openkanban`)
 
-No in-process handler. Two paths that actually work:
+**The TUI now has a built-in stall watchdog** (`internal/ui/stallwatch.go`) — prefer it over the SIGQUIT dance. It dumps to a file, so alt-screen can't eat it.
 
-1. **Pre-redirect stderr, then SIGQUIT.** The redirect must happen BEFORE launch; SIGQUIT can't reattach stderr after the fact.
+1. **Auto-capture (no action needed).** A watchdog samples the Update/View loop every second and, when a single Update/View runs >3s (`kind=in-call`) OR Update goes idle >3s while the daemon keeps pushing events (`kind=starved` — the loop is parked *outside* Update/View, e.g. on a `tea.Batch`/`tea.Sequence` `g.Wait`), it writes every goroutine's stack plus discriminating counters (`pushDelta`, `dropTotal`, in-flight msg type, mode, pane/session counts) to `~/.cache/openkanban/tui-stall.log` (override with `OPENKANBAN_TUI_STALL_LOG`). One dump per stall episode; a marker line lands in `tui.log` too. This is the first thing to read after any freeze:
+
+   ```bash
+   tail -200 ~/.cache/openkanban/tui-stall.log
+   ```
+
+   The `kind` tells you in-call vs starved; the parked main-goroutine frame names the blocking call. `kind=starved` with a rising `pushDelta` is the freeze-on-graceful-session-close signature (the main loop blocks while the other sessions' activity heartbeats stack up and overflow the subscriber channel).
+
+2. **On demand: SIGUSR2.** Force a dump anytime (repeatable, doesn't kill the process), mirroring the daemon's SIGUSR1:
+
+   ```bash
+   kill -USR2 $(pgrep -n openkanban)
+   tail -200 ~/.cache/openkanban/tui-stall.log
+   ```
+
+   Source: `internal/ui/stallwatch.go` registers `signal.Notify(sigCh, syscall.SIGUSR2)` and `runtime.Stack(buf, true)` → dump file. `OPENKANBAN_DEBUG_STALL_MS` injects a one-shot synthetic in-call stall (test/diagnostic only).
+
+**Fallbacks** (pre-watchdog binaries, or when you want stderr/runtime-default behavior):
+
+3. **Pre-redirect stderr, then SIGQUIT.** The redirect must happen BEFORE launch; SIGQUIT can't reattach stderr after the fact.
 
    ```bash
    # in the terminal where you're running the TUI:
@@ -993,6 +1012,6 @@ No in-process handler. Two paths that actually work:
    grep -A2 -E "goroutine|techdufus/openkanban/" /tmp/openkanban-stderr.log | head -200
    ```
 
-2. **`dlv attach <pid>`** → `goroutines` → `bt` per goroutine. Most reliable, slowest, doesn't kill the process.
+4. **`dlv attach <pid>`** → `goroutines` → `bt` per goroutine. Most reliable, slowest, doesn't kill the process.
 
 macOS `sample` (used in step 2 of this section) gives a statistical CPU profile but no goroutine state — fine for "what's hot," useless for "what's blocked on what."
