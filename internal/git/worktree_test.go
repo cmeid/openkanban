@@ -329,15 +329,15 @@ func TestBranchForWorktree(t *testing.T) {
 		t.Fatalf("CreateWorktree: %v", err)
 	}
 
-	branch, err := mgr.branchForWorktree(wtPath)
+	branch, err := mgr.BranchForWorktree(wtPath)
 	if err != nil {
-		t.Fatalf("branchForWorktree: %v", err)
+		t.Fatalf("BranchForWorktree: %v", err)
 	}
 	if branch != "branch-probe" {
-		t.Errorf("branchForWorktree = %q; want %q", branch, "branch-probe")
+		t.Errorf("BranchForWorktree = %q; want %q", branch, "branch-probe")
 	}
 
-	if _, err := mgr.branchForWorktree(filepath.Join(baseDir, "does-not-exist")); err == nil {
+	if _, err := mgr.BranchForWorktree(filepath.Join(baseDir, "does-not-exist")); err == nil {
 		t.Errorf("expected error for unknown path, got nil")
 	}
 }

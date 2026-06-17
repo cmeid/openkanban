@@ -3504,15 +3504,33 @@ func (m *Model) confirmDeleteTicket() (tea.Model, tea.Cmd) {
 	// drop it without editing config first. Capture proj here — the
 	// store entry is gone by the time the second confirm fires.
 	doDelete := func() tea.Cmd {
+		// Capture the worktree's actual branch before cleanup removes the
+		// worktree — it may differ from ticket.BranchName (a follow-up
+		// branch the worktree was switched to).
+		worktreeBranch := ""
+		if !m.config.Cleanup.DeleteBranch && ticket.WorktreePath != "" && proj != nil {
+			if mgr := m.worktreeMgrs[proj.ID]; mgr != nil {
+				worktreeBranch, _ = mgr.BranchForWorktree(ticket.WorktreePath)
+			}
+		}
 		m.performTicketCleanup(ticket)
-		if ticket.BranchName != "" && !m.config.Cleanup.DeleteBranch && proj != nil {
-			branchName := ticket.BranchName
+		if !m.config.Cleanup.DeleteBranch && proj != nil {
 			projID := proj.ID
-			m.showConfirm = true
-			m.confirmMsg = "Also delete branch '" + branchName + "'? [y/N]"
-			m.confirmFn = func() tea.Cmd {
-				m.deleteBranchOnly(projID, branchName)
-				return nil
+			ticketBranch := ticket.BranchName
+			divergent := ""
+			if worktreeBranch != "" && worktreeBranch != ticketBranch {
+				divergent = worktreeBranch
+			}
+			if ticketBranch != "" || divergent != "" {
+				m.showConfirm = true
+				m.confirmMsg = branchDeletePrompt(ticketBranch, divergent)
+				m.confirmFn = func() tea.Cmd {
+					if ticketBranch != "" {
+						m.deleteBranchOnly(projID, ticketBranch)
+					}
+					m.deleteDivergentBranchOnly(projID, divergent, ticketBranch)
+					return nil
+				}
 			}
 		}
 		return nil
@@ -3546,6 +3564,46 @@ func (m *Model) deleteBranchOnly(projID string, branchName string) {
 	m.notify("Deleted branch: " + branchName)
 }
 
+// branchDeletePrompt builds the follow-on confirm message for the
+// branches a ticket delete leaves behind: the ticket's recorded branch
+// and, when the worktree was switched to a different one, that divergent
+// branch too. Either may be empty.
+func branchDeletePrompt(ticketBranch, divergent string) string {
+	switch {
+	case ticketBranch != "" && divergent != "":
+		return "Also delete branches '" + ticketBranch + "' and '" + divergent + "'? [y/N]"
+	case divergent != "":
+		return "Also delete branch '" + divergent + "'? [y/N]"
+	default:
+		return "Also delete branch '" + ticketBranch + "'? [y/N]"
+	}
+}
+
+// deleteDivergentBranchOnly cleans up a branch the worktree was checked
+// out on when it differs from the ticket's recorded branch — the gap that
+// otherwise orphans follow-up (fix/) branches, since cleanup only targets
+// ticket.BranchName. Safe-deletes only (merged branches): an unmerged
+// divergent branch is left in place and surfaced, never force-dropped,
+// because openkanban didn't create it and can't assume it's disposable.
+func (m *Model) deleteDivergentBranchOnly(projID, worktreeBranch, ticketBranch string) {
+	if worktreeBranch == "" || worktreeBranch == ticketBranch {
+		return
+	}
+	mgr := m.worktreeMgrs[projID]
+	if mgr == nil {
+		return
+	}
+	deleted, err := mgr.DeleteMergedBranch(worktreeBranch)
+	switch {
+	case err != nil:
+		m.notify("Failed to delete branch " + worktreeBranch + ": " + err.Error())
+	case deleted:
+		m.notify("Deleted branch: " + worktreeBranch)
+	default:
+		m.notify("Branch " + worktreeBranch + " has unmerged commits — left in place")
+	}
+}
+
 func (m *Model) performTicketCleanup(ticket *board.Ticket) {
 	ticketTitle := ticket.Title // Capture before deletion
 
@@ -3574,6 +3632,16 @@ func (m *Model) performTicketCleanup(ticket *board.Ticket) {
 	if proj != nil {
 		mgr := m.worktreeMgrs[proj.ID]
 		if mgr != nil {
+			// Capture the branch actually checked out in the worktree
+			// BEFORE removing it. It can differ from ticket.BranchName when
+			// the worktree was switched to a follow-up branch (e.g. a
+			// post-merge fix/ branch) — without this it's orphaned, since
+			// cleanup otherwise only knows the ticket's recorded branch.
+			worktreeBranch := ""
+			if m.config.Cleanup.DeleteBranch && ticket.WorktreePath != "" {
+				worktreeBranch, _ = mgr.BranchForWorktree(ticket.WorktreePath)
+			}
+
 			if ticket.WorktreePath != "" && m.config.Cleanup.DeleteWorktree {
 				err := mgr.RemoveWorktree(ticket.WorktreePath)
 				if err != nil {
@@ -3581,11 +3649,13 @@ func (m *Model) performTicketCleanup(ticket *board.Ticket) {
 				}
 			}
 
-			if ticket.BranchName != "" && m.config.Cleanup.DeleteBranch {
-				err := mgr.DeleteBranch(ticket.BranchName)
-				if err != nil {
-					m.notify("Failed to delete branch: " + err.Error())
+			if m.config.Cleanup.DeleteBranch {
+				if ticket.BranchName != "" {
+					if err := mgr.DeleteBranch(ticket.BranchName); err != nil {
+						m.notify("Failed to delete branch: " + err.Error())
+					}
 				}
+				m.deleteDivergentBranchOnly(proj.ID, worktreeBranch, ticket.BranchName)
 			}
 		}
 	}
