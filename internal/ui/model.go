@@ -3437,9 +3437,9 @@ func (m *Model) performTicketCleanup(ticket *board.Ticket) {
 	// keeps daemon-owned sessions from being orphaned by TUI ticket
 	// deletion. Best-effort; failures logged but not surfaced — same
 	// contract as wrapUpSessionForTicket.
-	if m.guardAPI != nil {
+	if m.daemon != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		if _, err := m.guardAPI.TicketDone(ctx, string(ticket.ID)); err != nil {
+		if _, err := m.daemon.TicketDone(ctx, string(ticket.ID)); err != nil {
 			log.Printf("openkanban: TicketDone(%s) on ticket cleanup: %v", ticket.ID, err)
 		}
 		cancel()
