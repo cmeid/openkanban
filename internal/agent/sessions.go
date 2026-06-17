@@ -51,6 +51,21 @@ func claudeProjectsRoot() (string, error) {
 	return filepath.Join(home, ".claude", "projects"), nil
 }
 
+// ProjectDirFor returns the Claude Code per-project session directory
+// for a working-directory path: `~/.claude/projects/<encoded>`, where
+// <encoded> is the path with every `/` replaced by `-`. This is the
+// encoding Claude Code uses to key session storage by the cwd a session
+// was started in, and the directory `claude --resume` searches when
+// launched from that cwd. Honors $HOME via claudeProjectsRoot so tests
+// can redirect with t.Setenv.
+func ProjectDirFor(workdir string) (string, error) {
+	root, err := claudeProjectsRoot()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, strings.ReplaceAll(workdir, "/", "-")), nil
+}
+
 // SessionPath returns the on-disk JSONL path for the given session
 // UUID by scanning `~/.claude/projects/*/<uuid>.jsonl`. Returns
 // ("", os.ErrNotExist) if no match. The encoded-cwd directory name
@@ -183,12 +198,10 @@ func latestClaudeJSONL(worktreePath string) (string, error) {
 	if worktreePath == "" {
 		return "", nil
 	}
-	homeDir, err := os.UserHomeDir()
+	dir, err := ProjectDirFor(worktreePath)
 	if err != nil {
-		return "", fmt.Errorf("user home dir: %w", err)
+		return "", fmt.Errorf("project dir: %w", err)
 	}
-	encoded := strings.ReplaceAll(worktreePath, "/", "-")
-	dir := filepath.Join(homeDir, ".claude", "projects", encoded)
 
 	entries, err := os.ReadDir(dir)
 	if os.IsNotExist(err) {
@@ -312,6 +325,84 @@ func FindClaudeSession(worktreePath string) string {
 		return ""
 	}
 	return uuid
+}
+
+// NormalizeSessionBucket ensures the Claude transcript for `uuid` lives
+// in the project bucket of `worktreePath` — the directory openkanban
+// launches the agent from. Claude Code keys session storage by the cwd
+// at session start and resolves `--resume <uuid>` only within the
+// current directory's bucket (and that repo's worktrees); a session
+// born elsewhere — e.g. one started manually and then linked to a
+// ticket via `ticket new --session` — is unresumable from the ticket's
+// worktree until its transcript is moved into the matching bucket.
+//
+// It relocates `<uuid>.jsonl` and its sibling `<uuid>/` artifact
+// directory (subagent transcripts, tool-results) into the canonical
+// bucket via os.Rename. The sidecar directory moves first and the
+// `<uuid>.jsonl` lookup key last, so a crash mid-move never leaves a
+// transcript without its sidecars and `claude --resume` never sees a
+// half-written bucket.
+//
+// Idempotent — returns (false, nil) without touching anything when the
+// transcript is already in the canonical bucket, when no transcript
+// exists for the uuid, or when a live process holds it open (moving a
+// held file would strand the writer; live daemon-owned sessions are
+// attached by the caller's fast path, not relocated). Safe to call on
+// every spawn. A returned error is the caller's to log; callers treat
+// it as non-fatal and degrade to the prior launch-from-worktree
+// behavior.
+func NormalizeSessionBucket(uuid, worktreePath string) (moved bool, err error) {
+	if !SessionUUIDPattern.MatchString(uuid) || worktreePath == "" {
+		return false, nil
+	}
+	src, err := SessionPath(uuid)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	canonicalDir, err := ProjectDirFor(worktreePath)
+	if err != nil {
+		return false, err
+	}
+	if filepath.Dir(src) == canonicalDir {
+		return false, nil // already in the right bucket
+	}
+
+	// Never move a transcript a live process is writing. SessionActive
+	// returns an error if lsof is unavailable; the caller logs it and
+	// skips the move, which is the safe degrade.
+	holder, err := SessionActive(uuid)
+	if err != nil {
+		return false, err
+	}
+	if holder.PID != 0 {
+		return false, nil
+	}
+
+	dstJSONL := filepath.Join(canonicalDir, uuid+".jsonl")
+	if _, statErr := os.Stat(dstJSONL); statErr == nil {
+		// UUIDs are globally unique; a collision means something
+		// unexpected. Refuse rather than clobber an existing transcript.
+		return false, fmt.Errorf("session %s already present in %s", uuid, canonicalDir)
+	}
+
+	if err := os.MkdirAll(canonicalDir, 0o755); err != nil {
+		return false, fmt.Errorf("create bucket %s: %w", canonicalDir, err)
+	}
+
+	srcDir := filepath.Dir(src)
+	sidecar := filepath.Join(srcDir, uuid)
+	if info, statErr := os.Stat(sidecar); statErr == nil && info.IsDir() {
+		if err := os.Rename(sidecar, filepath.Join(canonicalDir, uuid)); err != nil {
+			return false, fmt.Errorf("move session sidecar dir: %w", err)
+		}
+	}
+	if err := os.Rename(src, dstJSONL); err != nil {
+		return false, fmt.Errorf("move session transcript: %w", err)
+	}
+	return true, nil
 }
 
 // extractAssistantText pulls user-visible text from a claude message

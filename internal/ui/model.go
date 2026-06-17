@@ -4465,6 +4465,27 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 		branchName = generatedBranch
 		baseBranch = base
 
+		// Ensure this ticket's Claude transcript lives in the bucket of
+		// the directory we're about to launch from. Claude Code resolves
+		// `--resume <uuid>` only within the launch cwd's project bucket;
+		// a session started elsewhere and later linked (ticket new
+		// --session) is filed under its original cwd's bucket, where the
+		// resume can't find it ("No conversation found"). Relocating it
+		// here makes resume directory-independent. Idempotent — a no-op
+		// for openkanban-created sessions, which already start in
+		// worktreePath. Non-fatal, like SeedClaudeSettings above: a
+		// failure logs and degrades to the prior launch-from-worktree
+		// behavior.
+		relocatedSession := false
+		if agentType == "claude" && agent.SessionUUIDPattern.MatchString(ticket.AgentSessionID) {
+			moved, nerr := agent.NormalizeSessionBucket(ticket.AgentSessionID, worktreePath)
+			if nerr != nil {
+				log.Printf("openkanban: normalize session bucket (%s → %s): %v",
+					ticket.AgentSessionID, worktreePath, nerr)
+			}
+			relocatedSession = moved
+		}
+
 		// Session name for terminal identification (priority:
 		// branch > ticket). The daemon picks this up in SpawnReq.SessionName
 		// and wires it into OPENKANBAN_SESSION via the terminal pane's
@@ -4520,6 +4541,14 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 		if plan.InjectResumeNotice {
 			if slug := agent.BranchSlug(ticket.BranchName); slug != "" {
 				readyNotice = fmt.Sprintf("Brief at tickets/%s.md updated.", slug)
+			}
+		}
+		if relocatedSession {
+			msg := "Relocated session transcript to this ticket's directory."
+			if readyNotice != "" {
+				readyNotice = msg + " " + readyNotice
+			} else {
+				readyNotice = msg
 			}
 		}
 		// External resume: spawn was given an AgentSessionID up front
