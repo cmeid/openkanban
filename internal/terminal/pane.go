@@ -905,26 +905,31 @@ func (p *Pane) stopReadLoop() {
 // stopDrainUnlocked terminates the response-drain goroutine. Must be
 // called with p.mu held.
 //
-// To unblock the drain goroutine's vt.Read we write a sentinel byte
-// into the emulator's response pipe (InputPipe is the writer end of
-// pr/pw; pr is what the drain reads). vt.Read returns with the
-// byte, the drain loop iterates, sees drainStop closed, and exits.
+// To unblock the drain goroutine's vt.Read we CLOSE the emulator's pipe
+// writer with io.EOF. The drain's vt.Read then returns (0, io.EOF), it
+// writes nothing (n==0) and exits.
 //
-// This avoids calling Emulator.Close(), which mutates an internal
-// `closed` field without a lock — a benign race in practice but one
-// the -race detector trips on against the concurrent Read.
+// Two traps this avoids, both load-bearing:
+//   - A sentinel-byte wakeup (writing into InputPipe) DEADLOCKS: charm/x/vt
+//     is backed by a SYNCHRONOUS io.Pipe, so that write blocks forever
+//     whenever the drain already observed drainStop and stopped reading
+//     (no reader). Since drainWG.Wait below is synchronous and runs while
+//     the caller holds p.mu, that block wedges the pane.
+//   - Emulator.Close() unblocks Read too, but writes an unsynchronized
+//     `closed` bool that the -race detector trips on against the drain's
+//     lock-free Read.
+//
+// CloseWithError(io.EOF) on the PipeWriter never blocks (io.Pipe close is
+// non-blocking + internally synchronized) and touches no unsynchronized
+// emulator state. Regression: TestPane_StopDrainDoesNotDeadlock.
 func (p *Pane) stopDrainUnlocked() {
 	if p.drainStop == nil {
 		return
 	}
 	close(p.drainStop)
 	if p.vt != nil {
-		// One-byte wakeup. The byte itself is irrelevant — drain
-		// will write it to ptyFile (which is likely already closed,
-		// so the write errors and is ignored) and then re-enter the
-		// for-loop which sees the closed stop channel and returns.
-		if w := p.vt.Emulator.InputPipe(); w != nil {
-			_, _ = w.Write([]byte{0})
+		if pw, ok := p.vt.Emulator.InputPipe().(*io.PipeWriter); ok {
+			_ = pw.CloseWithError(io.EOF)
 		}
 	}
 	p.drainStop = nil
