@@ -1160,3 +1160,51 @@ func TestNormalizeSessionBucket(t *testing.T) {
 		mustExist(t, filepath.Join(fromBucket, uuid+".jsonl"))
 	})
 }
+
+// TestDefaultPrompt_WrapUpContract pins the standardized close-out contract
+// in the shipped template's wrap-up section. The fresh-spawn branch must NOT
+// carry the retired "you must not push/merge/PR by default" prohibition, and
+// MUST tell the agent to land via the skill's single permission prompt. The
+// prefix-drift guard above only checks the leading sentence, so without this
+// test the wrap-up prose could regress to the old contradiction unnoticed.
+func TestDefaultPrompt_WrapUpContract(t *testing.T) {
+	tmpl := config.DefaultAgentPrompt()
+	if tmpl == "" {
+		t.Fatal("DefaultAgentPrompt returned empty string")
+	}
+	// Fresh-spawn branch (IsExternalResume:false) — the wrap-up prose under
+	// test lives in this branch. A resume fixture would false-pass the
+	// absence checks because it never contained the prohibition.
+	got := BuildContextPrompt(tmpl, ContextData{
+		Title:        "fixture",
+		BranchName:   "task/fixture",
+		BaseBranch:   "main",
+		Status:       "in_progress",
+		WorktreePath: "/tmp/fixture",
+	})
+
+	// Retired prohibitions must be absent.
+	for _, banned := range []string{
+		"you must not:",
+		"open a PR by default",
+		"pushing is per-repo and the user owns the call",
+	} {
+		if strings.Contains(got, banned) {
+			t.Errorf("wrap-up section still contains retired prohibition %q — it now lands work via the skill", banned)
+		}
+	}
+
+	// New contract must be present.
+	for _, want := range []string{
+		"commit", // the land route is named
+		"permission prompt",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("wrap-up section missing new-contract language %q", want)
+		}
+	}
+	// The skill is still the named close-out entry point.
+	if !strings.Contains(got, "finishing-an-openkanban-ticket") {
+		t.Error("wrap-up section no longer names the finishing-an-openkanban-ticket skill")
+	}
+}

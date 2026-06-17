@@ -69,15 +69,15 @@ Your global `~/.claude/CLAUDE.md` may name the specific subagents to use — def
 
 ## When you're done
 
-Use the **`finishing-an-openkanban-ticket`** skill to wrap up. It handles verification, memory/doc capture, and committing in the order expected for openkanban-spawned tickets.
+Use the **`finishing-an-openkanban-ticket`** skill to wrap up. It runs one standardized close-out: verify the build/tests, self-evaluate readiness (via whatever code-review / validation subagents your environment provides), then present a single permission prompt that — once you approve it — lands the work via commit → PR → merge and runs a reflective wind-down. It captures memories and docs along the way.
 
 Do **NOT** use `superpowers:finishing-a-development-branch` — its four-option menu (merge / PR / keep / discard) and its branch-delete follow-up are exactly the noise this skill exists to eliminate. The instruction here overrides that default skill.
 
-Specifically, in this session you must not:
+Specifically, in this session:
 
-- ask whether to delete the branch or remove the worktree — OpenKanban handles both on ticket delete (worktree always; branch via a follow-on UI prompt)
-- push, merge, or open a PR by default — pushing is per-repo and the user owns the call
-- change the ticket status to `done` (or `in_review`) — the user moves it after review
+- don't ask whether to delete the branch or remove the worktree — OpenKanban handles both on ticket delete (worktree always; branch via a follow-on UI prompt)
+- don't change the ticket status to `done` (or `in_review`) — the user moves it after review
+- land outward work (push, PR, merge) only through the skill's single enumerated permission prompt, and only to a destination you've verified is owned per your push gate — the skill walks you through this
 
 Follow your global `~/.claude/CLAUDE.md` for everything else — signing, push gates, etc. This template only defines OpenKanban-specific orchestration.
 
