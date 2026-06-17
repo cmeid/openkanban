@@ -874,3 +874,80 @@ worktreePath := filepath.Join(m.worktreeDir, branchName)
 ### Environment Filtering
 
 Prevents sensitive environment variables from leaking to agents and prevents nested session issues.
+
+## Diagnosing a hung TUI
+
+When the TUI is unresponsive or burning CPU, do all non-destructive observation BEFORE killing it. The running state is the diagnostic surface; once it's gone, the goroutine dump is your only remaining signal — and the dump is harder to capture than it should be (see SIGABRT note at the end).
+
+### 1. Is it pegged or deadlocked?
+
+```bash
+ps aux | grep -E "openkanban|openkanbankd" | grep -v grep
+ps -M <pid>                 # per-thread CPU breakdown
+ps -o wchan,state -p <pid>  # syscall / channel Update is blocked on, if any
+```
+
+`%CPU > 50` and `STAT = R+` → hot loop. `%CPU ≈ 0` and `STAT = S` → Update is blocked on a syscall or channel.
+
+### 2. Statistical CPU profile
+
+```bash
+sample <pid> 5 -mayDie -file /tmp/sample.txt
+grep -E "techdufus/openkanban" /tmp/sample.txt | \
+  sed -E 's/.*(github.com\/techdufus\/openkanban\/[^ ]+).*/\1/' | \
+  sort | uniq -c | sort -rn | head -25
+```
+
+Identifies the hot path within seconds. `View → renderBoard → renderColumn → renderTicket` means bubbletea is render-looping on stale state — usually upstream of an Update-side block. Hot frames inside `Update` mean a Cmd-returned Msg is actively being processed.
+
+### 3. fd inventory
+
+```bash
+lsof -p <pid> 2>/dev/null | wc -l           # total fds
+lsof -p <pid> | grep "\.md$" | wc -l        # ticket files held
+lsof -p <pid> | grep KQUEUE                 # fsnotify kqueues
+```
+
+`.md` fd count roughly matching the ticket file count on disk is the inherent fsnotify-on-kqueue cost (see `internal/watch/watcher.go` package doc) — NOT a leak. Excess beyond file count is rename-churn.
+
+### 4. Rule out fsnotify storm
+
+```bash
+timeout 5 fs_usage -w -f filesys <pid> > /tmp/fsusage.txt 2>&1
+wc -l /tmp/fsusage.txt
+```
+
+~1 line over 5s → fsnotify is quiet, the hang is in-memory CPU. Hundreds of lines → kqueue is delivering bursts; suspect the board-resync tick or a renaming agent.
+
+### 5. tui.log timestamp-gap analysis (the load-bearing step)
+
+```bash
+tail -100 ~/.cache/openkanban/tui.log
+```
+
+The TUI logs each daemon event twice: once when the Cmd goroutine receives it, once when Update handles it:
+
+```
+<ts> openkanban model: readNextDaemonEvent got event="X" session=...
+<ts> openkanban model: handleDaemonSessionEvent event="X" ...
+```
+
+A gap **between** the two lines means bubbletea's Update goroutine was blocked processing some *other* Msg — the event is sitting in the Msg queue waiting for its turn. The handler is innocent.
+
+A gap **inside** `handleDaemonSessionEvent` (no follow-up "waiting on channel" for a long time) means the handler itself is slow — usually a synchronous daemon RPC or `attachLoopWG.Wait()`. The latter was the cause of the multi-second post-quit freezes that PR #55 fixed.
+
+### 6. Get a goroutine dump (only after 1-5 captured)
+
+bubbletea's `Program` installs a SIGQUIT handler that restores the terminal and exits cleanly via its normal teardown path. **`kill -QUIT <pid>` will NOT print Go's runtime goroutine dump** — bubbletea swallows it.
+
+To force the dump: send SIGABRT instead.
+
+```bash
+kill -ABRT <pid>
+```
+
+bubbletea doesn't trap SIGABRT, so the Go runtime's default handler runs and prints all goroutines' stacks to the process's stderr — i.e. the terminal the TUI was attached to. Scroll up in that terminal to read it.
+
+Heavier alternatives:
+- `dlv attach <pid>` → `goroutines` → `bt` per goroutine (most reliable, slowest)
+- macOS `sample` for a statistical profile (no full state, but identifies hot paths)
