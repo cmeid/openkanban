@@ -511,6 +511,89 @@ func TestDetectStatusWithActivity_PermissionPromptStaysWaiting(t *testing.T) {
 	}
 }
 
+// TestDetectStatusWithActivity_BusyTurnNotWaiting pins the inverse of
+// the prompt guard: a session busy on an already-approved tool (no
+// prompt on screen) must not show "waiting" just because the file is
+// pinned there and the tool happens to be silent. An active-turn marker
+// on screen ("esc to interrupt" or a braille spinner) reclassifies to
+// "working". The prompt guard still wins when both a prompt and a turn
+// marker are present (the false-negative the critic flagged), and an
+// idle screen with neither marker stays "waiting".
+func TestDetectStatusWithActivity_BusyTurnNotWaiting(t *testing.T) {
+	tmpDir := t.TempDir()
+	d := NewStatusDetector()
+	d.statusDirs = []string{tmpDir}
+	statusFile := filepath.Join(tmpDir, "sess.status")
+	if err := os.WriteFile(statusFile, []byte("waiting"), 0644); err != nil {
+		t.Fatalf("write status: %v", err)
+	}
+
+	stale := time.Now().Add(-(WaitingActivityTTL + time.Second))
+	recent := time.Now()
+
+	runningFooter := strings.Join([]string{
+		"⎿ Running…",
+		"  $ go test ./...",
+		"",
+		" esc to interrupt",
+	}, "\n")
+	spinnerFooter := strings.Join([]string{
+		"  exploring the codebase",
+		"",
+		" ⠹ Thinking…",
+	}, "\n")
+	idleBox := strings.Join([]string{
+		"  Done. Anything else?",
+		"",
+		" │ >                                  │",
+		" ? for shortcuts",
+	}, "\n")
+	// Adversarial: a prompt AND a turn marker on one screen. Cannot occur
+	// in Claude's real UI, but proves the prompt guard is ordered first.
+	promptPlusInterrupt := strings.Join([]string{
+		" Do you want to proceed?",
+		" ❯ 1. Yes",
+		"   2. No",
+		" Esc to cancel · Tab to amend",
+		" esc to interrupt",
+	}, "\n")
+	promptPlusSpinner := strings.Join([]string{
+		" Do you want to proceed?",
+		" ❯ 1. Yes",
+		"   2. No",
+		" ⠹ Esc to cancel",
+	}, "\n")
+
+	tests := []struct {
+		name            string
+		terminalContent string
+		lastActivity    time.Time
+		want            board.AgentStatus
+	}{
+		// RED before the fix: stale activity, so the flip can only come
+		// from the new active-turn marker, not the activity fallback.
+		{"running footer with esc-to-interrupt is working", runningFooter, stale, board.AgentWorking},
+		{"braille spinner footer is working", spinnerFooter, stale, board.AgentWorking},
+		// Ordering guards: recent activity, so WITHOUT the prompt guard
+		// these would return working — proving prompt-first wins over both
+		// the turn marker and the activity fallback (not vacuous).
+		{"prompt plus interrupt marker stays waiting", promptPlusInterrupt, recent, board.AgentWaiting},
+		{"prompt plus braille glyph stays waiting", promptPlusSpinner, recent, board.AgentWaiting},
+		// Precision guard: idle screen, no marker — must not over-match.
+		{"idle input box stays waiting", idleBox, stale, board.AgentWaiting},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d.InvalidateCache("sess")
+			got := d.DetectStatusWithActivity("claude", "sess", "sess", "", 0, true, tt.terminalContent, tt.lastActivity)
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestDetectStatusWithActivity_NoDowngrade ensures the override never
 // downgrades a non-waiting status. Even when activity is present, a
 // file saying "working" / "idle" / "completed" passes through.
