@@ -201,7 +201,7 @@ func TestPerformTicketCleanup_NotifiesDaemonEvenWithoutLocalPane(t *testing.T) {
 		width:         120,
 		height:        40,
 		config:        &config.Config{Agents: map[string]config.AgentConfig{}},
-		guardAPI:      api,
+		daemon:        api,
 	}
 
 	m.performTicketCleanup(ticket)
@@ -255,7 +255,7 @@ func TestPerformTicketCleanup_NotifiesDaemonWhenLocalPaneExists(t *testing.T) {
 		width:         120,
 		height:        40,
 		config:        &config.Config{Agents: map[string]config.AgentConfig{}},
-		guardAPI:      api,
+		daemon:        api,
 	}
 
 	m.performTicketCleanup(ticket)
