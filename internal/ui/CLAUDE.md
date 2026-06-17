@@ -91,6 +91,28 @@ type agentStatusMsg struct {...}
 
 Return `tea.Cmd` from `Update()` for async work.
 
+## Startup daemon calls must stay bounded (no synchronous/unbounded RPC)
+
+`NewModel` must NOT issue a daemon RPC of its own. The startup daemon
+interaction is gated by a **bounded preflight** in `internal/app/app.go`,
+run BEFORE the TUI is built: `ui.PreflightListSessions(client)` does a
+short `List` (budget = `startupReconcileAttempts * startupReconcileTimeout`
+in `daemon_resync.go`, kept ≤10s — pinned by
+`TestPreflightBudgetStaysFastFail`). On success its snapshot is passed into
+`NewModel` as `ownedByDaemon`; on failure (dial error, version skew, or a
+wedged daemon that completes hello but stalls on `List`) `app.go` prints
+`daemon.UnresponsiveHint()` (PID + `kill -9` when the pidfile names a live
+process) and **exits** — it does not launch a daemon-less board.
+
+`Subscribe` is the only other startup RPC and is armed **asynchronously**
+from `Init` via `subscribeDaemonEventsCmd` under `startupSubscribeTimeout`;
+`daemonSubscribeReadyMsg` installs the channel once the bounded handshake
+returns. This is the regression that bit us: the old code called
+`client.Subscribe(context.Background())` synchronously in `NewModel`, and a
+wedged daemon blocked startup forever (before the bubbletea loop, so the
+TUI never painted and the stall watchdog never armed). **Never reintroduce
+a synchronous or `context.Background()` daemon call on the startup path.**
+
 ## Column Viewport Scopes
 
 Vertical scroll per column lives in `m.columnOffsets[i]`. Three functions touch it, each with a different scope — don't confuse them:

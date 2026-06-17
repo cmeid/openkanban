@@ -443,7 +443,7 @@ type Model struct {
 	lastWindowTitle string
 }
 
-func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projectRegistry *project.ProjectRegistry, agentMgr *agent.Manager, opencodeServer *agent.OpencodeServer, filterProjectID string, updateChecker *update.Checker, daemonClient *daemonclient.Client) *Model {
+func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projectRegistry *project.ProjectRegistry, agentMgr *agent.Manager, opencodeServer *agent.OpencodeServer, filterProjectID string, updateChecker *update.Checker, ownedByDaemon map[board.TicketID]daemon.SessionInfo, daemonClient *daemonclient.Client) *Model {
 	ti := textinput.New()
 	ti.Placeholder = "Enter ticket title..."
 	ti.CharLimit = 100
@@ -560,35 +560,25 @@ func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projec
 	// sessions from a previous TUI run (or a sibling TUI), so blindly
 	// resetting status would lie about the world.
 	//
+	// ownedByDaemon is the daemon's session snapshot, fetched by the
+	// caller's bounded preflight List (internal/app) and passed in.
+	// NewModel performs NO daemon RPC of its own — that synchronous
+	// reconcile used to block startup for up to ~30s, and the unbounded
+	// Subscribe right after it could hang forever against a wedged daemon.
+	// The preflight has already gated launch-vs-exit on the daemon's
+	// health, so by the time we get here the snapshot is trustworthy.
+	//
 	// Algorithm:
-	//   1. If we have a daemon client, ask it for the current set of
-	//      sessions via listSessionsWithRetry — up to 3 attempts with
-	//      linear backoff, each bounded by a 10s context. The retry
-	//      budget is the price of NOT silently showing every existing
-	//      session as gone when the daemon is slow at startup.
-	//   2. For every ticket whose ID matches a live session, construct
-	//      a PaneView in Unattached state and keep any status we can
-	//      read from the on-disk marker. For every ticket NOT owned by
-	//      the daemon, wipe any stale "working/waiting/etc" status.
-	//   3. If every retry failed, surface a toast and proceed with an
-	//      empty owned-set; the periodic resync (armed in Init) will
-	//      pick up state the next time the daemon answers.
-	ownedByDaemon := map[board.TicketID]daemon.SessionInfo{}
-	if m.daemon != nil {
-		got, err := listSessionsWithRetry(m.daemon,
-			startupReconcileAttempts, startupReconcileTimeout, startupReconcileBackoff)
-		if err != nil {
-			log.Printf("openkanban: startup reconcile failed after %d retries: %v",
-				startupReconcileAttempts, err)
-			m.notify(startupReconcileFailureMsg)
-		} else {
-			ownedByDaemon = got
-			for tid, s := range got {
-				m.daemonOwned[tid] = struct{}{}
-				if s.ViewerCount > 0 {
-					m.daemonViewing[tid] = s.ViewerCount
-				}
-			}
+	//   1. Record every session in the snapshot as daemon-owned (and its
+	//      viewer count) so the indicators render correctly.
+	//   2. For every ticket whose ID matches a live session, construct a
+	//      PaneView in Unattached state and keep any status we can read
+	//      from the on-disk marker. For every ticket NOT owned by the
+	//      daemon, wipe any stale "working/waiting/etc" status.
+	for tid, s := range ownedByDaemon {
+		m.daemonOwned[tid] = struct{}{}
+		if s.ViewerCount > 0 {
+			m.daemonViewing[tid] = s.ViewerCount
 		}
 	}
 
@@ -619,22 +609,13 @@ func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projec
 
 	m.refreshColumnTickets()
 
-	// Subscribe to daemon push events so status changes that happen in
-	// OTHER TUIs (or via daemon-internal pane exits) reach this model.
-	// Subscribe in NewModel (rather than Init) so the channel is alive
-	// before the first Update tick — Init only emits the tea.Cmd that
-	// arms the listener.
-	if daemonClient != nil {
-		events, unsub, _ := subscribeDaemonEvents(daemonClient)
-		if events != nil {
-			m.daemonEvents = events
-			m.daemonUnsub = unsub
-			m.daemonConnected.Store(true)
-			log.Printf("openkanban model: daemon Subscribe ok; push channel armed")
-		} else {
-			log.Printf("openkanban model: daemon Subscribe returned nil channel; push events disabled")
-		}
-	}
+	// Subscribe to daemon push events is armed ASYNCHRONOUSLY from Init
+	// (subscribeDaemonEventsCmd), NOT here. The handshake used to run
+	// synchronously in NewModel under context.Background(); a wedged
+	// daemon never answered it and blocked startup forever, before the
+	// bubbletea loop began. daemonSubscribeReadyMsg installs the channel
+	// once the bounded handshake completes; until then the startup
+	// snapshot + periodic resync cover the brief gap.
 
 	// Diagnostic stall monitor — created here so Update/View stamping has
 	// a target, but the watchdog goroutine + SIGUSR2 handler are only
@@ -657,8 +638,11 @@ func (m *Model) Init() tea.Cmd {
 		m.maybeSetWindowTitle(),
 		checkBinaryStaleness(),
 	}
-	if m.daemonEvents != nil {
-		cmds = append(cmds, readNextDaemonEvent(m.daemonEvents))
+	// Arm the daemon Subscribe handshake asynchronously (bounded ctx, off
+	// the Update goroutine) so a wedged daemon can't block startup. The
+	// Ready handler installs the channel and arms readNextDaemonEvent.
+	if m.daemonClient != nil {
+		cmds = append(cmds, subscribeDaemonEventsCmd(m.daemonClient))
 	}
 	// Arm the periodic daemon-state resync. NewModel's synchronous
 	// startup reconcile populated m.panes / m.daemonOwned from the
@@ -812,6 +796,8 @@ func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case daemonSessionEventsMsg:
 		return m.handleDaemonSessionEvents(msg)
+	case daemonSubscribeReadyMsg:
+		return m.handleDaemonSubscribeReady(msg)
 	case daemonSubscribeFailedMsg:
 		return m.handleDaemonSubscribeFailed(msg)
 	case daemonSubscribeEndedMsg:

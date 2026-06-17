@@ -3,7 +3,6 @@ package ui
 import (
 	"context"
 	"errors"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -385,30 +384,9 @@ func TestScheduleDaemonResync_WithAPIReturnsTick(t *testing.T) {
 	_ = cmd
 }
 
-// TestNewModelStartupReconcile_NotificationOnAllRetriesFail builds a
-// real Model via the same path NewModel uses and asserts the
-// "Daemon reconcile failed" notification fires when every retry
-// errors. We can't easily invoke NewModel directly (it expects a
-// real *daemonclient.Client), so we exercise the synchronous helper
-// + the notification surface that NewModel calls into.
-func TestNewModelStartupReconcile_NotificationOnAllRetriesFail(t *testing.T) {
-	stub := &listStubAPI{
-		failuresLeft: 99,
-		err:          errors.New("rpc timeout"),
-	}
-	m := makeReconcileTestModel(t, stub, nil)
-
-	got, err := listSessionsWithRetry(stub, startupReconcileAttempts, 50*time.Millisecond, 1*time.Millisecond)
-	if err == nil {
-		t.Fatalf("err = nil; want non-nil after exhausting retries")
-	}
-	if got != nil {
-		t.Errorf("got = %v; want nil on exhaustion", got)
-	}
-
-	// Mirror NewModel's notify path.
-	m.notify(startupReconcileFailureMsg)
-	if !strings.Contains(m.notification, "restart openkanban") {
-		t.Errorf("notification = %q, want substring %q", m.notification, "restart openkanban")
-	}
-}
+// Note: the old "Daemon reconcile failed" toast-on-exhaustion behavior
+// was removed when the startup reconcile moved to a preflight gate in
+// internal/app (PreflightListSessions): exhaustion now prints a PID+kill
+// hint and exits rather than launching a degraded board with a toast.
+// listSessionsWithRetry's exhaustion contract (nil map + last error) is
+// still covered by the retry tests above.
