@@ -88,6 +88,13 @@ type Pane struct {
 	pty         *os.File
 	cmd         *exec.Cmd
 	mu          sync.Mutex
+	// inputMu serializes WriteInput's blocking p.pty.Write calls WITHOUT
+	// holding p.mu. WriteInput used to hold p.mu across the write, so a
+	// child that stalled draining its PTY input pinned p.mu and wedged
+	// handleOutput (the output drain) — the stuck-session deadlock. Writes
+	// must still be serialized (so concurrent writers don't interleave a
+	// paste mid-stream), but on a lock the output path never touches.
+	inputMu     sync.Mutex
 	running     bool
 	exitErr     error
 	workdir     string
@@ -991,13 +998,28 @@ func (p *Pane) StopGraceful(timeout time.Duration) error {
 var ErrPaneNotRunning = fmt.Errorf("pane is not running")
 
 func (p *Pane) WriteInput(data []byte) (int, error) {
+	// Snapshot the pty handle under the lock, then release it BEFORE the
+	// write. p.pty.Write blocks when the child's PTY input buffer is full
+	// (e.g. claude busy ingesting a large paste); holding p.mu across that
+	// blocking write pins the lock and wedges handleOutput (the output
+	// drain), hanging the whole session and cascading into the daemon via
+	// handleList -> Session.Info -> Pane.Size. Mirrors Stop/StopGraceful,
+	// which also drop p.mu before blocking calls. Regression:
+	// TestPane_WriteInputDoesNotHoldLockAcrossBlockingWrite.
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	if !p.running || p.pty == nil {
+		p.mu.Unlock()
 		return 0, ErrPaneNotRunning
 	}
-	return p.pty.Write(data)
+	ptyFile := p.pty
+	p.mu.Unlock()
+
+	// Serialize concurrent writers on a dedicated lock so a blocked write
+	// can't pin p.mu (which handleOutput needs). Only WriteInput takes
+	// inputMu, so it can never deadlock against the output drain.
+	p.inputMu.Lock()
+	defer p.inputMu.Unlock()
+	return ptyFile.Write(data)
 }
 
 // readOutput returns a Cmd that reads from the PTY
