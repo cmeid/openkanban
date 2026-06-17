@@ -300,6 +300,13 @@ Day-to-day:
   openkanban update --check        # just print update status
   openkanban update                # pull + rebuild + reinstall from $REPO_ROOT
 
+Standardized ticket close-out:
+  The 'finishing-an-openkanban-ticket' skill installs itself into
+  ~/.claude/skills/ on first launch (and refreshes on every 'openkanban
+  update'). It self-evaluates with code-review / validation subagents;
+  install the oh-my-claude plugin to enable them (the skill degrades to
+  self-review without them, and openkanban warns at launch if missing).
+
 EOF
 
 # Surface the legacy-shim cleanup hint only when the shim actually exists —

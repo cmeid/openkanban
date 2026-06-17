@@ -11,6 +11,7 @@ import (
 
 	"github.com/techdufus/openkanban/internal/app"
 	"github.com/techdufus/openkanban/internal/config"
+	"github.com/techdufus/openkanban/internal/finishskill"
 )
 
 var (
@@ -59,6 +60,18 @@ for safe parallel development.`,
 		}
 
 		isTTY := isatty.IsTerminal(os.Stdin.Fd()) && isatty.IsTerminal(os.Stderr.Fd())
+
+		// Keep the standardized close-out skill in sync with this binary,
+		// and surface a one-line hint if its review subagents are missing.
+		// Both are best-effort and non-blocking — they run before the
+		// update prompt so an update re-exec re-applies the fresh embed.
+		if home, herr := os.UserHomeDir(); herr == nil && home != "" {
+			if _, serr := finishskill.EnsureInstalled(home); serr != nil {
+				fmt.Fprintf(os.Stderr, "openkanban: could not install close-out skill: %v\n", serr)
+			}
+			warnMissingAgentsIfNeeded(finishskill.RequiredAgents(), agentResolver(home), isTTY, os.Stderr)
+		}
+
 		if handled, err := MaybePromptForUpdate(cfg, isTTY, noUpdateCheck); handled {
 			// Either we re-exec'd into the freshly installed binary
 			// (in which case this line is unreachable on success) or

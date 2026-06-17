@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+
+	"github.com/techdufus/openkanban/internal/finishskill"
 )
 
 // UpdateStatus is the result of a CheckForUpdates call.
@@ -197,6 +199,16 @@ func ApplyUpdate(ctx context.Context, status UpdateStatus, out io.Writer) error 
 		fmt.Fprintf(out, "installed: %s/openkanban\n", gobin)
 	} else {
 		fmt.Fprintln(out, "installed")
+	}
+
+	// Refresh the vendored close-out skill from the freshly-installed
+	// binary's embed. The launch path also self-heals (and the re-exec
+	// after update runs it), but doing it here too makes the update
+	// immediately complete. Best-effort: never fail the update over it.
+	if home, herr := os.UserHomeDir(); herr == nil && home != "" {
+		if _, serr := finishskill.EnsureInstalled(home); serr != nil {
+			fmt.Fprintf(out, "note: could not refresh close-out skill: %v\n", serr)
+		}
 	}
 	return nil
 }
