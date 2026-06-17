@@ -195,6 +195,17 @@ type PaneView struct {
 	// signals, not data.
 	teaMsgs   chan tea.Msg
 	teaClosed atomic.Bool
+	// renderSignalPending coalesces output-driven render signals. The
+	// attach goroutine sets it (via signalRender) when it emits a
+	// PaneOutputMsg and skips emitting again while it stays set; the model
+	// clears it (via consumeRenderSignal in Update) when it consumes the
+	// PaneOutputMsg. Because applyOutput writes every frame's bytes to the
+	// emulator regardless of how many signals fire, a burst of N frames
+	// between two consumes collapses to ONE render — the fix for the
+	// large-paste render storm (tickets/build-handling-for-a-stuck-session).
+	// Lock-free (set from the attach goroutine, cleared from the Update
+	// goroutine) so it never contends with p.mu on the hot output path.
+	renderSignalPending atomic.Bool
 	// teaMu serialises send (emitTeaMsg) vs close (Close) on teaMsgs.
 	// teaClosed.Load() is a fast-path read; the actual send/close
 	// transaction is gated by this mutex. Without it, an attach
@@ -528,6 +539,14 @@ func (p *PaneView) initEmulatorLocked() {
 	})
 	p.cursorHidden.Store(false)
 	p.cursorAppMode.Store(false)
+	// Start each (re)attach with a clean render-signal flag. The flag is
+	// otherwise cleared only when the model consumes a PaneOutputMsg; if a
+	// prior attach detached with the flag still set (its final
+	// PaneOutputMsg dropped or never consumed), a stale true here would
+	// suppress the first signalRender after re-attach and render all
+	// subsequent output silently. Resetting at emulator (re)init severs
+	// that cross-lifecycle coupling.
+	p.renderSignalPending.Store(false)
 	p.scrollback = terminal.NewScrollbackBuffer(10000)
 	p.selection = terminal.NewSelectionState()
 	titleHandler := func(data []byte) bool {
@@ -576,12 +595,27 @@ func (p *PaneView) initEmulatorLocked() {
 func (p *PaneView) teardownEmulatorLocked() {
 	if p.drainStop != nil {
 		close(p.drainStop)
-		// Wake the drain goroutine via a sentinel byte, same as
-		// terminal.Pane.stopDrainUnlocked. Without this, vt.Read
-		// blocks forever and drainWG.Wait deadlocks.
+		// Unblock the drain goroutine's vt.Read by closing the emulator's
+		// pipe WRITER directly. Two traps to avoid, both load-bearing:
+		//   1. The old approach poked a sentinel byte into InputPipe (the
+		//      pipe's write end). charm/x/vt is backed by a SYNCHRONOUS
+		//      io.Pipe, so that write blocked forever whenever the drain
+		//      had already observed drainStop and stopped reading — no
+		//      reader, no completion — hanging teardown and every caller
+		//      holding p.mu (the flaky stuck-pane deadlock).
+		//   2. Emulator.Close() would unblock Read (it does the same
+		//      CloseWithError under the hood) but also writes an
+		//      unsynchronized `closed` bool that races the drain's
+		//      lock-free Read under -race (see the sibling
+		//      terminal.Pane.stopDrainUnlocked, which avoids Close for the
+		//      same reason).
+		// CloseWithError(io.EOF) on the PipeWriter unblocks Read with EOF,
+		// never blocks (io.Pipe close is non-blocking + internally
+		// synchronized), and touches no unsynchronized emulator state.
+		// Regression: TestPaneView_TeardownDoesNotDeadlock (also -race).
 		if p.vt != nil {
-			if w := p.vt.Emulator.InputPipe(); w != nil {
-				_, _ = w.Write([]byte{0})
+			if pw, ok := p.vt.Emulator.InputPipe().(*io.PipeWriter); ok {
+				_ = pw.CloseWithError(io.EOF)
 			}
 		}
 		p.drainStop = nil
@@ -1078,7 +1112,7 @@ func (p *PaneView) attachLoop(conn net.Conn, r *bufio.Reader) {
 			}
 			outputBytes += len(payload)
 			p.applyOutput(payload)
-			p.emitTeaMsg(PaneOutputMsg{PaneID: p.id})
+			p.signalRender()
 		case daemon.TypeDetach:
 			// Daemon-initiated detach: the session may or may not
 			// still be running. We transition to Unattached and let
@@ -1099,7 +1133,7 @@ func (p *PaneView) attachLoop(conn net.Conn, r *bufio.Reader) {
 			}
 			p.dirty = true
 			p.mu.Unlock()
-			p.emitTeaMsg(PaneOutputMsg{PaneID: p.id})
+			p.signalRender()
 		default:
 			// Unknown binary frame: drop.
 		}
@@ -1840,6 +1874,10 @@ func (p *PaneView) Update(msg tea.Msg) tea.Cmd {
 		if m.PaneID != p.id {
 			return nil
 		}
+		// Clear the coalescing flag so the next output burst emits a fresh
+		// render signal (see signalRender). Must run on every consumed
+		// PaneOutputMsg or output after this point would render silently.
+		p.consumeRenderSignal()
 		return p.readNextMsg()
 	case PaneRenderTickMsg:
 		if m.PaneID != p.id {
@@ -1909,6 +1947,27 @@ func (p *PaneView) emitTeaMsg(msg tea.Msg) {
 	default:
 		log.Printf("openkanban paneview: dropped %T session=%s (teaMsgs buffer full)", msg, p.sessionID)
 	}
+}
+
+// signalRender requests exactly one render for the current burst of output.
+// The attach goroutine calls it after each applyOutput; the first call after
+// a consume emits a PaneOutputMsg, and subsequent calls are suppressed until
+// the model consumes that message (consumeRenderSignal). Because applyOutput
+// has already written the bytes to the emulator, the single queued render
+// repaints the whole burst — collapsing a multi-megabyte paste echo's
+// hundreds of frames into one re-render instead of one per 64KB frame.
+func (p *PaneView) signalRender() {
+	if p.renderSignalPending.Swap(true) {
+		return
+	}
+	p.emitTeaMsg(PaneOutputMsg{PaneID: p.id})
+}
+
+// consumeRenderSignal clears the pending flag so the next output frame emits
+// a fresh PaneOutputMsg. Called by the model when it consumes a PaneOutputMsg
+// (PaneView.Update). Idempotent.
+func (p *PaneView) consumeRenderSignal() {
+	p.renderSignalPending.Store(false)
 }
 
 // Start is included for surface-parity with terminal.Pane. PaneView
