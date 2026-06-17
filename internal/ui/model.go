@@ -363,10 +363,11 @@ type Model struct {
 	filterInput textinput.Model
 	filterQuery string
 
-	sidebarVisible bool
-	sidebarFocused bool
-	sidebarIndex   int
-	sidebarWidth   int
+	sidebarVisible  bool
+	sidebarFocused  bool
+	sidebarIndex    int
+	sidebarWidth    int
+	sidebarOpenOnly bool // when true, sidebar counts exclude done+archived tickets
 
 	updateChecker *update.Checker
 
@@ -1447,11 +1448,30 @@ func (m *Model) handleSidebarNav(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.confirmDeleteProject(projects[m.sidebarIndex-1])
 		}
 		return m, nil
+	case "o":
+		m.sidebarOpenOnly = !m.sidebarOpenOnly
 	case "esc":
 		m.sidebarFocused = false
 	}
 
 	return m, nil
+}
+
+// sidebarTicketCount counts tickets for the sidebar. projectID=="" counts
+// across all projects. When sidebarOpenOnly is set, terminal-status tickets
+// (done, archived) are excluded so the count reflects open work only.
+func (m *Model) sidebarTicketCount(projectID string) int {
+	count := 0
+	for _, t := range m.globalStore.All() {
+		if projectID != "" && t.ProjectID != projectID {
+			continue
+		}
+		if m.sidebarOpenOnly && (t.Status == board.StatusDone || t.Status == board.StatusArchived) {
+			continue
+		}
+		count++
+	}
+	return count
 }
 
 func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {

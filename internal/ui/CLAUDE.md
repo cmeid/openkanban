@@ -56,6 +56,8 @@ Every keybinding has **two doc surfaces** in `view.go`:
 
 When you add, remove, or rebind a key, update **both** functions in the same change. The modal must stay complete; the footer must surface the key in any mode where it's relevant. They live ~50 lines apart on purpose — see one, edit the other.
 
+Keys that only apply while the **sidebar is focused** have a **third** surface: a hint line rendered directly inside `renderSidebar()` (e.g. `"  j/k ⏎toggle a/d o:open"`). It's width-budgeted to `m.sidebarWidth`, so keep tokens terse (`o:open`, not `o open only`). Sidebar-focused keys (handled in `handleSidebarNav`) must update all three: this in-sidebar line, the `contextualHints()` `sidebarFocused` branch, and the `renderHelp()` Sidebar section.
+
 ## View Composition
 
 Separate render methods composed in `View()`:
