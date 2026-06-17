@@ -36,6 +36,39 @@ var BinaryVersion = "dev"
 // past the last client disconnect.
 const shutdownGraceSeconds = 3
 
+// handlerDeadline is the maximum time a short RPC handler may run before
+// the dispatcher abandons it and returns a daemon_unresponsive error to
+// the client. Only applies to non-blocking handlers — handleAttach and
+// handleShutdown are explicitly excluded.
+const handlerDeadline = 10 * time.Second
+
+// handlerDeadlineOverride lets tests shorten the deadline. Zero means use
+// handlerDeadline.
+var handlerDeadlineOverride time.Duration
+
+// runHandlerWithDeadline runs fn (a short RPC handler) and returns true if
+// it finished within the deadline. On timeout it returns false and leaves
+// the handler goroutine running (it will finish or leak — the wedge
+// watchdog and the conn-sem bound the worst case). The caller writes an
+// "unresponsive" error to the client so it doesn't hang.
+// Not for use with handleAttach (blocks by design) or handleShutdown
+// (legitimately slow across many sessions).
+func (s *Server) runHandlerWithDeadline(name string, fn func()) bool {
+	d := handlerDeadline
+	if handlerDeadlineOverride > 0 {
+		d = handlerDeadlineOverride
+	}
+	done := make(chan struct{})
+	go func() { defer close(done); fn() }()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		log.Printf("openkanbankd: handler %q exceeded %s — abandoning (client will get unresponsive error)", name, d)
+		return false
+	}
+}
+
 // Server is the openkanbankd RPC server. It listens on a Unix socket,
 // accepts client connections, multiplexes JSON-mode RPCs, and owns the
 // set of live terminal.Pane-backed Sessions.
@@ -909,7 +942,12 @@ func (s *Server) dispatch(c *clientConn, typeName string, raw json.RawMessage) {
 			s.writeError(c, "bad_request", err.Error())
 			return
 		}
-		s.writeResp(c, MsgHelloResp, s.handleHello(c, req))
+		var resp HelloResp
+		if s.runHandlerWithDeadline("hello", func() { resp = s.handleHello(c, req) }) {
+			s.writeResp(c, MsgHelloResp, resp)
+		} else {
+			s.writeError(c, "daemon_unresponsive", "hello handler timed out")
+		}
 
 	case MsgSpawnReq:
 		var req SpawnReq
@@ -917,17 +955,27 @@ func (s *Server) dispatch(c *clientConn, typeName string, raw json.RawMessage) {
 			s.writeError(c, "bad_request", err.Error())
 			return
 		}
-		resp, err := s.handleSpawn(c, req)
-		if err != nil {
-			s.writeError(c, "spawn_failed", err.Error())
-			return
+		var resp SpawnResp
+		var spawnErr error
+		if s.runHandlerWithDeadline("spawn", func() { resp, spawnErr = s.handleSpawn(c, req) }) {
+			if spawnErr != nil {
+				s.writeError(c, "spawn_failed", spawnErr.Error())
+			} else {
+				s.writeResp(c, MsgSpawnResp, resp)
+			}
+		} else {
+			s.writeError(c, "daemon_unresponsive", "spawn handler timed out")
 		}
-		s.writeResp(c, MsgSpawnResp, resp)
 
 	case MsgListReq:
 		var req ListReq
 		_ = json.Unmarshal(raw, &req)
-		s.writeResp(c, MsgListResp, s.handleList(c, req))
+		var resp ListResp
+		if s.runHandlerWithDeadline("list", func() { resp = s.handleList(c, req) }) {
+			s.writeResp(c, MsgListResp, resp)
+		} else {
+			s.writeError(c, "daemon_unresponsive", "list handler timed out")
+		}
 
 	case MsgKillReq:
 		var req KillReq
@@ -935,12 +983,17 @@ func (s *Server) dispatch(c *clientConn, typeName string, raw json.RawMessage) {
 			s.writeError(c, "bad_request", err.Error())
 			return
 		}
-		resp, err := s.handleKill(c, req)
-		if err != nil {
-			s.writeError(c, "kill_failed", err.Error())
-			return
+		var resp KillResp
+		var killErr error
+		if s.runHandlerWithDeadline("kill", func() { resp, killErr = s.handleKill(c, req) }) {
+			if killErr != nil {
+				s.writeError(c, "kill_failed", killErr.Error())
+			} else {
+				s.writeResp(c, MsgKillResp, resp)
+			}
+		} else {
+			s.writeError(c, "daemon_unresponsive", "kill handler timed out")
 		}
-		s.writeResp(c, MsgKillResp, resp)
 
 	case MsgTicketDoneReq:
 		var req TicketDoneReq
@@ -948,12 +1001,17 @@ func (s *Server) dispatch(c *clientConn, typeName string, raw json.RawMessage) {
 			s.writeError(c, "bad_request", err.Error())
 			return
 		}
-		resp, err := s.handleTicketDone(c, req)
-		if err != nil {
-			s.writeError(c, "ticket_done_failed", err.Error())
-			return
+		var resp TicketDoneResp
+		var tdErr error
+		if s.runHandlerWithDeadline("ticket_done", func() { resp, tdErr = s.handleTicketDone(c, req) }) {
+			if tdErr != nil {
+				s.writeError(c, "ticket_done_failed", tdErr.Error())
+			} else {
+				s.writeResp(c, MsgTicketDoneResp, resp)
+			}
+		} else {
+			s.writeError(c, "daemon_unresponsive", "ticket_done handler timed out")
 		}
-		s.writeResp(c, MsgTicketDoneResp, resp)
 
 	case MsgOwnsReq:
 		var req OwnsReq
@@ -961,24 +1019,47 @@ func (s *Server) dispatch(c *clientConn, typeName string, raw json.RawMessage) {
 			s.writeError(c, "bad_request", err.Error())
 			return
 		}
-		s.writeResp(c, MsgOwnsResp, s.handleOwns(c, req))
+		var resp OwnsResp
+		if s.runHandlerWithDeadline("owns", func() { resp = s.handleOwns(c, req) }) {
+			s.writeResp(c, MsgOwnsResp, resp)
+		} else {
+			s.writeError(c, "daemon_unresponsive", "owns handler timed out")
+		}
 
 	case MsgSubscribeReq:
 		var req SubscribeReq
 		_ = json.Unmarshal(raw, &req)
-		s.writeResp(c, MsgSubscribeResp, s.handleSubscribe(c, req))
+		var resp SubscribeResp
+		if s.runHandlerWithDeadline("subscribe", func() { resp = s.handleSubscribe(c, req) }) {
+			s.writeResp(c, MsgSubscribeResp, resp)
+		} else {
+			s.writeError(c, "daemon_unresponsive", "subscribe handler timed out")
+		}
 
 	case MsgPrepareExitReq:
 		var req PrepareExitReq
 		_ = json.Unmarshal(raw, &req)
-		s.writeResp(c, MsgPrepareExitResp, s.handlePrepareExit(c, req))
+		var resp PrepareExitResp
+		if s.runHandlerWithDeadline("prepare_exit", func() { resp = s.handlePrepareExit(c, req) }) {
+			s.writeResp(c, MsgPrepareExitResp, resp)
+		} else {
+			s.writeError(c, "daemon_unresponsive", "prepare_exit handler timed out")
+		}
 
 	case MsgCancelExitReq:
 		var req CancelExitReq
 		_ = json.Unmarshal(raw, &req)
-		s.writeResp(c, MsgCancelExitResp, s.handleCancelExit(c, req))
+		var resp CancelExitResp
+		if s.runHandlerWithDeadline("cancel_exit", func() { resp = s.handleCancelExit(c, req) }) {
+			s.writeResp(c, MsgCancelExitResp, resp)
+		} else {
+			s.writeError(c, "daemon_unresponsive", "cancel_exit handler timed out")
+		}
 
 	case MsgShutdownReq:
+		// NOT wrapped — legitimately slow: kills every live session (up to
+		// grace seconds each) before replying; healthy multi-session shutdown
+		// can exceed handlerDeadline.
 		var req ShutdownReq
 		_ = json.Unmarshal(raw, &req)
 		s.writeResp(c, MsgShutdownResp, s.handleShutdown(c, req))
@@ -989,8 +1070,8 @@ func (s *Server) dispatch(c *clientConn, typeName string, raw json.RawMessage) {
 			s.writeError(c, "bad_request", err.Error())
 			return
 		}
-		// handleAttach BLOCKS for the lifetime of the binary stream.
-		// When it returns the conn is fully drained / closed; the
+		// NOT wrapped — handleAttach BLOCKS for the lifetime of the binary
+		// stream. When it returns the conn is fully drained / closed; the
 		// outer handleConn loop will hit EOF on its next ReadFrame
 		// and exit through the usual disconnect path.
 		s.handleAttach(c, req)
@@ -1005,7 +1086,9 @@ func (s *Server) dispatch(c *clientConn, typeName string, raw json.RawMessage) {
 		// leaving the conn in JSON mode. The client closes its dedicated
 		// peek conn after reading the snapshot, so handleConn hits EOF
 		// next and disconnects cleanly.
-		s.handlePeek(c, req)
+		if !s.runHandlerWithDeadline("peek", func() { s.handlePeek(c, req) }) {
+			s.writeError(c, "daemon_unresponsive", "peek handler timed out")
+		}
 
 	case MsgSetViewingReq:
 		var req SetViewingReq
@@ -1013,7 +1096,12 @@ func (s *Server) dispatch(c *clientConn, typeName string, raw json.RawMessage) {
 			s.writeError(c, "bad_request", err.Error())
 			return
 		}
-		s.writeResp(c, MsgSetViewingResp, s.handleSetViewing(c, req))
+		var resp SetViewingResp
+		if s.runHandlerWithDeadline("set_viewing", func() { resp = s.handleSetViewing(c, req) }) {
+			s.writeResp(c, MsgSetViewingResp, resp)
+		} else {
+			s.writeError(c, "daemon_unresponsive", "set_viewing handler timed out")
+		}
 
 	default:
 		s.writeError(c, "unknown_message", fmt.Sprintf("unknown message type %q", typeName))
