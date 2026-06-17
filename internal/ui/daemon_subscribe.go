@@ -292,6 +292,16 @@ func (m *Model) applyDaemonSessionEvent(ev daemon.SessionEvent) {
 				if m.applyDaemonStatus(ticket, ev.Status) {
 					m.saveTicket(ticket)
 				}
+			case "status":
+				// Daemon watchdog verdict (currently only Status:"stuck"):
+				// the pane wedged on input backpressure. applyDaemonStatus
+				// maps it to AgentStuck and guards AgentCompleted (a
+				// wrapped-up ticket is never knocked back to stuck), so the
+				// card renders red and the user can recover or destroy the
+				// session from the stuck-action modal.
+				if m.applyDaemonStatus(ticket, ev.Status) {
+					m.saveTicket(ticket)
+				}
 			}
 		}
 	}
@@ -318,7 +328,7 @@ func (m *Model) applyDaemonStatus(ticket *board.Ticket, raw string) bool {
 	status := board.AgentStatus(raw)
 	switch status {
 	case board.AgentIdle, board.AgentWorking, board.AgentWaiting,
-		board.AgentCompleted, board.AgentError:
+		board.AgentCompleted, board.AgentError, board.AgentStuck:
 		// known, applicable value
 	default:
 		// AgentNone ("no verdict") and any unknown string: leave the

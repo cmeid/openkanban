@@ -324,6 +324,16 @@ func (s *Server) binaryLoop(c *clientConn, sess *Session, ac *attachedClient) {
 				continue
 			}
 			if _, werr := sess.pane.WriteInput(payload); werr != nil {
+				if errors.Is(werr, terminal.ErrInputBackpressure) {
+					// The child has stopped draining stdin and the
+					// pane's bounded input buffer is full. Drop this
+					// chunk but keep the client attached — backpressure
+					// (transient or sustained) must not detach the user.
+					// The watchdog (broadcastActivity) surfaces a
+					// persistently-wedged session as "stuck" so the user
+					// can recover or destroy it from the TUI.
+					continue
+				}
 				if errors.Is(werr, terminal.ErrPaneNotRunning) {
 					// Child gone — emit detach and bail out so the
 					// client knows the session is no longer

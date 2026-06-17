@@ -62,6 +62,9 @@ func (m *Model) View() string {
 	if m.showChoice {
 		return m.renderWithOverlay(m.renderChoiceDialog())
 	}
+	if m.stuckActionPrompt {
+		return m.renderWithOverlay(m.renderStuckActionModal())
+	}
 	if m.mode == ModeConfirmExit {
 		return m.renderWithOverlay(m.renderConfirmExitDialog())
 	}
@@ -460,6 +463,11 @@ func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, w
 		sessionBadge = lipgloss.NewStyle().
 			Foreground(m.colors.err).
 			Render("✗")
+	case board.AgentStuck:
+		sessionBadge = lipgloss.NewStyle().
+			Foreground(m.colors.err).
+			Bold(true).
+			Render("⚠")
 	}
 
 	var viewingBadge string
@@ -585,8 +593,12 @@ func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, w
 			statusIcon = "✗"
 			statusText = "error"
 			statusColor = m.colors.err
+		case board.AgentStuck:
+			statusIcon = "⚠"
+			statusText = "stuck"
+			statusColor = m.colors.err
 		}
-		statusStyle := lipgloss.NewStyle().Foreground(statusColor)
+		statusStyle := lipgloss.NewStyle().Foreground(statusColor).Bold(effectiveStatus == board.AgentStuck)
 		statusParts = append(statusParts, statusStyle.Render(statusIcon+" "+statusText))
 	}
 
@@ -630,8 +642,12 @@ func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, w
 		accentColor = m.colors.success
 	case board.AgentError:
 		accentColor = m.colors.err
+	case board.AgentStuck:
+		accentColor = m.colors.err
 	}
-	if isRunning {
+	if isRunning && effectiveStatus != board.AgentStuck {
+		// A stuck session's pane is still "running", but its red accent
+		// must win over the running-green so the wedge is visible.
 		accentColor = m.colors.success
 	}
 
@@ -649,6 +665,12 @@ func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, w
 
 	if isRunning {
 		borderColor = m.colors.success
+	}
+
+	// A stuck session's border is RED and wins over the running-green
+	// and selection color so the wedge stands out on the board.
+	if effectiveStatus == board.AgentStuck {
+		borderColor = m.colors.err
 	}
 
 	cardStyle := lipgloss.NewStyle().
@@ -821,7 +843,7 @@ func (m *Model) contextualHints(hintStyle lipgloss.Style, sep string, maxWidth i
 		ticket := m.selectedTicket()
 		if ticket != nil {
 			if _, hasPane := m.panes[ticket.ID]; hasPane {
-				return m.packHints([]hintSpec{
+				hints := []hintSpec{
 					{key: "Enter/s", label: "open agent", prio: 9},
 					{key: "S", label: "stop", prio: 8},
 					{key: "Space/-", label: "move", prio: 7},
@@ -833,7 +855,14 @@ func (m *Model) contextualHints(hintStyle lipgloss.Style, sep string, maxWidth i
 					{key: "a", label: autoLabel, prio: 2},
 					{key: "[", label: "sidebar", prio: 1},
 					{key: "?", label: "help", prio: 10, pinned: true},
-				}, hintStyle, sep, maxWidth)
+				}
+				if ticket.AgentStatus == board.AgentStuck {
+					// Surface the recover/destroy entry only when the
+					// selected card is wedged; high prio so it survives
+					// width packing.
+					hints = append(hints, hintSpec{key: "r", label: "recover", prio: 9})
+				}
+				return m.packHints(hints, hintStyle, sep, maxWidth)
 			}
 			if ticket.Status == board.StatusInProgress {
 				return m.packHints([]hintSpec{
@@ -1031,7 +1060,7 @@ func (m *Model) renderHelp() string {
 		"  " + keyStyle.Render("j/k") + descStyle.Render("   Navigate projects       ") + keyStyle.Render("Ctrl+]") + descStyle.Render("  Next session (in view)") + "\n" +
 		"  " + keyStyle.Render("a") + descStyle.Render("     Add project             ") + keyStyle.Render("Ctrl+\\") + descStyle.Render("  Prev session (in view)") + "\n" +
 		"  " + keyStyle.Render("d") + descStyle.Render("     Delete project          ") + keyStyle.Render("Ctrl+Space") + descStyle.Render(" Promote + bg agent") + "\n" +
-		"  " + keyStyle.Render("o") + descStyle.Render("     Toggle open only") + "\n\n" +
+		"  " + keyStyle.Render("o") + descStyle.Render("     Toggle open only        ") + keyStyle.Render("r") + descStyle.Render("       Recover/destroy stuck session") + "\n\n" +
 		sep + "\n" +
 		sectionStyle.Render("  👁 View") + "                       " + sectionStyle.Render("⚙ System") + "\n" +
 		sep + "\n" +
@@ -2065,6 +2094,8 @@ func agentStatusGlyph(s board.AgentStatus) (icon, label string) {
 		return "✓", "done"
 	case board.AgentError:
 		return "✗", "error"
+	case board.AgentStuck:
+		return "⚠", "stuck"
 	}
 	return "", ""
 }
@@ -2089,6 +2120,8 @@ func (m *Model) renderAgentStatusPill(s board.AgentStatus) string {
 	case board.AgentCompleted:
 		color = m.colors.success
 	case board.AgentError:
+		color = m.colors.err
+	case board.AgentStuck:
 		color = m.colors.err
 	default:
 		color = m.colors.muted

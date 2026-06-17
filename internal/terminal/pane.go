@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"strings"
@@ -88,13 +89,6 @@ type Pane struct {
 	pty         *os.File
 	cmd         *exec.Cmd
 	mu          sync.Mutex
-	// inputMu serializes WriteInput's blocking p.pty.Write calls WITHOUT
-	// holding p.mu. WriteInput used to hold p.mu across the write, so a
-	// child that stalled draining its PTY input pinned p.mu and wedged
-	// handleOutput (the output drain) — the stuck-session deadlock. Writes
-	// must still be serialized (so concurrent writers don't interleave a
-	// paste mid-stream), but on a lock the output path never touches.
-	inputMu     sync.Mutex
 	running     bool
 	exitErr     error
 	workdir     string
@@ -102,6 +96,72 @@ type Pane struct {
 	ticketID    string
 	width       int
 	height      int
+
+	// --- lock-free read mirrors (Task 1) ---
+	//
+	// running / pid / dims mirror the plain fields above so the
+	// Info-reachable accessors (Running / PID / Size) can be read
+	// WITHOUT taking p.mu. This is what keeps handleList → Session.Info
+	// (which iterates every session under sessionsMu.RLock) from ever
+	// blocking on a pane whose p.mu is held by a stuck WriteInput /
+	// teardown — the daemon-wide deadlock these mirrors exist to
+	// prevent. Mirrors the existing lock-free Title() pattern.
+	//
+	// dims packs width<<32 | height into ONE atomic.Uint64 so Size()
+	// reads a single atomic and a concurrent resize can never produce a
+	// torn cols/rows pair. See packDims / unpackDims.
+	runningAtomic atomic.Bool
+	pid           atomic.Int64
+	dims          atomic.Uint64
+
+	// pgid is the child's process-group id, captured at spawn via
+	// syscall.Getpgid. creack/pty sets Setsid so pgid == child pid.
+	// Used by signalGroup to reap the whole agent process tree on
+	// teardown (Task 3). Lock-free so teardown never needs p.mu to read
+	// it. Zero until a successful spawn.
+	pgid atomic.Int64
+
+	// --- input-writer goroutine state (Task 2) ---
+	//
+	// inputCh feeds the single per-pane PTY-writer goroutine. WriteInput
+	// does a NON-BLOCKING send onto it, so p.mu never spans the
+	// (potentially blocking) PTY write — that decoupling is the
+	// root-cause fix for the paste-flood deadlock. inputStop signals the
+	// writer to exit; we NEVER close(inputCh) (a racing WriteInput send
+	// would panic). Both channels are write-once: assigned only in
+	// startInputWriterUnlocked under p.mu before the pane is observable,
+	// never reassigned, so WriteInput's lock-free read is safe.
+	inputCh       chan []byte
+	inputStop     chan struct{}
+	inputStopOnce sync.Once
+	inputWG       sync.WaitGroup
+
+	// teardownOnce ensures teardownUnlocked fires at most once. A second
+	// Stop() or a Stop() racing a natural exit must be a safe no-op: a
+	// re-issued signalGroup(SIGKILL) against a stale pgid risks hitting a
+	// recycled process (PID/PGID reuse). After the first teardown fires,
+	// pgid is zeroed so signalGroup's ≤0 guard catches any late caller.
+	teardownOnce sync.Once
+
+	// wedge tracking for the daemon watchdog (Task 5). WriteInput stamps
+	// these on input backpressure (the child stopped draining stdin and
+	// the bounded buffer filled). The watchdog reads them via
+	// WedgedSince() — atomics only, so it can never block on the wedged
+	// pane.
+	//
+	//   wedgedSinceNs — start of the current backpressure EPISODE.
+	//   lastWedgeNs   — time of the most recent backpressure.
+	//
+	// A single successful enqueue does NOT end the episode: a child that
+	// isn't draining still backpressures almost every write but the PTY
+	// buffer has enough slack that the odd chunk slips through. If a lone
+	// success reset the episode the start time would keep advancing and
+	// the watchdog could never observe a sustained wedge. Instead the
+	// episode is keyed off lastWedgeNs recency: WedgedSince reports the
+	// episode start while backpressure stays recent, and reports zero
+	// (recovered) once no backpressure has happened for wedgeRecency.
+	wedgedSinceNs atomic.Int64
+	lastWedgeNs   atomic.Int64
 
 	// expectedCompletedExit is true when the TUI initiated a
 	// StopGraceful as a reaction to AgentCompleted on a Done ticket
@@ -201,12 +261,16 @@ func New(id string, width, height int, scrollbackSize int) *Pane {
 	if scrollbackSize <= 0 {
 		scrollbackSize = 10000
 	}
-	return &Pane{
+	p := &Pane{
 		id:             id,
 		width:          width,
 		height:         height,
 		scrollbackSize: scrollbackSize,
 	}
+	// Seed the lock-free dims mirror so Size() is accurate before the
+	// pane is started (SetSize / spawn update it thereafter).
+	p.dims.Store(packDims(width, height))
+	return p
 }
 
 // ID returns the pane's identifier
@@ -252,11 +316,46 @@ func (p *Pane) ExpectedCompletedExit() bool {
 	return p.expectedCompletedExit
 }
 
-// Running returns whether the pane has a running process
+// stampStartedUnlocked seeds the lock-free read mirrors right after a
+// successful fork. Must be called with p.mu held and after p.pty and
+// p.cmd are set. Captures the child's process-group id for the
+// teardown group-kill (creack/pty sets Setsid, so pgid == child pid).
+func (p *Pane) stampStartedUnlocked() {
+	p.runningAtomic.Store(true)
+	p.dims.Store(packDims(p.width, p.height))
+	if p.cmd != nil && p.cmd.Process != nil {
+		pid := p.cmd.Process.Pid
+		p.pid.Store(int64(pid))
+		if pgid, err := syscall.Getpgid(pid); err == nil {
+			p.pgid.Store(int64(pgid))
+		}
+	}
+}
+
+// packDims packs width and height into a single uint64 (width in the
+// high 32 bits, height in the low 32). Negative or oversized values are
+// clamped to the uint32 range; pane dimensions are always small
+// positive ints in practice.
+func packDims(width, height int) uint64 {
+	if width < 0 {
+		width = 0
+	}
+	if height < 0 {
+		height = 0
+	}
+	return uint64(uint32(width))<<32 | uint64(uint32(height))
+}
+
+// unpackDims is the inverse of packDims.
+func unpackDims(v uint64) (width, height int) {
+	return int(uint32(v >> 32)), int(uint32(v))
+}
+
+// Running returns whether the pane has a running process. Lock-free
+// (reads the atomic mirror) so it never blocks on a stuck pane — see
+// the runningAtomic field comment.
 func (p *Pane) Running() bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.running
+	return p.runningAtomic.Load()
 }
 
 // ExitErr returns any error from the process exit
@@ -282,6 +381,9 @@ func (p *Pane) SetSize(width, height int) {
 
 	p.width = width
 	p.height = height
+	// Mirror into the lock-free packed atomic so Size() reflects the
+	// resize without taking p.mu.
+	p.dims.Store(packDims(width, height))
 	p.dirty = true
 	p.cachedView = ""
 
@@ -305,11 +407,11 @@ func (p *Pane) SetSize(width, height int) {
 	}
 }
 
-// Size returns the current dimensions
+// Size returns the current dimensions. Lock-free: reads a single packed
+// atomic so a concurrent resize can never yield a torn cols/rows pair,
+// and it never blocks on a stuck pane (see the dims field comment).
 func (p *Pane) Size() (width, height int) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.width, p.height
+	return unpackDims(p.dims.Load())
 }
 
 // ScrollbackLen returns the number of lines in the scrollback buffer.
@@ -439,6 +541,14 @@ func (p *Pane) Start(command string, args ...string) tea.Cmd {
 		p.pty = ptmx
 		p.running = true
 		p.exitErr = nil
+		// Wire the input-writer goroutine (which assigns inputCh) BEFORE
+		// stampStartedUnlocked publishes runningAtomic. WriteInput reads
+		// inputCh lock-free after an acquire-load of runningAtomic, so
+		// publishing running last gives that read its happens-before edge.
+		p.startInputWriterUnlocked()
+		// Stamp the lock-free mirrors so Running/PID/Size are accurate
+		// without p.mu the instant the pane becomes observable.
+		p.stampStartedUnlocked()
 
 		// Create the virtual terminal. charm/x/vt emits responses
 		// (device attributes, cursor reports, etc.) via Read(); we
@@ -531,6 +641,14 @@ func (p *Pane) StartHeadless(command string, args []string, extraEnv []string) e
 	p.pty = ptmx
 	p.running = true
 	p.exitErr = nil
+	// Wire the input-writer goroutine (which assigns inputCh) BEFORE
+	// stampStartedUnlocked publishes runningAtomic. WriteInput reads
+	// inputCh lock-free after an acquire-load of runningAtomic, so
+	// publishing running last gives that read its happens-before edge.
+	p.startInputWriterUnlocked()
+	// Stamp the lock-free mirrors so Running/PID/Size are accurate
+	// without p.mu the instant the pane becomes observable.
+	p.stampStartedUnlocked()
 
 	p.vt = xvt.NewSafeEmulator(p.width, p.height)
 	p.vt.SetCallbacks(xvt.Callbacks{
@@ -577,15 +695,11 @@ func (p *Pane) StartHeadless(command string, args []string, extraEnv []string) e
 }
 
 // PID returns the OS pid of the child process, or 0 if the pane has
-// not started or the process has exited. Safe to call from any
-// goroutine.
+// not started. Lock-free (reads the atomic mirror) so it never blocks
+// on a stuck pane. Stamped at spawn and never cleared — a caller that
+// needs liveness should pair this with Running().
 func (p *Pane) PID() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.cmd == nil || p.cmd.Process == nil {
-		return 0
-	}
-	return p.cmd.Process.Pid
+	return int(p.pid.Load())
 }
 
 // Title returns the most recent title the child process set via OSC 0/2
@@ -741,6 +855,60 @@ func (p *Pane) startDrainUnlocked() {
 	}()
 }
 
+// inputChanCapacity bounds the per-pane input queue. A child that stops
+// draining stdin fills the kernel PTY buffer; once the writer goroutine
+// parks inside f.Write, this many queued chunks accumulate before
+// WriteInput starts reporting ErrInputBackpressure. 256 is generous for
+// interactive typing and bursty pastes while keeping the backlog
+// bounded.
+const inputChanCapacity = 256
+
+// startInputWriterUnlocked spawns the SINGLE per-pane goroutine that
+// performs every PTY input write. Must be called with p.mu held and
+// after p.pty is set (mirrors startDrainUnlocked / startReadLoop). It
+// captures the *os.File once (the same idiom the read loop and drain
+// use) so the write path never touches p.pty — and never p.mu — again.
+//
+// Decoupling the write from p.mu is the root-cause fix for the
+// paste-flood deadlock: WriteInput now does a non-blocking enqueue onto
+// inputCh and returns immediately, so p.mu can never span the
+// (potentially forever-blocking) PTY write. Only THIS goroutine blocks
+// on a non-draining child; teardown's f.Close() unblocks it with EBADF.
+//
+// inputCh / inputStop are assigned exactly here, under p.mu, before the
+// pane is observable, and never reassigned. Start/StartHeadless call this
+// BEFORE stampStartedUnlocked publishes runningAtomic, so WriteInput's
+// acquire-load of runningAtomic happens-after these assignments — its
+// lock-free reads of inputCh/inputStop are therefore race-free.
+func (p *Pane) startInputWriterUnlocked() {
+	p.inputCh = make(chan []byte, inputChanCapacity)
+	p.inputStop = make(chan struct{})
+	ch := p.inputCh
+	stop := p.inputStop
+	f := p.pty
+
+	p.inputWG.Add(1)
+	go func() {
+		defer p.inputWG.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			case data := <-ch:
+				if f == nil {
+					return
+				}
+				if _, err := f.Write(data); err != nil {
+					// Write error (EBADF after teardown closes the fd,
+					// EIO after the slave collapses, etc.): the pane is
+					// gone. Exit — no point draining further input.
+					return
+				}
+			}
+		}
+	}()
+}
+
 // Subscribe registers a new event subscriber and returns the receive
 // end of a buffered channel plus an unsubscribe func. Calling the
 // unsubscribe func removes the channel from the registry and closes
@@ -826,6 +994,19 @@ func (p *Pane) startReadLoop() {
 		for {
 			select {
 			case <-stop:
+				// Teardown closed the stop channel. Publish a final
+				// ExitEvent and close subscribers so observers
+				// (watchSessionExit, the tea bridge) always learn the
+				// loop ended — they can't tell "stopped" from "child
+				// exited", and either way the session is gone.
+				// publishExit is safe to race with the Read-error path
+				// below: it nils the subscriber slice, so a second call
+				// is a no-op. Without this, a teardown that closes the
+				// fd and the stop channel near-simultaneously can win
+				// the stop race here and leave subscribers blocked on a
+				// never-closed channel (the daemon-side exit watcher
+				// would then never run removeSession).
+				p.publishExit(io.EOF)
 				return
 			default:
 			}
@@ -905,75 +1086,192 @@ func (p *Pane) stopReadLoop() {
 // stopDrainUnlocked terminates the response-drain goroutine. Must be
 // called with p.mu held.
 //
-// To unblock the drain goroutine's vt.Read we CLOSE the emulator's pipe
-// writer with io.EOF. The drain's vt.Read then returns (0, io.EOF), it
-// writes nothing (n==0) and exits.
+// To unblock the drain goroutine's vt.Read we write a sentinel byte
+// into the emulator's response pipe (InputPipe is the writer end of
+// pr/pw; pr is what the drain reads). vt.Read returns with the
+// byte, the drain loop iterates, sees drainStop closed, and exits.
 //
-// Two traps this avoids, both load-bearing:
-//   - A sentinel-byte wakeup (writing into InputPipe) DEADLOCKS: charm/x/vt
-//     is backed by a SYNCHRONOUS io.Pipe, so that write blocks forever
-//     whenever the drain already observed drainStop and stopped reading
-//     (no reader). Since drainWG.Wait below is synchronous and runs while
-//     the caller holds p.mu, that block wedges the pane.
-//   - Emulator.Close() unblocks Read too, but writes an unsynchronized
-//     `closed` bool that the -race detector trips on against the drain's
-//     lock-free Read.
-//
-// CloseWithError(io.EOF) on the PipeWriter never blocks (io.Pipe close is
-// non-blocking + internally synchronized) and touches no unsynchronized
-// emulator state. Regression: TestPane_StopDrainDoesNotDeadlock.
+// This avoids calling Emulator.Close(), which mutates an internal
+// `closed` field without a lock — a benign race in practice but one
+// the -race detector trips on against the concurrent Read.
 func (p *Pane) stopDrainUnlocked() {
 	if p.drainStop == nil {
 		return
 	}
-	close(p.drainStop)
-	if p.vt != nil {
-		if pw, ok := p.vt.Emulator.InputPipe().(*io.PipeWriter); ok {
-			_ = pw.CloseWithError(io.EOF)
-		}
-	}
-	p.drainStop = nil
+	p.signalDrainStopUnlocked()
 	// Wait without holding p.mu — currently callers already hold
 	// p.mu, but the drain goroutine doesn't touch p.mu so the Wait
 	// is safe. (We did NOT take p.mu in the goroutine itself.)
 	p.drainWG.Wait()
 }
 
-func (p *Pane) Stop() error {
-	p.mu.Lock()
+// signalDrainStopUnlocked closes drainStop and wakes the drain
+// goroutine's blocked vt.Read by closing its pipe writer (io.EOF), but
+// does NOT Wait.
+// Must be called with p.mu held. The teardown sequence in Stop /
+// StopGraceful uses this to signal the drain to stop WITHOUT blocking
+// under p.mu; the bounded drainWG.Wait runs later, off p.mu and AFTER
+// the PTY fd is closed (close-before-wait — see Stop()).
+//
+// Idempotent: a nil drainStop (already signalled) is a no-op.
+func (p *Pane) signalDrainStopUnlocked() {
+	if p.drainStop == nil {
+		return
+	}
+	close(p.drainStop)
+	if p.vt != nil {
+		// Close the emulator's pipe writer with io.EOF to unblock the
+		// drain's vt.Read. A sentinel-byte wakeup DEADLOCKS: charm/x/vt is
+		// backed by a SYNCHRONOUS io.Pipe, so writing into it blocks forever
+		// whenever the drain already observed drainStop and stopped reading
+		// (no reader) — and since teardown's drainWG.Wait is bounded but the
+		// write isn't, that block would wedge the pane. CloseWithError never
+		// blocks, makes Read return (0, io.EOF) (no garbage PTY write), and
+		// touches no unsynchronized emulator state (unlike Emulator.Close,
+		// which races e.closed under -race). Ported from PR #97. Regression:
+		// TestPane_StopDrainDoesNotDeadlock.
+		if pw, ok := p.vt.Emulator.InputPipe().(*io.PipeWriter); ok {
+			_ = pw.CloseWithError(io.EOF)
+		}
+	}
+	p.drainStop = nil
+}
 
-	if p.cmd != nil && p.cmd.Process != nil {
-		p.cmd.Process.Kill()
+// waitOrTimeout waits for wg with an upper bound. Returns true if wg
+// completed within d, false on timeout. On timeout the goroutine is
+// NOT abandoned-with-leak intent: it will exit later once its blocking
+// op (fd close / process death) finally returns — we simply refuse to
+// let it hold teardown hostage. This is what makes Stop() return
+// unconditionally even in the pathological case where neither f.Close()
+// nor the group SIGKILL releases a goroutine promptly.
+func waitOrTimeout(wg *sync.WaitGroup, d time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
 	}
-	if p.pty != nil {
-		p.pty.Close()
+}
+
+// teardownWaitTimeout bounds each post-close goroutine Wait in the
+// teardown sequence. Generous enough that a healthy goroutine always
+// finishes well within it; short enough that a wedged one can't freeze
+// the daemon.
+const teardownWaitTimeout = 2 * time.Second
+
+// signalGroup sends sig to the child's entire process group so the
+// agent's whole process tree (including children holding the PTY slave
+// open) is reaped, not just the immediate child. Guards against blast
+// radius / PID reuse: it refuses a non-positive pgid, the daemon's own
+// process group, and the init group (1). creack/pty sets Setsid at
+// spawn so the child leads its own group (pgid == child pid) captured
+// in stampStartedUnlocked.
+func (p *Pane) signalGroup(sig syscall.Signal) {
+	pgid := int(p.pgid.Load())
+	if pgid > 0 && pgid != syscall.Getpgrp() && pgid != 1 {
+		_ = syscall.Kill(-pgid, sig)
+		return
 	}
-	p.stopDrainUnlocked()
+	// pgid is missing/unsafe (Getpgid failed at spawn, or the value would
+	// hit our own group or init). Fall back to signaling just the child
+	// pid — the guarantee the pre-rebase Stop had via proc.Kill() — so a
+	// child that ignores the PTY-close SIGHUP is still reaped. pid is the
+	// lock-free mirror, so this stays off p.mu.
+	if pid := int(p.pid.Load()); pid > 0 {
+		_ = syscall.Kill(pid, sig)
+		return
+	}
+	log.Printf("openkanban pane %s: no usable pgid/pid to signal (pgid=%d)", p.id, pgid)
+}
+
+// teardownUnlocked performs the load-bearing close-before-wait teardown
+// shared by Stop and StopGraceful. The ordering is exact and must not be
+// reordered (see Task 3 / docs):
+//
+//  1. signalGroup(SIGKILL) — reap the agent's whole process tree
+//     (children holding the slave). Skipped by callers that already
+//     SIGKILLed (StopGraceful does it post-grace).
+//  2. Under p.mu: capture f := p.pty, nil p.pty, clear the running
+//     mirror, signal (NOT wait) the drain stop, and signal the input
+//     writer to stop. Unlock.
+//  3. f.Close() OUTSIDE p.mu — the primary unblock: returns the
+//     in-flight writer Write (EBADF), the drain Write, and the read
+//     loop Read.
+//  4. Bounded waits OFF p.mu for drain, input writer, and read loop —
+//     each waitOrTimeout so teardown returns unconditionally.
+func (p *Pane) teardownUnlocked(alreadyKilled bool) {
+	p.teardownOnce.Do(func() {
+		p.doTeardown(alreadyKilled)
+	})
+}
+
+func (p *Pane) doTeardown(alreadyKilled bool) {
+	if !alreadyKilled {
+		p.signalGroup(syscall.SIGKILL)
+	}
+	// Zero pgid after the group signal fires so any late caller to
+	// signalGroup (e.g. a concurrent second Stop()) hits the ≤0 guard and
+	// is a safe no-op. This closes the pgid-reuse window: once the group
+	// is killed, the pgid may be recycled by the OS.
+	p.pgid.Store(0)
+
+	p.mu.Lock()
+	f := p.pty
+	p.pty = nil
 	p.running = false
+	p.runningAtomic.Store(false)
+	p.signalDrainStopUnlocked()
+	if p.inputStop != nil {
+		p.inputStopOnce.Do(func() { close(p.inputStop) })
+	}
 	p.mu.Unlock()
 
-	// Tear down the read loop without holding p.mu: stopReadLoop
-	// waits for the goroutine to exit, and that goroutine calls
-	// handleOutput (which takes p.mu) — Wait()ing under p.mu would
-	// self-deadlock.
+	// Close the master fd OUTSIDE p.mu. This is the primary unblock for
+	// every PTY goroutine (each captured the same *os.File handle): the
+	// parked writer Write returns EBADF, the drain Write and read-loop
+	// Read return too. Closing needs no lock.
+	if f != nil {
+		_ = f.Close()
+	}
+
+	// Bounded waits, all OFF p.mu (the read goroutine calls handleOutput
+	// which takes p.mu, so Wait()ing under p.mu would self-deadlock).
+	// Each is bounded so Stop() returns even if a goroutine somehow
+	// stays blocked — it will exit later when its fd/process finally
+	// tears down, never blocking teardown.
+	if !waitOrTimeout(&p.drainWG, teardownWaitTimeout) {
+		log.Printf("openkanban pane %s: drain goroutine did not exit within %s during teardown", p.id, teardownWaitTimeout)
+	}
+	if !waitOrTimeout(&p.inputWG, teardownWaitTimeout) {
+		log.Printf("openkanban pane %s: input-writer goroutine did not exit within %s during teardown", p.id, teardownWaitTimeout)
+	}
 	p.stopReadLoop()
+}
+
+func (p *Pane) Stop() error {
+	p.teardownUnlocked(false)
 	return nil
 }
 
-// StopGraceful sends SIGTERM, waits for timeout, then SIGKILL if needed.
+// StopGraceful sends SIGTERM to the child's process group, waits up to
+// timeout for it to exit, then SIGKILLs the group and tears down. The
+// teardown (close-before-wait) is shared with Stop via teardownUnlocked.
 func (p *Pane) StopGraceful(timeout time.Duration) error {
 	p.mu.Lock()
 	if !p.running || p.cmd == nil || p.cmd.Process == nil {
 		p.mu.Unlock()
 		return nil
 	}
-
 	proc := p.cmd.Process
 	p.mu.Unlock()
 
-	if err := proc.Signal(syscall.SIGTERM); err != nil {
-		return p.Stop()
-	}
+	// SIGTERM the whole group so children get a chance to clean up.
+	p.signalGroup(syscall.SIGTERM)
 
 	done := make(chan error, 1)
 	go func() {
@@ -984,47 +1282,91 @@ func (p *Pane) StopGraceful(timeout time.Duration) error {
 	select {
 	case <-done:
 	case <-time.After(timeout):
-		proc.Kill()
 	}
 
-	p.mu.Lock()
-	if p.pty != nil {
-		p.pty.Close()
-	}
-	p.stopDrainUnlocked()
-	p.running = false
-	p.mu.Unlock()
-
-	// See Stop(): tear down the read loop outside p.mu.
-	p.stopReadLoop()
+	// SIGKILL the group regardless — if the child exited within the
+	// grace window the group is already gone and this is a harmless
+	// no-op; otherwise it reaps the tree. teardownUnlocked then does the
+	// close-before-wait fd teardown.
+	p.signalGroup(syscall.SIGKILL)
+	p.teardownUnlocked(true)
 	return nil
 }
 
 var ErrPaneNotRunning = fmt.Errorf("pane is not running")
 
+// ErrInputBackpressure is returned by WriteInput when the bounded input
+// queue is full because the child has stopped draining stdin. The chunk
+// is dropped whole (never partially written) and the caller decides how
+// to react — the daemon's attach loop treats it as non-fatal (drop the
+// chunk, stay attached) and the watchdog surfaces persistent
+// backpressure as a "stuck" session.
+var ErrInputBackpressure = fmt.Errorf("pane input buffer full (child not draining stdin)")
+
+// WriteInput queues data for the child's stdin via the single per-pane
+// writer goroutine. It NEVER holds p.mu across the PTY write — the
+// non-blocking enqueue below is what guarantees p.mu can't span a
+// blocking syscall, the root-cause fix for the paste-flood deadlock.
+//
+// A chunk is all-or-nothing: on backpressure the WHOLE chunk is dropped
+// and ErrInputBackpressure is returned (never a partial write that would
+// corrupt the input stream).
 func (p *Pane) WriteInput(data []byte) (int, error) {
-	// Snapshot the pty handle under the lock, then release it BEFORE the
-	// write. p.pty.Write blocks when the child's PTY input buffer is full
-	// (e.g. claude busy ingesting a large paste); holding p.mu across that
-	// blocking write pins the lock and wedges handleOutput (the output
-	// drain), hanging the whole session and cascading into the daemon via
-	// handleList -> Session.Info -> Pane.Size. Mirrors Stop/StopGraceful,
-	// which also drop p.mu before blocking calls. Regression:
-	// TestPane_WriteInputDoesNotHoldLockAcrossBlockingWrite.
-	p.mu.Lock()
-	if !p.running || p.pty == nil {
-		p.mu.Unlock()
+	if !p.runningAtomic.Load() {
 		return 0, ErrPaneNotRunning
 	}
-	ptyFile := p.pty
-	p.mu.Unlock()
+	ch := p.inputCh
+	if ch == nil {
+		return 0, ErrPaneNotRunning
+	}
+	// Copy the payload — the caller (attach binary loop) reuses its
+	// frame buffer, and the writer goroutine reads the slice later.
+	buf := append([]byte(nil), data...)
+	select {
+	case ch <- buf:
+		// A lone success does NOT clear the wedge episode — see the
+		// wedgedSinceNs/lastWedgeNs field comment. The episode ages out
+		// of WedgedSince() naturally once backpressure stops recurring.
+		return len(data), nil
+	default:
+		// Bounded backpressure: the child isn't draining stdin and the
+		// queue is full. Open a new episode only if the previous one has
+		// gone quiet (no backpressure for wedgeRecency); otherwise extend
+		// the current one by refreshing lastWedgeNs while keeping the
+		// original start.
+		now := time.Now().UnixNano()
+		last := p.lastWedgeNs.Load()
+		if last == 0 || now-last > int64(wedgeRecency) {
+			p.wedgedSinceNs.Store(now)
+		}
+		p.lastWedgeNs.Store(now)
+		return 0, ErrInputBackpressure
+	}
+}
 
-	// Serialize concurrent writers on a dedicated lock so a blocked write
-	// can't pin p.mu (which handleOutput needs). Only WriteInput takes
-	// inputMu, so it can never deadlock against the output drain.
-	p.inputMu.Lock()
-	defer p.inputMu.Unlock()
-	return ptyFile.Write(data)
+// wedgeRecency is how long after the last backpressure a pane is still
+// considered "in a wedge episode". A child not draining stdin lets the
+// occasional chunk through (PTY slack), so backpressure recurs in bursts
+// rather than continuously; this window bridges those gaps so the
+// episode start (wedgedSinceNs) is stable, while a genuinely-recovered
+// pane (no backpressure for longer than this) reports un-wedged.
+const wedgeRecency = 2 * time.Second
+
+// WedgedSince returns the start of the current input-backpressure episode
+// (the time WriteInput first backpressured in this episode), or the zero
+// time if the pane is not currently wedged — i.e. no backpressure has
+// occurred within wedgeRecency. Lock-free (atomics only) so the daemon
+// watchdog can poll it without ever blocking on the wedged pane.
+func (p *Pane) WedgedSince() time.Time {
+	last := p.lastWedgeNs.Load()
+	if last == 0 || time.Since(time.Unix(0, last)) > wedgeRecency {
+		return time.Time{} // never wedged, or recovered
+	}
+	start := p.wedgedSinceNs.Load()
+	if start == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, start)
 }
 
 // readOutput returns a Cmd that reads from the PTY
@@ -1113,18 +1455,18 @@ func (p *Pane) Update(msg tea.Msg) tea.Cmd {
 		if msg.PaneID != p.id {
 			return nil
 		}
+		// Record the exit error first (not covered by teardownOnce).
 		p.mu.Lock()
-		p.running = false
 		p.exitErr = msg.Err
-		if p.pty != nil {
-			p.pty.Close()
-		}
-		p.stopDrainUnlocked()
 		p.mu.Unlock()
-		// The read loop has already exited (it's what produced
-		// this ExitMsg). stopReadLoop is a cheap no-op in that
-		// case but ensures readLoopStop is closed exactly once.
-		p.stopReadLoop()
+
+		// Route through teardownOnce so this path and Stop()/StopGraceful()
+		// are mutually exclusive — avoids the legacy anti-pattern of closing
+		// p.pty under p.mu and leaking the input-writer goroutine. The read
+		// loop has already exited (it produced this ExitMsg), so
+		// teardownUnlocked's stopReadLoop call is a cheap idempotent no-op.
+		// alreadyKilled=true because the process already exited naturally.
+		p.teardownUnlocked(true)
 		return nil
 	}
 
