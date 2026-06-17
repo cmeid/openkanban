@@ -78,6 +78,35 @@ Template in config: `"init_prompt": "Work on: {{.Title}}"`
 
 Keywords: "waiting", "thinking", "error", etc.
 
+### Refining a file-based "waiting" (DetectStatusWithActivity)
+
+The hook status file pins "waiting" across the whole Notification→PostToolUse
+gap (permission granted, tool running, no hook fires). `DetectStatusWithActivity`
+refines that using **what's on the live PTY grid**, NOT byte-recency — a prompt
+Claude is blocked on (permission box, AskUserQuestion, idle notice) re-renders
+every couple of seconds and stamps fresh activity, so "bytes flowed recently"
+cannot tell an active turn apart from a re-rendering prompt. Precedence when the
+file says "waiting":
+
+1. `permissionPromptVisible` — a recognized approval prompt on screen
+   (`"do you want to"` / `"esc to cancel"`) → **waiting** (wins outright).
+2. `activeTurnVisible` — positive evidence of an active turn
+   (`"esc to interrupt"` / braille spinner) → **working**.
+3. otherwise → **waiting** (durable default).
+
+There is no byte-recency fallback: the old `lastActivity < WaitingActivityTTL →
+working` catch-all was removed (it mislabeled re-rendering prompts and
+empty-grid unattached sessions as "working"). Detection now **fails safe to
+"waiting"** — an unknown prompt type or a session with no grid is never shown as
+"working". The load-bearing assumption is that Claude renders `"esc to interrupt"`
+for the full duration of a tool run; if that footer string drifts, a busy session
+degrades to "waiting" (annoying, not dangerous), never the reverse. `lastActivity`
+is retained in the signature but no longer triggers promotion.
+
+For a session **no TUI is attached to**, the client has no grid, so the daemon
+supplies the verdict from its own live grid — see `internal/daemon`
+`resolveSessionStatus`.
+
 ## OpenCode Server
 
 Lifecycle management for opencode:

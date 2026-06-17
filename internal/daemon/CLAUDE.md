@@ -54,6 +54,32 @@ path. Don't reintroduce a force-kill there. This is orthogonal to the TUI-side
 exit-guard, which is about making the guard *fire reliably*; this is about what
 the daemon does *when* it doesn't.
 
+## Authoritative session status (resolveSessionStatus)
+
+The daemon owns the live PTY grid for **every** session it runs — attached or
+not — so it's the one place that can classify working-vs-waiting correctly for an
+unattached / bg-spawned session (the client's local grid is empty, and recent PTY
+activity is ambiguous: a re-rendering waiting prompt looks like activity).
+`broadcastActivity` stamps `SessionEvent.Status` with `resolveSessionStatus(sess)`
+on every activity heartbeat; the client applies it via `Model.applyDaemonStatus`
+(guards: empty/`none` no-op, `AgentCompleted` terminal).
+
+`resolveSessionStatus` → `resolveStatusVerdict` (pure, unit-tested in
+`resolve_status_test.go`) delegates to `agent.StatusDetector.DetectStatusWithActivity`,
+feeding it the live grid + `LastActivity` + the hook status file — same
+prompt-gate + work-evidence logic the UI uses. Returns `""` (no verdict — leave
+the client's file-poll in charge) for: a missing agent type (older client didn't
+send `SpawnReq.AgentType`), **opencode** (UI resolves its status via HTTP), and an
+`AgentNone` result. `AgentType` is recorded on the `Session` at spawn.
+
+The grid read is **non-blocking** (`Pane.GetContentTry`, TryLock): if a `Stop()`
+is mid-teardown holding `pane.mu` (the pre-existing emulator-drain hang, ticket
+`6fc0fdbd`), the broadcaster skips that tick rather than block — otherwise one
+stuck teardown would freeze the status heartbeat for **every** session. `running`
+is passed as the constant `true` (the broadcaster only resolves sessions whose
+`LastActivity` advanced this tick, so they're live), avoiding a second blocking
+`Running()` lock.
+
 ## Session field immutability
 
 `Session.id` and `Session.ticketID` are de-facto immutable after `NewSession`. The pane-exit watcher (`watchSessionExit`) reads `sess.TicketID()` from a goroutine without taking `sessionsMu` — only safe because of this invariant. Don't mutate `s.ticketID` post-construction; if you need to "re-ticket" a session, kill it and spawn a new one.
