@@ -81,10 +81,7 @@ func TestWatchSessionExit_PanicSafety(t *testing.T) {
 	deadline := time.Now().Add(3 * time.Second)
 	removed := false
 	for time.Now().Before(deadline) {
-		srv.sessionsMu.RLock()
-		_, stillThere := srv.sessions[spawn.SessionID]
-		srv.sessionsMu.RUnlock()
-		if !stillThere {
+		if _, stillThere := srv.reg.get(spawn.SessionID); !stillThere {
 			removed = true
 			break
 		}

@@ -123,9 +123,22 @@ func Run(cfg *config.Config, filterPath, version string, autostartDaemon bool) e
 	// only startup daemon RPC, now gated and bounded.
 	ownedByDaemon, perr := ui.PreflightListSessions(daemonClient)
 	if perr != nil {
-		fmt.Fprintln(os.Stderr, daemon.UnresponsiveHint())
-		_ = daemonClient.Close()
-		return errors.New("openkanbankd unresponsive")
+		if autostartDaemon && errors.Is(perr, daemon.ErrDaemonUnresponsive) {
+			fmt.Fprintln(os.Stderr, "openkanban: daemon is wedged — force-restarting it...")
+			_ = daemonClient.Close()
+			rctx, rcancel := context.WithTimeout(context.Background(), 10*time.Second)
+			fresh, rerr := daemonclient.ForceRestartDaemon(rctx)
+			rcancel()
+			if rerr == nil {
+				daemonClient = fresh
+				ownedByDaemon, perr = ui.PreflightListSessions(daemonClient)
+			}
+		}
+		if perr != nil {
+			fmt.Fprintln(os.Stderr, daemon.UnresponsiveHint())
+			_ = daemonClient.Close()
+			return errors.New("openkanbankd unresponsive")
+		}
 	}
 
 	updateChecker := update.NewChecker(version)

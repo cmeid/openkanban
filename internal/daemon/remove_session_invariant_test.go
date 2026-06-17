@@ -61,10 +61,8 @@ func TestRemoveSession_LogsInvariantViolationOnDuplicate(t *testing.T) {
 	sess1 := mkSess("dup-1")
 	sess2 := mkSess("dup-2")
 
-	srv.sessionsMu.Lock()
-	srv.sessions[sess1.ID()] = sess1
-	srv.sessions[sess2.ID()] = sess2
-	srv.sessionsMu.Unlock()
+	srv.reg.store(sess1.ID(), sess1)
+	srv.reg.store(sess2.ID(), sess2)
 
 	// Wire the watcher for sess1 so its natural-exit path runs
 	// removeSession (with the new defensive sweep). sess2 is left
@@ -83,19 +81,15 @@ func TestRemoveSession_LogsInvariantViolationOnDuplicate(t *testing.T) {
 	// that proves removeSession ran. sess2 must still be there.
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		srv.sessionsMu.RLock()
-		_, oneLives := srv.sessions[sess1.ID()]
-		_, twoLives := srv.sessions[sess2.ID()]
-		srv.sessionsMu.RUnlock()
+		_, oneLives := srv.reg.get(sess1.ID())
+		_, twoLives := srv.reg.get(sess2.ID())
 		if !oneLives && twoLives {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	srv.sessionsMu.RLock()
-	_, oneLives := srv.sessions[sess1.ID()]
-	_, twoLives := srv.sessions[sess2.ID()]
-	srv.sessionsMu.RUnlock()
+	_, oneLives := srv.reg.get(sess1.ID())
+	_, twoLives := srv.reg.get(sess2.ID())
 	if oneLives {
 		t.Fatalf("sess1 still in registry; removeSession did not run")
 	}
@@ -127,9 +121,7 @@ func TestRemoveSession_LogsInvariantViolationOnDuplicate(t *testing.T) {
 	if err := sess2.Kill(0); err != nil {
 		t.Fatalf("sess2.Kill: %v", err)
 	}
-	srv.sessionsMu.Lock()
-	delete(srv.sessions, sess2.ID())
-	srv.sessionsMu.Unlock()
+	srv.reg.delete(sess2.ID())
 
 	a.Close()
 	waitServerDone(t, errCh, 5*time.Second)
@@ -163,9 +155,7 @@ func TestRemoveSession_CleanExitNoWarn(t *testing.T) {
 		t.Fatalf("NewSession: %v", err)
 	}
 
-	srv.sessionsMu.Lock()
-	srv.sessions[sess.ID()] = sess
-	srv.sessionsMu.Unlock()
+	srv.reg.store(sess.ID(), sess)
 	srv.watchSessionExit(sess)
 
 	if err := sess.Kill(0); err != nil {
@@ -175,10 +165,7 @@ func TestRemoveSession_CleanExitNoWarn(t *testing.T) {
 	// Wait for removal.
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		srv.sessionsMu.RLock()
-		_, present := srv.sessions[sess.ID()]
-		srv.sessionsMu.RUnlock()
-		if !present {
+		if _, present := srv.reg.get(sess.ID()); !present {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -200,9 +187,7 @@ func TestRemoveSession_CleanExitNoWarn(t *testing.T) {
 	// the registry is empty before disconnecting so the last-client path
 	// takes the immediate (live==0) shutdown branch. Idempotent with any
 	// lagging watcher removal (the map delete is a no-op if already gone).
-	srv.sessionsMu.Lock()
-	delete(srv.sessions, sess.ID())
-	srv.sessionsMu.Unlock()
+	srv.reg.delete(sess.ID())
 
 	a.Close()
 	waitServerDone(t, errCh, 5*time.Second)

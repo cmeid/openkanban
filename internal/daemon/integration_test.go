@@ -442,9 +442,7 @@ func TestServerLifecycle_LastClientWithLiveSessions(t *testing.T) {
 
 	// Reach into the server (same package) to grab a handle on the
 	// session so we can verify it SURVIVES the last-client disconnect.
-	srv.sessionsMu.RLock()
-	sess := srv.sessions[spawn.SessionID]
-	srv.sessionsMu.RUnlock()
+	sess, _ := srv.reg.get(spawn.SessionID)
 	if sess == nil {
 		t.Fatalf("session %s not registered on server", spawn.SessionID)
 	}

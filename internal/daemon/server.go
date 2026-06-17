@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -34,6 +35,74 @@ var BinaryVersion = "dev"
 // the daemon's defensive kill path tears down sessions that survived
 // past the last client disconnect.
 const shutdownGraceSeconds = 3
+
+// handlerDeadline is the maximum time a short RPC handler may run before
+// the dispatcher abandons it and returns a daemon_unresponsive error to
+// the client. Only applies to non-blocking handlers — handleAttach and
+// handleShutdown are explicitly excluded.
+const handlerDeadline = 10 * time.Second
+
+// handlerDeadlineOverride lets tests shorten the deadline. Zero means use
+// handlerDeadline.
+var handlerDeadlineOverride time.Duration
+
+// reapTimeout is how long a Kill may run before we count it a reap failure
+// (a child stuck in uninterruptible kernel exit — e.g. a PTY whose master
+// the daemon already closed but the process won't die). The kill goroutine
+// keeps running; the counter surfaces the leak via health.
+const reapTimeout = 30 * time.Second
+
+// runHandlerWithDeadline runs fn (a short RPC handler) and returns true if
+// it finished within the deadline. On timeout it returns false and leaves
+// the handler goroutine running (it will finish or leak — the wedge
+// watchdog and the conn-sem bound the worst case). The caller writes an
+// "unresponsive" error to the client so it doesn't hang.
+// Not for use with handleAttach (blocks by design) or handleShutdown
+// (legitimately slow across many sessions).
+func (s *Server) runHandlerWithDeadline(name string, fn func()) bool {
+	d := handlerDeadline
+	if handlerDeadlineOverride > 0 {
+		d = handlerDeadlineOverride
+	}
+	done := make(chan struct{})
+	go func() { defer close(done); fn() }()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		log.Printf("openkanbankd: handler %q exceeded %s — abandoning (client will get unresponsive error)", name, d)
+		return false
+	}
+}
+
+// trackedKill starts a goroutine to kill the session and tracks it for
+// timeout-based reap failure detection. The kill itself is non-blocking from
+// the caller's perspective. If the kill exceeds reapTimeout, it moves from
+// inflightKills to reapFailures to surface kernel-stuck children.
+func (s *Server) trackedKill(sess *Session, grace int) {
+	s.inflightKills.Add(1)
+	done := make(chan error, 1)
+	go func() { done <- sess.Kill(grace) }()
+	go func() {
+		defer s.inflightKills.Add(-1)
+		select {
+		case err := <-done:
+			if err != nil {
+				log.Printf("openkanbankd: kill session %s: %v", sess.ID(), err)
+			}
+		case <-time.After(reapTimeout):
+			s.reapFailures.Add(1)
+			log.Printf("WARN: openkanbankd: session %s did not reap within %s (possible kernel-stuck child); will keep trying", sess.ID(), reapTimeout)
+			<-done // still account for eventual completion
+			s.reapFailures.Add(-1)
+		}
+	}()
+}
+
+// killStats returns the current counts of in-flight kills and reap failures.
+func (s *Server) killStats() (int64, int64) {
+	return s.inflightKills.Load(), s.reapFailures.Load()
+}
 
 // Server is the openkanbankd RPC server. It listens on a Unix socket,
 // accepts client connections, multiplexes JSON-mode RPCs, and owns the
@@ -56,8 +125,7 @@ type Server struct {
 	ln         net.Listener
 	persistent bool
 
-	sessionsMu sync.RWMutex
-	sessions   map[string]*Session
+	reg *sessionRegistry
 
 	clientsMu    sync.Mutex
 	clients      map[uint16]*clientConn
@@ -67,6 +135,8 @@ type Server struct {
 	shutdownOnce sync.Once
 
 	wg sync.WaitGroup
+
+	sem *connSem
 
 	// events fans daemon-internal SessionEvent updates out to the
 	// goroutine that pushes them to subscribed clients (PR9's
@@ -122,6 +192,24 @@ type Server struct {
 	// Only read once at goroutine start; no mutex needed because
 	// tests set it before triggering the event.
 	emitSessionExitFn func(SessionEvent)
+
+	// dispatchSeq increments at the end of every dispatch() call; inflight
+	// tracks handlers currently executing. The watchdog samples both: if
+	// inflight>0 but dispatchSeq is frozen past the wedge threshold, the
+	// daemon is stuck and must self-restart. Lock-free.
+	dispatchSeq atomic.Uint64
+	inflight    atomic.Int64
+
+	// inflightKills tracks the number of in-flight session kill operations.
+	// When a kill exceeds reapTimeout, it's moved to reapFailures to surface
+	// kernel-stuck children as a health concern.
+	inflightKills atomic.Int64
+
+	// reapFailures counts sessions that failed to reap within reapTimeout.
+	// These are kernel-stuck children (e.g. PTY master closed but process
+	// won't die); the kill goroutine keeps trying, and this counter makes
+	// the leak visible for health monitoring.
+	reapFailures atomic.Int64
 }
 
 // clientConn tracks one open connection's per-client state.
@@ -215,11 +303,12 @@ func NewServerWithOptions(sock, pidpath string, opts Options) (*Server, error) {
 		pidlock:        lock,
 		ln:             ln,
 		persistent:     opts.Persistent,
-		sessions:       make(map[string]*Session),
+		reg:            newSessionRegistry(),
 		clients:        make(map[uint16]*clientConn),
 		shutdown:       make(chan struct{}),
 		events:         make(chan SessionEvent, 64),
 		statusDetector: agent.NewStatusDetector(),
+		sem:            newConnSem(maxConcurrentConns),
 	}, nil
 }
 
@@ -343,6 +432,11 @@ func (s *Server) Serve(ctx context.Context) error {
 	// a fresh daemon from the new binary. Exits with the daemon.
 	go s.watchBinaryStaleness()
 
+	// Force-restart the daemon if dispatch is wedged (work queued but
+	// nothing completing) past the threshold so launchd/systemd can
+	// respawn it, picking up a fresh binary if one is present.
+	go s.runWedgeWatchdog()
+
 	// Diagnostic: dump every goroutine's stack on SIGUSR1 so we can
 	// inspect the daemon's runtime state without restarting it. The
 	// handler never exits the process — only the existing shutdown
@@ -393,9 +487,17 @@ func (s *Server) Serve(ctx context.Context) error {
 		}
 
 		c := s.registerClient(conn)
+		if !s.sem.tryAcquire() {
+			log.Printf("openkanbankd: connection cap (%d) reached — rejecting client %d", maxConcurrentConns, c.id)
+			s.writeError(c, "server_busy", "daemon at connection capacity")
+			conn.Close()
+			s.unregisterClient(c)
+			continue
+		}
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
+			defer s.sem.release()
 			// Intentionally NO panic recovery here. A panic in
 			// handleConn signals protocol / wire-state corruption,
 			// not a transient telemetry hiccup like the background
@@ -462,9 +564,7 @@ func (s *Server) watchBinaryStaleness() {
 				continue
 			}
 
-			s.sessionsMu.RLock()
-			liveSessions := len(s.sessions)
-			s.sessionsMu.RUnlock()
+			liveSessions := s.reg.len()
 
 			if liveSessions == 0 {
 				log.Printf("openkanbankd: binary on disk is newer than running process and no sessions are attached; shutting down so the next launch picks up the update")
@@ -472,7 +572,11 @@ func (s *Server) watchBinaryStaleness() {
 				return
 			}
 
-			log.Printf("WARN: openkanbankd binary on disk is newer than running process (%d live session(s) still attached); will exit when the last client disconnects so the next launch picks up the update", liveSessions)
+			if s.persistent {
+				log.Printf("WARN: openkanbankd binary on disk is newer than running process (%d live session(s) still attached); persistent mode will NOT auto-restart — run `openkanban daemon restart` or rely on the wedge watchdog", liveSessions)
+			} else {
+				log.Printf("WARN: openkanbankd binary on disk is newer than running process (%d live session(s) still attached); will exit when the last client disconnects so the next launch picks up the update", liveSessions)
+			}
 		}
 	}
 }
@@ -516,10 +620,7 @@ func (s *Server) awaitSessionDrain() {
 		case <-s.shutdown:
 			return
 		case <-ticker.C:
-			s.sessionsMu.RLock()
-			live := len(s.sessions)
-			s.sessionsMu.RUnlock()
-			if live > 0 {
+			if live := s.reg.len(); live > 0 {
 				continue
 			}
 
@@ -651,16 +752,11 @@ func (s *Server) broadcastActivity() {
 		case <-ticker.C:
 		}
 
-		// Snapshot the session set under lock, then operate on the
-		// copy. Sessions can be added/removed concurrently and we don't
-		// want to hold the lock while emitting (which takes
+		// Snapshot the session set (lock-free), then operate on the
+		// immutable copy. Sessions can be added/removed concurrently and
+		// we don't want to block while emitting (which takes
 		// s.events / s.clientsMu under broadcaster goroutines).
-		s.sessionsMu.RLock()
-		alive := make(map[string]*Session, len(s.sessions))
-		for id, sess := range s.sessions {
-			alive[id] = sess
-		}
-		s.sessionsMu.RUnlock()
+		alive := s.reg.snapshot()
 
 		// Drop memo entries for sessions that vanished.
 		for id := range lastSeen {
@@ -779,13 +875,7 @@ func (s *Server) initiateShutdown(reason string) {
 // removes the socket file, and is safe to call multiple times. Called
 // once from Serve as the final step before returning.
 func (s *Server) cleanup() {
-	s.sessionsMu.Lock()
-	live := make([]*Session, 0, len(s.sessions))
-	for _, sess := range s.sessions {
-		live = append(live, sess)
-	}
-	s.sessions = map[string]*Session{}
-	s.sessionsMu.Unlock()
+	live := s.reg.drain()
 
 	for _, sess := range live {
 		log.Printf("openkanbankd: shutdown-cleanup killing session %s (ticket=%s)", sess.ID(), sess.TicketID())
@@ -886,6 +976,11 @@ func (s *Server) handleConn(c *clientConn) {
 // the corresponding handler. Unknown message types produce an
 // ErrorResp but do not close the connection.
 func (s *Server) dispatch(c *clientConn, typeName string, raw json.RawMessage) {
+	s.inflight.Add(1)
+	defer func() {
+		s.inflight.Add(-1)
+		s.dispatchSeq.Add(1)
+	}()
 	switch typeName {
 	case MsgHelloReq:
 		var req HelloReq
@@ -893,7 +988,12 @@ func (s *Server) dispatch(c *clientConn, typeName string, raw json.RawMessage) {
 			s.writeError(c, "bad_request", err.Error())
 			return
 		}
-		s.writeResp(c, MsgHelloResp, s.handleHello(c, req))
+		var resp HelloResp
+		if s.runHandlerWithDeadline("hello", func() { resp = s.handleHello(c, req) }) {
+			s.writeResp(c, MsgHelloResp, resp)
+		} else {
+			s.writeError(c, "daemon_unresponsive", "hello handler timed out")
+		}
 
 	case MsgSpawnReq:
 		var req SpawnReq
@@ -901,17 +1001,27 @@ func (s *Server) dispatch(c *clientConn, typeName string, raw json.RawMessage) {
 			s.writeError(c, "bad_request", err.Error())
 			return
 		}
-		resp, err := s.handleSpawn(c, req)
-		if err != nil {
-			s.writeError(c, "spawn_failed", err.Error())
-			return
+		var resp SpawnResp
+		var spawnErr error
+		if s.runHandlerWithDeadline("spawn", func() { resp, spawnErr = s.handleSpawn(c, req) }) {
+			if spawnErr != nil {
+				s.writeError(c, "spawn_failed", spawnErr.Error())
+			} else {
+				s.writeResp(c, MsgSpawnResp, resp)
+			}
+		} else {
+			s.writeError(c, "daemon_unresponsive", "spawn handler timed out")
 		}
-		s.writeResp(c, MsgSpawnResp, resp)
 
 	case MsgListReq:
 		var req ListReq
 		_ = json.Unmarshal(raw, &req)
-		s.writeResp(c, MsgListResp, s.handleList(c, req))
+		var resp ListResp
+		if s.runHandlerWithDeadline("list", func() { resp = s.handleList(c, req) }) {
+			s.writeResp(c, MsgListResp, resp)
+		} else {
+			s.writeError(c, "daemon_unresponsive", "list handler timed out")
+		}
 
 	case MsgKillReq:
 		var req KillReq
@@ -919,12 +1029,17 @@ func (s *Server) dispatch(c *clientConn, typeName string, raw json.RawMessage) {
 			s.writeError(c, "bad_request", err.Error())
 			return
 		}
-		resp, err := s.handleKill(c, req)
-		if err != nil {
-			s.writeError(c, "kill_failed", err.Error())
-			return
+		var resp KillResp
+		var killErr error
+		if s.runHandlerWithDeadline("kill", func() { resp, killErr = s.handleKill(c, req) }) {
+			if killErr != nil {
+				s.writeError(c, "kill_failed", killErr.Error())
+			} else {
+				s.writeResp(c, MsgKillResp, resp)
+			}
+		} else {
+			s.writeError(c, "daemon_unresponsive", "kill handler timed out")
 		}
-		s.writeResp(c, MsgKillResp, resp)
 
 	case MsgTicketDoneReq:
 		var req TicketDoneReq
@@ -932,12 +1047,17 @@ func (s *Server) dispatch(c *clientConn, typeName string, raw json.RawMessage) {
 			s.writeError(c, "bad_request", err.Error())
 			return
 		}
-		resp, err := s.handleTicketDone(c, req)
-		if err != nil {
-			s.writeError(c, "ticket_done_failed", err.Error())
-			return
+		var resp TicketDoneResp
+		var tdErr error
+		if s.runHandlerWithDeadline("ticket_done", func() { resp, tdErr = s.handleTicketDone(c, req) }) {
+			if tdErr != nil {
+				s.writeError(c, "ticket_done_failed", tdErr.Error())
+			} else {
+				s.writeResp(c, MsgTicketDoneResp, resp)
+			}
+		} else {
+			s.writeError(c, "daemon_unresponsive", "ticket_done handler timed out")
 		}
-		s.writeResp(c, MsgTicketDoneResp, resp)
 
 	case MsgOwnsReq:
 		var req OwnsReq
@@ -945,24 +1065,47 @@ func (s *Server) dispatch(c *clientConn, typeName string, raw json.RawMessage) {
 			s.writeError(c, "bad_request", err.Error())
 			return
 		}
-		s.writeResp(c, MsgOwnsResp, s.handleOwns(c, req))
+		var resp OwnsResp
+		if s.runHandlerWithDeadline("owns", func() { resp = s.handleOwns(c, req) }) {
+			s.writeResp(c, MsgOwnsResp, resp)
+		} else {
+			s.writeError(c, "daemon_unresponsive", "owns handler timed out")
+		}
 
 	case MsgSubscribeReq:
 		var req SubscribeReq
 		_ = json.Unmarshal(raw, &req)
-		s.writeResp(c, MsgSubscribeResp, s.handleSubscribe(c, req))
+		var resp SubscribeResp
+		if s.runHandlerWithDeadline("subscribe", func() { resp = s.handleSubscribe(c, req) }) {
+			s.writeResp(c, MsgSubscribeResp, resp)
+		} else {
+			s.writeError(c, "daemon_unresponsive", "subscribe handler timed out")
+		}
 
 	case MsgPrepareExitReq:
 		var req PrepareExitReq
 		_ = json.Unmarshal(raw, &req)
-		s.writeResp(c, MsgPrepareExitResp, s.handlePrepareExit(c, req))
+		var resp PrepareExitResp
+		if s.runHandlerWithDeadline("prepare_exit", func() { resp = s.handlePrepareExit(c, req) }) {
+			s.writeResp(c, MsgPrepareExitResp, resp)
+		} else {
+			s.writeError(c, "daemon_unresponsive", "prepare_exit handler timed out")
+		}
 
 	case MsgCancelExitReq:
 		var req CancelExitReq
 		_ = json.Unmarshal(raw, &req)
-		s.writeResp(c, MsgCancelExitResp, s.handleCancelExit(c, req))
+		var resp CancelExitResp
+		if s.runHandlerWithDeadline("cancel_exit", func() { resp = s.handleCancelExit(c, req) }) {
+			s.writeResp(c, MsgCancelExitResp, resp)
+		} else {
+			s.writeError(c, "daemon_unresponsive", "cancel_exit handler timed out")
+		}
 
 	case MsgShutdownReq:
+		// NOT wrapped — legitimately slow: kills every live session (up to
+		// grace seconds each) before replying; healthy multi-session shutdown
+		// can exceed handlerDeadline.
 		var req ShutdownReq
 		_ = json.Unmarshal(raw, &req)
 		s.writeResp(c, MsgShutdownResp, s.handleShutdown(c, req))
@@ -973,8 +1116,8 @@ func (s *Server) dispatch(c *clientConn, typeName string, raw json.RawMessage) {
 			s.writeError(c, "bad_request", err.Error())
 			return
 		}
-		// handleAttach BLOCKS for the lifetime of the binary stream.
-		// When it returns the conn is fully drained / closed; the
+		// NOT wrapped — handleAttach BLOCKS for the lifetime of the binary
+		// stream. When it returns the conn is fully drained / closed; the
 		// outer handleConn loop will hit EOF on its next ReadFrame
 		// and exit through the usual disconnect path.
 		s.handleAttach(c, req)
@@ -989,7 +1132,9 @@ func (s *Server) dispatch(c *clientConn, typeName string, raw json.RawMessage) {
 		// leaving the conn in JSON mode. The client closes its dedicated
 		// peek conn after reading the snapshot, so handleConn hits EOF
 		// next and disconnects cleanly.
-		s.handlePeek(c, req)
+		if !s.runHandlerWithDeadline("peek", func() { s.handlePeek(c, req) }) {
+			s.writeError(c, "daemon_unresponsive", "peek handler timed out")
+		}
 
 	case MsgSetViewingReq:
 		var req SetViewingReq
@@ -997,7 +1142,22 @@ func (s *Server) dispatch(c *clientConn, typeName string, raw json.RawMessage) {
 			s.writeError(c, "bad_request", err.Error())
 			return
 		}
-		s.writeResp(c, MsgSetViewingResp, s.handleSetViewing(c, req))
+		var resp SetViewingResp
+		if s.runHandlerWithDeadline("set_viewing", func() { resp = s.handleSetViewing(c, req) }) {
+			s.writeResp(c, MsgSetViewingResp, resp)
+		} else {
+			s.writeError(c, "daemon_unresponsive", "set_viewing handler timed out")
+		}
+
+	case MsgHealthReq:
+		var req HealthReq
+		_ = json.Unmarshal(raw, &req)
+		var resp HealthResp
+		if s.runHandlerWithDeadline("health", func() { resp = s.handleHealth(c, req) }) {
+			s.writeResp(c, MsgHealthResp, resp)
+		} else {
+			s.writeError(c, "daemon_unresponsive", "health handler timed out")
+		}
 
 	default:
 		s.writeError(c, "unknown_message", fmt.Sprintf("unknown message type %q", typeName))
@@ -1056,9 +1216,7 @@ func (s *Server) handleSpawn(c *clientConn, req SpawnReq) (SpawnResp, error) {
 	// but it's kept as belt-and-braces in case the entry check is ever
 	// removed or refactored.
 	if req.TicketID != "" {
-		s.sessionsMu.RLock()
-		existing := s.findSessionForTicketLocked(req.TicketID)
-		s.sessionsMu.RUnlock()
+		existing := s.reg.findByTicket(req.TicketID)
 		if existing != nil {
 			log.Printf("openkanbankd: client %d spawn idempotent hit ticket=%s reused session=%s pid=%d",
 				c.id, req.TicketID, existing.ID(), existing.pane.PID())
@@ -1071,26 +1229,19 @@ func (s *Server) handleSpawn(c *clientConn, req SpawnReq) (SpawnResp, error) {
 		return SpawnResp{}, err
 	}
 
-	// Re-check under WLock to close the construct-outside-lock race
-	// window: two concurrent spawns may both have seen no existing
-	// session under RLock and both called NewSession. Exactly one wins
-	// the WLock; the other discards its just-built session. As above,
-	// the empty-TicketID guard at function entry makes this nil-check
-	// belt-and-braces — left in to defend against future refactors.
-	s.sessionsMu.Lock()
-	if req.TicketID != "" {
-		if winner := s.findSessionForTicketLocked(req.TicketID); winner != nil {
-			s.sessionsMu.Unlock()
-			log.Printf("openkanbankd: client %d spawn lost race ticket=%s discarding new session in favor of %s",
-				c.id, req.TicketID, winner.ID())
-			if killErr := sess.Kill(0); killErr != nil {
-				log.Printf("openkanbankd: cleanup of race-loser session %s: %v", sess.ID(), killErr)
-			}
-			return SpawnResp{SessionID: winner.ID(), PID: winner.pane.PID()}, nil
+	// Re-check under writeMu (inside storeIfNoTicket) to close the
+	// construct-outside-lock race window: two concurrent spawns may both
+	// have seen no existing session and both called NewSession. Exactly
+	// one wins the writeMu; the other discards its just-built session.
+	winner, stored := s.reg.storeIfNoTicket(req.TicketID, sess.ID(), sess)
+	if !stored {
+		log.Printf("openkanbankd: client %d spawn lost race ticket=%s discarding new session in favor of %s",
+			c.id, req.TicketID, winner.ID())
+		if killErr := sess.Kill(0); killErr != nil {
+			log.Printf("openkanbankd: cleanup of race-loser session %s: %v", sess.ID(), killErr)
 		}
+		return SpawnResp{SessionID: winner.ID(), PID: winner.pane.PID()}, nil
 	}
-	s.sessions[sess.ID()] = sess
-	s.sessionsMu.Unlock()
 
 	log.Printf("openkanbankd: client %d spawned session %s (ticket=%s pid=%d)", c.id, sess.ID(), sess.TicketID(), sess.pane.PID())
 
@@ -1105,33 +1256,12 @@ func (s *Server) handleSpawn(c *clientConn, req SpawnReq) (SpawnResp, error) {
 	return SpawnResp{SessionID: sess.ID(), PID: sess.pane.PID()}, nil
 }
 
-// findSessionForTicketLocked returns the (sole) session whose TicketID
-// matches, or nil if none. Caller must hold sessionsMu (R or W). After
-// handleSpawn enforces uniqueness on insert, at most one match exists
-// — but handleTicketDone defensively iterates the full map for any
-// duplicates inherited from older daemons that lacked this check.
-func (s *Server) findSessionForTicketLocked(ticketID string) *Session {
-	// Belt-and-braces: no caller should ever pass empty TicketID;
-	// handleSpawn rejects it at the door. Kept defensively so a future
-	// caller wired up with sloppy validation can't trigger a full-map
-	// scan that returns the first arbitrary session.
-	if ticketID == "" {
-		return nil
-	}
-	for _, sess := range s.sessions {
-		if sess.TicketID() == ticketID {
-			return sess
-		}
-	}
-	return nil
-}
-
 // watchSessionExit subscribes to sess.pane's event stream and emits an
 // "exited" SessionEvent when the pane publishes its final ExitEvent
 // (i.e. the underlying child process closed its PTY). Idempotent for
 // the daemon broadcast: if handleKill already emitted "exited",
 // subscribers will see both — fine. If sess is removed from
-// s.sessions before the exit fires, we still emit so cross-instance
+// the registry before the exit fires, we still emit so cross-instance
 // observers learn the child is gone.
 //
 // The Subscribe registers a fresh subscriber dedicated to lifecycle
@@ -1167,9 +1297,7 @@ func (s *Server) watchSessionExit(sess *Session) {
 		// may have already removed it via the explicit path; both paths
 		// must be safe to run concurrently.
 		removeSession := func() {
-			s.sessionsMu.Lock()
-			if cur, ok := s.sessions[sessID]; ok && cur == sess {
-				delete(s.sessions, sessID)
+			if s.reg.deleteIf(sessID, sess) {
 				log.Printf("openkanbankd: session %s (ticket=%s) exited; removed from registry", sessID, ticketID)
 			}
 			// Defense-in-depth: with the per-TicketID dedup in
@@ -1181,12 +1309,11 @@ func (s *Server) watchSessionExit(sess *Session) {
 			// that should never fire post-dedup; if it ever does we
 			// want a breadcrumb in the daemon log pointing at it.
 			if ticketID != "" {
-				if other := s.findSessionForTicketLocked(ticketID); other != nil {
+				if other := s.reg.findByTicket(ticketID); other != nil {
 					log.Printf("WARN: openkanbankd: after removing session %s, another session %s still references ticket %s — invariant violation",
 						sessID, other.ID(), ticketID)
 				}
 			}
-			s.sessionsMu.Unlock()
 		}
 		emit := func() {
 			expected := sess.ExpectedCompletion()
@@ -1235,23 +1362,18 @@ func (s *Server) watchSessionExit(sess *Session) {
 }
 
 func (s *Server) handleList(c *clientConn, req ListReq) ListResp {
-	s.sessionsMu.RLock()
-	defer s.sessionsMu.RUnlock()
-
-	infos := make([]SessionInfo, 0, len(s.sessions))
-	for _, sess := range s.sessions {
+	infos := make([]SessionInfo, 0)
+	for _, sess := range s.reg.snapshot() {
 		infos = append(infos, sess.Info())
 	}
 	return ListResp{Sessions: infos}
 }
 
 func (s *Server) handleKill(c *clientConn, req KillReq) (KillResp, error) {
-	s.sessionsMu.Lock()
-	sess, ok := s.sessions[req.SessionID]
+	sess, ok := s.reg.get(req.SessionID)
 	if ok {
-		delete(s.sessions, req.SessionID)
+		s.reg.delete(req.SessionID)
 	}
-	s.sessionsMu.Unlock()
 
 	if !ok {
 		// Idempotent: a concurrent Kill / TicketDone / delete path may
@@ -1262,10 +1384,6 @@ func (s *Server) handleKill(c *clientConn, req KillReq) (KillResp, error) {
 		return KillResp{}, nil
 	}
 
-	if err := sess.Kill(req.GraceSeconds); err != nil {
-		return KillResp{}, err
-	}
-
 	log.Printf("openkanbankd: client %d killed session %s", c.id, req.SessionID)
 
 	// watchSessionExit emits the "exited" SessionEvent once the pane
@@ -1274,6 +1392,10 @@ func (s *Server) handleKill(c *clientConn, req KillReq) (KillResp, error) {
 	// path inherits whatever Expected/Reason the watcher decides (false
 	// / "natural_exit" by default, true / "ticket_done" if the
 	// TicketDone path got there first).
+	//
+	// Kill is async via trackedKill so we return success immediately and
+	// account for in-flight kills; the kill itself runs in a goroutine.
+	s.trackedKill(sess, req.GraceSeconds)
 
 	return KillResp{}, nil
 }
@@ -1307,17 +1429,16 @@ func (s *Server) handleTicketDone(c *clientConn, req TicketDoneReq) (TicketDoneR
 		return TicketDoneResp{}, nil
 	}
 
-	s.sessionsMu.Lock()
+	snap := s.reg.snapshot()
 	matches := make([]*Session, 0, 1)
-	for _, sess := range s.sessions {
+	for _, sess := range snap {
 		if sess.TicketID() == req.TicketID {
 			matches = append(matches, sess)
 		}
 	}
 	for _, m := range matches {
-		delete(s.sessions, m.ID())
+		s.reg.deleteIf(m.ID(), m)
 	}
-	s.sessionsMu.Unlock()
 
 	if len(matches) == 0 {
 		return TicketDoneResp{Killed: false}, nil
@@ -1330,15 +1451,11 @@ func (s *Server) handleTicketDone(c *clientConn, req TicketDoneReq) (TicketDoneR
 	for _, m := range matches {
 		m.MarkExpectedCompletion()
 		log.Printf("openkanbankd: client %d ticket-done session %s (ticket=%s)", c.id, m.ID(), req.TicketID)
-		// Kill in a goroutine so the RPC returns synchronously. The
-		// grace window matches shutdownGraceSeconds — agents may have
-		// a few seconds of cleanup. The watcher emits the "exited"
-		// event when the pane's ExitEvent lands.
-		go func(sess *Session) {
-			if err := sess.Kill(shutdownGraceSeconds); err != nil {
-				log.Printf("openkanbankd: ticket-done kill session %s: %v", sess.ID(), err)
-			}
-		}(m)
+		// Kill via trackedKill so the RPC returns synchronously and we account
+		// for in-flight kills. The grace window matches shutdownGraceSeconds —
+		// agents may have a few seconds of cleanup. The watcher emits the
+		// "exited" event when the pane's ExitEvent lands.
+		s.trackedKill(m, shutdownGraceSeconds)
 	}
 
 	return TicketDoneResp{SessionID: matches[0].ID(), Killed: true}, nil
@@ -1349,7 +1466,7 @@ func (s *Server) handleTicketDone(c *clientConn, req TicketDoneReq) (TicketDoneR
 //
 // Sessions record their agent UUID at spawn time
 // (SpawnReq.AgentSessionUUID → Session.agentSessionUUID). We walk all
-// live sessions under sessionsMu.RLock and collect every match. The
+// live sessions via a registry snapshot and collect every match. The
 // caller distinguishes three states:
 //
 //   - len(matches) == 0: Owned=false (no caller action; either fresh
@@ -1370,10 +1487,8 @@ func (s *Server) handleOwns(c *clientConn, req OwnsReq) OwnsResp {
 	if req.SessionUUID == "" {
 		return OwnsResp{Owned: false}
 	}
-	s.sessionsMu.RLock()
-	defer s.sessionsMu.RUnlock()
 	var matches []*Session
-	for _, sess := range s.sessions {
+	for _, sess := range s.reg.snapshot() {
 		if sess.AgentSessionUUID() == req.SessionUUID {
 			matches = append(matches, sess)
 		}
@@ -1423,9 +1538,7 @@ func (s *Server) handleSubscribe(c *clientConn, req SubscribeReq) SubscribeResp 
 // may race the daemon's "exited" event for a session it was viewing
 // and the right behavior is silent no-op, not error.
 func (s *Server) handleSetViewing(c *clientConn, req SetViewingReq) SetViewingResp {
-	s.sessionsMu.RLock()
-	sess, ok := s.sessions[req.SessionID]
-	s.sessionsMu.RUnlock()
+	sess, ok := s.reg.get(req.SessionID)
 	if !ok {
 		return SetViewingResp{ViewerCount: 0}
 	}
@@ -1440,19 +1553,29 @@ func (s *Server) handleSetViewing(c *clientConn, req SetViewingReq) SetViewingRe
 	return SetViewingResp{ViewerCount: count}
 }
 
+// handleHealth returns the daemon's runtime counters — used by
+// `openkanban daemon health` and the client's wedge diagnostics.
+func (s *Server) handleHealth(c *clientConn, req HealthReq) HealthResp {
+	seq, inflight := s.dispatchStats()
+	kills, reapFail := s.killStats()
+	return HealthResp{
+		Goroutines:       runtime.NumGoroutine(),
+		Sessions:         s.reg.len(),
+		InflightHandlers: inflight,
+		InflightKills:    kills,
+		ReapFailures:     reapFail,
+		DispatchSeq:      seq,
+		PID:              os.Getpid(),
+	}
+}
+
 // cleanupViewersForClient removes clientID from every session's
 // viewers set and emits an "unviewing" SessionEvent for each session
 // where the client was actually a viewer. Called from the disconnect
 // path so a crashed or unceremoniously-closed TUI doesn't leave
 // zombie viewer counts on sibling boards.
 func (s *Server) cleanupViewersForClient(clientID uint16) {
-	s.sessionsMu.RLock()
-	sessions := make([]*Session, 0, len(s.sessions))
-	for _, sess := range s.sessions {
-		sessions = append(sessions, sess)
-	}
-	s.sessionsMu.RUnlock()
-	for _, sess := range sessions {
+	for _, sess := range s.reg.snapshot() {
 		if sess.RemoveViewer(clientID) {
 			s.emitEvent(SessionEvent{Event: "unviewing", SessionID: sess.ID(), TicketID: sess.TicketID()})
 		}
@@ -1498,12 +1621,10 @@ func (s *Server) handlePrepareExit(c *clientConn, req PrepareExitReq) PrepareExi
 	}
 	s.clientsMu.Unlock()
 
-	s.sessionsMu.RLock()
-	infos := make([]SessionInfo, 0, len(s.sessions))
-	for _, sess := range s.sessions {
+	infos := make([]SessionInfo, 0)
+	for _, sess := range s.reg.snapshot() {
 		infos = append(infos, sess.Info())
 	}
-	s.sessionsMu.RUnlock()
 
 	return PrepareExitResp{
 		ClientCount:        total,
@@ -1526,13 +1647,7 @@ func (s *Server) handleCancelExit(c *clientConn, req CancelExitReq) CancelExitRe
 }
 
 func (s *Server) handleShutdown(c *clientConn, req ShutdownReq) ShutdownResp {
-	s.sessionsMu.Lock()
-	live := make([]*Session, 0, len(s.sessions))
-	for _, sess := range s.sessions {
-		live = append(live, sess)
-	}
-	s.sessions = map[string]*Session{}
-	s.sessionsMu.Unlock()
+	live := s.reg.drain()
 
 	killed := 0
 	for _, sess := range live {
@@ -1566,9 +1681,7 @@ func (s *Server) handleShutdown(c *clientConn, req ShutdownReq) ShutdownResp {
 // alive until the registry drains naturally, then shut down (so we don't
 // linger as an orphan). A future TUI may also re-attach in the meantime.
 func (s *Server) handleLastClientDisconnect() {
-	s.sessionsMu.RLock()
-	live := len(s.sessions)
-	s.sessionsMu.RUnlock()
+	live := s.reg.len()
 
 	if s.persistent {
 		log.Printf("openkanbankd: last client disconnected; staying up (persistent mode); %d live session(s)", live)
@@ -1616,4 +1729,8 @@ func (s *Server) writeResp(c *clientConn, typeName string, resp any) {
 // writeError sends an ErrorResp envelope to the client.
 func (s *Server) writeError(c *clientConn, code, message string) {
 	s.writeResp(c, MsgErrorResp, ErrorResp{Code: code, Message: message})
+}
+
+func (s *Server) dispatchStats() (uint64, int64) {
+	return s.dispatchSeq.Load(), s.inflight.Load()
 }

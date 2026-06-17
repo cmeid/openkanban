@@ -301,9 +301,7 @@ func TestAttach_DetachCleansUp(t *testing.T) {
 
 	// Poll: wait for sess.attached to be cleared. The detach is
 	// asynchronous wrt our test goroutine.
-	srv.sessionsMu.RLock()
-	sess := srv.sessions[sessID]
-	srv.sessionsMu.RUnlock()
+	sess, _ := srv.reg.get(sessID)
 	if sess == nil {
 		t.Fatalf("session not registered post-spawn")
 	}
@@ -388,9 +386,7 @@ func TestAttach_Resize(t *testing.T) {
 	// SetSize on the pane is synchronous wrt the daemon's binaryLoop
 	// goroutine. Poll briefly to give that goroutine time to process
 	// the frame.
-	srv.sessionsMu.RLock()
-	sess := srv.sessions[sessID]
-	srv.sessionsMu.RUnlock()
+	sess, _ := srv.reg.get(sessID)
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -462,9 +458,7 @@ func TestAttach_SnapshotOnReAttach(t *testing.T) {
 	writeBinaryFrame(t, conn, TypeDetach, nil)
 
 	// Wait for the daemon to release sess.attached.
-	srv.sessionsMu.RLock()
-	sess := srv.sessions[sessID]
-	srv.sessionsMu.RUnlock()
+	sess, _ := srv.reg.get(sessID)
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		sess.attachMu.Lock()
@@ -648,9 +642,7 @@ func TestAttach_Takeover_DisplacesOldClient(t *testing.T) {
 	}
 
 	// Agent must still be running — takeover changes wire state only.
-	srv.sessionsMu.RLock()
-	sess := srv.sessions[sessID]
-	srv.sessionsMu.RUnlock()
+	sess, _ := srv.reg.get(sessID)
 	if sess == nil {
 		t.Fatalf("session not registered post-spawn")
 	}
@@ -802,9 +794,7 @@ func TestAttach_SnapshotIncludesScrollback(t *testing.T) {
 
 	// Wait for daemon to release sess.attached so the next attach
 	// proceeds without an already_attached error.
-	srv.sessionsMu.RLock()
-	sess := srv.sessions[sessID]
-	srv.sessionsMu.RUnlock()
+	sess, _ := srv.reg.get(sessID)
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		sess.attachMu.Lock()

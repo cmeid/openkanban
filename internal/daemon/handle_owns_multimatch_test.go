@@ -34,9 +34,7 @@ func TestHandleOwns_SingleMatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSession: %v", err)
 	}
-	srv.sessionsMu.Lock()
-	srv.sessions[sess.ID()] = sess
-	srv.sessionsMu.Unlock()
+	srv.reg.store(sess.ID(), sess)
 	srv.watchSessionExit(sess)
 
 	resp := srv.handleOwns(nil, OwnsReq{SessionUUID: uuid})
@@ -87,10 +85,8 @@ func TestHandleOwns_MultiMatch_ReturnsConflict(t *testing.T) {
 	}
 	sess1 := mkSess("TICK-A", "dup-a")
 	sess2 := mkSess("TICK-B", "dup-b")
-	srv.sessionsMu.Lock()
-	srv.sessions[sess1.ID()] = sess1
-	srv.sessions[sess2.ID()] = sess2
-	srv.sessionsMu.Unlock()
+	srv.reg.store(sess1.ID(), sess1)
+	srv.reg.store(sess2.ID(), sess2)
 	srv.watchSessionExit(sess1)
 	srv.watchSessionExit(sess2)
 

@@ -44,9 +44,7 @@ func TestHandleSpawn_RejectsEmptyTicketID(t *testing.T) {
 	}
 
 	// Registry must be untouched — no NewSession should have run.
-	srv.sessionsMu.RLock()
-	got := len(srv.sessions)
-	srv.sessionsMu.RUnlock()
+	got := srv.reg.len()
 	if got != 0 {
 		t.Errorf("after rejected spawn: sessions count=%d want 0 (no half-spawned session)", got)
 	}
@@ -81,10 +79,8 @@ func TestHandleSpawn_AcceptsNonEmptyTicketID(t *testing.T) {
 		t.Fatalf("handleSpawn returned empty SessionID on success")
 	}
 
-	srv.sessionsMu.RLock()
-	got := len(srv.sessions)
-	sess, ok := srv.sessions[resp.SessionID]
-	srv.sessionsMu.RUnlock()
+	got := srv.reg.len()
+	sess, ok := srv.reg.get(resp.SessionID)
 	if got != 1 {
 		t.Errorf("after accepted spawn: sessions count=%d want 1", got)
 	}
