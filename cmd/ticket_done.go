@@ -88,7 +88,7 @@ func wrapUpSessionTicketAt(target board.TicketStatus) error {
 		// it) is dismantled. Move is a thin wrapper over SetStatus —
 		// the AgentStatus update and the SaveTicket below land
 		// authoritatively after.
-		promoted, err := store.Move(ticket.ID, target)
+		promoted, pruned, err := store.Move(ticket.ID, target)
 		if err != nil {
 			return fmt.Errorf("move ticket %s: %w", ticket.ID, err)
 		}
@@ -98,6 +98,9 @@ func wrapUpSessionTicketAt(target board.TicketStatus) error {
 		}
 		if n := len(promoted); n > 0 {
 			fmt.Fprintf(os.Stderr, "openkanban: promoted %d claude approval(s) to repo defaults\n", n)
+		}
+		if n := len(pruned); n > 0 {
+			fmt.Fprintf(os.Stderr, "openkanban: pruned %d stale allowlist entr(y/ies) (see .claude/.pruned-log)\n", n)
 		}
 	}
 

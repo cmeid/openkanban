@@ -273,25 +273,41 @@ func (s *TicketStore) Delete(id board.TicketID) error {
 	return nil
 }
 
-// Move flips a ticket to newStatus. When the transition crosses into
-// in_review or done, any new claude-code approvals collected in the
-// ticket's worktree are promoted into the source repo's
-// .claude/settings.local.json so they persist across future tickets.
-// Returns the slice of promoted approval entries (empty when nothing
-// new went global, nil on error or non-promoting transition).
-func (s *TicketStore) Move(id board.TicketID, newStatus board.TicketStatus) ([]string, error) {
+// Move flips a ticket to newStatus. Two settings.local.json side-effects fire:
+//   1. When the transition crosses into in_review or done, any new
+//      claude-code approvals collected in the ticket's worktree are
+//      promoted into the source repo's .claude/settings.local.json.
+//   2. Unconditionally on every transition (including no-op same-status
+//      moves and direction-reversing moves), agent.ReviewAndPruneRepoSettings
+//      walks the repo file and removes noise / hard-deny entries. The
+//      idempotency contract in that function guarantees zero side
+//      effects when nothing would change.
+//
+// Returns (promoted approvals, pruned-noise records, error). Either
+// slice may be empty / nil; an error from either settings call is
+// LOGGED but doesn't fail the transition — the ticket move is
+// authoritative state, settings sync is best-effort.
+func (s *TicketStore) Move(id board.TicketID, newStatus board.TicketStatus) ([]string, []agent.PruneRecord, error) {
 	t, ok := s.Tickets[id]
 	if !ok {
-		return nil, board.ErrTicketNotFound
+		return nil, nil, board.ErrTicketNotFound
 	}
 	oldStatus := t.Status
 	t.SetStatus(newStatus)
 	added, err := agent.PromoteClaudeSettingsOnTransition(t.WorktreePath, s.repoPath, oldStatus, newStatus)
 	if err != nil {
 		log.Printf("openkanban: promote claude settings (%s → %s): %v", oldStatus, newStatus, err)
-		return nil, nil
+		added = nil
 	}
-	return added, nil
+	pruned, err := agent.ReviewAndPruneRepoSettings(s.repoPath)
+	if err != nil {
+		log.Printf("openkanban: review-and-prune (%s → %s): %v", oldStatus, newStatus, err)
+		// Don't drop the pruned slice even on error — appendPrunedLog
+		// failures still return the records that were successfully
+		// removed from the file, and surfacing them in the toast is
+		// useful provenance.
+	}
+	return added, pruned, nil
 }
 
 func (s *TicketStore) GetByStatus(status board.TicketStatus) []*board.Ticket {
@@ -409,15 +425,15 @@ func (g *GlobalTicketStore) Delete(id board.TicketID) error {
 	return nil
 }
 
-func (g *GlobalTicketStore) Move(id board.TicketID, newStatus board.TicketStatus) ([]string, error) {
+func (g *GlobalTicketStore) Move(id board.TicketID, newStatus board.TicketStatus) ([]string, []agent.PruneRecord, error) {
 	ticket, ok := g.allTickets[id]
 	if !ok {
-		return nil, board.ErrTicketNotFound
+		return nil, nil, board.ErrTicketNotFound
 	}
 
 	store := g.ticketStores[ticket.ProjectID]
 	if store == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	return store.Move(id, newStatus)
 }

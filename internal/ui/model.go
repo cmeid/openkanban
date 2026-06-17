@@ -1719,7 +1719,7 @@ func (m *Model) dropTicket() (tea.Model, tea.Cmd) {
 	// freezes for up to ~7s on the daemon RPCs.
 	wrapUpCmd := m.wrapUpSessionForTicket(ticket, targetStatus)
 
-	promoted, _ := m.globalStore.Move(ticket.ID, targetStatus)
+	promoted, pruned, _ := m.globalStore.Move(ticket.ID, targetStatus)
 	m.refreshColumnTickets()
 	m.saveTicket(ticket)
 
@@ -1733,7 +1733,7 @@ func (m *Model) dropTicket() (tea.Model, tea.Cmd) {
 	m.selectTicketByID(ticket.ID)
 	m.ensureColumnVisible()
 
-	m.notify(moveAndPromoteMsg(targetStatus, promoted))
+	m.notify(moveAndPromoteMsg(targetStatus, promoted, pruned))
 	m.dragging = false
 	m.dragTargetColumn = 0
 
@@ -3533,11 +3533,11 @@ func (m *Model) quickMoveTicket() (tea.Model, tea.Cmd) {
 	// The returned Cmd runs the daemon RPCs off the Update loop.
 	wrapUpCmd := m.wrapUpSessionForTicket(ticket, nextStatus)
 
-	promoted, _ := m.globalStore.Move(ticket.ID, nextStatus)
+	promoted, pruned, _ := m.globalStore.Move(ticket.ID, nextStatus)
 	m.refreshColumnTickets()
 	m.selectTicketByID(ticket.ID)
 	m.saveTicket(ticket)
-	m.notify(moveAndPromoteMsg(nextStatus, promoted))
+	m.notify(moveAndPromoteMsg(nextStatus, promoted, pruned))
 
 	return m, wrapUpCmd
 }
@@ -3752,11 +3752,11 @@ func (m *Model) quickMoveTicketBackward() (tea.Model, tea.Cmd) {
 	// to status ordering doesn't silently introduce an asymmetry.
 	wrapUpCmd := m.wrapUpSessionForTicket(ticket, prevStatus)
 
-	promoted, _ := m.globalStore.Move(ticket.ID, prevStatus)
+	promoted, pruned, _ := m.globalStore.Move(ticket.ID, prevStatus)
 	m.refreshColumnTickets()
 	m.selectTicketByID(ticket.ID)
 	m.saveTicket(ticket)
-	m.notify(moveAndPromoteMsg(prevStatus, promoted))
+	m.notify(moveAndPromoteMsg(prevStatus, promoted, pruned))
 
 	return m, wrapUpCmd
 }
@@ -5118,12 +5118,14 @@ func (m *Model) previousStatus(current board.TicketStatus) board.TicketStatus {
 	}
 }
 
-// moveAndPromoteMsg formats the post-Move status-bar toast. When the
-// transition into in_review/done promoted N claude-code approvals from
-// the worktree into the source repo's settings.local.json, it appends a
-// "promoted N approval(s)" suffix so the user sees what just went
-// global. Empty promoted → only the "Moved to <status>" core message.
-func moveAndPromoteMsg(target board.TicketStatus, promoted []string) string {
+// moveAndPromoteMsg formats the post-Move status-bar toast. Three
+// parts joined with " · ":
+//   1. core: "Moved to <status>" (always)
+//   2. promoted: "promoted N approval(s) to repo defaults" (when promoted>0)
+//   3. pruned: "pruned N stale entr(y/ies)" (when pruned>0)
+// Pruned entry strings are NOT inlined — they live in <repo>/.claude/.pruned-log
+// for the user to inspect. Toast is count-only to stay scannable.
+func moveAndPromoteMsg(target board.TicketStatus, promoted []string, pruned []agent.PruneRecord) string {
 	msg := "Moved to " + string(target)
 	switch n := len(promoted); n {
 	case 0:
@@ -5131,6 +5133,13 @@ func moveAndPromoteMsg(target board.TicketStatus, promoted []string) string {
 		msg += " · promoted 1 approval to repo defaults"
 	default:
 		msg += fmt.Sprintf(" · promoted %d approvals to repo defaults", n)
+	}
+	switch n := len(pruned); n {
+	case 0:
+	case 1:
+		msg += " · pruned 1 stale entry"
+	default:
+		msg += fmt.Sprintf(" · pruned %d stale entries", n)
 	}
 	return msg
 }

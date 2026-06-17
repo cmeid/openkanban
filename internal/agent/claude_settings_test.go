@@ -483,3 +483,350 @@ func stringSliceEqual(a, b []string) bool {
 	}
 	return true
 }
+
+// ----- review-and-prune tests -----
+
+// pruneCase pins the expected verdict for a single permissions.allow
+// entry. Used by TestReviewAndPrune table.
+type pruneCase struct {
+	name   string
+	entry  string
+	reason string // "" means keep
+}
+
+func TestReviewAndPrune(t *testing.T) {
+	// Resolve home for path-allowlist cases that bake in the absolute
+	// form. If HOME isn't available, those rows degrade to "untrusted"
+	// outcomes — captured in the test row's expected reason via the
+	// fallback comment.
+	home, _ := os.UserHomeDir()
+
+	cases := []pruneCase{
+		// (a) production entries — keep verdicts
+		{name: "keep glob bash", entry: "Bash(git config *)", reason: ""},
+		{name: "keep glob bash 2", entry: "Bash(git fetch *)", reason: ""},
+		{name: "keep go-test glob", entry: "Bash(go test *)", reason: ""},
+		{name: "keep find glob", entry: "Bash(find *)", reason: ""},
+		{name: "keep bare cat", entry: "Bash(cat)", reason: ""},
+		{name: "keep skill entry", entry: "Skill(oh-my-claude:prime)", reason: ""},
+		{name: "keep read glob", entry: "Read(//Users/cmeid/.cache/openkanban/**)", reason: ""},
+		{name: "keep agent entry", entry: "Agent(Explore)", reason: ""},
+
+		// (a) production entries — prune verdicts
+		{name: "prune xargs-stat", entry: `Bash(xargs -I{} stat -f "%Sm %N" -t '%H:%M' {})`, reason: "long-no-glob"},
+		{name: "prune awk-timestamp", entry: `Bash(awk '/2026-06-16T1[0-1]:[34][0-9]/' ~/.cache/openkanban/daemon.log)`, reason: "untrusted-path"},
+		{name: "prune xargs-rg-escapes", entry: `Bash(xargs rg -l "DeleteProject\\\\|app\\\\\\\\.Delete")`, reason: "escape-soup"},
+		{name: "prune grep-escapes", entry: `Bash(grep -E "\\.\\(go|md\\)$")`, reason: "escape-soup"},
+
+		// (d) hard-deny patterns
+		{name: "hard-deny git push glob", entry: "Bash(git push *)", reason: "hard-deny"},
+		{name: "hard-deny git push specific", entry: "Bash(git push origin main)", reason: "hard-deny"},
+		{name: "hard-deny gh pr create", entry: "Bash(gh pr create --title foo)", reason: "hard-deny"},
+		{name: "hard-deny gh pr merge", entry: "Bash(gh pr merge 22 --merge)", reason: "hard-deny"},
+		{name: "hard-deny gh auth", entry: "Bash(gh auth login)", reason: "hard-deny"},
+		{name: "hard-deny gh api", entry: "Bash(gh api /repos/foo)", reason: "hard-deny"},
+		{name: "hard-deny op signin", entry: "Bash(op signin)", reason: "hard-deny"},
+		{name: "hard-deny op item get", entry: "Bash(op item get vault Personal)", reason: "hard-deny"},
+		{name: "hard-deny aws", entry: "Bash(aws s3 ls)", reason: "hard-deny"},
+		{name: "hard-deny kubectl", entry: "Bash(kubectl get pods)", reason: "hard-deny"},
+		{name: "hard-deny docker run", entry: "Bash(docker run alpine sh)", reason: "hard-deny"},
+		{name: "hard-deny sudo", entry: "Bash(sudo rm /etc/foo)", reason: "hard-deny"},
+		{name: "hard-deny chmod", entry: "Bash(chmod +x foo)", reason: "hard-deny"},
+		{name: "hard-deny git remote add", entry: "Bash(git remote add upstream foo)", reason: "hard-deny"},
+		{name: "hard-deny git config global", entry: "Bash(git config --global user.email a@b)", reason: "hard-deny"},
+
+		// hard-deny path substrings
+		{name: "hard-deny ssh path tilde", entry: "Bash(cat ~/.ssh/id_rsa)", reason: "hard-deny"},
+		{name: "hard-deny ssh path absolute", entry: "Bash(cat " + home + "/.ssh/id_rsa)", reason: "hard-deny"},
+		{name: "hard-deny aws path", entry: "Bash(cat ~/.aws/credentials)", reason: "hard-deny"},
+		{name: "hard-deny gh-config", entry: "Bash(cat ~/.config/gh/hosts.yml)", reason: "hard-deny"},
+
+		// (e) non-Bash passthrough
+		{name: "passthrough skill", entry: "Skill(oh-my-claude:debugger)", reason: ""},
+		{name: "passthrough read glob", entry: "Read(//tmp/**)", reason: ""},
+		{name: "passthrough agent", entry: "Agent(oh-my-claude:librarian)", reason: ""},
+
+		// (f) ./... glob exemption
+		{name: "keep go test pkg-selector", entry: "Bash(go test ./...)", reason: ""},
+		{name: "keep go vet pkg-selector", entry: "Bash(go vet ./...)", reason: ""},
+
+		// (g) tilde-resolution rows — only meaningful if HOME resolves
+		// well-formed; if HOME is empty (CI edge case), these would
+		// otherwise prune via the fail-closed branch. Skip those rows
+		// in that case.
+
+		// untrusted-path: an absolute path outside the allowlist
+		{name: "prune untrusted-path /etc", entry: "Bash(cat /etc/passwd)", reason: "untrusted-path"},
+		{name: "prune untrusted-path /usr/local", entry: "Bash(ls /usr/local/bin/)", reason: "untrusted-path"},
+
+		// short benign entries
+		{name: "keep bare ls", entry: "Bash(ls)", reason: ""},
+		{name: "keep ls short", entry: "Bash(ls /tmp)", reason: ""},
+		{name: "keep go vet glob", entry: "Bash(go vet *)", reason: ""},
+
+		// long-no-glob catch-all (no path token)
+		{name: "prune long-no-glob no-paths", entry: "Bash(echo this is a long command without any wildcards anywhere)", reason: "long-no-glob"},
+	}
+
+	// HOME-dependent rows: separate slice so we can skip if HOME doesn't resolve.
+	if home != "" {
+		cases = append(cases,
+			pruneCase{name: "keep tilde manifold workspace", entry: "Bash(grep -r foo " + home + "/manifold/dev/openkanban/internal/)", reason: ""},
+			pruneCase{name: "keep tilde claude memory", entry: "Bash(ls " + home + "/.claude/projects/foo/)", reason: ""},
+			pruneCase{name: "keep tilde cache dir", entry: "Bash(tail " + home + "/.cache/openkanban/daemon.log)", reason: ""},
+		)
+	}
+
+	// Build the input perms map by aggregating every entry.
+	allow := make([]any, 0, len(cases))
+	for _, c := range cases {
+		allow = append(allow, c.entry)
+	}
+	input := map[string]any{
+		"permissions": map[string]any{
+			"allow": allow,
+		},
+	}
+
+	cleaned, pruned := reviewAndPrune(input)
+
+	// Validate per-row verdicts against the pruned set.
+	prunedByEntry := map[string]string{}
+	for _, p := range pruned {
+		prunedByEntry[p.Entry] = p.Reason
+	}
+	for _, c := range cases {
+		got, wasPruned := prunedByEntry[c.entry]
+		switch {
+		case c.reason == "" && wasPruned:
+			t.Errorf("%s: expected to KEEP %q, but pruned with reason %q", c.name, c.entry, got)
+		case c.reason != "" && !wasPruned:
+			t.Errorf("%s: expected to PRUNE %q with reason %q, but kept", c.name, c.entry, c.reason)
+		case c.reason != "" && got != c.reason:
+			t.Errorf("%s: pruned %q with reason %q, want %q", c.name, c.entry, got, c.reason)
+		}
+	}
+
+	// (c) Table-driven idempotency: second prune produces no further changes.
+	_, prunedAgain := reviewAndPrune(cleaned)
+	if len(prunedAgain) != 0 {
+		t.Errorf("idempotency violation: second prune produced %d records, want 0", len(prunedAgain))
+		for _, r := range prunedAgain {
+			t.Logf("  unexpectedly pruned on second pass: %s (%s)", r.Entry, r.Reason)
+		}
+	}
+}
+
+func TestReviewAndPrune_NilAndEmpty(t *testing.T) {
+	// nil map
+	cleaned, pruned := reviewAndPrune(nil)
+	if cleaned != nil || len(pruned) != 0 {
+		t.Errorf("nil input: got (%v, %v), want (nil, nil)", cleaned, pruned)
+	}
+	// no permissions key
+	in := map[string]any{"other": "value"}
+	cleaned, pruned = reviewAndPrune(in)
+	if len(pruned) != 0 {
+		t.Errorf("no permissions key: got pruned=%v, want empty", pruned)
+	}
+	if _, ok := cleaned["other"]; !ok {
+		t.Errorf("no permissions key: other top-level key was dropped")
+	}
+	// empty allow
+	in = map[string]any{"permissions": map[string]any{"allow": []any{}}}
+	_, pruned = reviewAndPrune(in)
+	if len(pruned) != 0 {
+		t.Errorf("empty allow: got pruned=%v, want empty", pruned)
+	}
+}
+
+func TestReviewAndPrune_PreservesAskAndDeny(t *testing.T) {
+	// ask and deny buckets must be untouched — even if they contain
+	// patterns that would be pruned in allow.
+	in := map[string]any{
+		"permissions": map[string]any{
+			"allow": []any{"Bash(xargs -I{} stat -f \"%Sm %N\" -t '%H:%M' {})"}, // noise
+			"ask":   []any{"Bash(git push *)"},                                  // would be hard-deny in allow
+			"deny":  []any{"Bash(sudo *)"},                                       // would be hard-deny in allow
+		},
+	}
+	cleaned, pruned := reviewAndPrune(in)
+	if len(pruned) != 1 {
+		t.Fatalf("expected 1 prune (from allow), got %d", len(pruned))
+	}
+	innerPerms := cleaned["permissions"].(map[string]any)
+	if ask, _ := innerPerms["ask"].([]any); len(ask) != 1 || ask[0] != "Bash(git push *)" {
+		t.Errorf("ask bucket modified: %v", ask)
+	}
+	if deny, _ := innerPerms["deny"].([]any); len(deny) != 1 || deny[0] != "Bash(sudo *)" {
+		t.Errorf("deny bucket modified: %v", deny)
+	}
+}
+
+func TestReviewAndPruneRepoSettings_IdempotentEarlyReturn(t *testing.T) {
+	repo, _ := setupRepoAndWorktree(t)
+	// Write a clean file (no entries that would trigger prune).
+	writeJSON(t, filepath.Join(repo, ".claude", "settings.local.json"),
+		perms(map[string][]string{"allow": {"Bash(git config *)", "Bash(go test *)"}}))
+
+	// First call: no prunes expected, no side effects.
+	pruned, err := ReviewAndPruneRepoSettings(repo)
+	if err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+	if len(pruned) != 0 {
+		t.Errorf("first call: expected no prunes, got %d", len(pruned))
+	}
+
+	// No snapshot file should exist.
+	matches, _ := filepath.Glob(filepath.Join(repo, ".claude", snapshotPrefix+"*"))
+	if len(matches) != 0 {
+		t.Errorf("idempotent no-op produced snapshot files: %v", matches)
+	}
+
+	// No .pruned-log should exist (or it should be empty).
+	if info, err := os.Stat(filepath.Join(repo, ".claude", prunedLogFile)); err == nil && info.Size() > 0 {
+		t.Errorf(".pruned-log written on no-op call (size=%d)", info.Size())
+	}
+
+	// Second call: still no side effects.
+	pruned, err = ReviewAndPruneRepoSettings(repo)
+	if err != nil {
+		t.Fatalf("second call: %v", err)
+	}
+	if len(pruned) != 0 {
+		t.Errorf("second call: expected no prunes, got %d", len(pruned))
+	}
+}
+
+func TestReviewAndPruneRepoSettings_PrunesAndAuditsAndSnapshots(t *testing.T) {
+	repo, _ := setupRepoAndWorktree(t)
+	// Seed with a known-noise entry plus a human-baseline entry.
+	writeJSON(t, filepath.Join(repo, ".claude", "settings.local.json"),
+		perms(map[string][]string{"allow": {
+			"Bash(git config *)",
+			`Bash(awk '/2026-06-16T1[0-1]:[34][0-9]/' /tmp/fake.log)`,
+		}}))
+
+	pruned, err := ReviewAndPruneRepoSettings(repo)
+	if err != nil {
+		t.Fatalf("ReviewAndPruneRepoSettings: %v", err)
+	}
+	if len(pruned) != 1 {
+		t.Fatalf("expected 1 prune, got %d: %v", len(pruned), pruned)
+	}
+
+	// Settings file no longer contains the noise.
+	got := readJSON(t, filepath.Join(repo, ".claude", "settings.local.json"))
+	allow := got["permissions"].(map[string]any)["allow"].([]any)
+	if len(allow) != 1 || allow[0] != "Bash(git config *)" {
+		t.Errorf("post-prune allow: got %v, want [Bash(git config *)]", allow)
+	}
+
+	// .pruned-log exists with one line.
+	logData, err := os.ReadFile(filepath.Join(repo, ".claude", prunedLogFile))
+	if err != nil {
+		t.Fatalf(".pruned-log not written: %v", err)
+	}
+	if !strings.Contains(string(logData), "awk '/2026-06-16T") {
+		t.Errorf(".pruned-log missing noise entry: %q", logData)
+	}
+	if lines := strings.Count(string(logData), "\n"); lines != 1 {
+		t.Errorf(".pruned-log line count: got %d, want 1", lines)
+	}
+
+	// Snapshot file exists with the pre-prune state (both entries).
+	matches, _ := filepath.Glob(filepath.Join(repo, ".claude", snapshotPrefix+"*"))
+	if len(matches) != 1 {
+		t.Fatalf("snapshot count: got %d, want 1: %v", len(matches), matches)
+	}
+	snapData, _ := os.ReadFile(matches[0])
+	if !strings.Contains(string(snapData), "awk '/2026-06-16T") {
+		t.Errorf("snapshot doesn't contain pre-prune state: %q", snapData)
+	}
+}
+
+func TestSnapshot_TightLoop_NoCollision(t *testing.T) {
+	repo, _ := setupRepoAndWorktree(t)
+	// Write a settings file so snapshot has something to copy.
+	writeJSON(t, filepath.Join(repo, ".claude", "settings.local.json"),
+		perms(map[string][]string{"allow": {"Bash(go test *)"}}))
+
+	// Call snapshotSettings twice in tight succession.
+	if err := snapshotSettings(repo); err != nil {
+		t.Fatalf("first snapshot: %v", err)
+	}
+	if err := snapshotSettings(repo); err != nil {
+		t.Fatalf("second snapshot: %v", err)
+	}
+
+	matches, _ := filepath.Glob(filepath.Join(repo, ".claude", snapshotPrefix+"*"))
+	if len(matches) != 2 {
+		t.Errorf("tight-loop snapshots: got %d distinct files, want 2 (nanos collision avoidance broken?): %v",
+			len(matches), matches)
+	}
+}
+
+func TestSnapshot_Rotation_KeepsLastThree(t *testing.T) {
+	repo, _ := setupRepoAndWorktree(t)
+	writeJSON(t, filepath.Join(repo, ".claude", "settings.local.json"),
+		perms(map[string][]string{"allow": {"Bash(go test *)"}}))
+
+	// Take 5 snapshots.
+	for i := 0; i < 5; i++ {
+		if err := snapshotSettings(repo); err != nil {
+			t.Fatalf("snapshot %d: %v", i, err)
+		}
+	}
+
+	matches, _ := filepath.Glob(filepath.Join(repo, ".claude", snapshotPrefix+"*"))
+	if len(matches) != 3 {
+		t.Errorf("rotation: got %d snapshots, want 3 (keepCount): %v", len(matches), matches)
+	}
+}
+
+func TestSnapshot_NoFile_NoError(t *testing.T) {
+	repo, _ := setupRepoAndWorktree(t)
+	// Don't write a settings file. Snapshot should noop.
+	if err := snapshotSettings(repo); err != nil {
+		t.Errorf("snapshot on missing file should be noop, got: %v", err)
+	}
+	matches, _ := filepath.Glob(filepath.Join(repo, ".claude", snapshotPrefix+"*"))
+	if len(matches) != 0 {
+		t.Errorf("snapshot created files when source missing: %v", matches)
+	}
+}
+
+func TestAppendPrunedLog(t *testing.T) {
+	repo, _ := setupRepoAndWorktree(t)
+	records := []PruneRecord{
+		{Entry: "Bash(git push *)", Reason: "hard-deny"},
+		{Entry: "Bash(awk '/x/' /etc/passwd)", Reason: "untrusted-path"},
+	}
+	if err := appendPrunedLog(repo, records); err != nil {
+		t.Fatalf("appendPrunedLog: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(repo, ".claude", prunedLogFile))
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	s := string(data)
+	if !strings.Contains(s, "hard-deny Bash(git push *)") {
+		t.Errorf("log missing record 1: %q", s)
+	}
+	if !strings.Contains(s, "untrusted-path Bash(awk") {
+		t.Errorf("log missing record 2: %q", s)
+	}
+	if lines := strings.Count(s, "\n"); lines != 2 {
+		t.Errorf("log line count: got %d, want 2", lines)
+	}
+
+	// Second call appends, doesn't overwrite.
+	if err := appendPrunedLog(repo, records[:1]); err != nil {
+		t.Fatalf("appendPrunedLog second: %v", err)
+	}
+	data, _ = os.ReadFile(filepath.Join(repo, ".claude", prunedLogFile))
+	if lines := strings.Count(string(data), "\n"); lines != 3 {
+		t.Errorf("after second append, line count: got %d, want 3", lines)
+	}
+}

@@ -767,6 +767,30 @@ Approvals collected in a ticket only escape its worktree if the user **conscious
 
 `agent.mergeSettingsLocal` is a pure additive merge over the `permissions.{allow,ask,deny}` arrays. No deletes, no reorders, no duplicates. Every other top-level key in the destination file is untouched, and unknown keys in the source are ignored. This means future Claude Code settings keys round-trip safely as long as they don't share the `permissions` name. All three helpers (`Seed`, `Promote`, `PromoteOnTransition`) are idempotent: running them twice in a row is a no-op on the second call.
 
+### Review-and-prune on every transition
+
+The promote machinery above is additive — entries accumulate over time. After a few days of work the per-repo `settings.local.json` had grown 12 noise entries (one-shot Bash commands with embedded timestamps, escape-soup grep patterns, debugging-flavored xargs) alongside the handful of useful glob-shaped entries. The trust surface bloated; the user re-prompts were already gone, but the *file* was no longer scannable.
+
+`TicketStore.Move` therefore also calls `agent.ReviewAndPruneRepoSettings(s.repoPath)` after the promote step. This fires on EVERY transition — including same-status no-ops, backwards moves, and any other direction — not just the promote-triggering `→ in_review` / `→ done` motion. The justification for the broad cadence is the load-bearing idempotency contract: `ReviewAndPruneRepoSettings` returns `(nil, nil)` without snapshotting, writing, or appending to the log whenever no entries would change. Repeated transitions on a clean file produce zero side effects.
+
+The heuristic for `Bash(arg)`, in precedence order:
+
+1. **Hard-deny verb prefixes** (`hard-deny` reason): `git push`, `gh pr create`, `gh pr merge`, `gh repo`, `gh auth`, `gh api`, `git remote add`, `git remote set-url`, `git remote rename`, `git config --global`, `chmod`, `sudo`, `op`, `aws`, `kubectl`, `docker run`. These collide with the user's global push-gate rule (which is destination-repo-sensitive and lives in CLAUDE.md prose — Claude Code's permission system never consults it) or with secret-management workflows.
+2. **Hard-deny path substrings** (`hard-deny` reason): any arg containing `/.ssh/`, `/.aws/`, `/.config/gh/`, `/.config/op/` — covers both absolute and tilde forms.
+3. **Escape-soup** (`escape-soup` reason): 3+ consecutive backslashes signals over-escaped regex that's nearly always session-specific.
+4. **Untrusted absolute path** (`untrusted-path` reason): any absolute path or `~/`-prefixed path that doesn't land under one of the allowlisted roots (`~/Documents/`, `~/.config/openkanban/`, `~/.cache/openkanban/`, `~/manifold/dev/`, `~/.claude/projects/`, `/tmp/`, `/private/tmp/`, `/var/folders/`). Tilde resolution is `sync.Once`-memoized off `os.UserHomeDir()`; if that returns an error the implementation fails closed, treating all home-rooted paths as untrusted. If ALL paths in an arg land in the allowlist, the entry is exempt from the long-no-glob catch-all.
+5. **Long-no-glob catch-all** (`long-no-glob` reason): arg length > 30 with no `*`, `**`, or `./...` wildcard. Bare `...` (e.g. in a URL) does not count as a glob.
+
+Skill / Read / Agent entries pass through untouched. Future Claude Code permission categories also pass through until the policy is explicitly extended. Only `permissions.allow` is filtered; `permissions.ask` and `permissions.deny` are never modified.
+
+### What's NOT generalized
+
+Verb-widening was considered and rejected. Collapsing `Bash(awk '/2026-.../' log)` into `Bash(awk *)` would auto-approve `Bash(awk 'BEGIN{system(...)}')` — and similarly for `xargs`, `find -exec`, every interpreter, every `git push`. The denylist required to make widening safe inverts the security model: it's an *allowlist of safe-to-widen verbs*, not a *denylist of dangerous ones*, and that allowlist is so small (`ls`, `pwd`, `stat`, `wc`) that the prompt-savings don't justify the implementation. Users who explicitly want a broader entry can hand-edit the repo file.
+
+### Recovery: audit log + snapshot rotation
+
+Every removal appends one RFC3339-timestamped line to `<repo>/.claude/.pruned-log` (`<ts> <reason> <entry>`). The pre-write file state snapshots to `<repo>/.claude/settings.local.json.bak.<unix-nanos>` before each write; rotation keeps the 3 most recent (by suffix lex-order, total-ordered under nanos so two transitions in the same wall-clock second don't collide). Restoring a false-positive prune: either append the line back manually (the log is the source for "what was removed and why") or restore the snapshot wholesale (`mv settings.local.json.bak.<latest> settings.local.json`). Both files are listed in the inner `.gitignore` written by `ensureRepoSettingsScaffolding`.
+
 ### What is not changing
 
 - `--permission-mode plan` stays forced for new sessions — design intent is unchanged.
@@ -774,7 +798,7 @@ Approvals collected in a ticket only escape its worktree if the user **conscious
 - Committed `<repo>/.claude/settings.json` is not touched.
 - Errors at any layer are non-fatal: a settings-write failure logs and degrades to today's per-worktree allowlist behavior, it never blocks a spawn or a status transition.
 
-See `internal/agent/claude_settings.go` (helpers + 28 subtests covering merge, seed, promote, transition-gate, round-trip).
+See `internal/agent/claude_settings.go` (helpers + tests covering merge, seed, promote, transition-gate, prune heuristic, snapshot rotation, audit log).
 
 ## Adding New Agents
 

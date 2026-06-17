@@ -87,7 +87,7 @@ func TestTicketStore_Move(t *testing.T) {
 	ticket := board.NewTicket("Test", "project-1")
 	store.Add(ticket)
 
-	if _, err := store.Move(ticket.ID, board.StatusInProgress); err != nil {
+	if _, _, err := store.Move(ticket.ID, board.StatusInProgress); err != nil {
 		t.Fatalf("Move() error: %v", err)
 	}
 
@@ -139,7 +139,7 @@ func TestTicketStore_Move_PromotesClaudeApprovals(t *testing.T) {
 	ticket.Status = board.StatusInProgress
 	store.Add(ticket)
 
-	added, err := store.Move(ticket.ID, board.StatusInReview)
+	added, _, err := store.Move(ticket.ID, board.StatusInReview)
 	if err != nil {
 		t.Fatalf("Move: %v", err)
 	}
@@ -153,6 +153,101 @@ func TestTicketStore_Move_PromotesClaudeApprovals(t *testing.T) {
 	}
 	if !strings.Contains(string(repoFile), "Bash(go test *)") {
 		t.Errorf("repo file missing promoted entry: %s", repoFile)
+	}
+}
+
+// TestTicketStore_Move_PrunesOnTransition exercises the prune wiring
+// end-to-end: a known-noise entry in the repo file gets removed when
+// any ticket transition fires (not just promote-triggering ones).
+// Asserts: (a) noise gone from file, (b) .pruned-log has one line,
+// (c) snapshot .bak file exists with pre-prune state, (d) second
+// move on the now-clean file is a no-op (no new snapshot, no new log).
+func TestTicketStore_Move_PrunesOnTransition(t *testing.T) {
+	isolation := t.TempDir()
+	t.Setenv("HOME", isolation)
+	t.Setenv("XDG_CONFIG_HOME", isolation)
+	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(isolation, ".gitconfig-absent"))
+	t.Setenv("GIT_CONFIG_SYSTEM", filepath.Join(isolation, ".gitconfig-system-absent"))
+
+	root := t.TempDir()
+	repoPath := filepath.Join(root, "repo")
+	if err := os.MkdirAll(filepath.Join(repoPath, ".claude"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Seed the repo file with a human-baseline entry plus a known-noise
+	// entry (long, no glob, no allowlisted path).
+	seedJSON := `{"permissions":{"allow":[
+		"Bash(git config *)",
+		"Bash(awk '/2026-06-16T1[0-1]:[34][0-9]/' /tmp/fake.log)"
+	]}}`
+	if err := os.WriteFile(
+		filepath.Join(repoPath, ".claude", "settings.local.json"),
+		[]byte(seedJSON), 0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	store := NewTicketStore("project-1", repoPath)
+	ticket := board.NewTicket("Test", "project-1")
+	ticket.Status = board.StatusBacklog
+	store.Add(ticket)
+
+	// Move backlog → in_progress. NOT a promote-triggering transition
+	// (in_progress isn't in {in_review, done}), but prune SHOULD fire.
+	_, pruned, err := store.Move(ticket.ID, board.StatusInProgress)
+	if err != nil {
+		t.Fatalf("Move: %v", err)
+	}
+	if len(pruned) != 1 {
+		t.Fatalf("pruned: got %d, want 1: %v", len(pruned), pruned)
+	}
+
+	// (a) noise gone from repo file
+	body, _ := os.ReadFile(filepath.Join(repoPath, ".claude", "settings.local.json"))
+	if strings.Contains(string(body), "2026-06-16T") {
+		t.Errorf("noise entry still in repo file: %s", body)
+	}
+	if !strings.Contains(string(body), "Bash(git config *)") {
+		t.Errorf("human-baseline entry was lost: %s", body)
+	}
+
+	// (b) .pruned-log has one line for the noise entry
+	logBytes, err := os.ReadFile(filepath.Join(repoPath, ".claude", ".pruned-log"))
+	if err != nil {
+		t.Fatalf(".pruned-log not written: %v", err)
+	}
+	if lines := strings.Count(string(logBytes), "\n"); lines != 1 {
+		t.Errorf(".pruned-log line count: got %d, want 1", lines)
+	}
+	if !strings.Contains(string(logBytes), "2026-06-16T") {
+		t.Errorf(".pruned-log missing noise entry: %s", logBytes)
+	}
+
+	// (c) snapshot .bak file exists with pre-prune state (BOTH entries)
+	matches, _ := filepath.Glob(filepath.Join(repoPath, ".claude", "settings.local.json.bak.*"))
+	if len(matches) != 1 {
+		t.Fatalf("snapshot count: got %d, want 1: %v", len(matches), matches)
+	}
+	snap, _ := os.ReadFile(matches[0])
+	if !strings.Contains(string(snap), "2026-06-16T") {
+		t.Errorf("snapshot doesn't contain pre-prune noise: %s", snap)
+	}
+
+	// (d) Second move is idempotent — no new snapshot, no new log line.
+	_, pruned2, err := store.Move(ticket.ID, board.StatusInReview)
+	if err != nil {
+		t.Fatalf("second Move: %v", err)
+	}
+	if len(pruned2) != 0 {
+		t.Errorf("second move produced prunes: %v", pruned2)
+	}
+	matches2, _ := filepath.Glob(filepath.Join(repoPath, ".claude", "settings.local.json.bak.*"))
+	if len(matches2) != 1 {
+		t.Errorf("second move created new snapshot: %v", matches2)
+	}
+	logBytes2, _ := os.ReadFile(filepath.Join(repoPath, ".claude", ".pruned-log"))
+	if lines := strings.Count(string(logBytes2), "\n"); lines != 1 {
+		t.Errorf("second move added log lines: now %d, want 1", lines)
 	}
 }
 
