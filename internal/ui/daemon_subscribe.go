@@ -258,8 +258,7 @@ func (m *Model) applyDaemonSessionEvent(ev daemon.SessionEvent) {
 					delete(m.panes, ticketID)
 				}
 				if m.focusedPane == ticketID {
-					m.mode = ModeNormal
-					m.focusedPane = ""
+					m.exitToBoard()
 				}
 			case "attached", "detached":
 				// Informational only — PTY-stream ownership; doesn't

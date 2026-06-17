@@ -1039,8 +1039,7 @@ func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// the daemon (e.g. takeover case).
 		ticketID := board.TicketID(msg.PaneID)
 		if m.focusedPane == ticketID {
-			m.mode = ModeNormal
-			m.focusedPane = ""
+			m.exitToBoard()
 			m.selectTicketByID(ticketID)
 		}
 		return m.handleTerminalMsg(msg)
@@ -1073,8 +1072,7 @@ func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		if m.focusedPane == ticketID {
-			m.mode = ModeNormal
-			m.focusedPane = ""
+			m.exitToBoard()
 			m.notify("Agent exited")
 			m.selectTicketByID(ticketID)
 		}
@@ -1100,8 +1098,7 @@ func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 			delete(m.panes, id)
 		}
 		if m.focusedPane != "" {
-			m.mode = ModeNormal
-			m.focusedPane = ""
+			m.exitToBoard()
 		}
 		// Daemon push channel is gone; the file-poll takes over as the
 		// AgentStatus source. Clear the subscribe handles so we don't
@@ -1128,8 +1125,7 @@ func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.maybeSetWindowTitle()
 
 	case terminal.ExitFocusMsg:
-		m.mode = ModeNormal
-		m.focusedPane = ""
+		m.exitToBoard()
 		return m, m.maybeSetWindowTitle()
 
 	case agentStatusMsg:
@@ -1873,6 +1869,20 @@ func shouldRetryAttachOnEnter(pane *daemonclient.PaneView) bool {
 	return pane.LastAttachErr() != nil && pane.State() != daemonclient.PaneViewAttached
 }
 
+// exitToBoard returns the user from agent view to the board, enforcing
+// the invariant that the cycle-attach modal flag never outlives the
+// focus that justified it. Every path that drops m.focusedPane — the
+// keyboard exit (Ctrl+g / Esc) AND the async daemon paths (session
+// exited, pane detached/exited, daemon disconnected) — must go through
+// here. A stranded cycleAttachPrompt would otherwise resurface as a
+// phantom modal on the next agent-view entry, swallowing Ctrl+g though
+// the user never cycled.
+func (m *Model) exitToBoard() {
+	m.mode = ModeNormal
+	m.focusedPane = ""
+	m.cycleAttachPrompt = false
+}
+
 func (m *Model) handleAgentViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// The cycle-attach modal swallows all keys until the user resolves
 	// it (Enter attaches, Esc returns to the board, Ctrl+\ / Ctrl+]
@@ -1884,8 +1894,7 @@ func (m *Model) handleAgentViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	pane, ok := m.panes[m.focusedPane]
 	if !ok {
-		m.mode = ModeNormal
-		m.focusedPane = ""
+		m.exitToBoard()
 		return m, m.maybeSetWindowTitle()
 	}
 
@@ -1940,8 +1949,7 @@ func (m *Model) handleAgentViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 			}
 			log.Printf("openkanban model: ExitFocusMsg received, mode -> ModeNormal")
-			m.mode = ModeNormal
-			m.focusedPane = ""
+			m.exitToBoard()
 		case daemonclient.AttachFirstMsg:
 			// User typed into an unattached pane — attach now and
 			// re-deliver the key would be nice but is out of scope for
@@ -1957,26 +1965,28 @@ func (m *Model) handleAgentViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 // handleCycleAttachPromptKey resolves the modal opened by
 // cycleUnattachedSession. Enter attaches to the currently focused
-// pane and clears the modal; Esc cancels and returns to the board;
-// Ctrl+\ / Ctrl+] keep cycling; every other key is swallowed so the
-// modal can't be bypassed by a stray keystroke landing in the PTY.
+// pane and clears the modal; Esc / Ctrl+g cancel and return to the
+// board; Ctrl+\ / Ctrl+] keep cycling; every other key is swallowed so
+// the modal can't be bypassed by a stray keystroke landing in the PTY.
+//
+// Ctrl+g is the documented agent-view "exit to board" gesture. Without
+// an explicit case here it fell through to the swallow at the bottom,
+// so the act of cycling silently disabled Ctrl+g until the user pressed
+// Esc — it stays an intentional exit gesture, not a PTY-bound key, so
+// it resolves the modal rather than bypassing it.
 func (m *Model) handleCycleAttachPromptKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "enter":
 		pv, ok := m.panes[m.focusedPane]
 		if !ok || pv == nil {
-			m.cycleAttachPrompt = false
-			m.mode = ModeNormal
-			m.focusedPane = ""
+			m.exitToBoard()
 			return m, m.maybeSetWindowTitle()
 		}
 		m.cycleAttachPrompt = false
 		cmd := m.attachExisting(m.focusedPane, pv)
 		return m, tea.Batch(cmd, m.maybeSetWindowTitle())
-	case "esc":
-		m.cycleAttachPrompt = false
-		m.mode = ModeNormal
-		m.focusedPane = ""
+	case "esc", "ctrl+g":
+		m.exitToBoard()
 		return m, m.maybeSetWindowTitle()
 	case "ctrl+]":
 		return m.cycleUnattachedSession(1)
