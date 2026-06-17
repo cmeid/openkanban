@@ -190,6 +190,20 @@ func TestRemoveSession_CleanExitNoWarn(t *testing.T) {
 		t.Errorf("clean single-session exit emitted invariant-violation WARN; got:\n%s", logOut)
 	}
 
+	// Wind-down must be deterministic. Under heavy full-suite load the
+	// watcher's natural removeSession can lag past the poll above; with
+	// the default-mode deferred-shutdown behavior (the daemon no longer
+	// force-kills live sessions on last-client-disconnect — see
+	// awaitSessionDrain), a still-registered session would make the
+	// daemon defer shutdown and this waitServerDone would time out.
+	// Mirror TestRemoveSession_LogsInvariantViolationOnDuplicate: ensure
+	// the registry is empty before disconnecting so the last-client path
+	// takes the immediate (live==0) shutdown branch. Idempotent with any
+	// lagging watcher removal (the map delete is a no-op if already gone).
+	srv.sessionsMu.Lock()
+	delete(srv.sessions, sess.ID())
+	srv.sessionsMu.Unlock()
+
 	a.Close()
 	waitServerDone(t, errCh, 5*time.Second)
 }

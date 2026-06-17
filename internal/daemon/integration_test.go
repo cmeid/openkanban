@@ -405,6 +405,13 @@ func TestServerLifecycle_AttachSessionNotFound(t *testing.T) {
 	waitServerDone(t, errCh, 3*time.Second)
 }
 
+// TestServerLifecycle_LastClientWithLiveSessions exercises the spawn-RPC
+// path of the exit-guard-bypass fix: when the last client disconnects in
+// default mode while a session is still live, the daemon must NOT
+// force-kill that session. It defers shutdown until the session drains
+// naturally. (TestServerLifecycle_DefaultDefersShutdownUntilSessionsDrain
+// covers the direct-registry-insert variant and the drained-shutdown log
+// assertions; this test drives the real Spawn RPC instead.)
 func TestServerLifecycle_LastClientWithLiveSessions(t *testing.T) {
 	srv, errCh := startServer(t)
 
@@ -434,8 +441,7 @@ func TestServerLifecycle_LastClientWithLiveSessions(t *testing.T) {
 	conn.SetReadDeadline(time.Time{})
 
 	// Reach into the server (same package) to grab a handle on the
-	// session so we can verify the defensive kill drove it to
-	// not-running.
+	// session so we can verify it SURVIVES the last-client disconnect.
 	srv.sessionsMu.RLock()
 	sess := srv.sessions[spawn.SessionID]
 	srv.sessionsMu.RUnlock()
@@ -445,22 +451,39 @@ func TestServerLifecycle_LastClientWithLiveSessions(t *testing.T) {
 	if !sess.Running() {
 		t.Fatalf("sleep session reported not running immediately after spawn")
 	}
+	t.Cleanup(func() { _ = sess.Kill(0) })
 
 	// Drop the client without killing the session — this simulates
 	// the exit-guard being bypassed.
 	conn.Close()
 
-	waitServerDone(t, errCh, 8*time.Second)
-
-	// The defensive cleanup should have killed the session.
-	deadline := time.Now().Add(3 * time.Second)
+	// The session must STAY running and the daemon must STAY up across
+	// more than one drain tick. The old (buggy) behavior killed it here.
+	deadline := time.Now().Add(drainPollInterval*2 + 500*time.Millisecond)
 	for time.Now().Before(deadline) {
 		if !sess.Running() {
-			return
+			t.Fatalf("session %s was killed after last-client disconnect; deferral failed", spawn.SessionID)
 		}
-		time.Sleep(20 * time.Millisecond)
+		select {
+		case err := <-errCh:
+			t.Fatalf("daemon exited while session %s was still live: %v", spawn.SessionID, err)
+		default:
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-	t.Errorf("session %s still running after last-client shutdown", spawn.SessionID)
+
+	// Daemon must still be listening.
+	if c2, err := net.Dial("unix", srv.SocketPath()); err != nil {
+		t.Fatalf("post-disconnect dial: default daemon should still listen while a session is live, got: %v", err)
+	} else {
+		c2.Close()
+	}
+
+	// Drain the session; the daemon must then shut down on its own.
+	if err := sess.Kill(0); err != nil {
+		t.Fatalf("sess.Kill: %v", err)
+	}
+	waitServerDone(t, errCh, drainPollInterval*3+2*time.Second)
 }
 
 // --- Concurrency smoke ---
