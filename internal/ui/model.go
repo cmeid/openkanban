@@ -1039,6 +1039,9 @@ func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case QuitRequestedMsg:
 		return m.handleQuitRequested()
 
+	case StallRecoverMsg:
+		return m.handleStallRecover()
+
 	case prepareExitResultMsg:
 		return m.handlePrepareExitResult(msg)
 
@@ -5966,6 +5969,38 @@ func (m *Model) Cleanup() {
 // in tests that construct a Model directly. Stopped by Cleanup.
 func (m *Model) StartStallMonitor() {
 	m.monitor.start()
+}
+
+// StallRecoverMsg is injected by the stall watchdog (via program.Send) when
+// it detects a sustained "starved" stall — the Update loop parked OUTSIDE
+// Update/View while the daemon keeps pushing events. It asks the loop to
+// detach the focused agent view back to the board, turning a wedge into a
+// recoverable blip. (Only "starved" stalls trigger it: program.Send is
+// actually processed in that shape, and it's a genuine wedge rather than a
+// transient slow render.)
+type StallRecoverMsg struct{}
+
+// SetStallRecoverySink wires the watchdog's recovery action to the running
+// program. Called from app.go AFTER tea.NewProgram so the watchdog can inject
+// a StallRecoverMsg on the goroutine-safe program.Send path. The closure is
+// the only thing the (tea-agnostic) monitor needs to know.
+func (m *Model) SetStallRecoverySink(send func(tea.Msg)) {
+	if m.monitor == nil {
+		return
+	}
+	m.monitor.setRecover(func() { send(StallRecoverMsg{}) })
+}
+
+// handleStallRecover detaches a stalled agent view back to the board. The
+// session keeps running on the daemon; the user can re-enter to resume. A
+// no-op outside agent view (a stall on the board has nothing to detach).
+func (m *Model) handleStallRecover() (tea.Model, tea.Cmd) {
+	if m.mode != ModeAgentView {
+		return m, nil
+	}
+	m.exitToBoard()
+	m.notify("Recovered a stalled session view — detached to the board; re-enter to resume")
+	return m, m.maybeSetWindowTitle()
 }
 
 func (m *Model) pollAgentStatusesAsync() tea.Cmd {
