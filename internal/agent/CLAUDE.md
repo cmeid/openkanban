@@ -96,6 +96,16 @@ Pure JSON-level merges — the helpers only touch `permissions.{allow,ask,deny}`
 
 Errors are non-fatal at all call sites: a settings-write failure logs and degrades to today's behavior (per-worktree allowlist), it never blocks a spawn or a status transition.
 
+## 1:1 ticket↔session enforcement (`internal/ticketsvc`)
+
+The package at `internal/ticketsvc/svc.go` is the **single sanctioned funnel** for any code that writes `ticket.AgentSessionID` or gates an attach to an existing Claude session. Both TUI (`internal/ui`) and CLI (`cmd/`) must call through here — direct `ticket.AgentSessionID = uuid` assignments are forbidden by policy.
+
+- `LinkSession(store, requesting, uuid, opts)` — claims `uuid` for the requesting ticket after a uniqueness scan over `GlobalTicketStore.FindByAgentSessionID(uuid)`. `LinkOpts.BestEffort` is silent-noop-on-conflict (used by back-fill); `LinkOpts.Force` clears conflicting tickets first. Caller is responsible for `store.SaveTicket(requesting)` on success.
+- `GateAttach(probe, uuid, selfDaemonSessionID)` — refuses attach when `lsof` shows the JSONL is held, or the daemon owns a session for a DIFFERENT ticket. `SessionProbe` is a `func` type (not an interface).
+- The pre-2026-06-17 `Ticket.SessionOwned` bool was removed when forking was eliminated; every spawn is now migrate-on-resume. The YAML frontmatter field is dormant for old `.md` compatibility. The grep guard at `internal/ui/forksession_guard_test.go` makes `--fork-session` re-introduction a build-time failure.
+
+See [[openkanban-one-to-one-ticket-session-invariant]] for the threat model.
+
 ### Review-and-prune
 
 `ReviewAndPruneRepoSettings(repoPath)` runs after Promote on every `TicketStore.Move`. It walks `permissions.allow` of the repo file and removes noise `Bash(...)` entries — hard-deny verbs (`git push`, `gh pr create`, `op`, `sudo`, `aws`, etc.), hard-deny paths (`/.ssh/`, `/.aws/`, …), escape-soup (3+ backslashes), untrusted absolute paths (anything outside the workspace allowlist), and the long-no-glob catch-all (length > 30 with no `*`/`**`/`./...`). Skill / Read / Agent entries pass through.
