@@ -1194,9 +1194,12 @@ func TestDefaultPrompt_WrapUpContract(t *testing.T) {
 		}
 	}
 
-	// New contract must be present.
+	// New contract must be present. Anchor on phrases unique to the
+	// wrap-up section so deleting that paragraph actually fails the test
+	// ("commit → PR → merge" and "permission prompt" appear nowhere else
+	// in the rendered fresh-spawn prompt).
 	for _, want := range []string{
-		"commit", // the land route is named
+		"commit → PR → merge",
 		"permission prompt",
 	} {
 		if !strings.Contains(got, want) {

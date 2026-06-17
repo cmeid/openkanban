@@ -111,7 +111,7 @@ Execute, in order. **Never push directly to main** (`git push origin <branch>:ma
 3. `git push -u origin <branch>` — push the branch only (never `:main`). Pass the remote explicitly (don't rely on a bare `git push` default, which in a fork can target a remote you don't own).
 4. `gh pr create --repo <owner/repo> --base main --head <branch> --title "<subject>" --body "<Summary / What landed / Test plan>"`.
 5. `gh pr merge <num> --repo <owner/repo> --merge` — merge commits, not squash/rebase.
-   - **Self-merge may be blocked.** On `manifold-security` org repos, `require_last_push_approval` refuses a self-merge (`[[manifold-security-pr-ruleset]]`): the agent can push + open the PR but cannot merge. If merge is refused, stop there and hand back with the PR URL and the reason — don't fight the ruleset.
+   - **Self-merge may be blocked even on an approved destination.** When the granted destination is an allowlisted `manifold-security` repo (e.g. `demo-seeder`), its `require_last_push_approval` ruleset refuses a self-merge (`[[manifold-security-pr-ruleset]]`): you can push + open the PR, but the merge needs approval from someone other than you. If merge is refused, stop there and hand back the PR URL + reason — don't fight the ruleset. (A non-owned, non-allowlisted org repo never reaches this step — Step 4 keeps an unowned destination commit-only.)
 
 **Memories** are written now (they live outside any repo; not committed). Apply only the doc edits Chris approved; keep them minimal.
 
