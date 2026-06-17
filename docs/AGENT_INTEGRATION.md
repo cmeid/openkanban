@@ -719,6 +719,22 @@ unlike the timer, holds for the entire wait and clears the instant the
 user answers and the tool starts streaming — at which point the
 override resumes covering the real Notification→PostToolUse gap.
 
+The inverse gap needs a symmetric guard. The file is *also* pinned at
+`waiting` for the whole run of an already-approved tool, and the
+activity heartbeat only bridges it while bytes flow. A **silent** tool
+defeats that: during a Bash tool Claude shows the command's output
+region, not its own ~10 Hz spinner, so a quiet `go test` emits nothing
+and the activity timestamp goes stale — leaving the card at `waiting`
+with nothing for the user to do. `activeTurnVisible(terminalContent)`
+closes it: when the live screen shows an active-turn marker
+(`esc to interrupt`, or a braille spinner glyph) and the prompt guard
+did not fire, the session is busy, not blocked on the user → `working`.
+Ordering is load-bearing — `activeTurnVisible` runs strictly *after*
+`permissionPromptVisible`, so an on-screen prompt always wins; the
+marker set is mutually exclusive with a prompt in Claude's real UI, and
+if the footer string drifts in a future version the check fails *safe*
+(reverts to showing `waiting` while busy, never hides a needs-you).
+
 The cost is bounded by the activity broadcaster's "only emit when
 advanced" check: an idle session generates zero traffic. Spinner-
 animating sessions emit one event per tick.

@@ -172,6 +172,20 @@ func (d *StatusDetector) DetectStatusWithActivity(agentType, fileSessionName, ap
 	if permissionPromptVisible(terminalContent) {
 		return board.AgentWaiting
 	}
+	// The file is also pinned at "waiting" through the whole run of a tool
+	// the user already approved (Notification fired, no hook until
+	// PostToolUse). For a *silent* tool — e.g. a quiet `go test` in a Bash
+	// tool, where Claude shows the command's output region instead of its
+	// own animated spinner — no bytes flow, so the activity fallback below
+	// can't rescue it and the card shows "waiting" with nothing for the
+	// user to do. If the live screen shows an active-turn marker (and no
+	// prompt, checked first above), the session is busy, not blocked on
+	// the user → "working". This must stay ordered after the prompt guard:
+	// the marker set is mutually exclusive with a prompt in Claude's real
+	// UI, but the ordering is what guarantees a prompt always wins.
+	if activeTurnVisible(terminalContent) {
+		return board.AgentWorking
+	}
 	if time.Since(lastActivity) < WaitingActivityTTL {
 		return board.AgentWorking
 	}
@@ -206,6 +220,53 @@ func permissionPromptVisible(content string) bool {
 	tail := strings.ToLower(strings.Join(lines, "\n"))
 	for _, sig := range permissionPromptSignatures {
 		if strings.Contains(tail, sig) {
+			return true
+		}
+	}
+	return false
+}
+
+// activeTurnMarkers are substrings that appear on screen only while a
+// Claude turn or tool is actively running and interruptible — never on a
+// permission prompt (which shows "esc to cancel") or an idle input box.
+// Observed in Claude Code as of 2026-06; if the footer string drifts in a
+// future version, activeTurnVisible simply stops matching and detection
+// falls through to the activity fallback and then the "waiting" default —
+// i.e. drift fails SAFE (a busy session shows "waiting", the original
+// annoyance) and never the dangerous direction (hiding a needs-you).
+var activeTurnMarkers = []string{
+	"esc to interrupt",
+}
+
+// activeTurnSpinnerGlyphs are the braille frames Claude animates while
+// thinking; detectCodingAgentStatus already treats them as "working".
+// Listed here too because that path is skipped when the status file is
+// authoritative (file=waiting short-circuits DetectStatusWithPortAPI).
+var activeTurnSpinnerGlyphs = []string{
+	"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
+}
+
+// activeTurnVisible reports whether the tail of the PTY content shows an
+// active (interruptible) turn or tool. Used to lift a file-pinned
+// "waiting" to "working" for an already-approved tool that emits no PTY
+// bytes — but only after permissionPromptVisible has had first refusal,
+// so an on-screen prompt always wins (guards the false-negative).
+func activeTurnVisible(content string) bool {
+	if content == "" {
+		return false
+	}
+	lines := strings.Split(content, "\n")
+	if len(lines) > 15 {
+		lines = lines[len(lines)-15:]
+	}
+	tail := strings.ToLower(strings.Join(lines, "\n"))
+	for _, m := range activeTurnMarkers {
+		if strings.Contains(tail, m) {
+			return true
+		}
+	}
+	for _, g := range activeTurnSpinnerGlyphs {
+		if strings.Contains(tail, g) {
 			return true
 		}
 	}
