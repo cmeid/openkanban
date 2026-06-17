@@ -154,6 +154,15 @@ type PaneView struct {
 	// SYNCHRONOUSLY inside vt.Write — must stay lock-free re: p.mu, hence
 	// the atomic.
 	cursorAppMode   atomic.Bool
+	// bracketedPasteActive tracks the child's bracketed-paste mode
+	// (DECSET 2004, ESC[?2004h/l). When set, a paste KeyMsg is forwarded
+	// wrapped in ESC[200~ … ESC[201~ so the child (e.g. claude) ingests it
+	// as one atomic paste and redraws once, instead of treating it as
+	// per-rune typed input — the char-by-char redraw flood that ballooned
+	// the TUI on a large paste. Set in applyOutput (under p.mu) but read in
+	// translateKey (which runs after p.mu is released), so atomic — same
+	// lock-free convention as cursorAppMode.
+	bracketedPasteActive atomic.Bool
 	mouseEnabled    bool
 	altScreenActive bool
 	// lastTopRow is the row-0 snapshot taken inside applyOutput just
@@ -1195,6 +1204,12 @@ func (p *PaneView) applySnapshotChunk(data []byte) {
 		if hasSeq(segment, mouseDisableSeqs) {
 			p.mouseEnabled = false
 		}
+		if hasSeq(segment, bracketedPasteEnableSeqs) {
+			p.bracketedPasteActive.Store(true)
+		}
+		if hasSeq(segment, bracketedPasteDisableSeqs) {
+			p.bracketedPasteActive.Store(false)
+		}
 		p.lastTopRow = terminal.CaptureTopRow(p.vt, p.altScreenActive)
 		p.vt.Write(segment)
 		terminal.PushScrolledLine(p.vt, p.altScreenActive, p.lastTopRow, p.scrollback)
@@ -1262,6 +1277,12 @@ func (p *PaneView) applyOutput(data []byte) {
 	if hasSeq(data, mouseDisableSeqs) {
 		p.mouseEnabled = false
 	}
+	if hasSeq(data, bracketedPasteEnableSeqs) {
+		p.bracketedPasteActive.Store(true)
+	}
+	if hasSeq(data, bracketedPasteDisableSeqs) {
+		p.bracketedPasteActive.Store(false)
+	}
 	// Capture scrollback: snapshot row 0 before vt.Write, push it
 	// after if it scrolled off. Without this, the local scrollback
 	// ring stays empty and wheel scroll silently no-ops because
@@ -1285,6 +1306,8 @@ var (
 		[]byte("\x1b[?1000l"), []byte("\x1b[?1002l"),
 		[]byte("\x1b[?1003l"), []byte("\x1b[?1006l"),
 	}
+	bracketedPasteEnableSeqs  = [][]byte{[]byte("\x1b[?2004h")}
+	bracketedPasteDisableSeqs = [][]byte{[]byte("\x1b[?2004l")}
 )
 
 func hasSeq(data []byte, seqs [][]byte) bool {
@@ -2083,6 +2106,19 @@ func (p *PaneView) translateKey(msg tea.KeyMsg) []byte {
 	case tea.KeySpace:
 		return []byte(" ")
 	case tea.KeyRunes:
+		// A bracketed paste (bubbletea strips the ESC[200~/201~ markers and
+		// sets Paste=true). Re-wrap before forwarding IF the child enabled
+		// bracketed-paste mode, so it ingests the paste atomically (one
+		// redraw) instead of per-rune — the char-by-char redraw flood that
+		// ballooned the TUI on a large paste. Only wrap when the child
+		// advertised ?2004h; otherwise it would render the literal markers.
+		if msg.Paste && p.bracketedPasteActive.Load() {
+			out := make([]byte, 0, len(msg.Runes)+12)
+			out = append(out, "\x1b[200~"...)
+			out = append(out, string(msg.Runes)...)
+			out = append(out, "\x1b[201~"...)
+			return out
+		}
 		return []byte(string(msg.Runes))
 	}
 
