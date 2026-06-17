@@ -1355,15 +1355,25 @@ func (s *Server) watchSessionExit(sess *Session) {
 			}()
 			removeSession()
 			emit()
+			// Reclaim the pane on natural exit. teardownUnlocked is
+			// idempotent (teardownOnce), so if Kill/TicketDone already
+			// tore the pane down (channel-closed-without-ExitEvent
+			// path) this is a safe no-op. Running in our own goroutine
+			// (not the read-loop goroutine), so readLoopWG/drainWG
+			// waits inside Stop() do not self-deadlock. Do NOT route
+			// through trackedKill — this is reclamation, not a kill,
+			// and must not inflate inflight-kills/reap-failures gauges.
+			sess.pane.Stop() //nolint:errcheck
 		}()
 		for ev := range ch {
 			if _, ok := ev.(terminal.ExitEvent); ok {
-				return // defer runs removeSession + emit
+				return // defer runs removeSession + emit + pane reclaim
 			}
 		}
 		// Channel closed without ExitEvent (e.g. Stop tore the loop
 		// down before the read returned). The defer still runs
-		// removeSession + emit so subscribers learn the session is gone.
+		// removeSession + emit + pane reclaim so the pane is always
+		// cleaned up regardless of exit path.
 	}()
 }
 
