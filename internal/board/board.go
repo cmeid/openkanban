@@ -65,6 +65,14 @@ const (
 	AgentWaiting   AgentStatus = "waiting"
 	AgentCompleted AgentStatus = "completed"
 	AgentError     AgentStatus = "error"
+	// AgentStuck is a transient daemon-derived state: the daemon's
+	// watchdog observed the pane wedged on input backpressure (the child
+	// stopped draining stdin). It is NOT a terminal status — it is not
+	// persisted as a wrap-up state like AgentCompleted, and clears once
+	// the session drains input (or the user destroys it). SetAgentStatus
+	// handles it like any other value; the TUI surfaces it as a red card
+	// with a recover/destroy modal.
+	AgentStuck AgentStatus = "stuck"
 )
 
 type Ticket struct {
