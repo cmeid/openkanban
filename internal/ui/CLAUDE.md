@@ -34,6 +34,8 @@ Vim-style navigation:
 - `Enter` - select/confirm
 - `Esc` - cancel/back
 
+`:` is **intentionally unhandled** in normal mode — it falls through `handleNormalMode`'s switch to a no-op. It once entered a `ModeCommand` stub (a husk present since the initial commit whose only behaviors bounced straight back to `ModeNormal`), removed as dead code. The key is deliberately left free so a future command-palette feature (`:q`, `:w`, `:e <ticket>`, …) can claim it cleanly. Don't re-add a no-op handler or repurpose `:` for an unrelated binding.
+
 Inside ModeAgentView, these keys are intercepted before the PTY child (claude, etc.) sees them:
 - `Ctrl+]` / `Ctrl+\` - cycle focus to next / prev open, unattached session
 - `Ctrl+g` - exit back to the board
@@ -53,6 +55,8 @@ Every keybinding has **two doc surfaces** in `view.go`:
 2. `renderHelp()` — the `?` modal, the canonical "every shortcut" reference. Must list every binding.
 
 When you add, remove, or rebind a key, update **both** functions in the same change. The modal must stay complete; the footer must surface the key (with a `prio`) in any mode where it's relevant. They live ~50 lines apart on purpose — see one, edit the other.
+
+Keys that only apply while the **sidebar is focused** have a **third** surface: a hint line rendered directly inside `renderSidebar()` (e.g. `"  j/k ⏎toggle a/d o:open"`). It's width-budgeted to `m.sidebarWidth`, so keep tokens terse (`o:open`, not `o open only`). Sidebar-focused keys (handled in `handleSidebarNav`) must update all three: this in-sidebar line, the `contextualHints()` `sidebarFocused` branch, and the `renderHelp()` Sidebar section.
 
 ## View Composition
 
@@ -84,6 +88,12 @@ Vertical scroll per column lives in `m.columnOffsets[i]`. Three functions touch 
 - `ensureTicketVisible` operates on the **active column only**, scrolling to keep `m.activeTicket` in view (used on cursor move and `selectTicketByID`).
 
 Card-height arithmetic in any path that runs *inside or after* `refreshColumnTickets` (and before the next render) must use the `ticketHeight` constant — NOT the `columnTicketHeights` cache. The cache is keyed to pre-refresh indices; after a filter shifts the ticket list, index `j` likely points at a different card. Reading it post-refresh is actively wrong, not just stale.
+
+### Keep focus on the acted-on ticket
+
+Selection is by **index** (`m.activeColumn`/`m.activeTicket`), but `refreshColumnTickets` re-sorts every column and does NOT preserve which ticket was selected. Any path that *moves, creates, or edits* a ticket must call `m.selectTicketByID(ticket.ID)` **after** `refreshColumnTickets` to re-anchor focus on that ticket by its stable UUID. All five mutation paths follow this: forward/backward quick-move, drag-drop (`dropTicket`), create and edit branches of `saveTicketForm`.
+
+Do **not** push `selectTicketByID` into `refreshColumnTickets` itself. That chokepoint is shared with filter/resync flows that intentionally rely on `selectTicketByID`'s clamp-degrade fallback to gracefully drop a selection a filter just hid. Centralizing the re-select would regress filter UX. Keep the call at the mutation call sites. `selectTicketByID` handles vertical scroll (`ensureTicketVisible`) but not horizontal — keep an explicit `ensureColumnVisible()` where the active column may change (e.g. `dropTicket`).
 
 ## Terminal Panes
 
