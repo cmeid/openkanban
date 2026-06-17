@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -347,6 +348,11 @@ type Model struct {
 	// decomposition.
 	daemon daemonAPI
 
+	// monitor is always-on diagnostic instrumentation for the bubbletea
+	// main goroutine — see stallwatch.go. Captures a goroutine dump when
+	// Update/View stalls (the intermittent freeze-on-session-close bug).
+	monitor *stallMonitor
+
 	// confirmExit carries modal state for ModeConfirmExit. Populated by
 	// handlePrepareExitResult when the user requests quit, cleared when
 	// the modal exits (either to ModeNormal on cancel or to tea.Quit).
@@ -591,6 +597,16 @@ func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projec
 		}
 	}
 
+	// Diagnostic stall monitor — created here so Update/View stamping has
+	// a target, but the watchdog goroutine + SIGUSR2 handler are only
+	// armed by StartStallMonitor (from app.go), keeping NewModel side in
+	// tests free of leaked goroutines.
+	var diag func() (uint64, uint64)
+	if daemonClient != nil {
+		diag = daemonClient.DiagCounters
+	}
+	m.monitor = newStallMonitor(diag)
+
 	return m
 }
 
@@ -678,6 +694,9 @@ func (m *Model) checkForUpdates() tea.Cmd {
 // the diff between viewingSessionID and the post-update truth covers
 // every transition path.
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	m.monitor.enterUpdate(reflect.TypeOf(msg).String(), string(m.mode), len(m.panes), len(m.daemonOwned))
+	defer m.monitor.exitUpdate()
+	maybeDebugStall()
 	next, cmd := m.dispatchUpdate(msg)
 	nm, ok := next.(*Model)
 	if !ok {
@@ -5333,9 +5352,17 @@ func (m *Model) getAgentIndex(agentName string) int {
 // place sessions die on TUI exit, and it only fires when the actual
 // last connection drops.
 func (m *Model) Cleanup() {
+	m.monitor.stop()
 	for _, pane := range m.panes {
 		_ = pane.Close()
 	}
+}
+
+// StartStallMonitor arms the diagnostic stall watchdog (ticker goroutine
+// + SIGUSR2 handler). Called from app.go for the real TUI; left unarmed
+// in tests that construct a Model directly. Stopped by Cleanup.
+func (m *Model) StartStallMonitor() {
+	m.monitor.start()
 }
 
 func (m *Model) pollAgentStatusesAsync() tea.Cmd {

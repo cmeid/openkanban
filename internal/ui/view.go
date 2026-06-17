@@ -14,6 +14,8 @@ import (
 )
 
 func (m *Model) View() string {
+	m.monitor.enterView()
+	defer m.monitor.exitView()
 	if m.width == 0 || m.height == 0 {
 		loadingStyle := lipgloss.NewStyle().
 			Foreground(m.colors.primary).
