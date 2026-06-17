@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/techdufus/openkanban/internal/config"
 )
 
 // stallMonitor is always-on diagnostic instrumentation for the bubbletea
@@ -201,6 +203,7 @@ func (m *stallMonitor) onTick(nowNanos int64) {
 	if !ok {
 		return
 	}
+	config.GuardHomeWrite(m.dumpPath)
 	f, err := os.OpenFile(m.dumpPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err == nil {
 		m.writeDump(f, kind, nowNanos)
@@ -215,6 +218,7 @@ func (m *stallMonitor) onTick(nowNanos int64) {
 }
 
 func (m *stallMonitor) manualDump() {
+	config.GuardHomeWrite(m.dumpPath)
 	f, err := os.OpenFile(m.dumpPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return

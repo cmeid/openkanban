@@ -48,6 +48,10 @@ for _, tt := range tests {
 }
 ```
 
+### Config isolation is mandatory
+
+Any test that persists a project, ticket, filter, config, or status MUST isolate the config home — call `testutil.NewTestEnv(t)` or `t.Setenv("OPENKANBAN_CONFIG_DIR", t.TempDir())`. `config.GuardHomeWrite` PANICS if a test writes under the developer's real `~/.config/openkanban` or `~/.cache/openkanban*`. Knobs: `OPENKANBAN_CONFIG_DIR`, `XDG_CONFIG_HOME`, `OPENKANBAN_STATUS_DIR`. The `withFakeHome` pattern (fake `$HOME` + emptied overrides) also works. The guard is a no-op in production (`testing.Testing()`-gated).
+
 ## JSON Config
 
 - Tags with omitempty: `json:"field,omitempty"`

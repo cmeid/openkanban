@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"testing"
 )
 
 const defaultGlobalPrompt = `You have been spawned by OpenKanban to work on a ticket.
@@ -251,6 +253,53 @@ func ConfigDir() (string, error) {
 	return filepath.Join(home, ".config", "openkanban"), nil
 }
 
+// guardedRealDirs captures the real openkanban dirs ONCE at init, before
+// any test mutates $HOME. NOTE: this comparison is textual (filepath.Clean
+// + HasPrefix), not EvalSymlinks-based — acceptable for a test-only guard.
+var guardedRealDirs = computeGuardedDirs()
+
+func computeGuardedDirs() []string {
+	// Guard the REAL $HOME-based openkanban dirs ONLY — deliberately NOT
+	// ConfigDir(), which honors OPENKANBAN_CONFIG_DIR / XDG_CONFIG_HOME.
+	// Those env overrides ARE isolation (tests, CI, multi-instance): a write
+	// they redirect is intentional and must not trip the guard. We protect
+	// the default locations a forgotten/unisolated test would silently
+	// corrupt. Keep the status literal in sync with agent.StatusDir()
+	// (config must NOT import agent — would cycle).
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+	return []string{
+		filepath.Clean(filepath.Join(home, ".config", "openkanban")),
+		filepath.Clean(filepath.Join(home, ".cache", "openkanban")),
+		filepath.Clean(filepath.Join(home, ".cache", "openkanban-status")),
+	}
+}
+
+func underAny(clean string, dirs []string) bool {
+	for _, d := range dirs {
+		if d != "" && (clean == d || strings.HasPrefix(clean, d+string(os.PathSeparator))) {
+			return true
+		}
+	}
+	return false
+}
+
+// GuardHomeWrite panics if, while running under `go test`, path is at/under
+// a real openkanban dir. It is a NO-OP in production (testing.Testing()==false)
+// — it can NEVER fire in the daemon/TUI/CLI. Do NOT widen the detector with
+// env checks; that would reintroduce production reachability.
+func GuardHomeWrite(path string) {
+	if !testing.Testing() {
+		return
+	}
+	if underAny(filepath.Clean(path), guardedRealDirs) {
+		panic("openkanban: test wrote under a REAL user dir: " + filepath.Clean(path) +
+			" — isolate it: testutil.NewTestEnv(t) or t.Setenv(\"OPENKANBAN_CONFIG_DIR\", t.TempDir()). See internal/CLAUDE.md > Testing.")
+	}
+}
+
 // ConfigPath returns the default config file path
 func ConfigPath() (string, error) {
 	dir, err := ConfigDir()
@@ -345,6 +394,8 @@ func (c *Config) Save(path string) error {
 			return err
 		}
 	}
+
+	GuardHomeWrite(path)
 
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {

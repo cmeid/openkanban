@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"syscall"
 	"time"
+
+	"github.com/techdufus/openkanban/internal/config"
 )
 
 // ErrDaemonNotRunning is returned by Dial when the socket file is
@@ -127,6 +129,7 @@ func forkDaemon() error {
 		return err
 	}
 
+	config.GuardHomeWrite(logPath)
 	logF, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return fmt.Errorf("daemon: open log %s: %w", logPath, err)

@@ -245,13 +245,23 @@ func ListProjects() error {
 		total := tickets.Count()
 		inProgress := tickets.CountByStatus("in_progress")
 
-		fmt.Printf("  %s (%s)\n", p.Name, p.ID[:8])
+		fmt.Printf("  %s (%s)\n", p.Name, shortID(p.ID))
 		fmt.Printf("    Path: %s\n", p.RepoPath)
 		fmt.Printf("    Tickets: %d total, %d in progress\n", total, inProgress)
 		fmt.Println()
 	}
 
 	return nil
+}
+
+// shortID truncates a project ID to its first 8 characters for display,
+// returning the full ID unchanged when it is shorter than 8 chars (e.g.
+// "proj-1"). Guards against the slice-bounds panic of a bare id[:8].
+func shortID(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
 }
 
 func DeleteProject(nameOrID string) error {
@@ -379,6 +389,8 @@ func redirectTUILog() io.Closer {
 		log.SetOutput(io.Discard)
 		return nil
 	}
+
+	config.GuardHomeWrite(path)
 
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {

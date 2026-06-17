@@ -336,6 +336,18 @@ Filename is cosmetic — identity comes from the `id` field in frontmatter. Rena
 
 If a stale legacy JSON ever reappears (e.g. an old binary was launched in another shell), the next load detects it is a strict subset of the per-ticket dir's state and renames it aside to `.stale-<timestamp>` rather than refusing to start.
 
+## Environment Overrides
+
+The config and status directories can be redirected via environment variables — primarily for tests, CI, and running multiple isolated instances:
+
+| Variable | Overrides | Default |
+|----------|-----------|---------|
+| `OPENKANBAN_CONFIG_DIR` | The config directory (config, projects, tickets) | `~/.config/openkanban` |
+| `XDG_CONFIG_HOME` | The config directory parent (`$XDG_CONFIG_HOME/openkanban`); ignored if `OPENKANBAN_CONFIG_DIR` is set | `~/.config` |
+| `OPENKANBAN_STATUS_DIR` | The agent status-file directory (where live agent status is written/read) | `~/.cache/openkanban-status` |
+
+`OPENKANBAN_CONFIG_DIR` takes precedence over `XDG_CONFIG_HOME`.
+
 ## Command Line
 
 In addition to the TUI, OpenKanban exposes a small command-line surface for scripting — useful when a running agent wants to create a ticket without driving the TUI.

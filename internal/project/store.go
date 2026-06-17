@@ -82,6 +82,7 @@ func (r *ProjectRegistry) Save() error {
 	if err != nil {
 		return err
 	}
+	config.GuardHomeWrite(path)
 
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
