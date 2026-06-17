@@ -92,6 +92,21 @@ Pure JSON-level merges — the helpers only touch `permissions.{allow,ask,deny}`
 
 Errors are non-fatal at all call sites: a settings-write failure logs and degrades to today's behavior (per-worktree allowlist), it never blocks a spawn or a status transition.
 
+### Review-and-prune
+
+`ReviewAndPruneRepoSettings(repoPath)` runs after Promote on every `TicketStore.Move`. It walks `permissions.allow` of the repo file and removes noise `Bash(...)` entries — hard-deny verbs (`git push`, `gh pr create`, `op`, `sudo`, `aws`, etc.), hard-deny paths (`/.ssh/`, `/.aws/`, …), escape-soup (3+ backslashes), untrusted absolute paths (anything outside the workspace allowlist), and the long-no-glob catch-all (length > 30 with no `*`/`**`/`./...`). Skill / Read / Agent entries pass through.
+
+The **idempotency contract** is load-bearing: if no entries would change, the function returns `(nil, nil)` without snapshotting, writing, or appending to `.pruned-log`. Repeated same-status transitions and already-clean files cost only a single read. Tests pin this with table-driven idempotency rows (`prune(prune(input)) == prune(input)` per row).
+
+Tilde resolution lives in two `sync.Once`-memoized package globals (`getResolvedHome`, `resolvedPathAllowlist`). If `os.UserHomeDir()` returns an error, the path allowlist degrades to only `/tmp/`, `/private/tmp/`, `/var/folders/` — fail-closed, prune anything else under common home roots.
+
+Recovery surfaces (both gitignored via the inner `.gitignore`):
+
+- `<repo>/.claude/.pruned-log` — append-only, one RFC3339-stamped line per removal (`<ts> <reason> <entry>`).
+- `<repo>/.claude/settings.local.json.bak.<unix-nanos>` — snapshot of pre-prune state. Rotation keeps the 3 most recent (sort by suffix; nanos suffix prevents same-second collisions).
+
+**No verb-widening.** Widening `Bash(<verb> <args>)` to `Bash(<verb> *)` is deliberately out of scope — it would collide with the global push-gate rule and the secret-management surface, and the safe-to-widen verbs are too few to justify the complexity. Users who want broader entries hand-edit the repo file.
+
 ## Thread Safety
 
 Use `sync.RWMutex` for cache access in StatusDetector.
