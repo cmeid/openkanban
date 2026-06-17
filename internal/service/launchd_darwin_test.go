@@ -117,6 +117,54 @@ func TestErrIndicatesNotLoaded(t *testing.T) {
 	}
 }
 
+func TestPlistInstalled(t *testing.T) {
+	// Redirect HOME so PlistPath resolves under a temp directory that we
+	// control, not the developer's real ~/Library/LaunchAgents.
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+
+	// Sanity: no plist present yet.
+	installed, err := PlistInstalled()
+	if err != nil {
+		t.Fatalf("PlistInstalled (absent): unexpected error: %v", err)
+	}
+	if installed {
+		t.Fatal("PlistInstalled (absent): want false, got true")
+	}
+
+	// Create the plist file and assert installed=true.
+	p, err := PlistPath()
+	if err != nil {
+		t.Fatalf("PlistPath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(p, []byte("<plist/>"), 0o600); err != nil {
+		t.Fatalf("write plist: %v", err)
+	}
+
+	installed, err = PlistInstalled()
+	if err != nil {
+		t.Fatalf("PlistInstalled (present): unexpected error: %v", err)
+	}
+	if !installed {
+		t.Fatal("PlistInstalled (present): want true, got false")
+	}
+
+	// Remove it and confirm we're back to false.
+	if err := os.Remove(p); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	installed, err = PlistInstalled()
+	if err != nil {
+		t.Fatalf("PlistInstalled (removed): unexpected error: %v", err)
+	}
+	if installed {
+		t.Fatal("PlistInstalled (removed): want false, got true")
+	}
+}
+
 func TestAtomicWrite(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "test.plist")

@@ -36,3 +36,9 @@ func Uninstall() error {
 func Status() (running bool, pid int, err error) {
 	return false, 0, ErrUnsupported
 }
+
+// PlistInstalled returns false on non-Darwin: there is no launchd plist
+// concept, so there is no supervision concern to report.
+func PlistInstalled() (bool, error) {
+	return false, nil
+}

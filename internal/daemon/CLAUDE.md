@@ -87,7 +87,9 @@ is passed as the constant `true` (the broadcaster only resolves sessions whose
 
 ## Wedge watchdog (watchdog.go)
 
-`runWedgeWatchdog` samples two atomic counters on each tick — `dispatchSeq` (incremented when a handler completes) and `inflight` (active handler count, incremented on accept / decremented on return). If work is in-flight AND `dispatchSeq` has not advanced for 90 seconds (45 s when the on-disk binary is stale and self-restart is imminent), the watchdog dumps all goroutine stacks and calls `os.Exit(1)`. launchd/systemd then respawns the daemon.
+`runWedgeWatchdog` samples two atomic counters on each tick — `dispatchSeq` (incremented when a handler completes) and `inflight` (active handler count, incremented on accept / decremented on return). If work is in-flight AND `dispatchSeq` has not advanced for 90 seconds (45 s when the on-disk binary is stale and self-restart is imminent), the watchdog dumps all goroutine stacks and calls `os.Exit(1)`.
+
+The exit **clears the wedge**, but automatic respawn only happens if the launchd service is loaded. In practice the daemon often runs `source=tui-fork` with the service unloaded — the startup log emits a `WARN` in that case, and `openkanban daemon health` flags it. When the service is not loaded the real respawner is the next TUI autostart, not launchd. Run `openkanban daemon install-service` to restore launchd supervision.
 
 The daemon is no longer detect-only: it self-restarts on a sustained wedge. The TUI-side stallwatch is a separate, unrelated mechanism.
 

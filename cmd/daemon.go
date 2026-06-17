@@ -19,6 +19,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/techdufus/openkanban/internal/daemon"
+	"github.com/techdufus/openkanban/internal/service"
 )
 
 // daemonFlagPersistent controls whether the daemon stays alive when
@@ -616,8 +617,14 @@ var daemonHealthCmd = &cobra.Command{
 		if err := json.Unmarshal(raw, &h); err != nil {
 			return fmt.Errorf("decode HealthResp: %w", err)
 		}
-		fmt.Printf("pid=%d goroutines=%d sessions=%d inflight_handlers=%d inflight_kills=%d reap_failures=%d dispatch_seq=%d\n",
-			h.PID, h.Goroutines, h.Sessions, h.InflightHandlers, h.InflightKills, h.ReapFailures, h.DispatchSeq)
+		fmt.Printf("pid=%d goroutines=%d sessions=%d inflight_handlers=%d inflight_kills=%d reap_failures=%d dispatch_seq=%d source=%s\n",
+			h.PID, h.Goroutines, h.Sessions, h.InflightHandlers, h.InflightKills, h.ReapFailures, h.DispatchSeq, h.Source)
+		if h.Source == "tui-fork" {
+			if installed, _ := service.PlistInstalled(); installed {
+				fmt.Fprintln(os.Stderr, "WARNING: daemon is running tui-forked despite an installed launchd plist — launchd is not supervising this process.")
+				fmt.Fprintln(os.Stderr, "Run `openkanban daemon install-service` to restore launchd management.")
+			}
+		}
 		return nil
 	},
 }

@@ -710,4 +710,8 @@ type HealthResp struct {
 	ReapFailures     int64  `json:"reap_failures"`
 	DispatchSeq      uint64 `json:"dispatch_seq"`
 	PID              int    `json:"pid"`
+	// Source identifies how this daemon was started: "tui-fork", "launchd",
+	// or "manual". Used by `openkanban daemon health` to flag a supervision
+	// gap when the daemon is tui-forked despite a launchd plist being installed.
+	Source string `json:"source"`
 }

@@ -22,6 +22,7 @@ import (
 	"github.com/techdufus/openkanban/internal/board"
 	"github.com/techdufus/openkanban/internal/config"
 	"github.com/techdufus/openkanban/internal/notify"
+	"github.com/techdufus/openkanban/internal/service"
 	"github.com/techdufus/openkanban/internal/terminal"
 	"github.com/techdufus/openkanban/internal/update"
 )
@@ -399,6 +400,11 @@ func daemonSource() string {
 // and any remaining sessions have been torn down. Safe to call once.
 func (s *Server) Serve(ctx context.Context) error {
 	log.Printf("openkanbankd: listening on %s (pid %d persistent=%v source=%s)", s.sock, os.Getpid(), s.persistent, daemonSource())
+	if daemonSource() == "tui-fork" {
+		if installed, _ := service.PlistInstalled(); installed {
+			log.Printf("WARN: openkanbankd running tui-forked but a launchd service plist is installed; launchd is NOT supervising this process, so the wedge watchdog's exit will not be auto-respawned — run `openkanban daemon install-service` to restore launchd management")
+		}
+	}
 
 	// Watch ctx in a goroutine that triggers the same shutdown path
 	// the last-client-disconnect handler uses, so both initiations
@@ -1566,6 +1572,7 @@ func (s *Server) handleHealth(c *clientConn, req HealthReq) HealthResp {
 		ReapFailures:     reapFail,
 		DispatchSeq:      seq,
 		PID:              os.Getpid(),
+		Source:           daemonSource(),
 	}
 }
 
