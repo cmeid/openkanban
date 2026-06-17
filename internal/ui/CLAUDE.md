@@ -109,6 +109,15 @@ PaneView is the client-side handle; the PTY itself lives in openkanbankd. Lifecy
 
 `Detach()` and `Close()` are non-blocking as of 2026-06-16. State mutations (state=Unattached, emulator teardown, detachCh swap) happen eagerly under `p.mu`; the underlying `attachLoopWG.Wait` runs in a goroutine with a 5s warning / 30s deadline watchdog. `PaneDetachedMsg` arrives whenever the read loop actually drains (not synchronously with the caller). `emitTeaMsg` and `Close` are serialised by a `teaMu sync.Mutex` so the goroutine can't send on a closed `teaMsgs` channel. Required reading before any teardown edit: memory [[reference_openkanban_paneview_detach_concurrency]].
 
+### Two title surfaces — keep their fallbacks straight
+
+The session header (`renderAgentView`) and the host terminal title (`computeWindowTitle`) resolve the title differently — don't unify them:
+
+- **In-app header bar** uses `m.globalStore.Get(m.focusedPane)` → `ticket.Title`, then `pane.TicketTitle()` (the pane's cached last-known-good ticket title, stamped at build/focus), then the literal `"Agent"`. It does NOT use the OSC title — the inner program's window title isn't the ticket title.
+- **Host terminal title** uses `pane.Title()` (the inner program's OSC 0/2 title) first, then `ticket.Title`, then `"openkanban"`.
+
+The `pane.TicketTitle()` fallback exists because a `PaneView` can outlive its store ticket: `GlobalTicketStore.ReloadTicket`'s `os.IsNotExist` branch drops the ticket from `allTickets` (the only silent runtime removal — now logged) when a file path vanishes from a board-resync snapshot, while the daemon session and pane stay live. Stamp `SetTicketTitle` wherever a pane is built or re-focused for a known ticket; never from `View()`. Memory: [[reference_openkanban_agent_view_title_resolution]].
+
 ### Attach-failure overlay
 
 When `attachWithRetry` (post-spawn or B4 fast-path) exhausts its retries, the closure calls `pv.SetLastAttachErr(err)` before returning the `spawnReadyMsg`. `PaneView.View()` then renders an actionable overlay instead of `blankPaneView` — same `cols × rows` contract so the chrome composition doesn't shift, pure ASCII so byte count == display cell count. Successful `Attach()` clears `lastAttachErr` automatically, so the overlay disappears on the next View() pass. The `shouldRetryAttachOnEnter` predicate (see Key Bindings above) gates Enter-retry on the SAME state pair, so the overlay's "Enter retries" hint is actually wired up.
