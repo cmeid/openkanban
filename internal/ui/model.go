@@ -781,8 +781,8 @@ func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// is never returned and every subsequent push event piles up in the
 	// subscriber channel buffer with no reader.
 	switch msg := msg.(type) {
-	case daemonSessionEventMsg:
-		return m.handleDaemonSessionEvent(msg)
+	case daemonSessionEventsMsg:
+		return m.handleDaemonSessionEvents(msg)
 	case daemonSubscribeFailedMsg:
 		return m.handleDaemonSubscribeFailed(msg)
 	case daemonSubscribeEndedMsg:
