@@ -56,8 +56,7 @@ type Server struct {
 	ln         net.Listener
 	persistent bool
 
-	sessionsMu sync.RWMutex
-	sessions   map[string]*Session
+	reg *sessionRegistry
 
 	clientsMu    sync.Mutex
 	clients      map[uint16]*clientConn
@@ -215,7 +214,7 @@ func NewServerWithOptions(sock, pidpath string, opts Options) (*Server, error) {
 		pidlock:        lock,
 		ln:             ln,
 		persistent:     opts.Persistent,
-		sessions:       make(map[string]*Session),
+		reg:            newSessionRegistry(),
 		clients:        make(map[uint16]*clientConn),
 		shutdown:       make(chan struct{}),
 		events:         make(chan SessionEvent, 64),
@@ -462,9 +461,7 @@ func (s *Server) watchBinaryStaleness() {
 				continue
 			}
 
-			s.sessionsMu.RLock()
-			liveSessions := len(s.sessions)
-			s.sessionsMu.RUnlock()
+			liveSessions := s.reg.len()
 
 			if liveSessions == 0 {
 				log.Printf("openkanbankd: binary on disk is newer than running process and no sessions are attached; shutting down so the next launch picks up the update")
@@ -516,10 +513,7 @@ func (s *Server) awaitSessionDrain() {
 		case <-s.shutdown:
 			return
 		case <-ticker.C:
-			s.sessionsMu.RLock()
-			live := len(s.sessions)
-			s.sessionsMu.RUnlock()
-			if live > 0 {
+			if live := s.reg.len(); live > 0 {
 				continue
 			}
 
@@ -651,16 +645,11 @@ func (s *Server) broadcastActivity() {
 		case <-ticker.C:
 		}
 
-		// Snapshot the session set under lock, then operate on the
-		// copy. Sessions can be added/removed concurrently and we don't
-		// want to hold the lock while emitting (which takes
+		// Snapshot the session set (lock-free), then operate on the
+		// immutable copy. Sessions can be added/removed concurrently and
+		// we don't want to block while emitting (which takes
 		// s.events / s.clientsMu under broadcaster goroutines).
-		s.sessionsMu.RLock()
-		alive := make(map[string]*Session, len(s.sessions))
-		for id, sess := range s.sessions {
-			alive[id] = sess
-		}
-		s.sessionsMu.RUnlock()
+		alive := s.reg.snapshot()
 
 		// Drop memo entries for sessions that vanished.
 		for id := range lastSeen {
@@ -779,13 +768,7 @@ func (s *Server) initiateShutdown(reason string) {
 // removes the socket file, and is safe to call multiple times. Called
 // once from Serve as the final step before returning.
 func (s *Server) cleanup() {
-	s.sessionsMu.Lock()
-	live := make([]*Session, 0, len(s.sessions))
-	for _, sess := range s.sessions {
-		live = append(live, sess)
-	}
-	s.sessions = map[string]*Session{}
-	s.sessionsMu.Unlock()
+	live := s.reg.drain()
 
 	for _, sess := range live {
 		log.Printf("openkanbankd: shutdown-cleanup killing session %s (ticket=%s)", sess.ID(), sess.TicketID())
@@ -1056,9 +1039,7 @@ func (s *Server) handleSpawn(c *clientConn, req SpawnReq) (SpawnResp, error) {
 	// but it's kept as belt-and-braces in case the entry check is ever
 	// removed or refactored.
 	if req.TicketID != "" {
-		s.sessionsMu.RLock()
-		existing := s.findSessionForTicketLocked(req.TicketID)
-		s.sessionsMu.RUnlock()
+		existing := s.reg.findByTicket(req.TicketID)
 		if existing != nil {
 			log.Printf("openkanbankd: client %d spawn idempotent hit ticket=%s reused session=%s pid=%d",
 				c.id, req.TicketID, existing.ID(), existing.pane.PID())
@@ -1071,26 +1052,19 @@ func (s *Server) handleSpawn(c *clientConn, req SpawnReq) (SpawnResp, error) {
 		return SpawnResp{}, err
 	}
 
-	// Re-check under WLock to close the construct-outside-lock race
-	// window: two concurrent spawns may both have seen no existing
-	// session under RLock and both called NewSession. Exactly one wins
-	// the WLock; the other discards its just-built session. As above,
-	// the empty-TicketID guard at function entry makes this nil-check
-	// belt-and-braces — left in to defend against future refactors.
-	s.sessionsMu.Lock()
-	if req.TicketID != "" {
-		if winner := s.findSessionForTicketLocked(req.TicketID); winner != nil {
-			s.sessionsMu.Unlock()
-			log.Printf("openkanbankd: client %d spawn lost race ticket=%s discarding new session in favor of %s",
-				c.id, req.TicketID, winner.ID())
-			if killErr := sess.Kill(0); killErr != nil {
-				log.Printf("openkanbankd: cleanup of race-loser session %s: %v", sess.ID(), killErr)
-			}
-			return SpawnResp{SessionID: winner.ID(), PID: winner.pane.PID()}, nil
+	// Re-check under writeMu (inside storeIfNoTicket) to close the
+	// construct-outside-lock race window: two concurrent spawns may both
+	// have seen no existing session and both called NewSession. Exactly
+	// one wins the writeMu; the other discards its just-built session.
+	winner, stored := s.reg.storeIfNoTicket(req.TicketID, sess.ID(), sess)
+	if !stored {
+		log.Printf("openkanbankd: client %d spawn lost race ticket=%s discarding new session in favor of %s",
+			c.id, req.TicketID, winner.ID())
+		if killErr := sess.Kill(0); killErr != nil {
+			log.Printf("openkanbankd: cleanup of race-loser session %s: %v", sess.ID(), killErr)
 		}
+		return SpawnResp{SessionID: winner.ID(), PID: winner.pane.PID()}, nil
 	}
-	s.sessions[sess.ID()] = sess
-	s.sessionsMu.Unlock()
 
 	log.Printf("openkanbankd: client %d spawned session %s (ticket=%s pid=%d)", c.id, sess.ID(), sess.TicketID(), sess.pane.PID())
 
@@ -1103,27 +1077,6 @@ func (s *Server) handleSpawn(c *clientConn, req SpawnReq) (SpawnResp, error) {
 	s.emitEvent(SessionEvent{Event: "started", SessionID: sess.ID(), TicketID: sess.TicketID(), Status: "working", LastActivityAt: sess.LastActivity()})
 
 	return SpawnResp{SessionID: sess.ID(), PID: sess.pane.PID()}, nil
-}
-
-// findSessionForTicketLocked returns the (sole) session whose TicketID
-// matches, or nil if none. Caller must hold sessionsMu (R or W). After
-// handleSpawn enforces uniqueness on insert, at most one match exists
-// — but handleTicketDone defensively iterates the full map for any
-// duplicates inherited from older daemons that lacked this check.
-func (s *Server) findSessionForTicketLocked(ticketID string) *Session {
-	// Belt-and-braces: no caller should ever pass empty TicketID;
-	// handleSpawn rejects it at the door. Kept defensively so a future
-	// caller wired up with sloppy validation can't trigger a full-map
-	// scan that returns the first arbitrary session.
-	if ticketID == "" {
-		return nil
-	}
-	for _, sess := range s.sessions {
-		if sess.TicketID() == ticketID {
-			return sess
-		}
-	}
-	return nil
 }
 
 // watchSessionExit subscribes to sess.pane's event stream and emits an
@@ -1167,9 +1120,7 @@ func (s *Server) watchSessionExit(sess *Session) {
 		// may have already removed it via the explicit path; both paths
 		// must be safe to run concurrently.
 		removeSession := func() {
-			s.sessionsMu.Lock()
-			if cur, ok := s.sessions[sessID]; ok && cur == sess {
-				delete(s.sessions, sessID)
+			if s.reg.deleteIf(sessID, sess) {
 				log.Printf("openkanbankd: session %s (ticket=%s) exited; removed from registry", sessID, ticketID)
 			}
 			// Defense-in-depth: with the per-TicketID dedup in
@@ -1181,12 +1132,11 @@ func (s *Server) watchSessionExit(sess *Session) {
 			// that should never fire post-dedup; if it ever does we
 			// want a breadcrumb in the daemon log pointing at it.
 			if ticketID != "" {
-				if other := s.findSessionForTicketLocked(ticketID); other != nil {
+				if other := s.reg.findByTicket(ticketID); other != nil {
 					log.Printf("WARN: openkanbankd: after removing session %s, another session %s still references ticket %s — invariant violation",
 						sessID, other.ID(), ticketID)
 				}
 			}
-			s.sessionsMu.Unlock()
 		}
 		emit := func() {
 			expected := sess.ExpectedCompletion()
@@ -1235,23 +1185,18 @@ func (s *Server) watchSessionExit(sess *Session) {
 }
 
 func (s *Server) handleList(c *clientConn, req ListReq) ListResp {
-	s.sessionsMu.RLock()
-	defer s.sessionsMu.RUnlock()
-
-	infos := make([]SessionInfo, 0, len(s.sessions))
-	for _, sess := range s.sessions {
+	infos := make([]SessionInfo, 0)
+	for _, sess := range s.reg.snapshot() {
 		infos = append(infos, sess.Info())
 	}
 	return ListResp{Sessions: infos}
 }
 
 func (s *Server) handleKill(c *clientConn, req KillReq) (KillResp, error) {
-	s.sessionsMu.Lock()
-	sess, ok := s.sessions[req.SessionID]
+	sess, ok := s.reg.get(req.SessionID)
 	if ok {
-		delete(s.sessions, req.SessionID)
+		s.reg.delete(req.SessionID)
 	}
-	s.sessionsMu.Unlock()
 
 	if !ok {
 		// Idempotent: a concurrent Kill / TicketDone / delete path may
@@ -1307,17 +1252,16 @@ func (s *Server) handleTicketDone(c *clientConn, req TicketDoneReq) (TicketDoneR
 		return TicketDoneResp{}, nil
 	}
 
-	s.sessionsMu.Lock()
+	snap := s.reg.snapshot()
 	matches := make([]*Session, 0, 1)
-	for _, sess := range s.sessions {
+	for _, sess := range snap {
 		if sess.TicketID() == req.TicketID {
 			matches = append(matches, sess)
 		}
 	}
 	for _, m := range matches {
-		delete(s.sessions, m.ID())
+		s.reg.deleteIf(m.ID(), m)
 	}
-	s.sessionsMu.Unlock()
 
 	if len(matches) == 0 {
 		return TicketDoneResp{Killed: false}, nil
@@ -1370,10 +1314,8 @@ func (s *Server) handleOwns(c *clientConn, req OwnsReq) OwnsResp {
 	if req.SessionUUID == "" {
 		return OwnsResp{Owned: false}
 	}
-	s.sessionsMu.RLock()
-	defer s.sessionsMu.RUnlock()
 	var matches []*Session
-	for _, sess := range s.sessions {
+	for _, sess := range s.reg.snapshot() {
 		if sess.AgentSessionUUID() == req.SessionUUID {
 			matches = append(matches, sess)
 		}
@@ -1423,9 +1365,7 @@ func (s *Server) handleSubscribe(c *clientConn, req SubscribeReq) SubscribeResp 
 // may race the daemon's "exited" event for a session it was viewing
 // and the right behavior is silent no-op, not error.
 func (s *Server) handleSetViewing(c *clientConn, req SetViewingReq) SetViewingResp {
-	s.sessionsMu.RLock()
-	sess, ok := s.sessions[req.SessionID]
-	s.sessionsMu.RUnlock()
+	sess, ok := s.reg.get(req.SessionID)
 	if !ok {
 		return SetViewingResp{ViewerCount: 0}
 	}
@@ -1446,13 +1386,7 @@ func (s *Server) handleSetViewing(c *clientConn, req SetViewingReq) SetViewingRe
 // path so a crashed or unceremoniously-closed TUI doesn't leave
 // zombie viewer counts on sibling boards.
 func (s *Server) cleanupViewersForClient(clientID uint16) {
-	s.sessionsMu.RLock()
-	sessions := make([]*Session, 0, len(s.sessions))
-	for _, sess := range s.sessions {
-		sessions = append(sessions, sess)
-	}
-	s.sessionsMu.RUnlock()
-	for _, sess := range sessions {
+	for _, sess := range s.reg.snapshot() {
 		if sess.RemoveViewer(clientID) {
 			s.emitEvent(SessionEvent{Event: "unviewing", SessionID: sess.ID(), TicketID: sess.TicketID()})
 		}
@@ -1498,12 +1432,10 @@ func (s *Server) handlePrepareExit(c *clientConn, req PrepareExitReq) PrepareExi
 	}
 	s.clientsMu.Unlock()
 
-	s.sessionsMu.RLock()
-	infos := make([]SessionInfo, 0, len(s.sessions))
-	for _, sess := range s.sessions {
+	infos := make([]SessionInfo, 0)
+	for _, sess := range s.reg.snapshot() {
 		infos = append(infos, sess.Info())
 	}
-	s.sessionsMu.RUnlock()
 
 	return PrepareExitResp{
 		ClientCount:        total,
@@ -1526,13 +1458,7 @@ func (s *Server) handleCancelExit(c *clientConn, req CancelExitReq) CancelExitRe
 }
 
 func (s *Server) handleShutdown(c *clientConn, req ShutdownReq) ShutdownResp {
-	s.sessionsMu.Lock()
-	live := make([]*Session, 0, len(s.sessions))
-	for _, sess := range s.sessions {
-		live = append(live, sess)
-	}
-	s.sessions = map[string]*Session{}
-	s.sessionsMu.Unlock()
+	live := s.reg.drain()
 
 	killed := 0
 	for _, sess := range live {
@@ -1566,9 +1492,7 @@ func (s *Server) handleShutdown(c *clientConn, req ShutdownReq) ShutdownResp {
 // alive until the registry drains naturally, then shut down (so we don't
 // linger as an orphan). A future TUI may also re-attach in the meantime.
 func (s *Server) handleLastClientDisconnect() {
-	s.sessionsMu.RLock()
-	live := len(s.sessions)
-	s.sessionsMu.RUnlock()
+	live := s.reg.len()
 
 	if s.persistent {
 		log.Printf("openkanbankd: last client disconnected; staying up (persistent mode); %d live session(s)", live)

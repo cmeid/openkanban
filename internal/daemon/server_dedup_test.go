@@ -71,9 +71,7 @@ func TestHandleSpawn_DuplicateTicketIDReturnsExisting(t *testing.T) {
 	first := spawnAndDecode(t, a, ra, dedupSpawnReq("DEDUP-1"), 0)
 
 	// Sanity: registry contains exactly one entry.
-	srv.sessionsMu.RLock()
-	got := len(srv.sessions)
-	srv.sessionsMu.RUnlock()
+	got := srv.reg.len()
 	if got != 1 {
 		t.Fatalf("after first spawn: sessions count=%d want 1", got)
 	}
@@ -90,9 +88,7 @@ func TestHandleSpawn_DuplicateTicketIDReturnsExisting(t *testing.T) {
 			second.PID, first.PID)
 	}
 
-	srv.sessionsMu.RLock()
-	got = len(srv.sessions)
-	srv.sessionsMu.RUnlock()
+	got = srv.reg.len()
 	if got != 1 {
 		t.Errorf("after second spawn: sessions count=%d want 1 (dedup should have prevented insert)", got)
 	}
@@ -165,10 +161,8 @@ func TestHandleSpawn_ConcurrentSpawnsDedup(t *testing.T) {
 	}
 
 	// Exactly one session survives.
-	srv.sessionsMu.RLock()
-	gotCount := len(srv.sessions)
-	_, winnerLives := srv.sessions[winner]
-	srv.sessionsMu.RUnlock()
+	gotCount := srv.reg.len()
+	_, winnerLives := srv.reg.get(winner)
 	if gotCount != 1 {
 		t.Errorf("post-race sessions count=%d want 1", gotCount)
 	}
@@ -205,9 +199,7 @@ func TestHandleSpawn_DifferentTicketIDsCoexist(t *testing.T) {
 		t.Errorf("different TicketIDs collapsed to same SessionID=%q", r1.SessionID)
 	}
 
-	srv.sessionsMu.RLock()
-	gotCount := len(srv.sessions)
-	srv.sessionsMu.RUnlock()
+	gotCount := srv.reg.len()
 	if gotCount != 2 {
 		t.Errorf("sessions count=%d want 2", gotCount)
 	}
@@ -270,10 +262,8 @@ func TestHandleTicketDone_KillsAllMatchesForTicket(t *testing.T) {
 	sess1 := mkSess("dup-1")
 	sess2 := mkSess("dup-2")
 
-	srv.sessionsMu.Lock()
-	srv.sessions[sess1.ID()] = sess1
-	srv.sessions[sess2.ID()] = sess2
-	srv.sessionsMu.Unlock()
+	srv.reg.store(sess1.ID(), sess1)
+	srv.reg.store(sess2.ID(), sess2)
 
 	// Wire pane-exit observation for both, mirroring what handleSpawn
 	// does. Without this the "exited" events won't fire and the test
@@ -300,9 +290,7 @@ func TestHandleTicketDone_KillsAllMatchesForTicket(t *testing.T) {
 	// The registry must drop both sessions. The matches are removed
 	// synchronously in handleTicketDone before the kill goroutine
 	// fires, so we can assert without polling.
-	srv.sessionsMu.RLock()
-	remaining := len(srv.sessions)
-	srv.sessionsMu.RUnlock()
+	remaining := srv.reg.len()
 	if remaining != 0 {
 		t.Errorf("after ticket-done: %d sessions remain; want 0 (both should have been swept)", remaining)
 	}

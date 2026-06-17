@@ -48,9 +48,7 @@ func (s *Server) handleAttach(c *clientConn, req AttachReq) {
 
 	log.Printf("openkanbankd: client %d handleAttach session=%s cols=%d rows=%d takeover=%v", c.id, req.SessionID, req.Cols, req.Rows, req.Takeover)
 
-	s.sessionsMu.RLock()
-	sess := s.sessions[req.SessionID]
-	s.sessionsMu.RUnlock()
+	sess, _ := s.reg.get(req.SessionID)
 
 	if sess == nil {
 		s.writeError(c, "session_not_found", fmt.Sprintf("session %q not found", req.SessionID))
@@ -137,9 +135,7 @@ func (s *Server) handleAttach(c *clientConn, req AttachReq) {
 // request are advisory only — the snapshot reflects the pane's current
 // geometry (no resize, since the peeker isn't the owner).
 func (s *Server) handlePeek(c *clientConn, req PeekReq) {
-	s.sessionsMu.RLock()
-	sess := s.sessions[req.SessionID]
-	s.sessionsMu.RUnlock()
+	sess, _ := s.reg.get(req.SessionID)
 
 	if sess == nil {
 		s.writeError(c, "session_not_found", fmt.Sprintf("session %q not found", req.SessionID))

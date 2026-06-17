@@ -45,9 +45,7 @@ func TestServerLifecycle_DefaultDefersShutdownUntilSessionsDrain(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = sess.Kill(0) })
 
-	srv.sessionsMu.Lock()
-	srv.sessions[sess.ID()] = sess
-	srv.sessionsMu.Unlock()
+	srv.reg.store(sess.ID(), sess)
 	srv.watchSessionExit(sess)
 
 	// Connect a TUI client, then disconnect it. This is the
@@ -63,10 +61,7 @@ func TestServerLifecycle_DefaultDefersShutdownUntilSessionsDrain(t *testing.T) {
 	// in cleanup() almost immediately.
 	deadline := time.Now().Add(drainPollInterval*2 + 500*time.Millisecond)
 	for time.Now().Before(deadline) {
-		srv.sessionsMu.RLock()
-		_, alive := srv.sessions[sess.ID()]
-		srv.sessionsMu.RUnlock()
-		if !alive {
+		if _, alive := srv.reg.get(sess.ID()); !alive {
 			t.Fatalf("live session was removed after last client disconnected; deferral failed")
 		}
 		// Daemon must also still be running.
@@ -149,9 +144,7 @@ func TestServerLifecycle_DeferralIsSingleInFlightAcrossReattach(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = sess.Kill(0) })
 
-	srv.sessionsMu.Lock()
-	srv.sessions[sess.ID()] = sess
-	srv.sessionsMu.Unlock()
+	srv.reg.store(sess.ID(), sess)
 	srv.watchSessionExit(sess)
 
 	const deferLine = "deferring shutdown until they exit"
@@ -188,9 +181,7 @@ func TestServerLifecycle_DeferralIsSingleInFlightAcrossReattach(t *testing.T) {
 	}
 
 	// Session must still be alive and the daemon still listening.
-	srv.sessionsMu.RLock()
-	_, alive := srv.sessions[sess.ID()]
-	srv.sessionsMu.RUnlock()
+	_, alive := srv.reg.get(sess.ID())
 	if !alive {
 		t.Fatalf("live session was removed during re-attach churn; deferral failed")
 	}
