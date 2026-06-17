@@ -244,3 +244,41 @@ func TestStop_KillsProcessGroup(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 }
+
+// TestStop_Idempotent proves Fix 1: a second Stop() on an already-stopped
+// pane must return promptly and must NOT re-issue signalGroup(SIGKILL)
+// (which risks hitting a recycled pgid). teardownOnce guarantees the
+// group signal fires at most once; pgid is zeroed after the first fire so
+// the ≤0 guard in signalGroup catches any late caller.
+//
+// Red-before-green proof: revert teardownOnce + pgid.Store(0) → the second
+// Stop() executes a full second teardown including signalGroup, which may
+// hit a recycled pgid. The timing assertion below may not always catch
+// that (it depends on pgid reuse timing), but the zero-pgid guard is
+// directly observable: after Stop(), p.pgid.Load() must be 0.
+func TestStop_Idempotent(t *testing.T) {
+	p := New("idempotent", 80, 24, 100)
+	if err := p.StartHeadless("/bin/sh", []string{"-c", "sleep 600"}, nil); err != nil {
+		t.Fatalf("StartHeadless: %v", err)
+	}
+
+	// First Stop must return promptly.
+	mustReturnWithin(t, "first Stop", 5*time.Second, func() {
+		if err := p.Stop(); err != nil {
+			t.Errorf("first Stop: %v", err)
+		}
+	})
+
+	// pgid must be zeroed after teardown so signalGroup's guard catches
+	// any subsequent call.
+	if got := p.pgid.Load(); got != 0 {
+		t.Errorf("pgid after Stop: got %d, want 0", got)
+	}
+
+	// Second Stop must also return promptly and not panic.
+	mustReturnWithin(t, "second Stop", 2*time.Second, func() {
+		if err := p.Stop(); err != nil {
+			t.Errorf("second Stop: %v", err)
+		}
+	})
+}

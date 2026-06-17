@@ -136,6 +136,13 @@ type Pane struct {
 	inputStopOnce sync.Once
 	inputWG       sync.WaitGroup
 
+	// teardownOnce ensures teardownUnlocked fires at most once. A second
+	// Stop() or a Stop() racing a natural exit must be a safe no-op: a
+	// re-issued signalGroup(SIGKILL) against a stale pgid risks hitting a
+	// recycled process (PID/PGID reuse). After the first teardown fires,
+	// pgid is zeroed so signalGroup's ≤0 guard catches any late caller.
+	teardownOnce sync.Once
+
 	// wedge tracking for the daemon watchdog (Task 5). WriteInput stamps
 	// these on input backpressure (the child stopped draining stdin and
 	// the bounded buffer filled). The watchdog reads them via
@@ -1173,9 +1180,20 @@ func (p *Pane) signalGroup(sig syscall.Signal) {
 //  4. Bounded waits OFF p.mu for drain, input writer, and read loop —
 //     each waitOrTimeout so teardown returns unconditionally.
 func (p *Pane) teardownUnlocked(alreadyKilled bool) {
+	p.teardownOnce.Do(func() {
+		p.doTeardown(alreadyKilled)
+	})
+}
+
+func (p *Pane) doTeardown(alreadyKilled bool) {
 	if !alreadyKilled {
 		p.signalGroup(syscall.SIGKILL)
 	}
+	// Zero pgid after the group signal fires so any late caller to
+	// signalGroup (e.g. a concurrent second Stop()) hits the ≤0 guard and
+	// is a safe no-op. This closes the pgid-reuse window: once the group
+	// is killed, the pgid may be recycled by the OS.
+	p.pgid.Store(0)
 
 	p.mu.Lock()
 	f := p.pty
@@ -1412,19 +1430,18 @@ func (p *Pane) Update(msg tea.Msg) tea.Cmd {
 		if msg.PaneID != p.id {
 			return nil
 		}
+		// Record the exit error first (not covered by teardownOnce).
 		p.mu.Lock()
-		p.running = false
-		p.runningAtomic.Store(false)
 		p.exitErr = msg.Err
-		if p.pty != nil {
-			p.pty.Close()
-		}
-		p.stopDrainUnlocked()
 		p.mu.Unlock()
-		// The read loop has already exited (it's what produced
-		// this ExitMsg). stopReadLoop is a cheap no-op in that
-		// case but ensures readLoopStop is closed exactly once.
-		p.stopReadLoop()
+
+		// Route through teardownOnce so this path and Stop()/StopGraceful()
+		// are mutually exclusive — avoids the legacy anti-pattern of closing
+		// p.pty under p.mu and leaking the input-writer goroutine. The read
+		// loop has already exited (it produced this ExitMsg), so
+		// teardownUnlocked's stopReadLoop call is a cheap idempotent no-op.
+		// alreadyKilled=true because the process already exited naturally.
+		p.teardownUnlocked(true)
 		return nil
 	}
 
