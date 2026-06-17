@@ -166,6 +166,21 @@ The invariant: a ticket's transcript always lives in its launch directory's buck
 
 See [`internal/agent/sessions.go`](internal/agent/sessions.go) (`ProjectDirFor`, `NormalizeSessionBucket`) and the call site in [`internal/ui/model.go`](internal/ui/model.go) (`prepareSpawnWith`).
 
+### 11. 1:1 ticket↔session enforcement
+
+The daemon enforces 1:1 ticket↔session at the PTY layer (`Spawn` is idempotent per `TicketID`), but the Claude session UUID layer was permissive: two tickets could end up linked to the same UUID via `ticket new --session <already-claimed>`, divergent forks via `--fork-session` on every re-spawn, or the post-spawn back-fill writing the same UUID across tickets. The result was silent data/session loss — re-spawning a ticket landed in a stale fork, not the live conversation.
+
+This fork closes the gap with three layered defenses:
+
+- **Creation gate** (`ticket new --session`): refuses to claim a UUID already linked to a different ticket. `--force` claims by clearing the conflicting ticket's `agent_session_id` first.
+- **Back-fill gate** (post-spawn UUID discovery via `FindClaudeSession`): silently no-ops when the discovered UUID is already claimed by a different ticket. No save, no `~/.claude/history.jsonl` purge.
+- **Forking eliminated entirely**: `--fork-session` is no longer appended to any Claude spawn argv. A build-time grep guard at `internal/ui/forksession_guard_test.go` makes re-introduction structurally impossible.
+- **Daemon `handleOwns` multi-match**: instead of silently returning the first match, the daemon now surfaces `Conflict=true` with all matching session IDs so upper layers refuse to route to one arbitrarily.
+
+The shared funnel is `internal/ticketsvc`: a small package of free functions (`LinkSession`, `GateAttach`) that both TUI and CLI call for any `agent_session_id` mutation. Storage tolerates duplicates by policy (existing on-disk duplicates aren't auto-migrated), but the runtime gates ensure no NEW duplicate ever launches a session. `openkanban ticket in-progress` also routes through `TicketStore.Move` now, closing a pre-existing harmonization gap where the CLI verb bypassed the promote/prune side-effects the UI was firing.
+
+See [`internal/ticketsvc/svc.go`](internal/ticketsvc/svc.go), [`internal/agent/CLAUDE.md`](internal/agent/CLAUDE.md), and the bug ticket `enforce-1-1-ticket-session` for the multi-vector analysis.
+
 ## Bugs fixed in upstream
 
 Seven correctness bugs that exist on `TechDufus/main` today are fixed in this fork. Each is verified against the upstream tree.
