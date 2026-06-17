@@ -827,6 +827,18 @@ func (s *Server) dispatch(c *clientConn, typeName string, raw json.RawMessage) {
 		// and exit through the usual disconnect path.
 		s.handleAttach(c, req)
 
+	case MsgPeekReq:
+		var req PeekReq
+		if err := json.Unmarshal(raw, &req); err != nil {
+			s.writeError(c, "bad_request", err.Error())
+			return
+		}
+		// handlePeek does NOT block — it ships a snapshot then returns,
+		// leaving the conn in JSON mode. The client closes its dedicated
+		// peek conn after reading the snapshot, so handleConn hits EOF
+		// next and disconnects cleanly.
+		s.handlePeek(c, req)
+
 	case MsgSetViewingReq:
 		var req SetViewingReq
 		if err := json.Unmarshal(raw, &req); err != nil {

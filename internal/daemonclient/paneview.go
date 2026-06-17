@@ -597,6 +597,41 @@ func (p *PaneView) teardownEmulatorLocked() {
 	p.cachedView = ""
 }
 
+// freshEmulatorLocked prepares the emulator for a snapshot replay. A
+// prior Peek (or re-attach) can leave a populated scrollback ring;
+// replaying a fresh authoritative snapshot into the same ring would
+// double the \r\n-terminated history rows (the on-grid redraw itself is
+// idempotent via CUP positioning, so only the ring needs clearing).
+//
+// When the emulator already exists we RESET the ring in place rather
+// than tearing the emulator down: teardownEmulatorLocked wakes the drain
+// goroutine via an InputPipe sentinel write, which blocks on a
+// snapshot-only emulator that has no live attach loop draining its input
+// (the pre-existing teardown-hang). Reusing the live vt + its single
+// drain goroutine sidesteps that entirely. On the common first-attach
+// path (vt == nil) it just initializes. Must hold p.mu.
+func (p *PaneView) freshEmulatorLocked() {
+	if p.vt == nil {
+		p.initEmulatorLocked()
+		return
+	}
+	// Reset the existing emulator in place. RIS (ESC c) clears the grid,
+	// the emulator's own scrollback, and resets modes — so a replayed
+	// snapshot lands on an empty screen exactly as a brand-new emulator
+	// would, without leaking the prior peek's grid rows into our ring.
+	// We pair it with a fresh scrollback ring + cleared tracking state.
+	// This is the same p.vt.Write path applySnapshotChunk uses; it does
+	// NOT touch the InputPipe, so it can't hit the teardown sentinel hang.
+	p.vt.Write([]byte("\x1bc"))
+	p.scrollback = terminal.NewScrollbackBuffer(10000)
+	p.viewportOffset = 0
+	p.altScreenActive = false
+	p.lastTopRow = nil
+	p.cursorHidden.Store(false)
+	p.cursorAppMode.Store(false)
+	p.cachedView = ""
+}
+
 // parseOscTitlePayload strips a leading "<digits>;" parameter from an
 // OSC title payload — same shape terminal.parseOscTitlePayload uses.
 // Duplicated here because the original is unexported.
@@ -691,15 +726,25 @@ func (p *PaneView) attach(ctx context.Context, takeover bool) error {
 	if _, err := readJSONResp(r, daemon.MsgAttachResp, &aresp); err != nil {
 		log.Printf("openkanban paneview: attach resp read failed session=%s: %v", sessionID, err)
 		conn.Close()
+		// Surface the daemon's "already_attached" rejection as a sentinel
+		// so the UI can warn before taking over a session held by another
+		// TUI. The rejection happens before binary mode, so the peer's
+		// stream is untouched by this probe.
+		var re *RemoteError
+		if errors.As(err, &re) && re.Code == "already_attached" {
+			return fmt.Errorf("daemonclient: attach resp: %w: %w", err, ErrAlreadyAttached)
+		}
 		return fmt.Errorf("daemonclient: attach resp: %w", err)
 	}
 
 	// Initialize the local emulator BEFORE consuming the snapshot. The
 	// snapshot is a sequence of TypePTYOutput frames totaling
 	// aresp.SnapshotSize bytes; we apply them to the emulator as if
-	// they were live PTY output.
+	// they were live PTY output. freshEmulatorLocked tears down any
+	// emulator a prior Peek left behind so the scrollback ring isn't
+	// doubled by replaying the snapshot twice.
 	p.mu.Lock()
-	p.initEmulatorLocked()
+	p.freshEmulatorLocked()
 	p.mu.Unlock()
 
 	remaining := aresp.SnapshotSize
@@ -770,6 +815,113 @@ func (p *PaneView) attach(ctx context.Context, takeover bool) error {
 	return nil
 }
 
+// Peek fills the local emulator with a one-shot snapshot of the
+// session's terminal state WITHOUT attaching: it does not become the
+// daemon's attached client, does not start a binary read loop, and does
+// not emit PaneAttachedMsg. The pane stays in its current state
+// (typically PaneViewUnattached) but View() will render the snapshot
+// content — used to show a live backdrop while cycling between sessions
+// so we never silently take a session over just to preview it.
+//
+// Uses a dedicated short-lived conn (closed before returning) so the
+// binary snapshot frames never interleave with the persistent JSON RPC
+// connection. A no-op if there's no session or no daemon client.
+func (p *PaneView) Peek(ctx context.Context) error {
+	p.mu.Lock()
+	if p.state == PaneViewAttached {
+		// Already attached — the live stream is strictly fresher than a
+		// snapshot; nothing to do.
+		p.mu.Unlock()
+		return nil
+	}
+	if p.sessionID == "" {
+		p.mu.Unlock()
+		return errors.New("daemonclient: peek without session id")
+	}
+	sessionID := p.sessionID
+	w, h := p.width, p.height
+	if w <= 0 {
+		w = 80
+	}
+	if h <= 0 {
+		h = 24
+	}
+	p.mu.Unlock()
+
+	conn, err := DialOrStart(ctx)
+	if err != nil {
+		log.Printf("openkanban paneview: peek dial failed session=%s: %v", sessionID, err)
+		return err
+	}
+	defer conn.Close()
+	r := bufio.NewReader(conn)
+
+	if err := writeJSONReq(conn, daemon.MsgHelloReq, daemon.HelloReq{
+		ProtocolVersion: daemon.ProtocolVersion,
+		BinaryVersion:   daemon.BinaryVersion,
+		ClientName:      clientNameForHello + "/peek",
+	}); err != nil {
+		return fmt.Errorf("daemonclient: peek hello: %w", err)
+	}
+	if _, err := readJSONResp(r, daemon.MsgHelloResp, nil); err != nil {
+		return fmt.Errorf("daemonclient: peek hello resp: %w", err)
+	}
+
+	if err := writeJSONReq(conn, daemon.MsgPeekReq, daemon.PeekReq{
+		SessionID: sessionID,
+		Cols:      uint16(w),
+		Rows:      uint16(h),
+	}); err != nil {
+		return fmt.Errorf("daemonclient: peek req: %w", err)
+	}
+	var presp daemon.PeekResp
+	if _, err := readJSONResp(r, daemon.MsgPeekResp, &presp); err != nil {
+		return fmt.Errorf("daemonclient: peek resp: %w", err)
+	}
+
+	// Apply the snapshot to a fresh emulator, mirroring attach()'s
+	// snapshot loop — but we never flip to PaneViewAttached or spawn a
+	// read loop, so the conn is one-shot. freshEmulatorLocked tears down
+	// any emulator a prior Peek left behind so re-peeking the same pane
+	// doesn't double its scrollback ring.
+	p.mu.Lock()
+	p.freshEmulatorLocked()
+	p.mu.Unlock()
+
+	remaining := presp.SnapshotSize
+	for remaining > 0 {
+		typ, payload, err := daemon.ReadFrame(r)
+		if err != nil {
+			p.mu.Lock()
+			p.teardownEmulatorLocked()
+			p.mu.Unlock()
+			return fmt.Errorf("daemonclient: read peek frame: %w", err)
+		}
+		if typ != daemon.TypePTYOutput {
+			p.mu.Lock()
+			p.teardownEmulatorLocked()
+			p.mu.Unlock()
+			return fmt.Errorf("daemonclient: unexpected peek frame type 0x%02x", typ)
+		}
+		if len(payload) == 0 {
+			continue
+		}
+		p.applySnapshotChunk(payload)
+		remaining -= len(payload)
+		if remaining < 0 {
+			remaining = 0
+		}
+	}
+
+	p.mu.Lock()
+	p.dirty = true
+	p.cachedView = ""
+	p.mu.Unlock()
+
+	log.Printf("openkanban paneview: peek OK session=%s snapshot=%d", sessionID, presp.SnapshotSize)
+	return nil
+}
+
 // Detach closes the attach conn cleanly. The daemon-side session
 // continues to run. Safe to call from any state.
 func (p *PaneView) Detach() error {
@@ -780,6 +932,14 @@ func (p *PaneView) detach(sendFrame bool) error {
 	p.mu.Lock()
 	conn := p.attachConn
 	if conn == nil {
+		// No live attach conn. We deliberately do NOT teardown a
+		// Peek-only emulator here: teardownEmulatorLocked's InputPipe
+		// sentinel write blocks on a snapshot-only vt (the pre-existing
+		// teardown-hang), so calling it off the attached path would wedge
+		// Close()/Detach(). A peeked pane therefore retains its drain
+		// goroutine until process exit — strictly lighter than the prior
+		// cycle behavior, which held a drain goroutine AND a live daemon
+		// attachment per cycled-through session.
 		p.mu.Unlock()
 		return nil
 	}
@@ -1849,6 +2009,23 @@ func writeJSONReq(conn net.Conn, typeName string, payload any) error {
 }
 
 // readJSONResp reads one TypeJSONResp frame from r and (optionally)
+// ErrAlreadyAttached is returned by Attach when the daemon refuses the
+// attach because another client already holds the binary stream for the
+// session. It maps the daemon's "already_attached" error code into a
+// sentinel the UI can branch on (errors.Is) to warn before taking over.
+var ErrAlreadyAttached = errors.New("daemonclient: session attached by another client")
+
+// RemoteError carries the daemon's machine-readable error Code alongside
+// its human-readable Message. readJSONResp returns it (instead of a flat
+// fmt.Errorf) so callers can inspect Code via errors.As; Error() keeps
+// the original "code: message" string so existing logs are unchanged.
+type RemoteError struct {
+	Code    string
+	Message string
+}
+
+func (e *RemoteError) Error() string { return e.Code + ": " + e.Message }
+
 // unmarshals it into out. Returns the type name (or an ErrorResp
 // rendered as an error) so the caller can verify it matches.
 func readJSONResp(r *bufio.Reader, expect string, out any) (string, error) {
@@ -1868,7 +2045,7 @@ func readJSONResp(r *bufio.Reader, expect string, out any) (string, error) {
 		if uerr := json.Unmarshal(raw, &er); uerr != nil {
 			return name, uerr
 		}
-		return name, fmt.Errorf("%s: %s", er.Code, er.Message)
+		return name, &RemoteError{Code: er.Code, Message: er.Message}
 	}
 	if name != expect {
 		return name, fmt.Errorf("got %q want %q", name, expect)

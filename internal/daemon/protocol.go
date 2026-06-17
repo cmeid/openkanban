@@ -180,6 +180,9 @@ const (
 	MsgAttachReq  = "attach.req"
 	MsgAttachResp = "attach.resp"
 
+	MsgPeekReq  = "peek.req"
+	MsgPeekResp = "peek.resp"
+
 	MsgSetViewingReq  = "set_viewing.req"
 	MsgSetViewingResp = "set_viewing.resp"
 
@@ -442,6 +445,26 @@ type AttachReq struct {
 type AttachResp struct {
 	ClientID     uint16 `json:"client_id"`
 	SnapshotSize int    `json:"snapshot_size"`
+}
+
+// PeekReq requests a one-shot snapshot of a session's terminal state
+// WITHOUT attaching: the daemon does not make the requester the attached
+// client, does not resize the pane, and does not subscribe it to PTY
+// output or emit attached/detached events. The existing attacher (if
+// any) is left completely undisturbed. Cols/Rows are advisory only —
+// the snapshot reflects the pane's current geometry. Used to render a
+// backdrop while cycling between sessions.
+type PeekReq struct {
+	SessionID string `json:"session_id"`
+	Cols      uint16 `json:"cols"`
+	Rows      uint16 `json:"rows"`
+}
+
+// PeekResp acknowledges a Peek. Like AttachResp, the daemon follows it
+// with SnapshotSize bytes' worth of TypePTYOutput frames (same layout),
+// after which the connection returns to JSON mode (no binary stream).
+type PeekResp struct {
+	SnapshotSize int `json:"snapshot_size"`
 }
 
 // SetViewingReq tells the daemon that this client is now (or no longer)
