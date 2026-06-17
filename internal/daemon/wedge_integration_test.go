@@ -43,28 +43,16 @@ func listContainsSession(t *testing.T, raw json.RawMessage, sid string) bool {
 	return false
 }
 
-// TestDaemon_WedgedPaneDoesNotStarveRPCs is an end-to-end LIVENESS guard
-// for the original daemon-wide-deadlock scenario: a session whose child
-// stops draining stdin gets flooded with input over a real attach binary
-// stream, and the daemon must keep servicing RPCs for every session. It
-// asserts that after the flood, List, TicketDone{S1}, and Kill{S2} all
-// return within the read deadline — and exercises the close-before-wait
-// group-kill teardown against a genuinely wedged pane end-to-end.
+// TestDaemon_WedgedPaneRPCsSmoke is an end-to-end smoke/liveness guard:
+// a session whose child stops draining stdin is flooded with input over a
+// real attach binary stream, and the daemon must keep servicing RPCs for
+// every session. Asserts List, TicketDone{S1}, and Kill{S2} all return
+// within the read deadline.
 //
-// The original incident was a TWO-fault deadlock (WriteInput holding p.mu
-// across the blocked PTY write AND handleList→Session.Info taking p.mu
-// under sessionsMu.RLock); either Task 1 or Task 2 alone breaks the
-// cascade. This is therefore the holistic guard, NOT a single-fix
-// discriminator — the per-fix red-before-green proofs live in the
-// deterministic terminal unit tests (TestSessionInfo_LockFree for Task 1,
-// TestWriteInput_DoesNotBlockOnFullChild for Task 2). NOTE (verified on
-// this darwin host): reverting Task 1, Task 2, or even both did NOT make
-// this end-to-end test hang within the deadline — the production
-// lock-coupling cascade does not deterministically reproduce through the
-// socket+goroutine harness here. It remains a useful regression guard
-// (it does drive the full flood→RPC path), but it is not a substitute
-// for the unit-level discriminators.
-func TestDaemon_WedgedPaneDoesNotStarveRPCs(t *testing.T) {
+// This is a SMOKE test, not a single-fix discriminator. The per-fix
+// proofs live in the deterministic terminal unit tests
+// (TestSessionInfo_LockFree, TestWriteInput_DoesNotBlockOnFullChild).
+func TestDaemon_WedgedPaneRPCsSmoke(t *testing.T) {
 	srv, errCh := startServer(t)
 
 	// Controller conn: issues spawn / list / ticket-done / kill RPCs.
