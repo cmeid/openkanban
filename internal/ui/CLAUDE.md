@@ -85,6 +85,12 @@ Vertical scroll per column lives in `m.columnOffsets[i]`. Three functions touch 
 
 Card-height arithmetic in any path that runs *inside or after* `refreshColumnTickets` (and before the next render) must use the `ticketHeight` constant — NOT the `columnTicketHeights` cache. The cache is keyed to pre-refresh indices; after a filter shifts the ticket list, index `j` likely points at a different card. Reading it post-refresh is actively wrong, not just stale.
 
+### Keep focus on the acted-on ticket
+
+Selection is by **index** (`m.activeColumn`/`m.activeTicket`), but `refreshColumnTickets` re-sorts every column and does NOT preserve which ticket was selected. Any path that *moves, creates, or edits* a ticket must call `m.selectTicketByID(ticket.ID)` **after** `refreshColumnTickets` to re-anchor focus on that ticket by its stable UUID. All five mutation paths follow this: forward/backward quick-move, drag-drop (`dropTicket`), create and edit branches of `saveTicketForm`.
+
+Do **not** push `selectTicketByID` into `refreshColumnTickets` itself. That chokepoint is shared with filter/resync flows that intentionally rely on `selectTicketByID`'s clamp-degrade fallback to gracefully drop a selection a filter just hid. Centralizing the re-select would regress filter UX. Keep the call at the mutation call sites. `selectTicketByID` handles vertical scroll (`ensureTicketVisible`) but not horizontal — keep an explicit `ensureColumnVisible()` where the active column may change (e.g. `dropTicket`).
+
 ## Terminal Panes
 
 `panes map[board.TicketID]*daemonclient.PaneView` — one per spawned agent.
