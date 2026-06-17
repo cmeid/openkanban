@@ -61,12 +61,15 @@ func promoteSessionTicketTo(target board.TicketStatus) error {
 	// directly + store.SaveTicket, bypassing both. See PR #67 wiring
 	// and the original promote/prune feature
 	// ([[plan-ancient-sparking-dusk]] / "Why fire on every
-	// transition"). Move handles SetStatus + persistence and returns
-	// (promoted, pruned, err) — we surface counts to stderr matching
-	// wrapUpSessionTicketAt's UX.
+	// transition"). Move mutates in memory and returns
+	// (promoted, pruned, err); persistence is still the caller's job
+	// — mirrors the wrapUpSessionTicketAt template.
 	promoted, pruned, err := store.Move(ticket.ID, target)
 	if err != nil {
 		return fmt.Errorf("move ticket %s: %w", ticket.ID, err)
+	}
+	if err := store.SaveTicket(ticket); err != nil {
+		return fmt.Errorf("save ticket %s: %w", ticket.ID, err)
 	}
 	if n := len(promoted); n > 0 {
 		fmt.Fprintf(os.Stderr, "openkanban: promoted %d claude approval(s) to repo defaults\n", n)
