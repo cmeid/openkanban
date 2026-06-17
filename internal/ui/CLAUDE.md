@@ -34,6 +34,8 @@ Vim-style navigation:
 - `Enter` - select/confirm
 - `Esc` - cancel/back
 
+`:` is **intentionally unhandled** in normal mode — it falls through `handleNormalMode`'s switch to a no-op. It once entered a `ModeCommand` stub (a husk present since the initial commit whose only behaviors bounced straight back to `ModeNormal`), removed as dead code. The key is deliberately left free so a future command-palette feature (`:q`, `:w`, `:e <ticket>`, …) can claim it cleanly. Don't re-add a no-op handler or repurpose `:` for an unrelated binding.
+
 Inside ModeAgentView, these keys are intercepted before the PTY child (claude, etc.) sees them:
 - `Ctrl+]` / `Ctrl+\` - cycle focus to next / prev open, unattached session
 - `Ctrl+g` - exit back to the board
