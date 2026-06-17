@@ -52,4 +52,30 @@ func TestWedge_StaleBinaryFrozenExitsSooner(t *testing.T) {
 	if !exit {
 		t.Fatal("stale+frozen did not exit at the shorter threshold")
 	}
+	// Symmetric: same elapsed time, but NOT stale → must NOT exit (proves
+	// the early exit was due to the stale threshold, not the wedge one).
+	w2 := newWedgeMonitor(60, 30)
+	w2.evaluate(wedgeSample{seq: 5, inflight: 1, nowNanos: 10 * sec})
+	if exit, _ := w2.evaluate(wedgeSample{seq: 5, inflight: 1, nowNanos: 41 * sec}); exit {
+		t.Fatal("non-stale path exited at 31s; should require the full 60s")
+	}
+}
+
+func TestWedge_ProdThresholds(t *testing.T) {
+	sec := int64(1e9)
+	// Non-stale: must NOT exit at 89s frozen, MUST exit just past 90s.
+	w := newWedgeMonitor(90, 45)
+	w.evaluate(wedgeSample{seq: 1, inflight: 2, nowNanos: 10 * sec})
+	if exit, _ := w.evaluate(wedgeSample{seq: 1, inflight: 2, nowNanos: 99 * sec}); exit {
+		t.Fatal("exited at 89s frozen; non-stale threshold must be 90s")
+	}
+	if exit, _ := w.evaluate(wedgeSample{seq: 1, inflight: 2, nowNanos: 101 * sec}); !exit {
+		t.Fatal("did not exit at 91s frozen; non-stale threshold must be 90s")
+	}
+	// Stale: must exit at the shorter 45s threshold, not wait for 90s.
+	w2 := newWedgeMonitor(90, 45)
+	w2.evaluate(wedgeSample{seq: 1, inflight: 1, pendingRestart: true, nowNanos: 10 * sec})
+	if exit, _ := w2.evaluate(wedgeSample{seq: 1, inflight: 1, pendingRestart: true, nowNanos: 56 * sec}); !exit {
+		t.Fatal("stale path did not exit at 46s; stale threshold must be 45s")
+	}
 }
