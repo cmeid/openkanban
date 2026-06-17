@@ -671,6 +671,11 @@ func (g *GlobalTicketStore) ReloadTicket(projectID, path string) error {
 			// this path and drop it from in-memory state.
 			for id, p := range store.paths {
 				if p == path {
+					// Diagnostic: this is the only silent ticket removal
+					// at runtime. If the session header ever shows a bare
+					// "Agent", this line names the dropped ticket/path and
+					// confirms the store-divergence path.
+					log.Printf("openkanban: store drop ticket id=%s path=%s project=%s (file vanished)", id, path, projectID)
 					delete(store.Tickets, id)
 					delete(store.paths, id)
 					delete(g.allTickets, id)
