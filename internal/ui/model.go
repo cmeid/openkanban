@@ -3545,12 +3545,15 @@ func (m *Model) performTicketCleanup(ticket *board.Ticket) {
 		}
 	}
 
-	// SessionOwned=true is the ticket's explicit claim on the session
-	// JSONL (set via `openkanban ticket new --session ... --migrate`).
-	// Link-mode sessions (SessionOwned=false) belong to the spawning
-	// agent and must survive ticket deletion. The pane.Stop above has
+	// Every ticket conceptually OWNS its session now that forking is
+	// eliminated (task/enforce-one-to-one-session). The pre-fix
+	// SessionOwned gate distinguished link-mode (don't delete JSONL on
+	// ticket-delete; the spawning agent owns it) from migrate-mode
+	// (delete JSONL since the ticket owned it). With every spawn
+	// migrate-on-resume, the ticket always owns the session; if it's
+	// being deleted, the JSONL goes with it. The pane.Stop above has
 	// already killed the writer process, so unlink is safe.
-	if ticket.SessionOwned && ticket.AgentSessionID != "" {
+	if ticket.AgentSessionID != "" {
 		path, err := agent.SessionPath(ticket.AgentSessionID)
 		switch {
 		case err == nil:
@@ -4401,10 +4404,14 @@ func buildSpawnReq(in spawnReqInputs) daemon.SpawnReq {
 				args = append(args, "-n", in.ticket.Title)
 			}
 			if in.ticket.AgentSessionID != "" && agent.SessionUUIDPattern.MatchString(in.ticket.AgentSessionID) {
+				// Always migrate-on-resume; the divergent-fork option was
+				// eliminated in task/enforce-one-to-one-session because
+				// silent divergence broke the 1:1 ticket↔session
+				// invariant the daemon enforces at the PTY layer. The
+				// grep guard at internal/ui/forksession_guard_test.go
+				// pins this invariant at build time. See
+				// [[openkanban-one-to-one-ticket-session-invariant]].
 				args = append(args, "--resume", in.ticket.AgentSessionID)
-				if !in.ticket.SessionOwned {
-					args = append(args, "--fork-session")
-				}
 			}
 			if in.promptTemplate != "" {
 				prompt := agent.BuildContextPrompt(in.promptTemplate, in.ctxData)
@@ -5586,35 +5593,24 @@ func (m *Model) pollAgentStatusesAsync() tea.Cmd {
 			// comments above. Keeping it here so --resume picks up the
 			// UUID on the next spawn / external-resume detection.
 			apiSessionID := p.agentSessionID
-			if apiSessionID == "" && p.agentType == "opencode" && p.worktreePath != "" {
-				if id := agent.FindOpencodeSession(p.worktreePath); id != "" {
+			if apiSessionID == "" {
+				home, _ := os.UserHomeDir()
+				// backfillAgentSession enforces the 1:1 invariant via
+				// ticketsvc.LinkSession(BestEffort). On claim conflict
+				// (UUID already held by a different ticket) the back-fill
+				// silently no-ops: returns empty, no save, no purge.
+				// See internal/ui/backfill_session.go.
+				if id := backfillAgentSession(
+					globalStore,
+					p.ticketID,
+					p.agentType,
+					p.worktreePath,
+					home,
+					agent.FindOpencodeSession,
+					agent.FindClaudeSession,
+					agent.PurgeClaudePrimingHistory,
+				); id != "" {
 					apiSessionID = id
-					if ticket, _ := globalStore.Get(p.ticketID); ticket != nil {
-						ticket.AgentSessionID = apiSessionID
-						globalStore.Save(ticket)
-					}
-				}
-			}
-			if apiSessionID == "" && p.agentType == "claude" && p.worktreePath != "" {
-				if id := agent.FindClaudeSession(p.worktreePath); id != "" {
-					apiSessionID = id
-					if ticket, _ := globalStore.Get(p.ticketID); ticket != nil {
-						ticket.AgentSessionID = apiSessionID
-						globalStore.Save(ticket)
-					}
-					// Once we know the back-filled UUID for a claude
-					// session, purge the priming-prompt entry openkanban
-					// caused claude to write into ~/.claude/history.jsonl
-					// at spawn-time. Without this the priming dominates
-					// the up-arrow input ring and hides the user's real
-					// recent prompts. This branch only fires while
-					// p.agentSessionID is still empty — i.e. before the
-					// ticket has the UUID — so the purge runs once per
-					// ticket lifecycle, not on every poll tick.
-					if home, err := os.UserHomeDir(); err == nil {
-						historyPath := filepath.Join(home, ".claude", "history.jsonl")
-						_ = agent.PurgeClaudePrimingHistory(historyPath, apiSessionID, agent.ClaudePrimingPrefixes...)
-					}
 				}
 			}
 

@@ -399,6 +399,26 @@ func (g *GlobalTicketStore) Get(id board.TicketID) (*board.Ticket, error) {
 	return t, nil
 }
 
+// FindByAgentSessionID returns every ticket in the global store whose
+// AgentSessionID matches uuid. Returns nil for empty uuid. Used by
+// ticketsvc.LinkSession to enforce uniqueness at the creation/back-fill
+// gate; storage tolerates duplicates by policy (the runtime gate at
+// attach is the real enforcement layer), but the gate REFUSES to
+// create new duplicates without explicit Force, so this scan is the
+// load-bearing read.
+func (g *GlobalTicketStore) FindByAgentSessionID(uuid string) []*board.Ticket {
+	if uuid == "" {
+		return nil
+	}
+	var out []*board.Ticket
+	for _, t := range g.allTickets {
+		if t.AgentSessionID == uuid {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
 func (g *GlobalTicketStore) Add(ticket *board.Ticket) error {
 	store := g.ticketStores[ticket.ProjectID]
 	if store == nil {

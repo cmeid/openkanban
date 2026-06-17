@@ -1177,12 +1177,25 @@ func (s *Server) handleTicketDone(c *clientConn, req TicketDoneReq) (TicketDoneR
 	return TicketDoneResp{SessionID: matches[0].ID(), Killed: true}, nil
 }
 
-// handleOwns answers whether the daemon currently owns the agent
-// session whose Claude / opencode UUID matches req.SessionUUID.
+// handleOwns answers whether the daemon currently owns one or more
+// agent sessions whose Claude / opencode UUID matches req.SessionUUID.
 //
 // Sessions record their agent UUID at spawn time
-// (SpawnReq.AgentSessionUUID → Session.agentSessionUUID). We walk
-// the live sessions under sessionsMu.RLock and return the first match.
+// (SpawnReq.AgentSessionUUID → Session.agentSessionUUID). We walk all
+// live sessions under sessionsMu.RLock and collect every match. The
+// caller distinguishes three states:
+//
+//   - len(matches) == 0: Owned=false (no caller action; either fresh
+//     spawn or a pre-back-fill state).
+//   - len(matches) == 1: Owned=true with SessionID + OwnedByTicketID
+//     populated. The caller compares OwnedByTicketID against its
+//     requesting ticket to decide idempotent re-attach vs foreign
+//     ownership refuse.
+//   - len(matches) > 1: Owned=true, Conflict=true,
+//     ConflictSessionIDs lists every session ID. The 1:1 invariant
+//     has been violated by something upstream — the caller refuses
+//     and surfaces the multi-match to the user.
+//
 // Empty UUIDs never match: a Spawn made without --session carries
 // AgentSessionUUID="" and an Owns query with SessionUUID="" is
 // ill-formed and reported as Owned=false.
@@ -1192,16 +1205,40 @@ func (s *Server) handleOwns(c *clientConn, req OwnsReq) OwnsResp {
 	}
 	s.sessionsMu.RLock()
 	defer s.sessionsMu.RUnlock()
+	var matches []*Session
 	for _, sess := range s.sessions {
 		if sess.AgentSessionUUID() == req.SessionUUID {
-			return OwnsResp{
-				Owned:       true,
-				SessionID:   sess.ID(),
-				SessionName: sess.SessionName(),
-			}
+			matches = append(matches, sess)
 		}
 	}
-	return OwnsResp{Owned: false}
+	switch len(matches) {
+	case 0:
+		return OwnsResp{Owned: false}
+	case 1:
+		return OwnsResp{
+			Owned:           true,
+			SessionID:       matches[0].ID(),
+			SessionName:     matches[0].SessionName(),
+			OwnedByTicketID: matches[0].TicketID(),
+		}
+	default:
+		// > 1: conflict. Return Owned=true so old clients reading only
+		// the legacy fields see "daemon claims this UUID" (their
+		// behavior won't be MORE wrong than today's first-match). New
+		// clients see Conflict=true and refuse.
+		conflictIDs := make([]string, 0, len(matches))
+		for _, sess := range matches {
+			conflictIDs = append(conflictIDs, sess.ID())
+		}
+		return OwnsResp{
+			Owned:              true,
+			SessionID:          matches[0].ID(),
+			SessionName:        matches[0].SessionName(),
+			OwnedByTicketID:    matches[0].TicketID(),
+			Conflict:           true,
+			ConflictSessionIDs: conflictIDs,
+		}
+	}
 }
 
 func (s *Server) handleSubscribe(c *clientConn, req SubscribeReq) SubscribeResp {

@@ -399,6 +399,27 @@ type OwnsResp struct {
 	Owned       bool   `json:"owned"`
 	SessionID   string `json:"session_id"`
 	SessionName string `json:"session_name,omitempty"`
+
+	// OwnedByTicketID names the ticket the matched session was spawned
+	// for. Empty when Owned=false. Lets the client distinguish "daemon
+	// owns this UUID for ME" (idempotent re-attach — proceed) from
+	// "daemon owns this UUID for a DIFFERENT ticket" (the 1:1
+	// invariant fracture — refuse with named conflict). Added in
+	// task/enforce-one-to-one-session; old daemons return "" and
+	// callers fall back to refusing any daemon-owns as foreign.
+	OwnedByTicketID string `json:"owned_by_ticket_id,omitempty"`
+
+	// Conflict is true when more than one live daemon session has the
+	// queried UUID. ConflictSessionIDs lists every matching session.
+	// The old "first-match" behavior was a structural risk: a daemon
+	// inheriting two pre-dedup sessions with the same UUID would
+	// silently route to one of them, hiding the duplicate. Now the
+	// daemon surfaces it loudly and the caller refuses the operation.
+	// Old clients ignore these fields and see Owned=true (first match
+	// behavior preserved when there's no conflict; conflict is the
+	// new signal).
+	Conflict           bool     `json:"conflict,omitempty"`
+	ConflictSessionIDs []string `json:"conflict_session_ids,omitempty"`
 }
 
 // AttachReq requests that the connection upgrade to binary mode and

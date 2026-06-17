@@ -119,8 +119,14 @@ func toFrontmatter(t *board.Ticket) ticketFrontmatter {
 		AgentStatus:      t.AgentStatus,
 		AgentSpawnedAt:   t.AgentSpawnedAt,
 		AgentPort:        t.AgentPort,
-		AgentSessionID:   t.AgentSessionID,
-		SessionOwned:     t.SessionOwned,
+		AgentSessionID: t.AgentSessionID,
+		// SessionOwned intentionally NOT populated — the field was
+		// removed from board.Ticket in task/enforce-one-to-one-session
+		// when forking was eliminated. The YAML frontmatter field stays
+		// (line 81) so old .md files load without "unknown field"
+		// errors, but it's dormant: never read, never written from
+		// struct state. The zero value gets written; old-file values
+		// silently drop on next save.
 		CreatedBySession: t.CreatedBySession,
 		BlockedBy:        blocked,
 		Meta:             meta,
@@ -155,8 +161,10 @@ func fromFrontmatter(fm ticketFrontmatter, body string) *board.Ticket {
 		AgentStatus:      fm.AgentStatus,
 		AgentSpawnedAt:   fm.AgentSpawnedAt,
 		AgentPort:        fm.AgentPort,
-		AgentSessionID:   fm.AgentSessionID,
-		SessionOwned:     fm.SessionOwned,
+		AgentSessionID: fm.AgentSessionID,
+		// SessionOwned ignored on load — see toFrontmatter comment.
+		// Old .md files with `session_owned: true` parse, but the
+		// value never reaches board.Ticket.
 		CreatedBySession: fm.CreatedBySession,
 		CreatedAt:        fm.CreatedAt,
 		UpdatedAt:        fm.UpdatedAt,
