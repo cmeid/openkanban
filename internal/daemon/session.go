@@ -33,6 +33,12 @@ type Session struct {
 	// NewSession; consulted by handleOwns.
 	agentSessionUUID string
 
+	// agentType is the agent kind ("claude", "opencode", …) from
+	// SpawnReq.AgentType. Read-only after NewSession; consulted by
+	// Server.resolveSessionStatus to classify the live grid. Empty for
+	// sessions spawned by an older client.
+	agentType string
+
 	// attachMu protects attached and serializes Attach/Detach.
 	attachMu sync.Mutex
 	attached *attachedClient // nil = no current attacher
@@ -151,6 +157,7 @@ func NewSession(req SpawnReq) (*Session, error) {
 		pane:             pane,
 		startedAt:        time.Now().UTC(),
 		agentSessionUUID: req.AgentSessionUUID,
+		agentType:        req.AgentType,
 		viewers:          make(map[uint16]struct{}),
 	}, nil
 }
@@ -272,6 +279,10 @@ func (s *Session) TicketID() string { return s.ticketID }
 // SessionName returns the OPENKANBAN_SESSION value the session was
 // spawned with.
 func (s *Session) SessionName() string { return s.sessionName }
+
+// AgentType returns the agent kind this session runs ("claude", etc.),
+// or "" if spawned by a client that didn't send it.
+func (s *Session) AgentType() string { return s.agentType }
 
 // Pane returns the underlying terminal.Pane. Reserved for PR5/PR7,
 // where the daemon's attach + snapshot paths need to talk to the

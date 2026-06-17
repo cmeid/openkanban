@@ -286,6 +286,14 @@ type SpawnReq struct {
 	Rows             int      `json:"rows"`
 	Scrollback       int      `json:"scrollback"`
 	AgentSessionUUID string   `json:"agent_session_uuid,omitempty"`
+	// AgentType is the agent kind ("claude", "opencode", "gemini",
+	// "codex") this session runs. The daemon records it so it can
+	// resolve the session's working/waiting status from its own live PTY
+	// grid (see Server.resolveSessionStatus) and ship the verdict on
+	// SessionEvent.Status — keeping a card accurate even while no TUI is
+	// attached. Empty for an older client; the daemon then emits no
+	// resolved Status and the client's file-poll stays in charge.
+	AgentType string `json:"agent_type,omitempty"`
 	// ForwardNotifications enables OSC 9 → desktop notification
 	// forwarding for this session. The daemon plumbs the flag into
 	// terminal.Pane.SetForwardNotifications after the pane is built;

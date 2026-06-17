@@ -134,30 +134,34 @@ func (d *StatusDetector) DetectStatusWithPortAPI(agentType, fileSessionName, api
 	return board.AgentNone
 }
 
-// WaitingActivityTTL is how recent the last PTY-output timestamp must
-// be for DetectStatusWithActivity to override file-based "waiting"
-// back to "working". 60s is intentionally generous: Claude's spinner
-// animation produces bytes ~10x/sec while a tool is running, so even
-// a single recent sample suffices; the long horizon covers brief
-// quiet stretches (model thinking between tool batches) without
-// snapping the card back to "waiting" and confusing the user.
+// WaitingActivityTTL is the horizon beyond which a PTY-output timestamp
+// is considered stale. It no longer gates a waiting→working promotion
+// (that is now decided by on-screen evidence in DetectStatusWithActivity,
+// not byte-recency); it is retained as the canonical "staleness" duration
+// used by tests to construct old timestamps.
 const WaitingActivityTTL = 60 * time.Second
 
-// DetectStatusWithActivity layers a PTY-activity override on top of
-// DetectStatusWithPortAPI to close the Claude Code hook gap:
-// Notification fires (permission prompt) → file = "waiting" → user
-// approves → tool runs (no hook for the duration) → PostToolUse
-// finally fires. During the gap, a long-running tool leaves status
-// pinned at "waiting" even though the agent's spinner / output is
-// actively streaming bytes through the PTY. When the file says
-// "waiting" but lastActivity is within WaitingActivityTTL, override
-// to "working".
+// DetectStatusWithActivity refines a file-based "waiting" using what's on
+// the live PTY grid, closing the Claude Code hook gap: Notification fires
+// (permission prompt) → file = "waiting" → user approves → tool runs (no
+// hook for the duration) → PostToolUse finally fires. During the gap the
+// file stays pinned at "waiting" even though the agent is working.
 //
-// The override is intentionally narrow: only "waiting" → "working".
-// Other states ("working", "idle", "completed", "error") and the
-// file's absence (AgentNone) pass through untouched. lastActivity
-// of zero (no daemon report yet) also passes through — the file is
-// authoritative until the daemon has spoken.
+// The discriminator is the SCREEN, not byte-recency: a prompt Claude is
+// blocked on re-renders every couple of seconds and stamps fresh activity,
+// so "bytes flowed recently" cannot tell an active turn apart from a
+// re-rendering prompt. Only "waiting" is refined (other states pass
+// through). When the file says "waiting":
+//
+//   - a recognized permission prompt on screen → stays "waiting";
+//   - positive evidence of an active turn (spinner / "esc to interrupt")
+//     → "working";
+//   - otherwise → "waiting" (the durable default: an unknown prompt type
+//     or an unattached session with no grid is never mislabeled "working").
+//
+// lastActivity is retained in the signature (callers and the daemon's
+// resolver pass it) but is no longer the promotion trigger; the IsZero
+// short-circuit keeps the "no daemon report yet → trust the file" path.
 //
 // `fileSessionName` and `apiSessionID` are separated for the same
 // reason DetectStatusWithPortAPI separates them: pollAgentStatusesAsync
@@ -172,16 +176,9 @@ func (d *StatusDetector) DetectStatusWithActivity(agentType, fileSessionName, ap
 	if lastActivity.IsZero() {
 		return status
 	}
-	// An open approval prompt is itself recent PTY output: rendering the
-	// box stamps lastActivity at the same instant the Notification hook
-	// writes "waiting". The activity override below exists for the
-	// opposite case — a tool streaming output AFTER the user grants
-	// permission — so without this guard a freshly-shown prompt looks
-	// like active work and the card never shows "waiting" until the
-	// prompt sits untouched past WaitingActivityTTL. Hold "waiting"
-	// while the prompt is on screen; it clears the moment the user
-	// answers and the tool starts streaming, at which point the override
-	// resumes.
+	// A recognized approval prompt on screen → blocked on the user. This
+	// is checked first so it wins even if an active-turn marker is also
+	// present (it never is in Claude's real UI, but ordering guarantees it).
 	if permissionPromptVisible(terminalContent) {
 		return board.AgentWaiting
 	}
@@ -199,9 +196,17 @@ func (d *StatusDetector) DetectStatusWithActivity(agentType, fileSessionName, ap
 	if activeTurnVisible(terminalContent) {
 		return board.AgentWorking
 	}
-	if time.Since(lastActivity) < WaitingActivityTTL {
-		return board.AgentWorking
-	}
+	// Default: hold "waiting". Recent PTY activity alone is NOT promoted to
+	// "working" — a prompt Claude is blocked on (permission box, an
+	// AskUserQuestion, an idle notice) re-renders every couple of seconds
+	// and stamps fresh activity, so a byte-recency override mislabels those
+	// as work. The two checks above are the only ways out of "waiting": a
+	// recognized prompt (→ stays waiting) or positive on-screen evidence of
+	// an active turn (→ working). Anything else — an unknown prompt type we
+	// don't enumerate, or a session no TUI is attached to (empty grid) —
+	// fails SAFE to "waiting" rather than a misleading "working". The real
+	// Notification→PostToolUse work gap is still covered because a running
+	// tool shows an active-turn marker (activeTurnVisible), not just bytes.
 	return status
 }
 
