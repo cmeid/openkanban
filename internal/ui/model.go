@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -26,6 +27,7 @@ import (
 	"github.com/techdufus/openkanban/internal/git"
 	"github.com/techdufus/openkanban/internal/project"
 	"github.com/techdufus/openkanban/internal/terminal"
+	"github.com/techdufus/openkanban/internal/ticketsvc"
 	"github.com/techdufus/openkanban/internal/update"
 )
 
@@ -4780,60 +4782,103 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 	dapi := m.daemon
 
 	return func() tea.Msg {
-		// Fast path (B4): if the daemon already owns the agent UUID this
-		// ticket would resume into, skip the Spawn RPC entirely and
-		// build a PaneView against the existing daemon-side session.
-		// Idempotent Spawn (PR #34) would handle the duplicate at the
-		// daemon level, but that still costs an RPC roundtrip and forces
-		// the daemon to walk the dedupe table. Symmetric with the
-		// spawn-gate Owns check in shouldCleanupDeadSession; see also
-		// the documentation block at the top of that helper.
+		// 1:1 invariant gate: before either the fast-path attach OR a
+		// fresh Spawn, prove that the Claude session UUID this ticket
+		// would resume into is safe to claim. ticketsvc.GateAttach
+		// refuses when lsof shows the JSONL is held externally, when
+		// the daemon owns the session for a DIFFERENT ticket, or when
+		// the daemon reports a multi-match conflict. Allows when the
+		// daemon owns for THIS ticket (idempotent re-attach) or for
+		// the wire-compat case where OwnedByTicketID is empty (old
+		// daemon mid-upgrade — degrade to "trust the single match").
 		//
-		// Runs BEFORE the mgr nil-check so the fast path doesn't need a
-		// worktree manager: a daemon-owned session already has its
-		// worktree set up from the original spawn, so re-fetching mgr
-		// is wasted work in the resume case. (cwd already locked in by
-		// the running PTY — local Workdir is decorative.)
+		// Runs BEFORE the mgr nil-check so the gate's refusal short-
+		// circuits without needing a worktree manager (a foreign-held
+		// session would never legitimately reach Spawn anyway).
 		//
-		// Guarded on ticket.AgentSessionID being set: tickets that have
-		// never had a session linked to them have no UUID to query, so
-		// the fast path is meaningless.
-		// The Unattached (ctrl+space) path deliberately skips the fast
-		// path: it must NEVER attach, even to an already-owned session.
-		// handleSpawn is idempotent per TicketID, so the regular Spawn
-		// call below returns the existing SessionID, which we then wrap
-		// in an Unattached PaneView.
-		if !plan.Unattached && dapi != nil && ticket.AgentSessionID != "" {
-			ownsCtx, ownsCancel := context.WithTimeout(context.Background(), ownsProbeTimeout)
-			ownsResp, ownsErr := dapi.Owns(ownsCtx, ticket.AgentSessionID)
-			ownsCancel()
-			if ownsErr == nil && ownsResp.Owned && ownsResp.SessionID != "" {
-				// Prefer the daemon's stored SessionName over a local
-				// recompute via sessionNameFor(). The daemon's value is
-				// what the live agent's OPENKANBAN_SESSION env var holds
-				// (baked at original spawn, possibly by a pre-fix binary
-				// that used the UUID priority) and is therefore the
-				// correct status-file lookup key. Empty SessionName
-				// (e.g. older daemon that doesn't return the field)
-				// falls back to local computation — same behavior as
-				// before the field existed.
-				resolvedName := ownsResp.SessionName
-				if resolvedName == "" {
-					resolvedName = sessionNameFor(ticket, branchName)
+		// The Owns response gathered here is reused immediately below
+		// for the fast-path attach so we don't double the daemon RPC.
+		// Guarded on ticket.AgentSessionID being set: tickets without a
+		// linked UUID have nothing to gate; fall through to Spawn.
+		//
+		// The Unattached (ctrl+space) path deliberately skips the
+		// fast-path attach below: it must NEVER attach, even to an
+		// already-owned session. handleSpawn is idempotent per TicketID,
+		// so the regular Spawn call later returns the existing SessionID
+		// which we then wrap in an Unattached PaneView. The gate itself
+		// still runs — Unattached doesn't get to bypass the 1:1
+		// invariant; a foreign-held UUID must refuse regardless.
+		var ownsResp daemon.OwnsResp
+		ownsValid := false
+		if ticket.AgentSessionID != "" {
+			if dapi != nil {
+				ownsCtx, ownsCancel := context.WithTimeout(context.Background(), ownsProbeTimeout)
+				var ownsErr error
+				ownsResp, ownsErr = dapi.Owns(ownsCtx, ticket.AgentSessionID)
+				ownsCancel()
+				if ownsErr == nil {
+					ownsValid = true
+				} else {
+					log.Printf("openkanban spawn-gate: daemon Owns(%s) failed: %v — degrading to lsof-only", ticket.AgentSessionID, ownsErr)
 				}
-				return attachExistingFastPath(
-					ticketID,
-					ownsResp.SessionID,
-					resolvedName,
-					ticket.Title,
-					worktreePath,
-					branchName,
-					baseBranch,
-					width,
-					height,
-					daemonClient,
-				)
 			}
+			lsofHolder, lerr := agent.SessionActive(ticket.AgentSessionID)
+			if lerr != nil && !os.IsNotExist(lerr) {
+				log.Printf("openkanban spawn-gate: lsof probe (%s): %v — treating as not held", ticket.AgentSessionID, lerr)
+				lsofHolder = agent.SessionHolder{}
+			}
+			probe := func(_ string) (agent.SessionHolder, *daemon.OwnsResp, error) {
+				if ownsValid {
+					return lsofHolder, &ownsResp, nil
+				}
+				return lsofHolder, nil, nil
+			}
+			if gerr := ticketsvc.GateAttach(probe, ticket.AgentSessionID, ticketID); gerr != nil {
+				var inUse *ticketsvc.ErrSessionInUse
+				if errors.As(gerr, &inUse) {
+					return spawnErrorMsg{ticketID: ticketID, err: "session in use: " + inUse.Error()}
+				}
+				return spawnErrorMsg{ticketID: ticketID, err: "spawn gate: " + gerr.Error()}
+			}
+		}
+
+		// Fast path (B4): with the gate passed, if the daemon already
+		// owns the session, skip the Spawn RPC entirely and build a
+		// PaneView against the existing daemon-side session. Idempotent
+		// Spawn (PR #34) would handle the duplicate at the daemon level,
+		// but that still costs an RPC roundtrip and forces the daemon
+		// to walk the dedupe table.
+		//
+		// Reuses the OwnsResp gathered for the gate above — single
+		// daemon round-trip. The Unattached path skips this entirely so
+		// it falls through to the normal Spawn → Unattached PaneView
+		// flow below.
+		if !plan.Unattached && ownsValid && ownsResp.Owned && ownsResp.SessionID != "" {
+			// Prefer the daemon's stored SessionName over a local
+			// recompute via sessionNameFor(). The daemon's value is
+			// what the live agent's OPENKANBAN_SESSION env var holds
+			// (baked at original spawn, possibly by a pre-fix binary
+			// that used the UUID priority) and is therefore the
+			// correct status-file lookup key. Empty SessionName
+			// (e.g. older daemon that doesn't return the field)
+			// falls back to local computation — same behavior as
+			// before the field existed.
+			resolvedName := ownsResp.SessionName
+			if resolvedName == "" {
+				resolvedName = sessionNameFor(ticket, branchName)
+			}
+			return attachExistingFastPath(
+				ticketID,
+				ownsResp.SessionID,
+				resolvedName,
+				ticket.Title,
+				worktreePath,
+				branchName,
+				baseBranch,
+				width,
+				height,
+				daemonClient,
+			)
 		}
 
 		if mgr == nil {

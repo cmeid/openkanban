@@ -31,7 +31,10 @@
 package ticketsvc
 
 import (
+	"context"
 	"fmt"
+	"log"
+	"time"
 
 	"github.com/techdufus/openkanban/internal/agent"
 	"github.com/techdufus/openkanban/internal/board"
@@ -83,19 +86,37 @@ func (e *ErrSessionAlreadyLinked) Error() string {
 }
 
 // ErrSessionInUse is returned by GateAttach when the session JSONL is
-// held by a local process (HolderPID > 0) or by a daemon session that
-// is NOT for the requesting ticket (DaemonSessionID set). Exactly one
-// of HolderPID / DaemonSessionID is populated.
+// held by something that isn't the requesting ticket's existing
+// daemon session. The three populated-field patterns are mutually
+// exclusive in single-match cases:
+//
+//   - HolderPID > 0: lsof shows a local process holds the JSONL.
+//   - DaemonOwnedByTicketID set: daemon owns the session for a
+//     DIFFERENT ticket. DaemonSessionID names the daemon-side handle.
+//   - ConflictSessionIDs has > 1 entry: daemon reported multi-match
+//     (1:1 invariant fractured upstream). GateAttach refuses even if
+//     one of the matches happens to be ours — the conflict must
+//     surface.
 type ErrSessionInUse struct {
-	UUID             string
-	HolderPID        int
-	HolderPath       string
-	DaemonSessionID  string
+	UUID                  string
+	HolderPID             int
+	HolderPath            string
+	DaemonSessionID       string
+	DaemonOwnedByTicketID string
+	ConflictSessionIDs    []string
 }
 
 func (e *ErrSessionInUse) Error() string {
 	if e.HolderPID > 0 {
 		return fmt.Sprintf("session %s is held by pid %d (path %s)", e.UUID, e.HolderPID, e.HolderPath)
+	}
+	if len(e.ConflictSessionIDs) > 1 {
+		return fmt.Sprintf("session %s is claimed by %d daemon sessions (1:1 invariant fractured); session IDs: %v",
+			e.UUID, len(e.ConflictSessionIDs), e.ConflictSessionIDs)
+	}
+	if e.DaemonOwnedByTicketID != "" {
+		return fmt.Sprintf("session %s is held by daemon session %s for ticket %s",
+			e.UUID, e.DaemonSessionID, e.DaemonOwnedByTicketID)
 	}
 	if e.DaemonSessionID != "" {
 		return fmt.Sprintf("session %s is held by daemon session %s (a different ticket)", e.UUID, e.DaemonSessionID)
@@ -176,6 +197,45 @@ func LinkSession(store TicketStore, requesting *board.Ticket, uuid string, opts 
 	return true, nil
 }
 
+// daemonProbeTimeout caps the daemon Owns RPC inside NewRealProbe. The
+// Owns query is a local socket round-trip; we'd rather degrade to "not
+// owned" than stall the spawn path on a wedged daemon.
+const daemonProbeTimeout = 750 * time.Millisecond
+
+// OwnsFunc is the daemon Owns RPC reduced to its (ctx, uuid) -> response
+// shape, so NewRealProbe can be constructed from any daemonclient flavor
+// (real client, test fake, m.daemon interface in the UI). Avoids dragging
+// the daemonAPI / daemonclient.Client surface into this package.
+type OwnsFunc func(ctx context.Context, sessionUUID string) (daemon.OwnsResp, error)
+
+// NewRealProbe assembles the production SessionProbe: lsof via
+// agent.SessionActive plus the daemon Owns RPC. owns may be nil (no
+// daemon reachable); lsof always runs.
+//
+// Errors from lsof bubble up (it's a hard precondition for safe attach).
+// Errors from the daemon RPC are logged and squashed to "not owned" —
+// a wedged daemon must not block spawn; the lsof side already covered
+// the local-process case.
+func NewRealProbe(owns OwnsFunc) SessionProbe {
+	return func(uuid string) (agent.SessionHolder, *daemon.OwnsResp, error) {
+		holder, lerr := agent.SessionActive(uuid)
+		if lerr != nil {
+			return agent.SessionHolder{}, nil, fmt.Errorf("ticketsvc: lsof probe: %w", lerr)
+		}
+		if owns == nil {
+			return holder, nil, nil
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), daemonProbeTimeout)
+		defer cancel()
+		resp, oerr := owns(ctx, uuid)
+		if oerr != nil {
+			log.Printf("ticketsvc: daemon owns probe (%s): %v — treating as not owned", uuid, oerr)
+			return holder, nil, nil
+		}
+		return holder, &resp, nil
+	}
+}
+
 // SessionProbe queries whether a Claude session UUID is currently held.
 //
 //   - lsof.PID > 0 means a local process holds the JSONL.
@@ -196,17 +256,22 @@ type SessionProbe func(uuid string) (lsof agent.SessionHolder, daemonOwn *daemon
 // ticket whose AgentSessionID is non-empty. Returns nil when attach is
 // safe; *ErrSessionInUse with the holder identity when it isn't.
 //
-// daemonOwn matching selfDaemonSessionID is treated as "idempotent
-// re-attach" (the daemon already has a session for us — Spawn's per-
-// TicketID idempotency would have returned it; we shouldn't refuse).
-// Pass selfDaemonSessionID="" when there's no known existing session
-// for this ticket — any daemon-owns is then foreign and refused.
+// Self-check uses OwnsResp.OwnedByTicketID — the daemon names the
+// ticket that owns the matching session. If that's the requesting
+// ticket, GateAttach treats it as idempotent re-attach (the daemon's
+// per-TicketID Spawn idempotency will return the existing session;
+// no new Claude launches).
 //
-// lsof is a hard refuse regardless of selfDaemonSessionID: the daemon
-// owns its child Claude's FDs, so reaching GateAttach with a non-zero
-// lsof PID means an EXTERNAL process (a user-launched `claude --resume`,
-// a sibling TUI's child, etc.) is holding the JSONL.
-func GateAttach(probe SessionProbe, uuid string, selfDaemonSessionID string) error {
+// lsof is a hard refuse regardless of self-status: the daemon owns
+// its child Claude's FDs, so a non-zero lsof PID at GateAttach time
+// means an EXTERNAL process (user-launched `claude --resume`, sibling
+// TUI's child, etc.) holds the JSONL. Two Claudes can't both append
+// safely.
+//
+// daemonOwn.Conflict (multi-match) is propagated as a refuse — the
+// 1:1 invariant has fractured upstream; the safe move is to surface
+// the conflict, not pick one of the matches arbitrarily.
+func GateAttach(probe SessionProbe, uuid string, requestingTicketID board.TicketID) error {
 	if probe == nil || uuid == "" {
 		return nil
 	}
@@ -218,10 +283,28 @@ func GateAttach(probe SessionProbe, uuid string, selfDaemonSessionID string) err
 		return &ErrSessionInUse{UUID: uuid, HolderPID: lsof.PID, HolderPath: lsof.Path}
 	}
 	if daemonOwn != nil && daemonOwn.Owned {
-		if daemonOwn.SessionID == selfDaemonSessionID {
+		if daemonOwn.Conflict {
+			return &ErrSessionInUse{
+				UUID:               uuid,
+				DaemonSessionID:    daemonOwn.SessionID,
+				ConflictSessionIDs: daemonOwn.ConflictSessionIDs,
+			}
+		}
+		// Old-daemon wire compat: a pre-OwnedByTicketID daemon returns
+		// the field empty even on a match. Refusing would regress the
+		// fast-path attach for users mid-upgrade; trust the single-match
+		// (the daemon already deduped) and treat as ours.
+		if daemonOwn.OwnedByTicketID == "" {
 			return nil
 		}
-		return &ErrSessionInUse{UUID: uuid, DaemonSessionID: daemonOwn.SessionID}
+		if daemonOwn.OwnedByTicketID == string(requestingTicketID) {
+			return nil
+		}
+		return &ErrSessionInUse{
+			UUID:                  uuid,
+			DaemonSessionID:       daemonOwn.SessionID,
+			DaemonOwnedByTicketID: daemonOwn.OwnedByTicketID,
+		}
 	}
 	return nil
 }

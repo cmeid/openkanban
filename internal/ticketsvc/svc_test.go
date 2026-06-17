@@ -240,18 +240,26 @@ func TestGateAttach_LsofHolder_Refuses(t *testing.T) {
 
 func TestGateAttach_DaemonOwnsForUs_Allows(t *testing.T) {
 	probe := func(uuid string) (agent.SessionHolder, *daemon.OwnsResp, error) {
-		return agent.SessionHolder{}, &daemon.OwnsResp{Owned: true, SessionID: "ours-123"}, nil
+		return agent.SessionHolder{}, &daemon.OwnsResp{
+			Owned:           true,
+			SessionID:       "ours-123",
+			OwnedByTicketID: "TICK-A",
+		}, nil
 	}
-	if err := GateAttach(probe, "uuid-1", "ours-123"); err != nil {
+	if err := GateAttach(probe, "uuid-1", "TICK-A"); err != nil {
 		t.Errorf("GateAttach idempotent re-attach: got %v, want nil", err)
 	}
 }
 
 func TestGateAttach_DaemonOwnsForOther_Refuses(t *testing.T) {
 	probe := func(uuid string) (agent.SessionHolder, *daemon.OwnsResp, error) {
-		return agent.SessionHolder{}, &daemon.OwnsResp{Owned: true, SessionID: "theirs-456"}, nil
+		return agent.SessionHolder{}, &daemon.OwnsResp{
+			Owned:           true,
+			SessionID:       "theirs-456",
+			OwnedByTicketID: "TICK-B",
+		}, nil
 	}
-	err := GateAttach(probe, "uuid-1", "ours-123")
+	err := GateAttach(probe, "uuid-1", "TICK-A")
 	var inUse *ErrSessionInUse
 	if !errors.As(err, &inUse) {
 		t.Fatalf("err: got %v, want *ErrSessionInUse", err)
@@ -259,18 +267,64 @@ func TestGateAttach_DaemonOwnsForOther_Refuses(t *testing.T) {
 	if inUse.DaemonSessionID != "theirs-456" {
 		t.Errorf("DaemonSessionID: got %q, want theirs-456", inUse.DaemonSessionID)
 	}
+	if inUse.DaemonOwnedByTicketID != "TICK-B" {
+		t.Errorf("DaemonOwnedByTicketID: got %q, want TICK-B", inUse.DaemonOwnedByTicketID)
+	}
+}
+
+func TestGateAttach_DaemonOwnsEmptyTicketID_AllowsForOldDaemonCompat(t *testing.T) {
+	// Wire compat: a pre-OwnedByTicketID daemon returns Owned=true with
+	// the field empty. GateAttach must NOT refuse — fall through to
+	// "treat as ours" to preserve the existing fast-path attach behavior
+	// for users mid-upgrade.
+	probe := func(uuid string) (agent.SessionHolder, *daemon.OwnsResp, error) {
+		return agent.SessionHolder{}, &daemon.OwnsResp{
+			Owned:     true,
+			SessionID: "legacy-sess",
+			// OwnedByTicketID intentionally empty — old daemon.
+		}, nil
+	}
+	if err := GateAttach(probe, "uuid-1", "TICK-A"); err != nil {
+		t.Errorf("old-daemon compat: got %v, want nil", err)
+	}
+}
+
+func TestGateAttach_DaemonConflict_Refuses(t *testing.T) {
+	// Daemon multi-match: refuse even if one of the matches happens to
+	// be ours. The 1:1 invariant has fractured; we surface it.
+	probe := func(uuid string) (agent.SessionHolder, *daemon.OwnsResp, error) {
+		return agent.SessionHolder{}, &daemon.OwnsResp{
+			Owned:              true,
+			SessionID:          "first",
+			OwnedByTicketID:    "TICK-A", // matches our requesting ticket
+			Conflict:           true,
+			ConflictSessionIDs: []string{"first", "second"},
+		}, nil
+	}
+	err := GateAttach(probe, "uuid-1", "TICK-A")
+	var inUse *ErrSessionInUse
+	if !errors.As(err, &inUse) {
+		t.Fatalf("err: got %v, want *ErrSessionInUse on conflict even when first match is ours", err)
+	}
+	if len(inUse.ConflictSessionIDs) != 2 {
+		t.Errorf("ConflictSessionIDs: got %v, want 2 entries", inUse.ConflictSessionIDs)
+	}
 }
 
 func TestGateAttach_LsofTrumpsDaemon(t *testing.T) {
 	// If lsof shows a holder AND daemon owns for us, lsof wins
 	// (external process is the harder refuse).
 	probe := func(uuid string) (agent.SessionHolder, *daemon.OwnsResp, error) {
-		return agent.SessionHolder{PID: 99, Path: "/tmp/x"}, &daemon.OwnsResp{Owned: true, SessionID: "ours"}, nil
+		return agent.SessionHolder{PID: 99, Path: "/tmp/x"}, &daemon.OwnsResp{
+			Owned:           true,
+			SessionID:       "ours",
+			OwnedByTicketID: "TICK-A",
+		}, nil
 	}
-	err := GateAttach(probe, "uuid-1", "ours")
+	err := GateAttach(probe, "uuid-1", "TICK-A")
 	var inUse *ErrSessionInUse
 	if !errors.As(err, &inUse) {
-		t.Fatalf("err: got %v, want *ErrSessionInUse (lsof should refuse even when daemon SessionID matches)", err)
+		t.Fatalf("err: got %v, want *ErrSessionInUse (lsof should refuse even when daemon owns for us)", err)
 	}
 	if inUse.HolderPID != 99 {
 		t.Errorf("HolderPID: got %d, want 99", inUse.HolderPID)
@@ -278,7 +332,7 @@ func TestGateAttach_LsofTrumpsDaemon(t *testing.T) {
 }
 
 func TestGateAttach_NilProbe_NoOp(t *testing.T) {
-	if err := GateAttach(nil, "uuid-1", ""); err != nil {
+	if err := GateAttach(nil, "uuid-1", "TICK-A"); err != nil {
 		t.Errorf("nil probe: got %v, want nil", err)
 	}
 }
@@ -288,7 +342,7 @@ func TestGateAttach_EmptyUUID_NoOp(t *testing.T) {
 		t.Fatal("probe should not be called for empty uuid")
 		return agent.SessionHolder{}, nil, nil
 	}
-	if err := GateAttach(probe, "", "anything"); err != nil {
+	if err := GateAttach(probe, "", "TICK-A"); err != nil {
 		t.Errorf("empty uuid: got %v, want nil", err)
 	}
 }
@@ -298,7 +352,7 @@ func TestGateAttach_ProbeError_Wrapped(t *testing.T) {
 	probe := func(uuid string) (agent.SessionHolder, *daemon.OwnsResp, error) {
 		return agent.SessionHolder{}, nil, want
 	}
-	err := GateAttach(probe, "uuid-1", "")
+	err := GateAttach(probe, "uuid-1", "TICK-A")
 	if !errors.Is(err, want) {
 		t.Errorf("probe error not propagated: got %v", err)
 	}
