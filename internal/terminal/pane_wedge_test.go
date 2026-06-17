@@ -4,6 +4,7 @@ package terminal
 
 import (
 	"errors"
+	"runtime"
 	"syscall"
 	"testing"
 	"time"
@@ -90,12 +91,23 @@ func TestSessionInfo_LockFree(t *testing.T) {
 // spinning forever.
 func floodToBackpressure(t *testing.T, p *Pane) {
 	t.Helper()
-	if err := p.StartHeadless("/bin/sh", []string{"-c", "sleep 600"}, nil); err != nil {
+	// Put the slave tty in raw, no-echo mode BEFORE the long sleep. In the
+	// default cooked+echo mode the line discipline drains our input (echoing
+	// it, which the pane's read loop then consumes) — so master writes keep
+	// succeeding and the writer never parks, making saturation racy. Raw mode
+	// stops that drain: input accumulates until the kernel buffer fills and
+	// f.Write hard-blocks. The child still never reads stdin.
+	if err := p.StartHeadless("/bin/sh", []string{"-c", "stty raw -echo </dev/tty >/dev/tty 2>/dev/null; exec sleep 600"}, nil); err != nil {
 		t.Fatalf("StartHeadless: %v", err)
 	}
+	// Give the child a moment to apply the stty before we flood.
+	time.Sleep(100 * time.Millisecond)
 	chunk := make([]byte, 4096)
-	const maxChunks = 8192 // 32 MiB ceiling — far past any PTY+channel buffer
-	const sustained = 64   // consecutive backpressure hits proving saturation
+	// Generous ceiling: with input no longer drained the buffers MUST fill and
+	// the writer MUST park; the cap only guards against a regression that
+	// never backpressures. Each iteration is a cheap channel op.
+	const maxChunks = 1 << 18
+	const sustained = 64 // backpressure dominance proving the writer is parked
 	streak := 0
 	for i := 0; i < maxChunks; i++ {
 		_, err := p.WriteInput(chunk)
@@ -109,9 +121,17 @@ func floodToBackpressure(t *testing.T, p *Pane) {
 		if err != nil {
 			t.Fatalf("WriteInput returned unexpected error before backpressure: %v", err)
 		}
-		// A successful enqueue means the writer drained one — reset the
-		// streak; we want sustained, not transient, backpressure.
-		streak = 0
+		// Interleaved success: the writer freed a slot. A lone success during
+		// the fill phase must not zero hard-won progress (that was the old
+		// flake), so penalize instead of reset — once the buffers fill and the
+		// writer parks, backpressure is uninterrupted and the streak climbs
+		// cleanly. Yield so the writer gets scheduled to drain and park.
+		if streak > 4 {
+			streak -= 4
+		} else {
+			streak = 0
+		}
+		runtime.Gosched()
 	}
 	t.Fatalf("never reached sustained ErrInputBackpressure after %d chunks — writer is draining or unbounded", maxChunks)
 }
