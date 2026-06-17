@@ -20,6 +20,7 @@ import (
 	"github.com/techdufus/openkanban/internal/agent"
 	"github.com/techdufus/openkanban/internal/board"
 	"github.com/techdufus/openkanban/internal/config"
+	"github.com/techdufus/openkanban/internal/notify"
 	"github.com/techdufus/openkanban/internal/terminal"
 	"github.com/techdufus/openkanban/internal/update"
 )
@@ -637,6 +638,12 @@ func (s *Server) broadcastActivity() {
 	// sessions, no leak hazard.
 	lastSeen := make(map[string]time.Time)
 
+	// Per-session memo of which sessions we've already flagged "stuck"
+	// this episode, so the WARN log + "stuck" SessionEvent fire exactly
+	// once per wedge (not every tick). Cleared when the session
+	// un-wedges or leaves the alive set.
+	stuckSeen := make(map[string]struct{})
+
 	for {
 		select {
 		case <-s.shutdown:
@@ -661,8 +668,21 @@ func (s *Server) broadcastActivity() {
 				delete(lastSeen, id)
 			}
 		}
+		for id := range stuckSeen {
+			if _, ok := alive[id]; !ok {
+				delete(stuckSeen, id)
+			}
+		}
 
 		for id, sess := range alive {
+			// Wedge detection (DETECT-ONLY — never auto-kill). Reads
+			// ONLY atomics via WedgedSince(), so it can never block on
+			// the wedged pane — preserving the broadcaster's
+			// never-block-on-a-stuck-session guarantee. A pane counts as
+			// stuck when WriteInput has been backpressured (the child
+			// stopped draining stdin) for at least stuckThreshold.
+			s.checkSessionWedge(id, sess, stuckSeen)
+
 			la := sess.LastActivity()
 			if la.IsZero() {
 				continue
@@ -685,6 +705,62 @@ func (s *Server) broadcastActivity() {
 			})
 		}
 	}
+}
+
+// stuckThreshold is how long a pane must be continuously wedged on input
+// backpressure before the watchdog surfaces it as "stuck". Two activity
+// ticks: long enough that a brief paste burst that drains within a tick
+// doesn't trip it, short enough that a genuinely-wedged session surfaces
+// within a few seconds.
+const stuckThreshold = 2 * activityTickInterval
+
+// checkSessionWedge surfaces a wedged session to subscribers + the log
+// exactly once per wedge episode, and clears the per-episode memo when
+// the session un-wedges. DETECT-ONLY: it NEVER kills the session
+// (honoring the no-force-kill invariant — input backpressure can't
+// distinguish "busy" from "wedged"; the user decides via the TUI).
+//
+// Reads only the pane's lock-free WedgedSince() atomic, so it can never
+// block on the wedged pane. Must not take p.mu or call any blocking pane
+// accessor.
+func (s *Server) checkSessionWedge(id string, sess *Session, stuckSeen map[string]struct{}) {
+	if sess == nil || sess.pane == nil {
+		return
+	}
+	since := sess.pane.WedgedSince()
+	if since.IsZero() || time.Since(since) < stuckThreshold {
+		// Not (yet) stuck — if it had been flagged, the wedge cleared,
+		// so reset the memo for the next episode.
+		delete(stuckSeen, id)
+		return
+	}
+	if _, already := stuckSeen[id]; already {
+		return // already surfaced this episode
+	}
+	stuckSeen[id] = struct{}{}
+
+	log.Printf("WARN: openkanbankd: session %s (ticket=%s) appears stuck — input backpressured for %s (child not draining stdin); user can recover or destroy it from the TUI",
+		id, sess.TicketID(), time.Since(since).Round(time.Second))
+
+	s.emitEvent(SessionEvent{
+		Event:          "status",
+		SessionID:      id,
+		TicketID:       sess.TicketID(),
+		Status:         "stuck",
+		LastActivityAt: sess.LastActivity(),
+	})
+
+	// Best-effort desktop notification, fired in its own goroutine so it
+	// can never block the tick. Errors are logged, never fatal — the
+	// macOS bundle may be absent (notify is a no-op off-bundle). The
+	// primary surfaces are the WARN log + the "stuck" SessionEvent → TUI
+	// red card; the notification is a bonus.
+	ticketID := sess.TicketID()
+	go func() {
+		if err := notify.Send(fmt.Sprintf("Session stuck (ticket %s) — recover or destroy it in openkanban", ticketID)); err != nil {
+			log.Printf("openkanbankd: stuck-session notify failed: %v", err)
+		}
+	}()
 }
 
 // initiateShutdown closes the shutdown channel exactly once and the
