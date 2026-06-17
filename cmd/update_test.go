@@ -675,6 +675,129 @@ func TestUpdateCheckForUpdates_NotARepo(t *testing.T) {
 	}
 }
 
+// --- assembleBundle unit tests ---
+
+// recordingRunner returns a run func that appends each invocation's
+// (name, args) to *calls and returns the provided err.
+func recordingRunner(calls *[][]string, err error) func(ctx context.Context, name string, args ...string) error {
+	return func(ctx context.Context, name string, args ...string) error {
+		entry := append([]string{name}, args...)
+		*calls = append(*calls, entry)
+		return err
+	}
+}
+
+// makeBundleScript creates an executable stub at
+// <dir>/dist/macos/build-bundle.sh so assembleBundle sees a real file.
+func makeBundleScript(t *testing.T, dir string) string {
+	t.Helper()
+	scriptDir := filepath.Join(dir, "dist", "macos")
+	if err := os.MkdirAll(scriptDir, 0755); err != nil {
+		t.Fatalf("mkdir %s: %v", scriptDir, err)
+	}
+	script := filepath.Join(scriptDir, "build-bundle.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatalf("write stub script: %v", err)
+	}
+	return script
+}
+
+func TestAssembleBundle_NonDarwin(t *testing.T) {
+	var calls [][]string
+	var out strings.Builder
+	tempSource := t.TempDir()
+	makeBundleScript(t, tempSource)
+
+	assembleBundle(context.Background(), &out, "linux", tempSource, "/go/bin/openkanban", recordingRunner(&calls, nil))
+
+	if len(calls) != 0 {
+		t.Errorf("expected runner not called on linux, got calls: %v", calls)
+	}
+	// No output expected for non-darwin
+	if out.Len() != 0 {
+		t.Errorf("expected no output on linux, got: %q", out.String())
+	}
+}
+
+func TestAssembleBundle_EmptyInstalledBin(t *testing.T) {
+	var calls [][]string
+	var out strings.Builder
+	tempSource := t.TempDir()
+	makeBundleScript(t, tempSource)
+
+	assembleBundle(context.Background(), &out, "darwin", tempSource, "", recordingRunner(&calls, nil))
+
+	if len(calls) != 0 {
+		t.Errorf("expected runner not called when installedBin is empty, got: %v", calls)
+	}
+	if !strings.Contains(out.String(), "could not resolve installed binary path") {
+		t.Errorf("expected resolve note, got: %q", out.String())
+	}
+}
+
+func TestAssembleBundle_ScriptAbsent(t *testing.T) {
+	var calls [][]string
+	var out strings.Builder
+	tempSource := t.TempDir() // no dist/macos/build-bundle.sh
+
+	assembleBundle(context.Background(), &out, "darwin", tempSource, "/go/bin/openkanban", recordingRunner(&calls, nil))
+
+	if len(calls) != 0 {
+		t.Errorf("expected runner not called when script absent, got: %v", calls)
+	}
+	if !strings.Contains(out.String(), "not found") {
+		t.Errorf("expected 'not found' note, got: %q", out.String())
+	}
+}
+
+func TestAssembleBundle_ScriptPresent_RunnerCalled(t *testing.T) {
+	var calls [][]string
+	var out strings.Builder
+	tempSource := t.TempDir()
+	script := makeBundleScript(t, tempSource)
+	installedBin := "/go/bin/openkanban"
+
+	// HOME must be set so assembleBundle can compute dest.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	assembleBundle(context.Background(), &out, "darwin", tempSource, installedBin, recordingRunner(&calls, nil))
+
+	if len(calls) != 1 {
+		t.Fatalf("expected runner called once, got %d calls: %v", len(calls), calls)
+	}
+	got := calls[0]
+	if got[0] != script {
+		t.Errorf("expected script arg %q, got %q", script, got[0])
+	}
+	if got[1] != installedBin {
+		t.Errorf("expected installedBin arg %q, got %q", installedBin, got[1])
+	}
+	wantDest := filepath.Join(home, "Applications")
+	if got[2] != wantDest {
+		t.Errorf("expected dest arg %q, got %q", wantDest, got[2])
+	}
+}
+
+func TestAssembleBundle_RunnerError_WarnsNoPanic(t *testing.T) {
+	var calls [][]string
+	var out strings.Builder
+	tempSource := t.TempDir()
+	makeBundleScript(t, tempSource)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	runErr := errors.New("bundle script exploded")
+	assembleBundle(context.Background(), &out, "darwin", tempSource, "/go/bin/openkanban", recordingRunner(&calls, runErr))
+
+	if len(calls) != 1 {
+		t.Fatalf("expected runner called once even on error, got %d", len(calls))
+	}
+	if !strings.Contains(out.String(), "warning: bundle refresh failed") {
+		t.Errorf("expected warning in output, got: %q", out.String())
+	}
+}
+
 func TestCurrentBranch_OnNamed(t *testing.T) {
 	_, local := setupRepos(t)
 

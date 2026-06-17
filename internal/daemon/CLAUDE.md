@@ -113,6 +113,23 @@ Session kills run via `trackedKill` (asynchronous, accounted):
 
 `Session.id` and `Session.ticketID` are de-facto immutable after `NewSession`. The pane-exit watcher (`watchSessionExit`) reads `sess.TicketID()` from a goroutine without taking `sessionsMu` — only safe because of this invariant. Don't mutate `s.ticketID` post-construction; if you need to "re-ticket" a session, kill it and spawn a new one.
 
+## Deploying daemon changes
+
+`openkanban update` now refreshes the macOS app-bundle daemon binary
+(`~/Applications/OpenKanban.app/Contents/MacOS/openkanbankd`) after
+`go install` via `dist/macos/build-bundle.sh` (non-fatal if the script is
+absent). Previously only `./scripts/install.sh` refreshed the bundle, so
+daemon-side changes were silently not deployed after a plain `update`.
+
+After `openkanban update` completes, the bundle contains the new binary, but
+a running `--persistent` daemon must be restarted to load it:
+
+```
+openkanban daemon restart
+```
+
+This ends any running agent sessions, so coordinate accordingly.
+
 ## Where to look
 
 | Task | Location |
