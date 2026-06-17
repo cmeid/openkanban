@@ -46,6 +46,12 @@ const handlerDeadline = 10 * time.Second
 // handlerDeadline.
 var handlerDeadlineOverride time.Duration
 
+// reapTimeout is how long a Kill may run before we count it a reap failure
+// (a child stuck in uninterruptible kernel exit — e.g. a PTY whose master
+// the daemon already closed but the process won't die). The kill goroutine
+// keeps running; the counter surfaces the leak via health.
+const reapTimeout = 30 * time.Second
+
 // runHandlerWithDeadline runs fn (a short RPC handler) and returns true if
 // it finished within the deadline. On timeout it returns false and leaves
 // the handler goroutine running (it will finish or leak — the wedge
@@ -67,6 +73,35 @@ func (s *Server) runHandlerWithDeadline(name string, fn func()) bool {
 		log.Printf("openkanbankd: handler %q exceeded %s — abandoning (client will get unresponsive error)", name, d)
 		return false
 	}
+}
+
+// trackedKill starts a goroutine to kill the session and tracks it for
+// timeout-based reap failure detection. The kill itself is non-blocking from
+// the caller's perspective. If the kill exceeds reapTimeout, it moves from
+// inflightKills to reapFailures to surface kernel-stuck children.
+func (s *Server) trackedKill(sess *Session, grace int) {
+	s.inflightKills.Add(1)
+	done := make(chan error, 1)
+	go func() { done <- sess.Kill(grace) }()
+	go func() {
+		defer s.inflightKills.Add(-1)
+		select {
+		case err := <-done:
+			if err != nil {
+				log.Printf("openkanbankd: kill session %s: %v", sess.ID(), err)
+			}
+		case <-time.After(reapTimeout):
+			s.reapFailures.Add(1)
+			log.Printf("WARN: openkanbankd: session %s did not reap within %s (possible kernel-stuck child); will keep trying", sess.ID(), reapTimeout)
+			<-done // still account for eventual completion
+			s.reapFailures.Add(-1)
+		}
+	}()
+}
+
+// killStats returns the current counts of in-flight kills and reap failures.
+func (s *Server) killStats() (int64, int64) {
+	return s.inflightKills.Load(), s.reapFailures.Load()
 }
 
 // Server is the openkanbankd RPC server. It listens on a Unix socket,
@@ -164,6 +199,17 @@ type Server struct {
 	// daemon is stuck and must self-restart. Lock-free.
 	dispatchSeq atomic.Uint64
 	inflight    atomic.Int64
+
+	// inflightKills tracks the number of in-flight session kill operations.
+	// When a kill exceeds reapTimeout, it's moved to reapFailures to surface
+	// kernel-stuck children as a health concern.
+	inflightKills atomic.Int64
+
+	// reapFailures counts sessions that failed to reap within reapTimeout.
+	// These are kernel-stuck children (e.g. PTY master closed but process
+	// won't die); the kill goroutine keeps trying, and this counter makes
+	// the leak visible for health monitoring.
+	reapFailures atomic.Int64
 }
 
 // clientConn tracks one open connection's per-client state.
@@ -1328,10 +1374,6 @@ func (s *Server) handleKill(c *clientConn, req KillReq) (KillResp, error) {
 		return KillResp{}, nil
 	}
 
-	if err := sess.Kill(req.GraceSeconds); err != nil {
-		return KillResp{}, err
-	}
-
 	log.Printf("openkanbankd: client %d killed session %s", c.id, req.SessionID)
 
 	// watchSessionExit emits the "exited" SessionEvent once the pane
@@ -1340,6 +1382,10 @@ func (s *Server) handleKill(c *clientConn, req KillReq) (KillResp, error) {
 	// path inherits whatever Expected/Reason the watcher decides (false
 	// / "natural_exit" by default, true / "ticket_done" if the
 	// TicketDone path got there first).
+	//
+	// Kill is async via trackedKill so we return success immediately and
+	// account for in-flight kills; the kill itself runs in a goroutine.
+	s.trackedKill(sess, req.GraceSeconds)
 
 	return KillResp{}, nil
 }
@@ -1395,15 +1441,11 @@ func (s *Server) handleTicketDone(c *clientConn, req TicketDoneReq) (TicketDoneR
 	for _, m := range matches {
 		m.MarkExpectedCompletion()
 		log.Printf("openkanbankd: client %d ticket-done session %s (ticket=%s)", c.id, m.ID(), req.TicketID)
-		// Kill in a goroutine so the RPC returns synchronously. The
-		// grace window matches shutdownGraceSeconds — agents may have
-		// a few seconds of cleanup. The watcher emits the "exited"
-		// event when the pane's ExitEvent lands.
-		go func(sess *Session) {
-			if err := sess.Kill(shutdownGraceSeconds); err != nil {
-				log.Printf("openkanbankd: ticket-done kill session %s: %v", sess.ID(), err)
-			}
-		}(m)
+		// Kill via trackedKill so the RPC returns synchronously and we account
+		// for in-flight kills. The grace window matches shutdownGraceSeconds —
+		// agents may have a few seconds of cleanup. The watcher emits the
+		// "exited" event when the pane's ExitEvent lands.
+		s.trackedKill(m, shutdownGraceSeconds)
 	}
 
 	return TicketDoneResp{SessionID: matches[0].ID(), Killed: true}, nil
