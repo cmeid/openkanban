@@ -705,6 +705,20 @@ report `working` instead. The override is intentionally narrow —
 other file states pass through untouched, and zero `LastActivityAt`
 (no daemon report yet) also passes through.
 
+One further narrowing closes a false-positive in the override itself.
+Rendering the approval prompt is a `vt.Write`, so it stamps
+`LastActivity` at the same moment the `Notification` hook writes
+`waiting`. Without a guard the override reads that render burst as
+"activity" and flips a genuinely-blocked session to `working` until
+the prompt sits untouched past the TTL — so a session awaiting a bash
+approval shows `working` for the whole approve-within-60s window.
+`DetectStatusWithActivity` therefore skips the override while
+`permissionPromptVisible(terminalContent)` matches the prompt's
+on-screen text (`do you want to`, `esc to cancel`). That signal,
+unlike the timer, holds for the entire wait and clears the instant the
+user answers and the tool starts streaming — at which point the
+override resumes covering the real Notification→PostToolUse gap.
+
 The cost is bounded by the activity broadcaster's "only emit when
 advanced" check: an idle session generates zero traffic. Spinner-
 animating sessions emit one event per tick.

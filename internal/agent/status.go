@@ -159,10 +159,57 @@ func (d *StatusDetector) DetectStatusWithActivity(agentType, fileSessionName, ap
 	if lastActivity.IsZero() {
 		return status
 	}
+	// An open approval prompt is itself recent PTY output: rendering the
+	// box stamps lastActivity at the same instant the Notification hook
+	// writes "waiting". The activity override below exists for the
+	// opposite case — a tool streaming output AFTER the user grants
+	// permission — so without this guard a freshly-shown prompt looks
+	// like active work and the card never shows "waiting" until the
+	// prompt sits untouched past WaitingActivityTTL. Hold "waiting"
+	// while the prompt is on screen; it clears the moment the user
+	// answers and the tool starts streaming, at which point the override
+	// resumes.
+	if permissionPromptVisible(terminalContent) {
+		return board.AgentWaiting
+	}
 	if time.Since(lastActivity) < WaitingActivityTTL {
 		return board.AgentWorking
 	}
 	return status
+}
+
+// permissionPromptSignatures are substrings that appear only in an open
+// interactive approval prompt — Claude Code's tool-permission box ("Do
+// you want to proceed?" and its edit/create variants) and its
+// keyboard-hint footer ("Esc to cancel", distinct from the running
+// state's "esc to interrupt"). They are deliberately narrower than the
+// keyword list in detectCodingAgentStatus: a running tool's streamed
+// output won't contain them, so matching one is strong evidence the
+// session is genuinely blocked on the user rather than actively working.
+var permissionPromptSignatures = []string{
+	"do you want to",
+	"esc to cancel",
+}
+
+// permissionPromptVisible reports whether the tail of the PTY content
+// shows an open approval prompt. Scoped to the last lines so a prompt
+// that has already scrolled off (the tool ran and produced output)
+// doesn't keep a session pinned at "waiting".
+func permissionPromptVisible(content string) bool {
+	if content == "" {
+		return false
+	}
+	lines := strings.Split(content, "\n")
+	if len(lines) > 15 {
+		lines = lines[len(lines)-15:]
+	}
+	tail := strings.ToLower(strings.Join(lines, "\n"))
+	for _, sig := range permissionPromptSignatures {
+		if strings.Contains(tail, sig) {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *StatusDetector) detectFromTerminalContent(agentType, content string) board.AgentStatus {
