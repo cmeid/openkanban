@@ -763,6 +763,7 @@ func (m *Model) contextualHints(hintStyle lipgloss.Style, sep string) string {
 			return join(
 				hint("j/k", "navigate"),
 				hint("Space/Enter", "toggle"),
+				hint("o", "open only"),
 				hint("a", "add"),
 				hint("d", "delete"),
 				hint("l/Esc", "back"),
@@ -874,7 +875,8 @@ func (m *Model) renderHelp() string {
 		"  " + keyStyle.Render("h/l") + descStyle.Render("   Enter / exit sidebar    ") + keyStyle.Render("Ctrl+g") + descStyle.Render("  Exit agent view") + "\n" +
 		"  " + keyStyle.Render("j/k") + descStyle.Render("   Navigate projects       ") + keyStyle.Render("Ctrl+]") + descStyle.Render("  Next session (in view)") + "\n" +
 		"  " + keyStyle.Render("a") + descStyle.Render("     Add project             ") + keyStyle.Render("Ctrl+\\") + descStyle.Render("  Prev session (in view)") + "\n" +
-		"  " + keyStyle.Render("d") + descStyle.Render("     Delete project") + "\n\n" +
+		"  " + keyStyle.Render("d") + descStyle.Render("     Delete project") + "\n" +
+		"  " + keyStyle.Render("o") + descStyle.Render("     Toggle open only") + "\n\n" +
 		sep + "\n" +
 		sectionStyle.Render("  👁 View") + "                       " + sectionStyle.Render("⚙ System") + "\n" +
 		sep + "\n" +
@@ -2098,10 +2100,14 @@ func (m *Model) renderSidebar() string {
 
 	var lines []string
 
-	lines = append(lines, titleStyle.Render("  Projects"))
+	sidebarTitle := "  Projects"
+	if m.sidebarOpenOnly {
+		sidebarTitle = "  Projects (open)"
+	}
+	lines = append(lines, titleStyle.Render(sidebarTitle))
 	lines = append(lines, "")
 
-	allCount := m.globalStore.Count()
+	allCount := m.sidebarTicketCount("")
 	selectedCount := len(m.filterProjectIDs)
 	noFilter := selectedCount == 0
 	var allLabel string
@@ -2125,12 +2131,7 @@ func (m *Model) renderSidebar() string {
 
 	for i, p := range projects {
 		idx := i + 1
-		count := 0
-		for _, t := range m.globalStore.All() {
-			if t.ProjectID == p.ID {
-				count++
-			}
-		}
+		count := m.sidebarTicketCount(p.ID)
 
 		isSelected := m.filterProjectIDs[p.ID]
 		var checkbox string
@@ -2167,7 +2168,7 @@ func (m *Model) renderSidebar() string {
 
 	hintStyle := lipgloss.NewStyle().Foreground(m.colors.muted).Italic(true)
 	if m.sidebarFocused {
-		lines = append(lines, hintStyle.Render("  j/k ⏎toggle a/d"))
+		lines = append(lines, hintStyle.Render("  j/k ⏎toggle a/d o:open"))
 	} else {
 		lines = append(lines, hintStyle.Render("  h→focus  [hide"))
 	}
