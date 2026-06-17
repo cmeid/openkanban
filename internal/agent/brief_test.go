@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/techdufus/openkanban/internal/board"
@@ -588,5 +589,90 @@ func TestUpsertManagedBlock(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestMergeTicketBrief_AtomicRename is the one check that distinguishes the
+// atomic temp+rename write from a non-atomic in-place os.WriteFile. A rename
+// swaps the destination inode; a truncate-in-place keeps it. Reverting the
+// write to os.WriteFile makes this test fail; the other invariant tests below
+// pass under both implementations, so this is the real red-before-green guard.
+func TestMergeTicketBrief_AtomicRename(t *testing.T) {
+	wt := t.TempDir()
+	ticket := &board.Ticket{Title: "Foo", BranchName: "task/foo", Description: "first"}
+	if _, _, err := MergeTicketBrief(ticket, wt); err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+	path := filepath.Join(wt, "tickets", "foo.md")
+
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inoBefore := before.Sys().(*syscall.Stat_t).Ino
+
+	// Materially change the description so wouldChange == true and a real
+	// write happens on the second call.
+	ticket.Description = "second, materially different notes"
+	if _, _, err := MergeTicketBrief(ticket, wt); err != nil {
+		t.Fatalf("update write: %v", err)
+	}
+
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inoAfter := after.Sys().(*syscall.Stat_t).Ino
+
+	if inoAfter == inoBefore {
+		t.Errorf("brief inode unchanged (%d) — write was not atomic temp+rename", inoBefore)
+	}
+
+	// The destination must always hold the complete new content, never a
+	// partial brief.
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := string(b); !strings.Contains(s, "second, materially different notes") || !strings.Contains(s, briefBlockEnd) {
+		t.Errorf("brief not fully written:\n%s", s)
+	}
+}
+
+// TestMergeTicketBrief_FileMode pins the 0644 mode. os.CreateTemp yields 0600,
+// so this guards the explicit Chmod in the atomic write path. (Passes under the
+// old os.WriteFile(...,0o644) path too — it is an implementation guard, not a
+// new-vs-old discriminator.)
+func TestMergeTicketBrief_FileMode(t *testing.T) {
+	wt := t.TempDir()
+	ticket := &board.Ticket{Title: "Foo", BranchName: "task/foo", Description: "notes"}
+	if _, _, err := MergeTicketBrief(ticket, wt); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(filepath.Join(wt, "tickets", "foo.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o644 {
+		t.Errorf("brief mode = %o, want 644", got)
+	}
+}
+
+// TestMergeTicketBrief_NoTempResidue ensures the temp file is renamed (or
+// cleaned up), never left behind in the brief dir.
+func TestMergeTicketBrief_NoTempResidue(t *testing.T) {
+	wt := t.TempDir()
+	ticket := &board.Ticket{Title: "Foo", BranchName: "task/foo", Description: "notes"}
+	if _, _, err := MergeTicketBrief(ticket, wt); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(filepath.Join(wt, "tickets"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".tmp-") {
+			t.Errorf("leftover temp file in brief dir: %s", e.Name())
+		}
 	}
 }

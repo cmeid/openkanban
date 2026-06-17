@@ -210,7 +210,7 @@ func TestTicketNew_Migrate_DaemonOwns_WithoutForce_Refuses(t *testing.T) {
 	ticketNewForce = false
 
 	ticket := board.NewTicket("t", "proj-x")
-	err := applySessionFlags(ticket)
+	err := applySessionFlags(ticket, project.NewGlobalTicketStore(nil))
 	if err == nil {
 		t.Fatalf("applySessionFlags: want error, got nil")
 	}
@@ -220,10 +220,11 @@ func TestTicketNew_Migrate_DaemonOwns_WithoutForce_Refuses(t *testing.T) {
 	if !strings.Contains(err.Error(), "--force") {
 		t.Errorf("error %q should mention --force", err.Error())
 	}
-	if ticket.AgentSessionID != "" || ticket.SessionOwned {
-		t.Errorf("ticket fields stamped on failure: AgentSessionID=%q SessionOwned=%v",
-			ticket.AgentSessionID, ticket.SessionOwned)
+	if ticket.AgentSessionID != "" {
+		t.Errorf("ticket fields stamped on failure: AgentSessionID=%q", ticket.AgentSessionID)
 	}
+	// SessionOwned removed in task/enforce-one-to-one-session — every
+	// spawn is migrate-on-resume so the flag has no readers.
 }
 
 func TestTicketNew_Migrate_DaemonOwns_WithForce_KillsViaDaemon(t *testing.T) {
@@ -241,15 +242,13 @@ func TestTicketNew_Migrate_DaemonOwns_WithForce_KillsViaDaemon(t *testing.T) {
 	ticketNewForce = true
 
 	ticket := board.NewTicket("t", "proj-x")
-	if err := applySessionFlags(ticket); err != nil {
+	if err := applySessionFlags(ticket, project.NewGlobalTicketStore(nil)); err != nil {
 		t.Fatalf("applySessionFlags: %v", err)
 	}
 	if ticket.AgentSessionID != uuid {
 		t.Errorf("AgentSessionID = %q, want %q", ticket.AgentSessionID, uuid)
 	}
-	if !ticket.SessionOwned {
-		t.Errorf("SessionOwned = false, want true")
-	}
+	// SessionOwned removed — see board/board.go comment.
 
 	// The daemon session should be gone now. Use the List RPC.
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -297,7 +296,7 @@ func TestTicketNew_Migrate_DaemonUpDoesntOwn_WithoutForce_UsesLsofPath(t *testin
 	ticketNewForce = false
 
 	ticket := board.NewTicket("t", "proj-x")
-	err := applySessionFlags(ticket)
+	err := applySessionFlags(ticket, project.NewGlobalTicketStore(nil))
 	if err == nil {
 		t.Fatalf("applySessionFlags: want error, got nil")
 	}
@@ -328,7 +327,7 @@ func TestTicketNew_Migrate_DaemonUpDoesntOwn_WithForce_UsesLsofForceExit(t *test
 	ticketNewForce = true
 
 	ticket := board.NewTicket("t", "proj-x")
-	if err := applySessionFlags(ticket); err != nil {
+	if err := applySessionFlags(ticket, project.NewGlobalTicketStore(nil)); err != nil {
 		t.Fatalf("applySessionFlags: %v", err)
 	}
 
@@ -372,7 +371,7 @@ func TestTicketNew_Migrate_DaemonDown_WithoutForce_UsesLsofPath(t *testing.T) {
 	ticketNewForce = false
 
 	ticket := board.NewTicket("t", "proj-x")
-	err := applySessionFlags(ticket)
+	err := applySessionFlags(ticket, project.NewGlobalTicketStore(nil))
 	if err == nil {
 		t.Fatalf("applySessionFlags: want error, got nil")
 	}
@@ -401,15 +400,13 @@ func TestTicketNew_Migrate_DaemonDown_WithForce_UsesLsofForceExit(t *testing.T) 
 	ticketNewForce = true
 
 	ticket := board.NewTicket("t", "proj-x")
-	if err := applySessionFlags(ticket); err != nil {
+	if err := applySessionFlags(ticket, project.NewGlobalTicketStore(nil)); err != nil {
 		t.Fatalf("applySessionFlags: %v", err)
 	}
 	if ticket.AgentSessionID != uuid {
 		t.Errorf("AgentSessionID = %q, want %q", ticket.AgentSessionID, uuid)
 	}
-	if !ticket.SessionOwned {
-		t.Errorf("SessionOwned = false, want true")
-	}
+	// SessionOwned removed — see board/board.go comment.
 }
 
 // Sanity test for the no-holder, daemon-down case.
@@ -429,7 +426,7 @@ func TestTicketNew_Migrate_DaemonDown_NoHolder_Succeeds(t *testing.T) {
 	ticketNewForce = false
 
 	ticket := board.NewTicket("t", "proj-x")
-	if err := applySessionFlags(ticket); err != nil {
+	if err := applySessionFlags(ticket, project.NewGlobalTicketStore(nil)); err != nil {
 		t.Fatalf("applySessionFlags: %v", err)
 	}
 	if ticket.AgentSessionID != uuid {

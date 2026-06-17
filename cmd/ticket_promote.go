@@ -55,9 +55,27 @@ func promoteSessionTicketTo(target board.TicketStatus) error {
 	if ticket.Status == target {
 		return nil
 	}
-	ticket.SetStatus(target)
+	// Route through TicketStore.Move so the existing side effects fire:
+	// promote-claude-approvals on -> in_review/done and prune-allowlist
+	// on every transition. The pre-fix path called ticket.SetStatus
+	// directly + store.SaveTicket, bypassing both. See PR #67 wiring
+	// and the original promote/prune feature
+	// ([[plan-ancient-sparking-dusk]] / "Why fire on every
+	// transition"). Move mutates in memory and returns
+	// (promoted, pruned, err); persistence is still the caller's job
+	// — mirrors the wrapUpSessionTicketAt template.
+	promoted, pruned, err := store.Move(ticket.ID, target)
+	if err != nil {
+		return fmt.Errorf("move ticket %s: %w", ticket.ID, err)
+	}
 	if err := store.SaveTicket(ticket); err != nil {
 		return fmt.Errorf("save ticket %s: %w", ticket.ID, err)
+	}
+	if n := len(promoted); n > 0 {
+		fmt.Fprintf(os.Stderr, "openkanban: promoted %d claude approval(s) to repo defaults\n", n)
+	}
+	if n := len(pruned); n > 0 {
+		fmt.Fprintf(os.Stderr, "openkanban: pruned %d stale allowlist entr(y/ies) (see .claude/.pruned-log)\n", n)
 	}
 	return nil
 }

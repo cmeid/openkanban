@@ -399,6 +399,26 @@ func (g *GlobalTicketStore) Get(id board.TicketID) (*board.Ticket, error) {
 	return t, nil
 }
 
+// FindByAgentSessionID returns every ticket in the global store whose
+// AgentSessionID matches uuid. Returns nil for empty uuid. Used by
+// ticketsvc.LinkSession to enforce uniqueness at the creation/back-fill
+// gate; storage tolerates duplicates by policy (the runtime gate at
+// attach is the real enforcement layer), but the gate REFUSES to
+// create new duplicates without explicit Force, so this scan is the
+// load-bearing read.
+func (g *GlobalTicketStore) FindByAgentSessionID(uuid string) []*board.Ticket {
+	if uuid == "" {
+		return nil
+	}
+	var out []*board.Ticket
+	for _, t := range g.allTickets {
+		if t.AgentSessionID == uuid {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
 func (g *GlobalTicketStore) Add(ticket *board.Ticket) error {
 	store := g.ticketStores[ticket.ProjectID]
 	if store == nil {
@@ -671,6 +691,11 @@ func (g *GlobalTicketStore) ReloadTicket(projectID, path string) error {
 			// this path and drop it from in-memory state.
 			for id, p := range store.paths {
 				if p == path {
+					// Diagnostic: this is the only silent ticket removal
+					// at runtime. If the session header ever shows a bare
+					// "Agent", this line names the dropped ticket/path and
+					// confirms the store-divergence path.
+					log.Printf("openkanban: store drop ticket id=%s path=%s project=%s (file vanished)", id, path, projectID)
 					delete(store.Tickets, id)
 					delete(store.paths, id)
 					delete(g.allTickets, id)

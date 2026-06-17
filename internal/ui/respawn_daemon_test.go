@@ -74,6 +74,52 @@ func baseClaudeInputs(t *testing.T, ticketID, branchName string) spawnReqInputs 
 	}
 }
 
+// TestBuildSpawnReq_NeverForks is the dynamic counterpart to the
+// static grep guard at forksession_guard_test.go. Tabled over the
+// cartesian {isNewSession ∈ {true, false}} × {AgentSessionID ∈ {empty,
+// valid UUID}} × {spawn-plan branches}, asserts the assembled argv
+// NEVER contains the divergent-fork flag literal. The grep guard
+// catches re-introduction in source; this catches a hypothetical
+// dynamic addition (e.g., conditional logic that builds the string
+// from parts). The forbidden literal is reconstructed at runtime so
+// this test file itself doesn't trip the grep guard.
+func TestBuildSpawnReq_NeverForks(t *testing.T) {
+	forbidden := "--fork" + "-session"
+	uuid := "abcdefab-cdef-4abc-8def-abcdefabcdef"
+
+	cases := []struct {
+		name         string
+		isNewSession bool
+		hasUUID      bool
+		plan         spawnPlan
+	}{
+		{"new + uuid + force-fresh", true, true, spawnPlan{ForceFresh: true}},
+		{"new + uuid + plain", true, true, spawnPlan{}},
+		{"new + no-uuid + plain", true, false, spawnPlan{}},
+		{"resume + uuid + plain", false, true, spawnPlan{}},
+		{"resume + uuid + inject-notice", false, true, spawnPlan{InjectResumeNotice: true}},
+		{"resume + uuid + skip-merge", false, true, spawnPlan{SkipMerge: true}},
+		{"resume + no-uuid + plain", false, false, spawnPlan{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := baseClaudeInputs(t, "TICK-"+tc.name, "task/x")
+			in.isNewSession = tc.isNewSession
+			if tc.hasUUID {
+				in.ticket.AgentSessionID = uuid
+			}
+			in.plan = tc.plan
+			req := buildSpawnReq(in)
+			for _, a := range req.Args {
+				if strings.Contains(a, forbidden) {
+					t.Errorf("Args[%q] contains forbidden literal %q (table row %s, full Args: %v)",
+						a, forbidden, tc.name, req.Args)
+				}
+			}
+		})
+	}
+}
+
 // TestBuildSpawnReq_ForceFresh_FullPrime asserts the Discard branch:
 // the caller has cleared AgentSpawnedAt before invoking, so
 // buildSpawnReq treats this as a fresh spawn. argv must NOT contain

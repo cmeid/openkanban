@@ -14,8 +14,6 @@ import (
 )
 
 func (m *Model) View() string {
-	m.monitor.enterView()
-	defer m.monitor.exitView()
 	if m.width == 0 || m.height == 0 {
 		loadingStyle := lipgloss.NewStyle().
 			Foreground(m.colors.primary).
@@ -777,8 +775,14 @@ func (m *Model) contextualHints(hintStyle lipgloss.Style, sep string, maxWidth i
 		}, hintStyle, sep, maxWidth)
 
 	case ModeAgentView:
+		// Reflect Auto mode here: it's where Ctrl+G's destination changes
+		// (oldest waiter vs board). The toggle itself lives on the board.
+		gLabel := "board"
+		if m.autoAttach {
+			gLabel = "next waiter (Auto)"
+		}
 		return m.packHints([]hintSpec{
-			{key: "Ctrl+G", label: "board", prio: 3, pinned: true},
+			{key: "Ctrl+G", label: gLabel, prio: 3, pinned: true},
 			{key: "Ctrl+]/\\", label: "cycle sessions", prio: 2},
 			{label: "Shift+click to select text", prio: 1},
 		}, hintStyle, sep, maxWidth)
@@ -804,6 +808,13 @@ func (m *Model) contextualHints(hintStyle lipgloss.Style, sep string, maxWidth i
 			}, hintStyle, sep, maxWidth)
 		}
 
+		// Auto-mode toggle ('a'); label reflects current state so the
+		// board shows at a glance whether Auto is armed.
+		autoLabel := "auto"
+		if m.autoAttach {
+			autoLabel = "auto on"
+		}
+
 		ticket := m.selectedTicket()
 		if ticket != nil {
 			if _, hasPane := m.panes[ticket.ID]; hasPane {
@@ -816,6 +827,7 @@ func (m *Model) contextualHints(hintStyle lipgloss.Style, sep string, maxWidth i
 					{key: "K/J", label: "prio", prio: 4},
 					{key: "o", label: "sort", prio: 3},
 					{key: "w", label: "filter", prio: 2},
+					{key: "a", label: autoLabel, prio: 2},
 					{key: "[", label: "sidebar", prio: 1},
 					{key: "?", label: "help", prio: 10, pinned: true},
 				}, hintStyle, sep, maxWidth)
@@ -830,6 +842,7 @@ func (m *Model) contextualHints(hintStyle lipgloss.Style, sep string, maxWidth i
 					{key: "K/J", label: "prio", prio: 4},
 					{key: "o", label: "sort", prio: 3},
 					{key: "w", label: "filter", prio: 2},
+					{key: "a", label: autoLabel, prio: 2},
 					{key: "[", label: "sidebar", prio: 1},
 					{key: "?", label: "help", prio: 10, pinned: true},
 				}, hintStyle, sep, maxWidth)
@@ -837,7 +850,7 @@ func (m *Model) contextualHints(hintStyle lipgloss.Style, sep string, maxWidth i
 		}
 
 		// Drop order (lowest prio first), per the ticket brief:
-		// sidebar → settings → global → sort → filter → prio → spawn →
+		// sidebar → settings → global/auto → sort → filter → prio → spawn →
 		// move → search → del → edit → new → nav. `q quit` carries the
 		// lowest prio for documentation, but is pinned so it never actually
 		// drops — pinned wins. `? help` is likewise pinned.
@@ -853,6 +866,7 @@ func (m *Model) contextualHints(hintStyle lipgloss.Style, sep string, maxWidth i
 			{key: "o", label: "sort", prio: 6},
 			{key: "w", label: "filter", prio: 5},
 			{key: "W", label: "global", prio: 4},
+			{key: "a", label: autoLabel, prio: 4},
 			{key: "/", label: "search", prio: 3},
 			{key: "[", label: "sidebar", prio: 2},
 			{key: "O", label: "settings", prio: 1},
@@ -1022,7 +1036,8 @@ func (m *Model) renderHelp() string {
 		"  " + keyStyle.Render("o") + descStyle.Render("     Cycle sort order      ") + keyStyle.Render("?") + descStyle.Render("       Toggle help") + "\n" +
 		"  " + keyStyle.Render("w") + descStyle.Render("     Toggle session filter ") + keyStyle.Render("Esc") + descStyle.Render("     Cancel / back") + "\n" +
 		"  " + keyStyle.Render("W") + descStyle.Render("     Show working sessions ") + keyStyle.Render("Ctrl+R") + descStyle.Render("  Restart (when binary updates)") + "\n" +
-		"  " + keyStyle.Render(" ") + descStyle.Render("       across all projects ") + keyStyle.Render("q") + descStyle.Render("       Quit") + "\n\n" +
+		"  " + keyStyle.Render(" ") + descStyle.Render("       across all projects ") + keyStyle.Render("q") + descStyle.Render("       Quit") + "\n" +
+		"  " + keyStyle.Render("a") + descStyle.Render("     Auto mode (Ctrl+g jumps to oldest waiting session)") + "\n\n" +
 		sep + "\n" +
 		sectionStyle.Render("  ✎ Ticket form") + "                " + sectionStyle.Render("⚙ Settings & dialogs") + "\n" +
 		sep + "\n" +
@@ -1805,6 +1820,11 @@ func (m *Model) renderAgentView() string {
 			duration := time.Since(*ticket.AgentSpawnedAt)
 			sessionDuration = formatDuration(duration)
 		}
+	} else if cached := pane.TicketTitle(); cached != "" {
+		// Store transiently dropped the ticket (e.g. board-resync saw the
+		// file vanish during a rename/move) but the session is live. Fall
+		// back to the pane's last-known-good title instead of bare "Agent".
+		title = cached
 	}
 
 	titleStyle := lipgloss.NewStyle().

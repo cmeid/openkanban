@@ -446,6 +446,71 @@ func TestDetectStatusWithActivity_OverridesWaiting(t *testing.T) {
 	}
 }
 
+// TestDetectStatusWithActivity_PermissionPromptStaysWaiting pins the
+// fix for the permission-prompt masking bug. Rendering Claude Code's
+// tool-approval box is itself PTY output, so the box's render stamps
+// fresh activity at the same instant the Notification hook writes
+// "waiting". Without the on-screen-prompt guard, the activity override
+// (meant for a tool running AFTER the user grants permission) flips
+// "waiting" to "working" and the card never shows the blocked state
+// for the whole approve-within-TTL window. The prompt's on-screen text
+// must hold the verdict at "waiting" despite recent activity, while a
+// genuinely-running tool (no prompt) still overrides to "working".
+func TestDetectStatusWithActivity_PermissionPromptStaysWaiting(t *testing.T) {
+	tmpDir := t.TempDir()
+	d := NewStatusDetector()
+	d.statusDirs = []string{tmpDir}
+	statusFile := filepath.Join(tmpDir, "sess.status")
+	if err := os.WriteFile(statusFile, []byte("waiting"), 0644); err != nil {
+		t.Fatalf("write status: %v", err)
+	}
+
+	bashPrompt := strings.Join([]string{
+		" Bash command",
+		"   echo \"=== MY session id ===\"",
+		"   Confirm session id + read linking memories",
+		" Contains simple_expansion",
+		" Do you want to proceed?",
+		" ❯ 1. Yes",
+		"   2. No",
+		" Esc to cancel · Tab to amend · ctrl+e to explain",
+	}, "\n")
+
+	tests := []struct {
+		name            string
+		terminalContent string
+		want            board.AgentStatus
+	}{
+		{
+			name:            "open prompt holds waiting despite fresh activity",
+			terminalContent: bashPrompt,
+			want:            board.AgentWaiting,
+		},
+		{
+			name:            "running tool (no prompt) still overrides to working",
+			terminalContent: "⠹ Running bash command… (esc to interrupt)",
+			want:            board.AgentWorking,
+		},
+		{
+			name:            "empty content still overrides to working",
+			terminalContent: "",
+			want:            board.AgentWorking,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d.InvalidateCache("sess")
+			// Activity is fresh in every case — the discriminator is the
+			// on-screen prompt, not the timer.
+			got := d.DetectStatusWithActivity("claude", "sess", "sess", "", 0, true, tt.terminalContent, time.Now())
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestDetectStatusWithActivity_NoDowngrade ensures the override never
 // downgrades a non-waiting status. Even when activity is present, a
 // file saying "working" / "idle" / "completed" passes through.

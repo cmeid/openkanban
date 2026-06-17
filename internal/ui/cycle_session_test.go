@@ -3,6 +3,7 @@ package ui
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
@@ -252,6 +253,87 @@ func TestHandleCycleAttachPromptKey_EscReturnsToBoard(t *testing.T) {
 	}
 }
 
+func TestHandleCycleAttachPromptKey_CtrlGReturnsToBoard(t *testing.T) {
+	// Ctrl+g is the agent-view "get me out" gesture. While the cycle
+	// modal is open it must behave like Esc — drop the modal and return
+	// to ModeNormal with no focused pane — rather than being swallowed.
+	// Regression: the modal's key handler had no ctrl+g case, so cycling
+	// with Ctrl+] silently disabled Ctrl+g until the user pressed Esc.
+	m := newCycleTestModel(t, [][]*board.Ticket{{}, {}, {}, {}}, nil)
+	m.cycleAttachPrompt = true
+	m.mode = ModeAgentView
+	m.focusedPane = "T-modal"
+
+	model, _ := m.handleCycleAttachPromptKey(tea.KeyMsg{Type: tea.KeyCtrlG})
+	got := model.(*Model)
+
+	if got.cycleAttachPrompt {
+		t.Errorf("cycleAttachPrompt = true after Ctrl+g, want false")
+	}
+	if got.mode != ModeNormal {
+		t.Errorf("mode = %v after Ctrl+g, want ModeNormal", got.mode)
+	}
+	if got.focusedPane != "" {
+		t.Errorf("focusedPane = %q after Ctrl+g, want \"\"", got.focusedPane)
+	}
+}
+
+func TestDaemonExitedClearsStaleCycleAttachPrompt(t *testing.T) {
+	// The race behind "ctrl+g works after a while": the cycle modal is
+	// open (cycleAttachPrompt=true) on the focused pane when an async
+	// daemon "exited" event lands for that same pane. The handler returns
+	// the user to the board (mode=ModeNormal, focusedPane="") — but it
+	// must ALSO clear cycleAttachPrompt. If it doesn't, the flag is
+	// stranded true, and the NEXT agent-view entry gets a phantom modal
+	// that swallows ctrl+g though the user never cycled.
+	t.Setenv("OPENKANBAN_CONFIG_DIR", t.TempDir())
+
+	proj := &project.Project{ID: "p", Name: "P", RepoPath: t.TempDir()}
+	globalStore := project.NewGlobalTicketStore(nil)
+	globalStore.AddProject(proj)
+	tk := &board.Ticket{
+		ID: "T-focus", Title: "Focused", Status: board.StatusInProgress,
+		ProjectID: proj.ID, AgentStatus: board.AgentNone,
+	}
+	if err := globalStore.Add(tk); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	info := &daemon.SessionInfo{SessionID: "sid-T-focus", TicketID: "T-focus", Running: true, Cols: 80, Rows: 24}
+	m := &Model{
+		globalStore:     globalStore,
+		panes:           map[board.TicketID]*daemonclient.PaneView{"T-focus": daemonclient.NewPaneView(nil, "T-focus", info.SessionID, info)},
+		daemonOwned:     map[board.TicketID]struct{}{"T-focus": {}},
+		daemonViewing:   map[board.TicketID]int{},
+		lastPTYActivity: map[board.TicketID]time.Time{},
+		columnTickets:   [][]*board.Ticket{{tk}, {}, {}, {}},
+		columnOffsets:   []int{0, 0, 0, 0},
+		mode:            ModeAgentView,
+		focusedPane:     "T-focus",
+		width:           120,
+		height:          40,
+		config:          &config.Config{Agents: map[string]config.AgentConfig{}},
+	}
+	m.cycleAttachPrompt = true
+
+	// Unexpected exit of the focused session (natural agent /quit, daemon
+	// churn). ticket is AgentNone so no saveTicket/state-clear side effects.
+	model, _ := m.handleDaemonSessionEvent(daemonSessionEventMsg{
+		Event: daemon.SessionEvent{Event: "exited", TicketID: "T-focus", SessionID: "sid-T-focus", Expected: false},
+	})
+	got := model.(*Model)
+
+	if got.cycleAttachPrompt {
+		t.Errorf("cycleAttachPrompt = true after focused session exited, want false (stranded flag → phantom modal)")
+	}
+	if got.mode != ModeNormal {
+		t.Errorf("mode = %v after exit, want ModeNormal", got.mode)
+	}
+	if got.focusedPane != "" {
+		t.Errorf("focusedPane = %q after exit, want \"\"", got.focusedPane)
+	}
+}
+
 func TestHandleCycleAttachPromptKey_SwallowsOtherKeys(t *testing.T) {
 	// A stray keystroke (any printable character, or arrow keys, etc.)
 	// while the modal is open must NOT bypass the modal. If it did, the
@@ -335,6 +417,58 @@ func TestRenderAgentViewWithCycleModal_StacksModalOverAgentView(t *testing.T) {
 	if !strings.Contains(got, target.Title) {
 		t.Errorf("View() missing focused ticket title %q (agent view chrome should render below modal); got:\n%s",
 			target.Title, got)
+	}
+}
+
+func TestRenderAgentView_FallsBackToCachedTitleWhenTicketMissing(t *testing.T) {
+	t.Setenv("OPENKANBAN_CONFIG_DIR", t.TempDir())
+
+	// Simulate the divergence bug: the in-memory store has transiently
+	// dropped the ticket (it is NOT added below), but the daemon session
+	// — and thus the pane — is still live and focused. Without the
+	// fallback the header would render the bare "Agent" default; with it,
+	// the pane's last-known-good ticket title is used.
+	proj := &project.Project{ID: "test-proj", Name: "TestProj", RepoPath: t.TempDir()}
+	globalStore := project.NewGlobalTicketStore(nil)
+	globalStore.AddProject(proj)
+	// Deliberately do NOT globalStore.Add(...) — Get(focusedPane) returns nil.
+
+	const cachedTitle = "enrich the counts" // distinctive; contains no "Agent"
+	pv := daemonclient.NewPaneView(nil, "T-orphan", "sid-orphan", nil)
+	pv.SetTicketTitle(cachedTitle)
+
+	sp := spinner.New()
+	sp.Spinner = spinner.Dot
+
+	m := &Model{
+		globalStore:   globalStore,
+		panes:         map[board.TicketID]*daemonclient.PaneView{"T-orphan": pv},
+		daemonViewing: map[board.TicketID]int{},
+		columns:       board.DefaultColumns(),
+		columnTickets: [][]*board.Ticket{{}, {}, {}, {}},
+		columnOffsets: []int{0, 0, 0, 0},
+		spinner:       sp,
+		width:         120,
+		height:        40,
+		mode:          ModeAgentView,
+		focusedPane:   "T-orphan",
+		config:        &config.Config{Agents: map[string]config.AgentConfig{}},
+		colors:        newUIColors(config.DefaultConfig().GetTheme()),
+	}
+
+	got := m.View()
+
+	// Primary (red/green) assertion: the distinctive cached title is the
+	// only place this string can come from. With the fallback reverted,
+	// title stays "Agent" and this fails.
+	if !strings.Contains(got, cachedTitle) {
+		t.Errorf("View() missing cached title %q; header degraded instead of falling back. got:\n%s", cachedTitle, got)
+	}
+	// Secondary: the bare default must not leak. In the ticket==nil path
+	// the agentType badge is suppressed, so "Agent" can only come from the
+	// title default, and a blank unattached pane renders no stray "Agent".
+	if strings.Contains(got, "Agent") {
+		t.Errorf("View() rendered the bare \"Agent\" default despite a cached title; got:\n%s", got)
 	}
 }
 

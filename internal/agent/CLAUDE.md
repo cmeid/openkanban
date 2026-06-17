@@ -61,6 +61,12 @@ Use `NewContextData(ticket, briefRelPath, hasBrief, isExternalResume) ContextDat
 
 `HasBrief` / `BriefPath` are populated by `MergeTicketBrief` at spawn time. The brief lives at `<worktree>/tickets/<slug>.md` and contains a managed block (`<!-- openkanban:card-notes ... -->`) carrying the openkanban card's Description.
 
+### Brief concurrency contract
+
+- The **store** `ticket.Description` is the source of truth; the brief is a **one-way generated view** (store → brief, never brief → store).
+- `MergeTicketBrief` rewrites **only** the managed-block fences (`upsertManagedBlock`). Content outside the block is agent-authored, preserved verbatim, and **worktree-only** — the store has no copy, so it is lost if the worktree is removed.
+- The brief write is **atomic (temp+rename, mirroring `TicketStore.SaveTicket`)** so concurrent readers (the spawned agent, a second TUI) always see a complete brief, never a torn one. Keep `PreviewBriefMerge` strictly read-only; only `MergeTicketBrief` writes.
+
 Template in config: `"init_prompt": "Work on: {{.Title}}"`
 
 ## Status Detection
@@ -95,6 +101,16 @@ Callers — keep them in sync if you add a new transition path:
 Pure JSON-level merges — the helpers only touch `permissions.{allow,ask,deny}` and leave every other top-level key untouched. They do NOT claim to validate Claude Code's full settings schema; new top-level keys Claude adds in the future round-trip safely as long as they aren't named `permissions`.
 
 Errors are non-fatal at all call sites: a settings-write failure logs and degrades to today's behavior (per-worktree allowlist), it never blocks a spawn or a status transition.
+
+## 1:1 ticket↔session enforcement (`internal/ticketsvc`)
+
+The package at `internal/ticketsvc/svc.go` is the **single sanctioned funnel** for any code that writes `ticket.AgentSessionID` or gates an attach to an existing Claude session. Both TUI (`internal/ui`) and CLI (`cmd/`) must call through here — direct `ticket.AgentSessionID = uuid` assignments are forbidden by policy.
+
+- `LinkSession(store, requesting, uuid, opts)` — claims `uuid` for the requesting ticket after a uniqueness scan over `GlobalTicketStore.FindByAgentSessionID(uuid)`. `LinkOpts.BestEffort` is silent-noop-on-conflict (used by back-fill); `LinkOpts.Force` clears conflicting tickets first. Caller is responsible for `store.SaveTicket(requesting)` on success.
+- `GateAttach(probe, uuid, selfDaemonSessionID)` — refuses attach when `lsof` shows the JSONL is held, or the daemon owns a session for a DIFFERENT ticket. `SessionProbe` is a `func` type (not an interface).
+- The pre-2026-06-17 `Ticket.SessionOwned` bool was removed when forking was eliminated; every spawn is now migrate-on-resume. The YAML frontmatter field is dormant for old `.md` compatibility. The grep guard at `internal/ui/forksession_guard_test.go` makes `--fork-session` re-introduction a build-time failure.
+
+See [[openkanban-one-to-one-ticket-session-invariant]] for the threat model.
 
 ### Review-and-prune
 

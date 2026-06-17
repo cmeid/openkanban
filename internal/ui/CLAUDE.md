@@ -38,7 +38,7 @@ Vim-style navigation:
 
 Inside ModeAgentView, these keys are intercepted before the PTY child (claude, etc.) sees them:
 - `Ctrl+]` / `Ctrl+\` - cycle focus to next / prev open, unattached session
-- `Ctrl+g` - exit back to the board
+- `Ctrl+g` - leave this session. Destination is parameterized by **Auto mode** (`m.autoAttach`, toggled by board key `a`): Auto off → back to the board (the default); Auto on → jump to the session that entered `waiting` longest ago (FIFO by `StatusChangedAt`), skipping sessions another TUI holds, falling through to the board when none waits. See `oldestWaitingPeer` / `focusAndPromptAttach` in `model.go` and memory `reference_openkanban_auto_mode_feature_map`.
 - `Enter` - **conditionally** intercepted via `shouldRetryAttachOnEnter`: only when the focused pane has `LastAttachErr() != nil` AND `State() != PaneViewAttached`. In that state Enter retries `attachExisting`; otherwise it falls through to the PTY child as normal. The predicate is gated the same way as `PaneView.View()`'s failure-overlay branch — keep them locked together, otherwise the user sees the "Enter retries" hint but pressing Enter does nothing.
 
 `Ctrl+[` cannot be used: in bubbletea v1.3.x (no Kitty keyboard protocol enabled here) it is bytewise indistinguishable from `Esc`. Any new ctrl-combo binding should be verified against `~/golang/pkg/mod/github.com/charmbracelet/bubbletea@<ver>/key.go` before promising it.
@@ -46,6 +46,10 @@ Inside ModeAgentView, these keys are intercepted before the PTY child (claude, e
 **Getting a goroutine dump from a hung TUI:** the TUI has a built-in **stall watchdog** (`stallwatch.go`) — prefer it. `Update`/`View` stamp a phase + heartbeat into atomics; a 1s watchdog dumps all goroutine stacks + counters to `~/.cache/openkanban/tui-stall.log` (override `OPENKANBAN_TUI_STALL_LOG`) when a single Update/View runs >3s (`kind=in-call`) or Update idles >3s while the daemon keeps pushing events (`kind=starved`, i.e. parked outside Update/View on a `tea.Batch`/`tea.Sequence` `g.Wait`). One dump per episode; a marker also lands in `tui.log`. On demand: `kill -USR2 $(pgrep -n openkanban)`. `OPENKANBAN_DEBUG_STALL_MS` injects a one-shot synthetic in-call stall (test only). The watchdog is created in `NewModel` but only armed by `StartStallMonitor` (from `app.go`) so tests don't leak the ticker; `Cleanup` stops it. Why a file and not SIGQUIT: nothing traps SIGQUIT (bubbletea v1.3.10 `tea.go` Notifies only SIGINT/SIGTERM; `app.go:122` mirrors it), the runtime default prints stacks to stderr, but `app.go:124`'s `tea.WithAltScreen()` means those bytes land on the alt-screen buffer the terminal discards on exit — invisible. The **daemon** has the analogous SIGUSR1 → `daemon.log` handler (`internal/daemon/server.go:272`). Full recipe + fallbacks (pre-redirect stderr + `kill -QUIT`, `dlv attach`) in `docs/AGENT_INTEGRATION.md` → "Diagnosing a hung TUI".
 
 The cycle-attach modal renders OVER the focused pane's agent view (chrome stays visible behind), via `renderAgentViewWithCycleModal`. Do not switch it back to `renderWithOverlay`, which uses a blank background and hides the state needed to make the cycle decision. `cycleUnattachedSession` auto-attaches the target peer if it's Unattached so the modal backdrop shows live PTY content (not just chrome); the cycle iterates ALL open peers, not just Unattached ones.
+
+While the modal is open (`cycleAttachPrompt == true`), `handleAgentViewMode` routes EVERY key to `handleCycleAttachPromptKey` before any pane dispatch — so a key the modal doesn't explicitly handle is swallowed, never reaching the PTY or the normal agent-view bindings. It handles `enter` (attach), `esc`/`ctrl+g` (exit to board), and `ctrl+]`/`ctrl+\` (keep cycling). `ctrl+g` MUST stay listed: it's the documented agent-view exit gesture, and without an explicit case the act of cycling silently disabled it until the user pressed `esc`.
+
+**Invariant: `cycleAttachPrompt` must never outlive agent-view focus.** Every path that drops `m.focusedPane` goes through the `exitToBoard()` chokepoint (sets `mode=ModeNormal`, `focusedPane=""`, `cycleAttachPrompt=false`) — the keyboard exits AND the four async daemon paths that can fire while the modal is open: session `"exited"` (`daemon_subscribe.go`), `PaneDetachedMsg`, `PaneExitMsg`, `DaemonDisconnectedMsg`. If a new focus-drop path resets `mode`/`focusedPane` inline instead of calling `exitToBoard()`, the flag strands true and resurfaces as a phantom modal on the next agent-view entry — `ctrl+g` (and every other key) swallowed though the user never cycled. Pinned by `TestDaemonExitedClearsStaleCycleAttachPrompt`.
 
 ### Keep both doc surfaces synced
 
@@ -108,6 +112,15 @@ Do **not** push `selectTicketByID` into `refreshColumnTickets` itself. That chok
 PaneView is the client-side handle; the PTY itself lives in openkanbankd. Lifecycle is daemon-driven: `Spawn` happens server-side at construction time, `Attach` / `Detach` swap which TUI is the one attached client, and `daemonclient.PaneViewAttached` vs `PaneViewUnattached` describe what this TUI sees, not whether the agent is alive (the agent can be alive in the daemon while every TUI is `Unattached`). Methods preserve the old `*terminal.Pane` surface — see `internal/daemonclient/paneview.go` for the full 13-method shape and the unattached-state behavior table.
 
 `Detach()` and `Close()` are non-blocking as of 2026-06-16. State mutations (state=Unattached, emulator teardown, detachCh swap) happen eagerly under `p.mu`; the underlying `attachLoopWG.Wait` runs in a goroutine with a 5s warning / 30s deadline watchdog. `PaneDetachedMsg` arrives whenever the read loop actually drains (not synchronously with the caller). `emitTeaMsg` and `Close` are serialised by a `teaMu sync.Mutex` so the goroutine can't send on a closed `teaMsgs` channel. Required reading before any teardown edit: memory [[reference_openkanban_paneview_detach_concurrency]].
+
+### Two title surfaces — keep their fallbacks straight
+
+The session header (`renderAgentView`) and the host terminal title (`computeWindowTitle`) resolve the title differently — don't unify them:
+
+- **In-app header bar** uses `m.globalStore.Get(m.focusedPane)` → `ticket.Title`, then `pane.TicketTitle()` (the pane's cached last-known-good ticket title, stamped at build/focus), then the literal `"Agent"`. It does NOT use the OSC title — the inner program's window title isn't the ticket title.
+- **Host terminal title** uses `pane.Title()` (the inner program's OSC 0/2 title) first, then `ticket.Title`, then `"openkanban"`.
+
+The `pane.TicketTitle()` fallback exists because a `PaneView` can outlive its store ticket: `GlobalTicketStore.ReloadTicket`'s `os.IsNotExist` branch drops the ticket from `allTickets` (the only silent runtime removal — now logged) when a file path vanishes from a board-resync snapshot, while the daemon session and pane stay live. Stamp `SetTicketTitle` wherever a pane is built or re-focused for a known ticket; never from `View()`. Memory: [[reference_openkanban_agent_view_title_resolution]].
 
 ### Attach-failure overlay
 

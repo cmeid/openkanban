@@ -129,6 +129,12 @@ type PaneView struct {
 	sessionID   string
 	sessionName string
 	workdir     string
+	// ticketTitle is the last-known-good openkanban ticket title for this
+	// pane, stamped by the UI whenever it resolves the backing ticket.
+	// Unlike cachedTitle (the inner program's OSC 0/2 window title), this
+	// is the board ticket's title, used as a fallback for the session
+	// header when the in-memory store transiently drops the ticket.
+	ticketTitle string
 
 	// Local rendering state. Mirrors the corresponding fields on
 	// terminal.Pane so View/GetContent can reuse the same render code.
@@ -344,6 +350,23 @@ func (p *PaneView) SessionName() string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.sessionName
+}
+
+// SetTicketTitle caches the backing ticket's title. The UI stamps this
+// whenever it resolves the ticket for this pane, so the session header
+// can fall back to it if the in-memory store later drops the ticket.
+func (p *PaneView) SetTicketTitle(title string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.ticketTitle = title
+}
+
+// TicketTitle returns the last-known-good ticket title, or "" if one was
+// never stamped.
+func (p *PaneView) TicketTitle() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.ticketTitle
 }
 
 // Title returns the most recent OSC 0/2 window title.

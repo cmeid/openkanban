@@ -604,6 +604,12 @@ case agentStatusMsg:
 
 The embedded `agent_prompt.tmpl` is deliberately **generic about cross-cutting workflow discipline**. It points at categories of help — "code-review, validation, cross-stack risk subagents", "adversarial / multi-role doc reviewer" — without naming specific agents, plugins, or skills that may not be installed in the spawned environment. Personal subagent loadouts and named-agent guidance belong in the user's own `~/.claude/CLAUDE.md`, which the template explicitly defers to. When extending the template, prefer naming a role over naming a tool; if you want to name a specific agent, the right home is your global CLAUDE.md.
 
+The one deliberate exception is the **`finishing-an-openkanban-ticket`** skill, which the template names for the close-out. That skill is openkanban-owned (vendored at [`internal/finishskill/SKILL.md`](../internal/finishskill/SKILL.md) and written into `~/.claude/skills/` on launch — see "Standardized close-out" below), so it is guaranteed present in any openkanban-spawned session. The template's wrap-up section delegates the entire end-of-ticket flow to it: verify → self-evaluate readiness → one enumerated permission prompt → land via commit → PR → merge → reflective wind-down. The template itself stays generic and prose-affirmative (it describes *what* the close-out does, not a list of `NEVER` rules) so it doesn't restate the user's global push-gate.
+
+### Standardized close-out
+
+The shipped skill standardizes the two prompts a user otherwise re-types at the end of every ticket ("land the work" and "anything else / lessons learned"). Its safety model: the single permission prompt enumerates every outward action (push remote+branch, PR repo, merge target+strategy) and is only offered for a destination verified owned per the user's push-gate; the grant is scoped to the named actions; verification failures and blocking review findings stop the land (fail closed). The skill is shipped via `//go:embed` (mirroring how this template is embedded) and `finishskill.EnsureInstalled` rewrites the global copy from the embed on launch, so `openkanban update` propagates skill changes on the next start.
+
 `validateInitPromptOverlap` (in `internal/config/validate.go`) backs this discipline up with a warning when a user-supplied `init_prompt` restates rules from their global CLAUDE.md. Its `strongRuleMarkers` are universal patterns (`HARD RULE`, `NEVER gh pr create / git push`, `\bglobal rule\b`) — not phrases lifted from any one user's CLAUDE.md.
 
 ## Environment Isolation
@@ -698,6 +704,20 @@ an override on top of `DetectStatusWithPort`: when the file says
 report `working` instead. The override is intentionally narrow —
 other file states pass through untouched, and zero `LastActivityAt`
 (no daemon report yet) also passes through.
+
+One further narrowing closes a false-positive in the override itself.
+Rendering the approval prompt is a `vt.Write`, so it stamps
+`LastActivity` at the same moment the `Notification` hook writes
+`waiting`. Without a guard the override reads that render burst as
+"activity" and flips a genuinely-blocked session to `working` until
+the prompt sits untouched past the TTL — so a session awaiting a bash
+approval shows `working` for the whole approve-within-60s window.
+`DetectStatusWithActivity` therefore skips the override while
+`permissionPromptVisible(terminalContent)` matches the prompt's
+on-screen text (`do you want to`, `esc to cancel`). That signal,
+unlike the timer, holds for the entire wait and clears the instant the
+user answers and the tool starts streaming — at which point the
+override resumes covering the real Notification→PostToolUse gap.
 
 The cost is bounded by the activity broadcaster's "only emit when
 advanced" check: an idle session generates zero traffic. Spinner-
@@ -951,11 +971,11 @@ wc -l /tmp/fsusage.txt
 tail -100 ~/.cache/openkanban/tui.log
 ```
 
-The TUI logs each daemon event twice: once when the Cmd goroutine receives it, once when Update handles it:
+The TUI logs daemon events twice: once when the Cmd goroutine receives a batch (events are coalesced — one read drains a whole burst), once per event when Update applies it:
 
 ```
-<ts> openkanban model: readNextDaemonEvent got event="X" session=...
-<ts> openkanban model: handleDaemonSessionEvent event="X" ...
+<ts> openkanban model: readNextDaemonEvent got N event(s); first="X" session=...
+<ts> openkanban model: handleDaemonSessionEvent event="X" ...   (one per event in the batch)
 ```
 
 A gap **between** the two lines means bubbletea's Update goroutine was blocked processing some *other* Msg — the event is sitting in the Msg queue waiting for its turn. The handler is innocent.

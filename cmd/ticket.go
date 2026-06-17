@@ -17,6 +17,7 @@ import (
 	"github.com/techdufus/openkanban/internal/daemon"
 	"github.com/techdufus/openkanban/internal/daemonclient"
 	"github.com/techdufus/openkanban/internal/project"
+	"github.com/techdufus/openkanban/internal/ticketsvc"
 )
 
 var (
@@ -136,7 +137,16 @@ Description sources (mutually exclusive, in priority order):
 			ticket.UseWorktree = false
 		}
 
-		if err := applySessionFlags(ticket); err != nil {
+		// Build the global store BEFORE applySessionFlags so LinkSession
+		// can scan all tickets across all projects for the uniqueness
+		// check. LoadGlobalTicketStore is read-only (no mutations); we
+		// reuse the same `store` (single-project) for the actual write.
+		globalStore, gerr := project.LoadGlobalTicketStore(registry)
+		if gerr != nil {
+			return fmt.Errorf("load global ticket store: %w", gerr)
+		}
+
+		if err := applySessionFlags(ticket, globalStore); err != nil {
 			return err
 		}
 
@@ -365,12 +375,17 @@ func configTicketsDir() (string, error) {
 //
 // The audit field is independent of the operational fields and is
 // applied unconditionally if set.
-func applySessionFlags(ticket *board.Ticket) error {
+func applySessionFlags(ticket *board.Ticket, globalStore *project.GlobalTicketStore) error {
 	if ticketNewMigrate && ticketNewSession == "" {
 		return fmt.Errorf("--migrate requires --session")
 	}
-	if ticketNewForce && !ticketNewMigrate {
-		return fmt.Errorf("--force only makes sense with --migrate")
+	// --force used to require --migrate (kill the lsof holder). Now
+	// --force also acts on --session alone: claim a uuid that's already
+	// linked to a different ticket by clearing the other ticket's link
+	// first. Both behaviors stack: --migrate --force kills the process
+	// AND clears the conflicting ticket link.
+	if ticketNewForce && !ticketNewMigrate && ticketNewSession == "" {
+		return fmt.Errorf("--force requires --migrate or --session")
 	}
 
 	if ticketNewSession != "" {
@@ -431,8 +446,27 @@ func applySessionFlags(ticket *board.Ticket) error {
 			}
 		}
 
-		ticket.AgentSessionID = uuid
-		ticket.SessionOwned = ticketNewMigrate
+		// 1:1 invariant gate: refuse if uuid is already linked to a
+		// DIFFERENT ticket. Storage layer tolerates duplicates by
+		// policy, but creation must not produce new ones — see
+		// [[openkanban-one-to-one-ticket-session-invariant]]. --force
+		// here means "claim the uuid from the other ticket" (clear
+		// other ticket's AgentSessionID before claiming).
+		opts := ticketsvc.LinkOpts{Force: ticketNewForce}
+		if _, err := ticketsvc.LinkSession(globalStore, ticket, uuid, opts); err != nil {
+			var conflict *ticketsvc.ErrSessionAlreadyLinked
+			if errors.As(err, &conflict) {
+				return fmt.Errorf("--session refused: %w; "+
+					"re-run with --force to claim the session from the "+
+					"other ticket(s), clearing their AgentSessionID first",
+					conflict)
+			}
+			return fmt.Errorf("link session %s: %w", uuid, err)
+		}
+		// SessionOwned removed: every spawn is migrate-on-resume.
+		// --migrate's lsof/daemon-owns kill above is still meaningful
+		// (clears the JSONL holder), but there's no link-vs-migrate
+		// bit on the ticket anymore.
 	}
 
 	if ticketNewCreatedBy != "" {

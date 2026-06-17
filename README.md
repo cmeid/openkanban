@@ -136,6 +136,8 @@ A status-bar toast surfaces how many approvals just went global (`Moved to in_re
 
 **Auto-prune of stale entries.** On every ticket transition (regardless of direction), openkanban also runs a noise-filter pass over `<repo>/.claude/settings.local.json` and removes entries that look one-shot — long no-glob Bash commands with embedded timestamps, escape-soup grep patterns, absolute paths outside an allowlist of trusted locations (`~/manifold/dev/**`, `~/.claude/projects/**`, etc.). A hard-deny list also blocks any auto-introduction of high-risk patterns (`Bash(git push *)`, `Bash(gh pr create *)`, `Bash(op *)`, paths under `~/.ssh/**` / `~/.aws/**`) — those collide with the global push-gate rule in `~/.claude/CLAUDE.md` and the 1Password CLI's secret-management surface. Every removal is appended to `<repo>/.claude/.pruned-log` with a timestamp + reason, and the pre-write file is snapshotted to `settings.local.json.bak.<unix-nanos>` (rotation keeps the last 3) so any false-positive prune is recoverable. The toast extends with `· pruned N stale entries`. **Verb-widening is explicitly out of scope** — collapsing `Bash(awk '/2026-.../' log)` to `Bash(awk *)` would auto-approve `awk 'BEGIN{system(...)}'`, which the global push-gate's threat model relies on the user denying per-call. Users who want explicit widening can do it by hand in the repo file.
 
+This promotion is **independent of the standardized close-out** (the `finishing-an-openkanban-ticket` skill): promotion fires only on the human-driven `→ in_review` / `→ done` status transition, and the close-out skill never changes ticket status. So an agent landing its work via the skill's commit → PR → merge never triggers (or bypasses) the trust-gate — the two mechanisms are orthogonal.
+
 See [`internal/agent/claude_settings.go`](internal/agent/claude_settings.go) and wiring in [`internal/ui/model.go`](internal/ui/model.go), [`internal/project/tickets.go`](internal/project/tickets.go), [`cmd/ticket_done.go`](cmd/ticket_done.go).
 
 ### 9. PTY-activity overrides "waiting" state
@@ -144,11 +146,12 @@ Claude Code emits an OSC 9 notification when it enters a permission-prompt state
 
 This fork closes the gap with a PTY-activity heartbeat:
 
-- **Daemon side.** `terminal.Pane` timestamps every non-empty `vt.Write` — bytes-flowed, not grid-hash. (Cursor blinks are terminal-side, idle prompts emit no bytes, the spinner emits ~10 Hz throughout tool execution.) A 2-second broadcaster ticks `SessionEvent{Event:"activity", LastActivityAt:...}` only when the timestamp advanced, so idle sessions produce zero traffic. The same field rides on `started`/`exited`/`attached`/`detached` events so subscribers seed before the first heartbeat.
+- **Daemon side.** `terminal.Pane` timestamps every non-empty `vt.Write` — bytes-flowed, not grid-hash. (Cursor blinks are terminal-side; a displayed prompt then sits quiet — though its *initial render* is a byte burst, which is what the prompt guard below exists to handle; the spinner emits ~10 Hz throughout tool execution.) A 2-second broadcaster ticks `SessionEvent{Event:"activity", LastActivityAt:...}` only when the timestamp advanced, so idle sessions produce zero traffic. The same field rides on `started`/`exited`/`attached`/`detached` events so subscribers seed before the first heartbeat.
 - **UI side.** `DetectStatusWithActivity` layers an override on top of `DetectStatusWithPort`: when the status file reads `waiting` but the session had PTY activity within the last 60 seconds (`WaitingActivityTTL`), the card renders **working** instead. Other states (idle, completed, error) pass through untouched.
+- **Prompt guard.** Rendering the permission prompt is *itself* a burst of PTY bytes, landing at the same instant the `Notification` hook writes `waiting` — so the raw override would mask a genuinely-blocked session as **working** for the entire approve-within-60s window (i.e. almost always). `DetectStatusWithActivity` therefore suppresses the override while the approval prompt is still on screen: `permissionPromptVisible` matches the prompt's own text in the tail of the pane (`do you want to…` / `esc to cancel` — narrower than the generic keyword list, so a running tool's output won't trip it). Unlike the 60s timer, the on-screen text holds for the whole wait and clears the moment the user answers and the tool starts streaming.
 - **Backward compat.** `SessionEvent.LastActivityAt` is `omitempty`, so older clients that don't understand the field just see today's events.
 
-The net effect: the moment Claude responds to a permission grant by emitting any byte, the card flips from waiting to working — no waiting for the next hook fire.
+The net effect: while the approval prompt is up the card reads **waiting**; the moment Claude answers the grant by streaming tool output, it flips to **working** — without waiting for the next hook fire.
 
 See [`internal/terminal/pane.go`](internal/terminal/pane.go) (`LastActivity`, write-timestamping), [`internal/daemon/server.go`](internal/daemon/server.go) (`broadcastActivity`), [`internal/agent/status.go`](internal/agent/status.go) (`DetectStatusWithActivity`, `WaitingActivityTTL`), and [`internal/ui/daemon_subscribe.go`](internal/ui/daemon_subscribe.go) / [`internal/ui/model.go`](internal/ui/model.go) (`m.lastPTYActivity` map + override wiring).
 
@@ -165,6 +168,21 @@ This fork makes resume directory-independent by normalizing the transcript into 
 The invariant: a ticket's transcript always lives in its launch directory's bucket, so reopening a ticket resumes the exact session regardless of where it — or openkanban — was originally started.
 
 See [`internal/agent/sessions.go`](internal/agent/sessions.go) (`ProjectDirFor`, `NormalizeSessionBucket`) and the call site in [`internal/ui/model.go`](internal/ui/model.go) (`prepareSpawnWith`).
+
+### 11. 1:1 ticket↔session enforcement
+
+The daemon enforces 1:1 ticket↔session at the PTY layer (`Spawn` is idempotent per `TicketID`), but the Claude session UUID layer was permissive: two tickets could end up linked to the same UUID via `ticket new --session <already-claimed>`, divergent forks via `--fork-session` on every re-spawn, or the post-spawn back-fill writing the same UUID across tickets. The result was silent data/session loss — re-spawning a ticket landed in a stale fork, not the live conversation.
+
+This fork closes the gap with three layered defenses:
+
+- **Creation gate** (`ticket new --session`): refuses to claim a UUID already linked to a different ticket. `--force` claims by clearing the conflicting ticket's `agent_session_id` first.
+- **Back-fill gate** (post-spawn UUID discovery via `FindClaudeSession`): silently no-ops when the discovered UUID is already claimed by a different ticket. No save, no `~/.claude/history.jsonl` purge.
+- **Forking eliminated entirely**: `--fork-session` is no longer appended to any Claude spawn argv. A build-time grep guard at `internal/ui/forksession_guard_test.go` makes re-introduction structurally impossible.
+- **Daemon `handleOwns` multi-match**: instead of silently returning the first match, the daemon now surfaces `Conflict=true` with all matching session IDs so upper layers refuse to route to one arbitrarily.
+
+The shared funnel is `internal/ticketsvc`: a small package of free functions (`LinkSession`, `GateAttach`) that both TUI and CLI call for any `agent_session_id` mutation. Storage tolerates duplicates by policy (existing on-disk duplicates aren't auto-migrated), but the runtime gates ensure no NEW duplicate ever launches a session. `openkanban ticket in-progress` also routes through `TicketStore.Move` now, closing a pre-existing harmonization gap where the CLI verb bypassed the promote/prune side-effects the UI was firing.
+
+See [`internal/ticketsvc/svc.go`](internal/ticketsvc/svc.go), [`internal/agent/CLAUDE.md`](internal/agent/CLAUDE.md), and the bug ticket `enforce-1-1-ticket-session` for the multi-vector analysis.
 
 ## Bugs fixed in upstream
 

@@ -149,6 +149,53 @@ func warnSourcePathMissingIfNeeded(cfg *config.Config, sourcePath string, isTTY 
 	fmt.Fprintln(w, "openkanban: auto-update disabled (release build / no source clone). Run ./scripts/install.sh from a clone to enable.")
 }
 
+// warnMissingAgentsIfNeeded emits a one-line notice to w when review/
+// validation subagents the standardized close-out relies on can't be
+// resolved. The `resolve` callback is injected so the gating logic is
+// unit-testable without touching the filesystem (see launch_check_test).
+//
+// Strictly a best-effort hint — never a blocker. The finish skill
+// degrades to self-review when these agents are absent, so a missing
+// agent costs rigor, not correctness. Non-TTY callers stay silent.
+func warnMissingAgentsIfNeeded(expected []string, resolve func(string) bool, isTTY bool, w io.Writer) {
+	if !isTTY || len(expected) == 0 || resolve == nil {
+		return
+	}
+	var missing []string
+	for _, name := range expected {
+		if !resolve(name) {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "openkanban: close-out review subagents not found: %s. "+
+		"The finish skill will self-review; install the oh-my-claude plugin to enable them.\n",
+		strings.Join(missing, ", "))
+}
+
+// agentResolver returns a callback that reports whether a Claude subagent
+// named `name` is resolvable under the given home dir — either a user
+// agent (~/.claude/agents/<name>.md) or one provided by an installed
+// plugin (~/.claude/plugins/cache/.../agents/<name>.md). Heuristic and
+// best-effort; only feeds the non-blocking launch warning.
+func agentResolver(home string) func(string) bool {
+	return func(name string) bool {
+		patterns := []string{
+			filepath.Join(home, ".claude", "agents", name+".md"),
+			filepath.Join(home, ".claude", "plugins", "cache", "*", "*", "*", "agents", name+".md"),
+			filepath.Join(home, ".claude", "plugins", "cache", "*", "*", "agents", name+".md"),
+		}
+		for _, p := range patterns {
+			if matches, _ := filepath.Glob(p); len(matches) > 0 {
+				return true
+			}
+		}
+		return false
+	}
+}
+
 // shouldPromptForUpdate is the pure gating predicate. It does NOT
 // perform any I/O — it just evaluates the four preconditions for
 // running the launch-time check. Split out so it can be unit-tested

@@ -288,6 +288,16 @@ type Model struct {
 	// AttachFirstMsg handshake the first time they type into the pane.
 	cycleAttachPrompt bool
 
+	// autoAttach is the "Auto" mode toggle (board key 'a'). When true,
+	// leaving the current session (Ctrl+G) does not return to the board —
+	// it jumps to the session that has been WAITING the longest (FIFO by
+	// StatusChangedAt), skipping sessions a sibling TUI is attached to. If
+	// no such waiter exists it falls through to the board (the always-
+	// available off-ramp, since the board is where the toggle lives). In-
+	// memory and session-only by design — a persisted auto-pilot is a
+	// multi-TUI footgun. See oldestWaitingPeer.
+	autoAttach bool
+
 	// daemonClient is the long-lived control connection to openkanbankd.
 	// nil when the daemon couldn't be reached at startup — every call
 	// site MUST nil-check before use (the TUI degrades to a no-spawn
@@ -568,6 +578,7 @@ func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projec
 			if info.SessionName != "" {
 				pv.SetSessionName(info.SessionName)
 			}
+			pv.SetTicketTitle(ticket.Title)
 			m.panes[ticket.ID] = pv
 			// Best-effort status read from the existing on-disk marker.
 			// PR9 will replace this with push events.
@@ -776,8 +787,8 @@ func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// is never returned and every subsequent push event piles up in the
 	// subscriber channel buffer with no reader.
 	switch msg := msg.(type) {
-	case daemonSessionEventMsg:
-		return m.handleDaemonSessionEvent(msg)
+	case daemonSessionEventsMsg:
+		return m.handleDaemonSessionEvents(msg)
 	case daemonSubscribeFailedMsg:
 		return m.handleDaemonSubscribeFailed(msg)
 	case daemonSubscribeEndedMsg:
@@ -1059,8 +1070,7 @@ func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// the daemon (e.g. takeover case).
 		ticketID := board.TicketID(msg.PaneID)
 		if m.focusedPane == ticketID {
-			m.mode = ModeNormal
-			m.focusedPane = ""
+			m.exitToBoard()
 			m.selectTicketByID(ticketID)
 		}
 		return m.handleTerminalMsg(msg)
@@ -1093,8 +1103,7 @@ func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		if m.focusedPane == ticketID {
-			m.mode = ModeNormal
-			m.focusedPane = ""
+			m.exitToBoard()
 			m.notify("Agent exited")
 			m.selectTicketByID(ticketID)
 		}
@@ -1120,8 +1129,7 @@ func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 			delete(m.panes, id)
 		}
 		if m.focusedPane != "" {
-			m.mode = ModeNormal
-			m.focusedPane = ""
+			m.exitToBoard()
 		}
 		// Daemon push channel is gone; the file-poll takes over as the
 		// AgentStatus source. Clear the subscribe handles so we don't
@@ -1148,8 +1156,7 @@ func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.maybeSetWindowTitle()
 
 	case terminal.ExitFocusMsg:
-		m.mode = ModeNormal
-		m.focusedPane = ""
+		m.exitToBoard()
 		return m, m.maybeSetWindowTitle()
 
 	case agentStatusMsg:
@@ -1415,6 +1422,8 @@ func (m *Model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.cycleSessionFilter()
 	case "W":
 		return m.toggleAlwaysShowWorking()
+	case "a":
+		return m.toggleAutoAttach()
 
 	case "/":
 		m.filterInput.SetValue(m.filterQuery)
@@ -1895,6 +1904,20 @@ func shouldRetryAttachOnEnter(pane *daemonclient.PaneView) bool {
 	return pane.LastAttachErr() != nil && pane.State() != daemonclient.PaneViewAttached
 }
 
+// exitToBoard returns the user from agent view to the board, enforcing
+// the invariant that the cycle-attach modal flag never outlives the
+// focus that justified it. Every path that drops m.focusedPane — the
+// keyboard exit (Ctrl+g / Esc) AND the async daemon paths (session
+// exited, pane detached/exited, daemon disconnected) — must go through
+// here. A stranded cycleAttachPrompt would otherwise resurface as a
+// phantom modal on the next agent-view entry, swallowing Ctrl+g though
+// the user never cycled.
+func (m *Model) exitToBoard() {
+	m.mode = ModeNormal
+	m.focusedPane = ""
+	m.cycleAttachPrompt = false
+}
+
 func (m *Model) handleAgentViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// The cycle-attach modal swallows all keys until the user resolves
 	// it (Enter attaches, Esc returns to the board, Ctrl+\ / Ctrl+]
@@ -1906,8 +1929,7 @@ func (m *Model) handleAgentViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	pane, ok := m.panes[m.focusedPane]
 	if !ok {
-		m.mode = ModeNormal
-		m.focusedPane = ""
+		m.exitToBoard()
 		return m, m.maybeSetWindowTitle()
 	}
 
@@ -1939,9 +1961,30 @@ func (m *Model) handleAgentViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if result := pane.HandleKey(msg); result != nil {
 		switch r := result.(type) {
 		case terminal.ExitFocusMsg:
+			// Auto mode: instead of returning to the board, jump to the
+			// session that has been waiting the longest (skipping any held
+			// by a sibling TUI). If none qualifies we fall through to the
+			// board below — the always-available off-ramp.
+			if m.autoAttach {
+				// One List snapshot serves both the attached-elsewhere
+				// filter and the subsequent attach's takeover decision, so
+				// the jump does a single List, not two.
+				sessions := m.liveSessions()
+				var elsewhere map[board.TicketID]bool
+				if m.daemonClient != nil {
+					elsewhere = attachedElsewhereSet(sessions, m.daemonClient.ClientID())
+				}
+				if id, ok := m.oldestWaitingPeer(elsewhere); ok {
+					// No toast: m.notification isn't painted over the agent
+					// view, and the cycle-attach modal already shows the
+					// target's title + live content, so the jump is
+					// self-evident.
+					log.Printf("openkanban model: Auto mode jump -> %s", id)
+					return m, m.focusAndPromptAttachSnap(id, sessions)
+				}
+			}
 			log.Printf("openkanban model: ExitFocusMsg received, mode -> ModeNormal")
-			m.mode = ModeNormal
-			m.focusedPane = ""
+			m.exitToBoard()
 		case daemonclient.AttachFirstMsg:
 			// User typed into an unattached pane — attach now and
 			// re-deliver the key would be nice but is out of scope for
@@ -1957,26 +2000,28 @@ func (m *Model) handleAgentViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 // handleCycleAttachPromptKey resolves the modal opened by
 // cycleUnattachedSession. Enter attaches to the currently focused
-// pane and clears the modal; Esc cancels and returns to the board;
-// Ctrl+\ / Ctrl+] keep cycling; every other key is swallowed so the
-// modal can't be bypassed by a stray keystroke landing in the PTY.
+// pane and clears the modal; Esc / Ctrl+g cancel and return to the
+// board; Ctrl+\ / Ctrl+] keep cycling; every other key is swallowed so
+// the modal can't be bypassed by a stray keystroke landing in the PTY.
+//
+// Ctrl+g is the documented agent-view "exit to board" gesture. Without
+// an explicit case here it fell through to the swallow at the bottom,
+// so the act of cycling silently disabled Ctrl+g until the user pressed
+// Esc — it stays an intentional exit gesture, not a PTY-bound key, so
+// it resolves the modal rather than bypassing it.
 func (m *Model) handleCycleAttachPromptKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "enter":
 		pv, ok := m.panes[m.focusedPane]
 		if !ok || pv == nil {
-			m.cycleAttachPrompt = false
-			m.mode = ModeNormal
-			m.focusedPane = ""
+			m.exitToBoard()
 			return m, m.maybeSetWindowTitle()
 		}
 		m.cycleAttachPrompt = false
 		cmd := m.attachExisting(m.focusedPane, pv)
 		return m, tea.Batch(cmd, m.maybeSetWindowTitle())
-	case "esc":
-		m.cycleAttachPrompt = false
-		m.mode = ModeNormal
-		m.focusedPane = ""
+	case "esc", "ctrl+g":
+		m.exitToBoard()
 		return m, m.maybeSetWindowTitle()
 	case "ctrl+]":
 		return m.cycleUnattachedSession(1)
@@ -3167,9 +3212,9 @@ func (m *Model) moveTicket(delta int) {
 // preceding newline). headerHeight() already includes its own padding/border.
 func (m *Model) boardAreaHeight() int {
 	const (
-		newlineAfterHeader      = 1
-		newlineBeforeStatusBar  = 1
-		statusBarHeight         = 1
+		newlineAfterHeader     = 1
+		newlineBeforeStatusBar = 1
+		statusBarHeight        = 1
 	)
 	return m.height - m.headerHeight() - newlineAfterHeader - newlineBeforeStatusBar - statusBarHeight
 }
@@ -3366,32 +3411,38 @@ func (m *Model) editTicket() (tea.Model, tea.Cmd) {
 //     into an unattached pane)
 //   - Update's AttachFirstMsg routing.
 func (m *Model) attachExisting(ticketID board.TicketID, pv *daemonclient.PaneView) tea.Cmd {
+	return m.attachExistingSnap(ticketID, pv, nil)
+}
+
+// attachExistingSnap is attachExisting with an optional pre-fetched session
+// list. When sessions is non-nil it is used to decide attach-vs-takeover and
+// to Refresh the pane, avoiding a redundant List — Auto mode passes the same
+// snapshot it already fetched for its attached-elsewhere filter, so the jump
+// does one List rather than two. When sessions is nil, a single List is done
+// here (the original behavior for every other caller). takeover displaces any
+// other client holding the binary stream (the desired no-prompt UX).
+func (m *Model) attachExistingSnap(ticketID board.TicketID, pv *daemonclient.PaneView, sessions []daemon.SessionInfo) tea.Cmd {
 	if pv == nil || m.daemonClient == nil {
 		return nil
 	}
-	// Decide attach vs takeover based on the most recent List snapshot.
-	// We don't List again here — the model already has the info that
-	// was attached at construction or refresh time. If another client
-	// holds the binary stream, the daemon would reject a plain Attach;
-	// Takeover unconditionally displaces them. Per the design, takeover
-	// is the desired UX (no destructive prompt).
-	takeover := false
-	if m.daemonClient != nil {
+	if sessions == nil {
 		listCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		resp, err := m.daemonClient.List(listCtx)
 		cancel()
 		if err == nil {
-			for _, s := range resp.Sessions {
-				if s.SessionID != pv.SessionID() {
-					continue
-				}
-				if s.AttachedClient != 0 && s.AttachedClient != m.daemonClient.ClientID() {
-					takeover = true
-				}
-				pv.Refresh(s)
-				break
-			}
+			sessions = resp.Sessions
 		}
+	}
+	takeover := false
+	for _, s := range sessions {
+		if s.SessionID != pv.SessionID() {
+			continue
+		}
+		if s.AttachedClient != 0 && s.AttachedClient != m.daemonClient.ClientID() {
+			takeover = true
+		}
+		pv.Refresh(s)
+		break
 	}
 	id := ticketID
 	return func() tea.Msg {
@@ -3539,12 +3590,15 @@ func (m *Model) performTicketCleanup(ticket *board.Ticket) {
 		}
 	}
 
-	// SessionOwned=true is the ticket's explicit claim on the session
-	// JSONL (set via `openkanban ticket new --session ... --migrate`).
-	// Link-mode sessions (SessionOwned=false) belong to the spawning
-	// agent and must survive ticket deletion. The pane.Stop above has
+	// Every ticket conceptually OWNS its session now that forking is
+	// eliminated (task/enforce-one-to-one-session). The pre-fix
+	// SessionOwned gate distinguished link-mode (don't delete JSONL on
+	// ticket-delete; the spawning agent owns it) from migrate-mode
+	// (delete JSONL since the ticket owned it). With every spawn
+	// migrate-on-resume, the ticket always owns the session; if it's
+	// being deleted, the JSONL goes with it. The pane.Stop above has
 	// already killed the writer process, so unlink is safe.
-	if ticket.SessionOwned && ticket.AgentSessionID != "" {
+	if ticket.AgentSessionID != "" {
 		path, err := agent.SessionPath(ticket.AgentSessionID)
 		switch {
 		case err == nil:
@@ -3818,27 +3872,125 @@ func (m *Model) cycleUnattachedSession(delta int) (tea.Model, tea.Cmd) {
 		next = allOpen[(cur+delta+len(allOpen))%len(allOpen)]
 	}
 
-	m.focusedPane = next
-	pv, ok := m.panes[next]
+	return m, m.focusAndPromptAttach(next)
+}
+
+// focusAndPromptAttach focuses the target peer pane, opens the cycle-attach
+// modal over it, and — if the pane is Unattached — kicks off the attach so
+// the modal backdrop shows live PTY content instead of bare chrome.
+//
+// Shared by Ctrl+]/Ctrl+\ cycling (cycleUnattachedSession) and Auto mode's
+// oldest-waiter jump (the ExitFocusMsg branch in handleAgentViewMode) so the
+// SetSize(-2) sizing and the cycleAttachPrompt handshake can't drift between
+// the two entry points. Callers build target from m.panes; the defensive
+// pv==nil bail still sets the modal flag so the user sees the prompt with
+// the bare ticket title if the map raced out from under us.
+func (m *Model) focusAndPromptAttach(target board.TicketID) tea.Cmd {
+	return m.focusAndPromptAttachSnap(target, nil)
+}
+
+// focusAndPromptAttachSnap is focusAndPromptAttach with an optional pre-fetched
+// session list threaded into the attach (see attachExistingSnap). Auto mode
+// passes the snapshot it already Listed; cycling passes nil (List as before).
+func (m *Model) focusAndPromptAttachSnap(target board.TicketID, sessions []daemon.SessionInfo) tea.Cmd {
+	m.focusedPane = target
+	pv, ok := m.panes[target]
 	if !ok || pv == nil {
-		// Defensive — allOpen was built from m.panes a few lines up, so
-		// this shouldn't fire. Bail with the modal flag set so the user
-		// at least sees the prompt with the bare ticket title.
 		m.cycleAttachPrompt = true
-		return m, m.maybeSetWindowTitle()
+		return m.maybeSetWindowTitle()
 	}
 	pv.SetSize(m.width, m.height-2)
 	m.cycleAttachPrompt = true
 
-	// Auto-attach if the target is Unattached so the modal backdrop
-	// shows live content. Already-Attached peers (cycled-through from
-	// a previous Ctrl+] hop, or the originally-attached pane on wrap)
-	// already have a populated vt — no new attach needed.
+	// Auto-attach if the target is Unattached so the modal backdrop shows
+	// live content. Already-Attached peers already have a populated vt.
 	var attachCmd tea.Cmd
 	if pv.State() == daemonclient.PaneViewUnattached {
-		attachCmd = m.attachExisting(next, pv)
+		attachCmd = m.attachExistingSnap(target, pv, sessions)
 	}
-	return m, tea.Batch(attachCmd, m.maybeSetWindowTitle())
+	return tea.Batch(attachCmd, m.maybeSetWindowTitle())
+}
+
+// oldestWaitingPeer returns the open peer session that has been WAITING the
+// longest (FIFO by StatusChangedAt), for Auto mode's un-attach jump. A
+// ticket qualifies iff it has a live pane (Attached/Unattached), its
+// activity-overridden AgentStatus is "waiting" (the poll writes the
+// overridden value back onto ticket.AgentStatus, so this matches what the
+// card renders), it is not the session being left (m.focusedPane — else
+// Auto would re-attach you to the one you just left), it has a non-nil
+// StatusChangedAt, and no other TUI client holds it (attachedElsewhere,
+// built by the caller from a List snapshot — skipping these avoids
+// taking a session away from a sibling TUI). Ties on StatusChangedAt
+// resolve to board order (m.columnTickets walk order). Returns ok=false
+// when nothing qualifies, which the caller treats as "fall through to the
+// board" — the always-available off-ramp.
+func (m *Model) oldestWaitingPeer(attachedElsewhere map[board.TicketID]bool) (board.TicketID, bool) {
+	var best board.TicketID
+	var bestTime time.Time
+	found := false
+	for _, col := range m.columnTickets {
+		for _, t := range col {
+			if t == nil || t.ID == m.focusedPane {
+				continue
+			}
+			if attachedElsewhere[t.ID] {
+				continue
+			}
+			// AgentStatus here is the activity-overridden value the poll
+			// writes back (model.go agentStatusResultMsg handler), so this
+			// matches what the card renders. columnTickets holds the same
+			// *board.Ticket the store mutates, so no globalStore lookup.
+			if t.AgentStatus != board.AgentWaiting || t.StatusChangedAt == nil {
+				continue
+			}
+			pv, ok := m.panes[t.ID]
+			if !ok || pv == nil {
+				continue
+			}
+			switch pv.State() {
+			case daemonclient.PaneViewAttached, daemonclient.PaneViewUnattached:
+			default:
+				continue
+			}
+			if !found || t.StatusChangedAt.Before(bestTime) {
+				best = t.ID
+				bestTime = *t.StatusChangedAt
+				found = true
+			}
+		}
+	}
+	return best, found
+}
+
+// liveSessions returns a single daemon List snapshot (1s timeout), or nil
+// when the daemon is unreachable. Auto mode fetches it once and threads it
+// into both attachedElsewhereSet (the skip filter) and the attach
+// (attachExistingSnap), so a jump does one List rather than two.
+func (m *Model) liveSessions() []daemon.SessionInfo {
+	if m.daemonClient == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	resp, err := m.daemonClient.List(ctx)
+	if err != nil {
+		return nil
+	}
+	return resp.Sessions
+}
+
+// attachedElsewhereSet returns the set of tickets whose daemon session is held
+// by a client other than myClientID. Pure (no I/O) so it's unit-testable;
+// Auto mode uses it to skip sibling-TUI sessions so a jump never displaces
+// another viewer.
+func attachedElsewhereSet(sessions []daemon.SessionInfo, myClientID uint16) map[board.TicketID]bool {
+	out := make(map[board.TicketID]bool)
+	for _, s := range sessions {
+		if s.AttachedClient != 0 && s.AttachedClient != myClientID {
+			out[board.TicketID(s.TicketID)] = true
+		}
+	}
+	return out
 }
 
 // cycleSortMode advances to the next sort mode and re-renders the board.
@@ -3883,6 +4035,18 @@ func (m *Model) toggleAlwaysShowWorking() (tea.Model, tea.Cmd) {
 		state = "on"
 	}
 	m.notify("Always show working: " + state)
+	return m, nil
+}
+
+// toggleAutoAttach flips Auto mode (board key 'a'). See the autoAttach
+// field doc and oldestWaitingPeer for the behavior it gates.
+func (m *Model) toggleAutoAttach() (tea.Model, tea.Cmd) {
+	m.autoAttach = !m.autoAttach
+	state := "off"
+	if m.autoAttach {
+		state = "on"
+	}
+	m.notify("Auto-attach: " + state)
 	return m, nil
 }
 
@@ -4068,6 +4232,9 @@ func (m *Model) spawnAgent() (tea.Model, tea.Cmd) {
 	}
 
 	if existing, exists := m.panes[ticket.ID]; exists {
+		// Refresh the pane's cached title on every re-focus so a later
+		// store drop still has a current title to fall back to.
+		existing.SetTicketTitle(ticket.Title)
 		switch existing.State() {
 		case daemonclient.PaneViewAttached:
 			// Already attached in this TUI — just switch to its view.
@@ -4377,10 +4544,14 @@ func buildSpawnReq(in spawnReqInputs) daemon.SpawnReq {
 				args = append(args, "-n", in.ticket.Title)
 			}
 			if in.ticket.AgentSessionID != "" && agent.SessionUUIDPattern.MatchString(in.ticket.AgentSessionID) {
+				// Always migrate-on-resume; the divergent-fork option was
+				// eliminated in task/enforce-one-to-one-session because
+				// silent divergence broke the 1:1 ticket↔session
+				// invariant the daemon enforces at the PTY layer. The
+				// grep guard at internal/ui/forksession_guard_test.go
+				// pins this invariant at build time. See
+				// [[openkanban-one-to-one-ticket-session-invariant]].
 				args = append(args, "--resume", in.ticket.AgentSessionID)
-				if !in.ticket.SessionOwned {
-					args = append(args, "--fork-session")
-				}
 			}
 			if in.promptTemplate != "" {
 				prompt := agent.BuildContextPrompt(in.promptTemplate, in.ctxData)
@@ -4584,6 +4755,7 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 					ticketID,
 					ownsResp.SessionID,
 					resolvedName,
+					ticket.Title,
 					worktreePath,
 					branchName,
 					baseBranch,
@@ -4805,6 +4977,7 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 		pv := daemonclient.NewPaneView(daemonClient, string(ticketID), resp.SessionID, nil)
 		pv.SetWorkdir(worktreePath)
 		pv.SetSessionName(sessionName)
+		pv.SetTicketTitle(ticket.Title)
 		pv.SetSize(width, height)
 
 		// B7: retry attach after spawn with backoff. The daemon-side
@@ -4972,6 +5145,7 @@ func attachExistingFastPath(
 	ticketID board.TicketID,
 	sessionID string,
 	sessionName string,
+	ticketTitle string,
 	worktreePath string,
 	branchName string,
 	baseBranch string,
@@ -4982,6 +5156,7 @@ func attachExistingFastPath(
 	pv := daemonclient.NewPaneView(daemonClient, string(ticketID), sessionID, nil)
 	pv.SetWorkdir(worktreePath)
 	pv.SetSessionName(sessionName)
+	pv.SetTicketTitle(ticketTitle)
 	pv.SetSize(width, height)
 
 	attachErr := attachWithRetry(pv)
@@ -5606,35 +5781,24 @@ func (m *Model) pollAgentStatusesAsync() tea.Cmd {
 			// comments above. Keeping it here so --resume picks up the
 			// UUID on the next spawn / external-resume detection.
 			apiSessionID := p.agentSessionID
-			if apiSessionID == "" && p.agentType == "opencode" && p.worktreePath != "" {
-				if id := agent.FindOpencodeSession(p.worktreePath); id != "" {
+			if apiSessionID == "" {
+				home, _ := os.UserHomeDir()
+				// backfillAgentSession enforces the 1:1 invariant via
+				// ticketsvc.LinkSession(BestEffort). On claim conflict
+				// (UUID already held by a different ticket) the back-fill
+				// silently no-ops: returns empty, no save, no purge.
+				// See internal/ui/backfill_session.go.
+				if id := backfillAgentSession(
+					globalStore,
+					p.ticketID,
+					p.agentType,
+					p.worktreePath,
+					home,
+					agent.FindOpencodeSession,
+					agent.FindClaudeSession,
+					agent.PurgeClaudePrimingHistory,
+				); id != "" {
 					apiSessionID = id
-					if ticket, _ := globalStore.Get(p.ticketID); ticket != nil {
-						ticket.AgentSessionID = apiSessionID
-						globalStore.Save(ticket)
-					}
-				}
-			}
-			if apiSessionID == "" && p.agentType == "claude" && p.worktreePath != "" {
-				if id := agent.FindClaudeSession(p.worktreePath); id != "" {
-					apiSessionID = id
-					if ticket, _ := globalStore.Get(p.ticketID); ticket != nil {
-						ticket.AgentSessionID = apiSessionID
-						globalStore.Save(ticket)
-					}
-					// Once we know the back-filled UUID for a claude
-					// session, purge the priming-prompt entry openkanban
-					// caused claude to write into ~/.claude/history.jsonl
-					// at spawn-time. Without this the priming dominates
-					// the up-arrow input ring and hides the user's real
-					// recent prompts. This branch only fires while
-					// p.agentSessionID is still empty — i.e. before the
-					// ticket has the UUID — so the purge runs once per
-					// ticket lifecycle, not on every poll tick.
-					if home, err := os.UserHomeDir(); err == nil {
-						historyPath := filepath.Join(home, ".claude", "history.jsonl")
-						_ = agent.PurgeClaudePrimingHistory(historyPath, apiSessionID, agent.ClaudePrimingPrefixes...)
-					}
 				}
 			}
 
