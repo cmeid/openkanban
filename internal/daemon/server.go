@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -121,6 +122,13 @@ type Server struct {
 	// Only read once at goroutine start; no mutex needed because
 	// tests set it before triggering the event.
 	emitSessionExitFn func(SessionEvent)
+
+	// dispatchSeq increments at the end of every dispatch() call; inflight
+	// tracks handlers currently executing. The watchdog samples both: if
+	// inflight>0 but dispatchSeq is frozen past the wedge threshold, the
+	// daemon is stuck and must self-restart. Lock-free.
+	dispatchSeq atomic.Uint64
+	inflight    atomic.Int64
 }
 
 // clientConn tracks one open connection's per-client state.
@@ -869,6 +877,11 @@ func (s *Server) handleConn(c *clientConn) {
 // the corresponding handler. Unknown message types produce an
 // ErrorResp but do not close the connection.
 func (s *Server) dispatch(c *clientConn, typeName string, raw json.RawMessage) {
+	s.inflight.Add(1)
+	defer func() {
+		s.inflight.Add(-1)
+		s.dispatchSeq.Add(1)
+	}()
 	switch typeName {
 	case MsgHelloReq:
 		var req HelloReq
@@ -1540,4 +1553,8 @@ func (s *Server) writeResp(c *clientConn, typeName string, resp any) {
 // writeError sends an ErrorResp envelope to the client.
 func (s *Server) writeError(c *clientConn, code, message string) {
 	s.writeResp(c, MsgErrorResp, ErrorResp{Code: code, Message: message})
+}
+
+func (s *Server) dispatchStats() (uint64, int64) {
+	return s.dispatchSeq.Load(), s.inflight.Load()
 }
