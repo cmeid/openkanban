@@ -27,6 +27,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/techdufus/openkanban/internal/config"
 	"github.com/techdufus/openkanban/internal/daemon"
 )
 
@@ -96,6 +97,7 @@ func ensureRuntimeDir() error {
 		return err
 	}
 	dir := filepath.Dir(sock)
+	config.GuardHomeWrite(dir)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("daemonclient: mkdir %s: %w", dir, err)
 	}
@@ -202,6 +204,7 @@ func forkDaemon() error {
 		return err
 	}
 
+	config.GuardHomeWrite(logFile)
 	logF, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return fmt.Errorf("daemonclient: open log %s: %w", logFile, err)

@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+
+	"github.com/techdufus/openkanban/internal/config"
 )
 
 // PidLock is an advisory file lock around the daemon's pidfile. The
@@ -42,6 +44,7 @@ func (e *ErrAlreadyLocked) Error() string {
 // The pidfile's parent directory must already exist; the caller is
 // expected to have invoked EnsureRuntimeDir first.
 func AcquirePidLock(path string) (*PidLock, error) {
+	config.GuardHomeWrite(path)
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("daemon: open pidfile %s: %w", path, err)
@@ -114,6 +117,7 @@ func (l *PidLock) Release() error {
 	err := l.f.Close()
 	l.f = nil
 	if l.path != "" {
+		config.GuardHomeWrite(l.path)
 		_ = os.Remove(l.path)
 	}
 	return err

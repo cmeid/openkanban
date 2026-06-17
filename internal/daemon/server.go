@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/techdufus/openkanban/internal/config"
 	"github.com/techdufus/openkanban/internal/terminal"
 	"github.com/techdufus/openkanban/internal/update"
 )
@@ -180,6 +181,7 @@ func NewServerWithOptions(sock, pidpath string, opts Options) (*Server, error) {
 	// pidlock above guarantees no other daemon is currently bound
 	// to it, so this is safe.
 	if _, statErr := os.Stat(sock); statErr == nil {
+		config.GuardHomeWrite(sock)
 		if rmErr := os.Remove(sock); rmErr != nil {
 			lock.Release()
 			return nil, fmt.Errorf("daemon: remove stale socket %s: %w", sock, rmErr)
@@ -646,6 +648,7 @@ func (s *Server) cleanup() {
 	}
 	// Best-effort socket removal: net.Listen("unix") doesn't unlink
 	// the file when the listener is closed.
+	config.GuardHomeWrite(s.sock)
 	_ = os.Remove(s.sock)
 }
 

@@ -532,6 +532,7 @@ func executeRestorePlan(reader *bufio.Reader, out io.Writer, plan restorePlan) e
 			return fmt.Errorf("stat dest %q: %w", dest, err)
 		}
 
+		config.GuardHomeWrite(dest)
 		if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
 			return fmt.Errorf("mkdir for %q: %w", dest, err)
 		}

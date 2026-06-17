@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/techdufus/openkanban/internal/board"
+	"github.com/techdufus/openkanban/internal/config"
 )
 
 // MigrationState captures whether a project's tickets are stored in the
@@ -94,6 +95,7 @@ func MigrationStateFor(projectID string) MigrationState {
 // Returns the count of tickets migrated, or 0 if no migration was
 // needed.
 func MigrateProjectToPerTicket(projectID string) (int, error) {
+	config.GuardHomeWrite(perTicketDirPath(projectID))
 	state := MigrationStateFor(projectID)
 
 	switch state {

@@ -11,7 +11,20 @@ import (
 	"time"
 
 	"github.com/techdufus/openkanban/internal/board"
+	"github.com/techdufus/openkanban/internal/config"
 )
+
+// StatusDir returns the agent status-file directory.
+// OPENKANBAN_STATUS_DIR > ~/.cache/openkanban-status.
+// The default MUST stay in sync with config.computeGuardedDirs' status
+// literal (config can't import agent — would cycle).
+func StatusDir() string {
+	if v := os.Getenv("OPENKANBAN_STATUS_DIR"); v != "" {
+		return v
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".cache", "openkanban-status")
+}
 
 const (
 	opencodeDefaultPort = 4096
@@ -624,9 +637,8 @@ func (d *StatusDetector) InvalidateCache(sessionName string) {
 }
 
 func WriteStatusFile(sessionName string, status board.AgentStatus) error {
-	homeDir, _ := os.UserHomeDir()
-	statusDir := filepath.Join(homeDir, ".cache", "openkanban-status")
-	statusFile := filepath.Join(statusDir, sessionName+".status")
+	statusFile := filepath.Join(StatusDir(), sessionName+".status")
+	config.GuardHomeWrite(statusFile)
 
 	// Create parent directory for status file (handles slashed session names like "task/my-feature")
 	if err := os.MkdirAll(filepath.Dir(statusFile), 0755); err != nil {
@@ -653,9 +665,8 @@ func WriteStatusFile(sessionName string, status board.AgentStatus) error {
 }
 
 func CleanupStatusFile(sessionName string) error {
-	homeDir, _ := os.UserHomeDir()
-	statusDir := filepath.Join(homeDir, ".cache", "openkanban-status")
-	statusFile := filepath.Join(statusDir, sessionName+".status")
+	statusFile := filepath.Join(StatusDir(), sessionName+".status")
+	config.GuardHomeWrite(statusFile)
 	os.Remove(statusFile)
 	return nil
 }
@@ -668,8 +679,7 @@ func CleanupStatusFile(sessionName string) error {
 // 500ms cache would serve stale values to a guard check made microseconds
 // after a write.
 func ReadStatusFile(sessionName string) (string, error) {
-	homeDir, _ := os.UserHomeDir()
-	statusFile := filepath.Join(homeDir, ".cache", "openkanban-status", sessionName+".status")
+	statusFile := filepath.Join(StatusDir(), sessionName+".status")
 	data, err := os.ReadFile(statusFile)
 	if err != nil {
 		if os.IsNotExist(err) {

@@ -67,6 +67,7 @@ func LoadTicketStore(project *Project) (*TicketStore, error) {
 	}
 
 	dir := store.ticketDir()
+	config.GuardHomeWrite(dir)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create project ticket dir: %w", err)
 	}
@@ -170,6 +171,7 @@ func (s *TicketStore) SaveTicket(t *board.Ticket) error {
 	}
 
 	dir := s.ticketDir()
+	config.GuardHomeWrite(dir)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("ensure project dir: %w", err)
 	}
@@ -226,6 +228,7 @@ func (s *TicketStore) DeleteTicketFile(id board.TicketID) error {
 	if !ok {
 		return nil
 	}
+	config.GuardHomeWrite(path)
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove ticket file: %w", err)
 	}
@@ -605,6 +608,8 @@ func (g *GlobalTicketStore) RemoveProject(id string) error {
 			return err
 		}
 		dstDir := filepath.Join(archivedRoot, fmt.Sprintf("%s_%d", id, time.Now().Unix()))
+		config.GuardHomeWrite(srcDir)
+		config.GuardHomeWrite(dstDir)
 		if err := os.Rename(srcDir, dstDir); err != nil {
 			return err
 		}

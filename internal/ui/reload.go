@@ -129,6 +129,7 @@ func appendWatchErrorLog(path string, reloadErr error) {
 		return
 	}
 	logPath := filepath.Join(cfgDir, "watch-errors.log")
+	config.GuardHomeWrite(logPath)
 	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return
