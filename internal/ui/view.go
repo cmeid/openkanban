@@ -1818,6 +1818,11 @@ func (m *Model) renderAgentView() string {
 			duration := time.Since(*ticket.AgentSpawnedAt)
 			sessionDuration = formatDuration(duration)
 		}
+	} else if cached := pane.TicketTitle(); cached != "" {
+		// Store transiently dropped the ticket (e.g. board-resync saw the
+		// file vanish during a rename/move) but the session is live. Fall
+		// back to the pane's last-known-good title instead of bare "Agent".
+		title = cached
 	}
 
 	titleStyle := lipgloss.NewStyle().

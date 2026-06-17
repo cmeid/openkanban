@@ -232,6 +232,7 @@ func (m *Model) handleDaemonResyncMsg(msg daemonResyncMsg) (tea.Model, tea.Cmd) 
 		if info.SessionName != "" {
 			pv.SetSessionName(info.SessionName)
 		}
+		pv.SetTicketTitle(ticket.Title)
 		m.panes[ticketID] = pv
 		m.daemonOwned[ticketID] = struct{}{}
 	}
