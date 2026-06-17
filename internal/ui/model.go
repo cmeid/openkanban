@@ -1922,13 +1922,21 @@ func (m *Model) handleAgentViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// by a sibling TUI). If none qualifies we fall through to the
 			// board below — the always-available off-ramp.
 			if m.autoAttach {
-				if id, ok := m.oldestWaitingPeer(m.sessionsAttachedElsewhere()); ok {
+				// One List snapshot serves both the attached-elsewhere
+				// filter and the subsequent attach's takeover decision, so
+				// the jump does a single List, not two.
+				sessions := m.liveSessions()
+				var elsewhere map[board.TicketID]bool
+				if m.daemonClient != nil {
+					elsewhere = attachedElsewhereSet(sessions, m.daemonClient.ClientID())
+				}
+				if id, ok := m.oldestWaitingPeer(elsewhere); ok {
 					// No toast: m.notification isn't painted over the agent
 					// view, and the cycle-attach modal already shows the
 					// target's title + live content, so the jump is
 					// self-evident.
 					log.Printf("openkanban model: Auto mode jump -> %s", id)
-					return m, m.focusAndPromptAttach(id)
+					return m, m.focusAndPromptAttachSnap(id, sessions)
 				}
 			}
 			log.Printf("openkanban model: ExitFocusMsg received, mode -> ModeNormal")
@@ -3358,32 +3366,38 @@ func (m *Model) editTicket() (tea.Model, tea.Cmd) {
 //     into an unattached pane)
 //   - Update's AttachFirstMsg routing.
 func (m *Model) attachExisting(ticketID board.TicketID, pv *daemonclient.PaneView) tea.Cmd {
+	return m.attachExistingSnap(ticketID, pv, nil)
+}
+
+// attachExistingSnap is attachExisting with an optional pre-fetched session
+// list. When sessions is non-nil it is used to decide attach-vs-takeover and
+// to Refresh the pane, avoiding a redundant List — Auto mode passes the same
+// snapshot it already fetched for its attached-elsewhere filter, so the jump
+// does one List rather than two. When sessions is nil, a single List is done
+// here (the original behavior for every other caller). takeover displaces any
+// other client holding the binary stream (the desired no-prompt UX).
+func (m *Model) attachExistingSnap(ticketID board.TicketID, pv *daemonclient.PaneView, sessions []daemon.SessionInfo) tea.Cmd {
 	if pv == nil || m.daemonClient == nil {
 		return nil
 	}
-	// Decide attach vs takeover based on the most recent List snapshot.
-	// We don't List again here — the model already has the info that
-	// was attached at construction or refresh time. If another client
-	// holds the binary stream, the daemon would reject a plain Attach;
-	// Takeover unconditionally displaces them. Per the design, takeover
-	// is the desired UX (no destructive prompt).
-	takeover := false
-	if m.daemonClient != nil {
+	if sessions == nil {
 		listCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		resp, err := m.daemonClient.List(listCtx)
 		cancel()
 		if err == nil {
-			for _, s := range resp.Sessions {
-				if s.SessionID != pv.SessionID() {
-					continue
-				}
-				if s.AttachedClient != 0 && s.AttachedClient != m.daemonClient.ClientID() {
-					takeover = true
-				}
-				pv.Refresh(s)
-				break
-			}
+			sessions = resp.Sessions
 		}
+	}
+	takeover := false
+	for _, s := range sessions {
+		if s.SessionID != pv.SessionID() {
+			continue
+		}
+		if s.AttachedClient != 0 && s.AttachedClient != m.daemonClient.ClientID() {
+			takeover = true
+		}
+		pv.Refresh(s)
+		break
 	}
 	id := ticketID
 	return func() tea.Msg {
@@ -3732,6 +3746,13 @@ func (m *Model) cycleUnattachedSession(delta int) (tea.Model, tea.Cmd) {
 // pv==nil bail still sets the modal flag so the user sees the prompt with
 // the bare ticket title if the map raced out from under us.
 func (m *Model) focusAndPromptAttach(target board.TicketID) tea.Cmd {
+	return m.focusAndPromptAttachSnap(target, nil)
+}
+
+// focusAndPromptAttachSnap is focusAndPromptAttach with an optional pre-fetched
+// session list threaded into the attach (see attachExistingSnap). Auto mode
+// passes the snapshot it already Listed; cycling passes nil (List as before).
+func (m *Model) focusAndPromptAttachSnap(target board.TicketID, sessions []daemon.SessionInfo) tea.Cmd {
 	m.focusedPane = target
 	pv, ok := m.panes[target]
 	if !ok || pv == nil {
@@ -3745,7 +3766,7 @@ func (m *Model) focusAndPromptAttach(target board.TicketID) tea.Cmd {
 	// live content. Already-Attached peers already have a populated vt.
 	var attachCmd tea.Cmd
 	if pv.State() == daemonclient.PaneViewUnattached {
-		attachCmd = m.attachExisting(target, pv)
+		attachCmd = m.attachExistingSnap(target, pv, sessions)
 	}
 	return tea.Batch(attachCmd, m.maybeSetWindowTitle())
 }
@@ -3801,13 +3822,11 @@ func (m *Model) oldestWaitingPeer(attachedElsewhere map[board.TicketID]bool) (bo
 	return best, found
 }
 
-// sessionsAttachedElsewhere returns the set of tickets whose daemon session
-// is currently held by a client other than this TUI. Built from a single
-// List snapshot (1s timeout), mirroring attachExisting's takeover check.
-// Used by Auto mode to skip sibling-TUI sessions so a jump never displaces
-// another viewer. Returns nil (empty filter) when the daemon is
-// unreachable — single-TUI behavior is then unaffected.
-func (m *Model) sessionsAttachedElsewhere() map[board.TicketID]bool {
+// liveSessions returns a single daemon List snapshot (1s timeout), or nil
+// when the daemon is unreachable. Auto mode fetches it once and threads it
+// into both attachedElsewhereSet (the skip filter) and the attach
+// (attachExistingSnap), so a jump does one List rather than two.
+func (m *Model) liveSessions() []daemon.SessionInfo {
 	if m.daemonClient == nil {
 		return nil
 	}
@@ -3817,9 +3836,17 @@ func (m *Model) sessionsAttachedElsewhere() map[board.TicketID]bool {
 	if err != nil {
 		return nil
 	}
+	return resp.Sessions
+}
+
+// attachedElsewhereSet returns the set of tickets whose daemon session is held
+// by a client other than myClientID. Pure (no I/O) so it's unit-testable;
+// Auto mode uses it to skip sibling-TUI sessions so a jump never displaces
+// another viewer.
+func attachedElsewhereSet(sessions []daemon.SessionInfo, myClientID uint16) map[board.TicketID]bool {
 	out := make(map[board.TicketID]bool)
-	for _, s := range resp.Sessions {
-		if s.AttachedClient != 0 && s.AttachedClient != m.daemonClient.ClientID() {
+	for _, s := range sessions {
+		if s.AttachedClient != 0 && s.AttachedClient != myClientID {
 			out[board.TicketID(s.TicketID)] = true
 		}
 	}

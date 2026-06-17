@@ -269,3 +269,35 @@ func TestToggleAutoAttach(t *testing.T) {
 		t.Errorf("autoAttach = true after second toggle, want false")
 	}
 }
+
+// TestAttachedElsewhereSet covers the pure filter Auto mode uses to skip
+// sessions a sibling TUI holds: only sessions whose AttachedClient is set AND
+// differs from our own client ID count as "elsewhere".
+func TestAttachedElsewhereSet(t *testing.T) {
+	const me uint16 = 7
+	sessions := []daemon.SessionInfo{
+		{TicketID: "T-free", AttachedClient: 0},    // nobody attached
+		{TicketID: "T-mine", AttachedClient: me},   // this TUI
+		{TicketID: "T-other", AttachedClient: 42},  // a sibling TUI
+		{TicketID: "T-other2", AttachedClient: 99}, // another sibling
+	}
+	got := attachedElsewhereSet(sessions, me)
+
+	if len(got) != 2 {
+		t.Fatalf("len = %d, want 2 (T-other, T-other2); got %v", len(got), got)
+	}
+	for _, id := range []board.TicketID{"T-other", "T-other2"} {
+		if !got[id] {
+			t.Errorf("%q should be in the elsewhere set", id)
+		}
+	}
+	for _, id := range []board.TicketID{"T-free", "T-mine"} {
+		if got[id] {
+			t.Errorf("%q must NOT be in the elsewhere set", id)
+		}
+	}
+
+	if s := attachedElsewhereSet(nil, me); len(s) != 0 {
+		t.Errorf("nil sessions -> empty set, got %v", s)
+	}
+}
