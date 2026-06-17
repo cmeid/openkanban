@@ -350,6 +350,11 @@ func (s *Server) Serve(ctx context.Context) error {
 	// a fresh daemon from the new binary. Exits with the daemon.
 	go s.watchBinaryStaleness()
 
+	// Force-restart the daemon if dispatch is wedged (work queued but
+	// nothing completing) past the threshold so launchd/systemd can
+	// respawn it, picking up a fresh binary if one is present.
+	go s.runWedgeWatchdog()
+
 	// Diagnostic: dump every goroutine's stack on SIGUSR1 so we can
 	// inspect the daemon's runtime state without restarting it. The
 	// handler never exits the process — only the existing shutdown
@@ -477,7 +482,11 @@ func (s *Server) watchBinaryStaleness() {
 				return
 			}
 
-			log.Printf("WARN: openkanbankd binary on disk is newer than running process (%d live session(s) still attached); will exit when the last client disconnects so the next launch picks up the update", liveSessions)
+			if s.persistent {
+				log.Printf("WARN: openkanbankd binary on disk is newer than running process (%d live session(s) still attached); persistent mode will NOT auto-restart — run `openkanban daemon restart` or rely on the wedge watchdog", liveSessions)
+			} else {
+				log.Printf("WARN: openkanbankd binary on disk is newer than running process (%d live session(s) still attached); will exit when the last client disconnects so the next launch picks up the update", liveSessions)
+			}
 		}
 	}
 }
