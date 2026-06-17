@@ -41,6 +41,8 @@ Inside ModeAgentView, these keys are intercepted before the PTY child (claude, e
 
 `Ctrl+[` cannot be used: in bubbletea v1.3.x (no Kitty keyboard protocol enabled here) it is bytewise indistinguishable from `Esc`. Any new ctrl-combo binding should be verified against `~/golang/pkg/mod/github.com/charmbracelet/bubbletea@<ver>/key.go` before promising it.
 
+bubbletea also traps **SIGQUIT** (alongside SIGINT/SIGTERM) and exits cleanly through its terminal-restore path. `kill -QUIT <pid>` on a hung openkanban TUI therefore does NOT produce Go's goroutine dump. To get a stack trace from a hung TUI, send **SIGABRT** instead (`kill -ABRT`). Full hang-diagnostic recipe in `docs/AGENT_INTEGRATION.md` → "Diagnosing a hung TUI".
+
 The cycle-attach modal renders OVER the focused pane's agent view (chrome stays visible behind), via `renderAgentViewWithCycleModal`. Do not switch it back to `renderWithOverlay`, which uses a blank background and hides the state needed to make the cycle decision. `cycleUnattachedSession` auto-attaches the target peer if it's Unattached so the modal backdrop shows live PTY content (not just chrome); the cycle iterates ALL open peers, not just Unattached ones.
 
 ### Keep both doc surfaces synced
