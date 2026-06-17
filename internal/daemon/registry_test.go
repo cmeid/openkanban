@@ -3,6 +3,7 @@ package daemon
 import (
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestRegistry_StoreGetLenDelete(t *testing.T) {
@@ -84,4 +85,25 @@ func TestRegistry_ConcurrentReadsNeverBlockWrites(t *testing.T) {
 		r.delete("a")
 	}
 	wg.Wait()
+}
+
+func TestRegistry_ReaderUnaffectedByConcurrentWriter(t *testing.T) {
+	r := newSessionRegistry()
+	r.store("a", &Session{id: "a"})
+	release := make(chan struct{})
+	writing := make(chan struct{})
+	go func() {
+		close(writing)
+		<-release
+		r.store("b", &Session{id: "b"})
+	}()
+	<-writing
+	done := make(chan int, 1)
+	go func() { done <- r.len() }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("read blocked behind a pending writer")
+	}
+	close(release)
 }

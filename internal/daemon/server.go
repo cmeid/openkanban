@@ -1084,7 +1084,7 @@ func (s *Server) handleSpawn(c *clientConn, req SpawnReq) (SpawnResp, error) {
 // (i.e. the underlying child process closed its PTY). Idempotent for
 // the daemon broadcast: if handleKill already emitted "exited",
 // subscribers will see both — fine. If sess is removed from
-// s.sessions before the exit fires, we still emit so cross-instance
+// the registry before the exit fires, we still emit so cross-instance
 // observers learn the child is gone.
 //
 // The Subscribe registers a fresh subscriber dedicated to lifecycle
@@ -1293,7 +1293,7 @@ func (s *Server) handleTicketDone(c *clientConn, req TicketDoneReq) (TicketDoneR
 //
 // Sessions record their agent UUID at spawn time
 // (SpawnReq.AgentSessionUUID → Session.agentSessionUUID). We walk all
-// live sessions under sessionsMu.RLock and collect every match. The
+// live sessions via a registry snapshot and collect every match. The
 // caller distinguishes three states:
 //
 //   - len(matches) == 0: Owned=false (no caller action; either fresh
