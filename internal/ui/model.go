@@ -3545,12 +3545,15 @@ func (m *Model) performTicketCleanup(ticket *board.Ticket) {
 		}
 	}
 
-	// SessionOwned=true is the ticket's explicit claim on the session
-	// JSONL (set via `openkanban ticket new --session ... --migrate`).
-	// Link-mode sessions (SessionOwned=false) belong to the spawning
-	// agent and must survive ticket deletion. The pane.Stop above has
+	// Every ticket conceptually OWNS its session now that forking is
+	// eliminated (task/enforce-one-to-one-session). The pre-fix
+	// SessionOwned gate distinguished link-mode (don't delete JSONL on
+	// ticket-delete; the spawning agent owns it) from migrate-mode
+	// (delete JSONL since the ticket owned it). With every spawn
+	// migrate-on-resume, the ticket always owns the session; if it's
+	// being deleted, the JSONL goes with it. The pane.Stop above has
 	// already killed the writer process, so unlink is safe.
-	if ticket.SessionOwned && ticket.AgentSessionID != "" {
+	if ticket.AgentSessionID != "" {
 		path, err := agent.SessionPath(ticket.AgentSessionID)
 		switch {
 		case err == nil:
@@ -4401,10 +4404,14 @@ func buildSpawnReq(in spawnReqInputs) daemon.SpawnReq {
 				args = append(args, "-n", in.ticket.Title)
 			}
 			if in.ticket.AgentSessionID != "" && agent.SessionUUIDPattern.MatchString(in.ticket.AgentSessionID) {
+				// Always migrate-on-resume; the divergent-fork option was
+				// eliminated in task/enforce-one-to-one-session because
+				// silent divergence broke the 1:1 ticket↔session
+				// invariant the daemon enforces at the PTY layer. The
+				// grep guard at internal/ui/forksession_guard_test.go
+				// pins this invariant at build time. See
+				// [[openkanban-one-to-one-ticket-session-invariant]].
 				args = append(args, "--resume", in.ticket.AgentSessionID)
-				if !in.ticket.SessionOwned {
-					args = append(args, "--fork-session")
-				}
 			}
 			if in.promptTemplate != "" {
 				prompt := agent.BuildContextPrompt(in.promptTemplate, in.ctxData)

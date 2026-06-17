@@ -47,8 +47,11 @@ func fixtureTicket(t *testing.T) *board.Ticket {
 		AgentSpawnedAt:   ptrTime(spawned),
 		AgentPort:        4097,
 		AgentSessionID:   "sess-42",
-		SessionOwned:     true,
 		CreatedBySession: "demo-session-2026-06-13",
+		// SessionOwned intentionally absent — field removed in
+		// task/enforce-one-to-one-session. Round-trip test below also
+		// pins that an old .md with session_owned: true loads cleanly
+		// but the value drops on next write.
 		CreatedAt:       created,
 		UpdatedAt:       updated,
 		StartedAt:       ptrTime(started),

@@ -463,7 +463,10 @@ func applySessionFlags(ticket *board.Ticket, globalStore *project.GlobalTicketSt
 			}
 			return fmt.Errorf("link session %s: %w", uuid, err)
 		}
-		ticket.SessionOwned = ticketNewMigrate
+		// SessionOwned removed: every spawn is migrate-on-resume.
+		// --migrate's lsof/daemon-owns kill above is still meaningful
+		// (clears the JSONL holder), but there's no link-vs-migrate
+		// bit on the ticket anymore.
 	}
 
 	if ticketNewCreatedBy != "" {
