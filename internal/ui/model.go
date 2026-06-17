@@ -5586,35 +5586,24 @@ func (m *Model) pollAgentStatusesAsync() tea.Cmd {
 			// comments above. Keeping it here so --resume picks up the
 			// UUID on the next spawn / external-resume detection.
 			apiSessionID := p.agentSessionID
-			if apiSessionID == "" && p.agentType == "opencode" && p.worktreePath != "" {
-				if id := agent.FindOpencodeSession(p.worktreePath); id != "" {
+			if apiSessionID == "" {
+				home, _ := os.UserHomeDir()
+				// backfillAgentSession enforces the 1:1 invariant via
+				// ticketsvc.LinkSession(BestEffort). On claim conflict
+				// (UUID already held by a different ticket) the back-fill
+				// silently no-ops: returns empty, no save, no purge.
+				// See internal/ui/backfill_session.go.
+				if id := backfillAgentSession(
+					globalStore,
+					p.ticketID,
+					p.agentType,
+					p.worktreePath,
+					home,
+					agent.FindOpencodeSession,
+					agent.FindClaudeSession,
+					agent.PurgeClaudePrimingHistory,
+				); id != "" {
 					apiSessionID = id
-					if ticket, _ := globalStore.Get(p.ticketID); ticket != nil {
-						ticket.AgentSessionID = apiSessionID
-						globalStore.Save(ticket)
-					}
-				}
-			}
-			if apiSessionID == "" && p.agentType == "claude" && p.worktreePath != "" {
-				if id := agent.FindClaudeSession(p.worktreePath); id != "" {
-					apiSessionID = id
-					if ticket, _ := globalStore.Get(p.ticketID); ticket != nil {
-						ticket.AgentSessionID = apiSessionID
-						globalStore.Save(ticket)
-					}
-					// Once we know the back-filled UUID for a claude
-					// session, purge the priming-prompt entry openkanban
-					// caused claude to write into ~/.claude/history.jsonl
-					// at spawn-time. Without this the priming dominates
-					// the up-arrow input ring and hides the user's real
-					// recent prompts. This branch only fires while
-					// p.agentSessionID is still empty — i.e. before the
-					// ticket has the UUID — so the purge runs once per
-					// ticket lifecycle, not on every poll tick.
-					if home, err := os.UserHomeDir(); err == nil {
-						historyPath := filepath.Join(home, ".claude", "history.jsonl")
-						_ = agent.PurgeClaudePrimingHistory(historyPath, apiSessionID, agent.ClaudePrimingPrefixes...)
-					}
 				}
 			}
 
