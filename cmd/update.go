@@ -27,6 +27,14 @@ type UpdateStatus struct {
 	LocalSHA  string
 	RemoteSHA string
 
+	// InstalledSHA is the commit the running binary was built from
+	// (resolvedCommit), populated only in the binary-stale case where it
+	// differs from the source HEAD. Used purely for display: when the
+	// source already matches origin/main (LocalSHA == RemoteSHA) but the
+	// binary lags, showing LocalSHA on both sides of the "X -> Y" summary
+	// reads as a no-op. Empty otherwise.
+	InstalledSHA string
+
 	// Reason describes why a check was not actionable when Available
 	// is false: "up to date", "ahead", "diverged", "no source clone",
 	// "remote unreachable", etc.
@@ -45,6 +53,19 @@ type UpdateStatus struct {
 	// path still runs `go install` in this case; no `git pull` happens
 	// because the source is already correct.
 	BinaryStale bool
+}
+
+// displayFromSHA returns the SHA to show on the left of the "X -> Y"
+// update summary. In the binary-stale-only case the source is already at
+// origin/main (LocalSHA == RemoteSHA), so printing LocalSHA on both sides
+// reads as a no-op ("c3bab6 -> c3bab6"); we show the installed binary's
+// commit instead to make the staleness legible. Falls back to LocalSHA
+// whenever the installed commit is unknown or a real pull is pending.
+func (s UpdateStatus) displayFromSHA() string {
+	if s.BinaryStale && s.LocalSHA == s.RemoteSHA && s.InstalledSHA != "" {
+		return s.InstalledSHA
+	}
+	return s.LocalSHA
 }
 
 // updateCheckOnly is bound to --check on the update subcommand.
@@ -108,7 +129,7 @@ var updateCmd = &cobra.Command{
 			// Fall through into the "update available" path below.
 		}
 
-		fmt.Fprintf(cmd.OutOrStdout(), "update available: %s -> %s\n", status.LocalSHA, status.RemoteSHA)
+		fmt.Fprintf(cmd.OutOrStdout(), "update available: %s -> %s\n", status.displayFromSHA(), status.RemoteSHA)
 
 		if updateCheckOnly {
 			return nil
@@ -136,7 +157,11 @@ func runUpdate(ctx context.Context, out io.Writer, status UpdateStatus) error {
 // slow on a cold cache.
 func ApplyUpdate(ctx context.Context, status UpdateStatus, out io.Writer) error {
 	if status.BinaryStale && status.LocalSHA == status.RemoteSHA {
-		fmt.Fprintf(out, "rebuilding %s (source at %s; installed binary is older)\n", SourcePath, status.LocalSHA)
+		installed := status.InstalledSHA
+		if installed == "" {
+			installed = "older commit"
+		}
+		fmt.Fprintf(out, "rebuilding %s (source at %s; installed binary at %s is older)\n", SourcePath, status.LocalSHA, installed)
 	} else {
 		fmt.Fprintf(out, "updating %s: %s -> %s\n", SourcePath, status.LocalSHA, status.RemoteSHA)
 
@@ -161,19 +186,7 @@ func ApplyUpdate(ctx context.Context, status UpdateStatus, out io.Writer) error 
 
 	installCtx, cancelInstall := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancelInstall()
-	ldflags := fmt.Sprintf("-X github.com/techdufus/openkanban/cmd.SourcePath=%s", SourcePath)
-	// Mark the resulting binary as built via the canonical install
-	// path so its PersistentPreRunE guard lets it run. Bare
-	// `go install .` skips this flag → stub binary.
-	ldflags += " -X github.com/techdufus/openkanban/cmd.BuildMarker=official"
-	// Bake the post-pull commit so `openkanban version` reflects the
-	// rebuilt binary. Mirrors scripts/install.sh: missing commit is
-	// non-fatal — we degrade to the default "none" rather than blocking
-	// the rebuild.
-	if c, err := shortHeadSHA(installCtx, SourcePath); err == nil && c != "" {
-		ldflags += fmt.Sprintf(" -X github.com/techdufus/openkanban/cmd.Commit=%s", c)
-	}
-	install := exec.CommandContext(installCtx, "go", "install", "-ldflags", ldflags, SourcePath)
+	install := buildInstallCmd(installCtx, SourcePath)
 	install.Stdout = os.Stderr
 	install.Stderr = os.Stderr
 	if err := install.Run(); err != nil {
@@ -186,6 +199,33 @@ func ApplyUpdate(ctx context.Context, status UpdateStatus, out io.Writer) error 
 		fmt.Fprintln(out, "installed")
 	}
 	return nil
+}
+
+// buildInstallCmd constructs the `go install` command that rebuilds and
+// reinstalls openkanban from the source clone at sourcePath.
+//
+// It sets cmd.Dir = sourcePath, which is load-bearing: `go install <pkg>`
+// resolves the main module from the subprocess's working directory, NOT
+// from the package argument. openkanban is typically launched from the
+// user's home dir (or anywhere outside the module), so without Dir the
+// rebuild fails with "go.mod file not found in current directory or any
+// parent directory". This mirrors scripts/install.sh's `cd "$REPO_ROOT"`
+// before `go install`; the package target is "." for the same reason.
+//
+// ldflags bake: SourcePath (so the rebuilt binary keeps source-clone
+// awareness), BuildMarker=official (so the PersistentPreRunE guard lets
+// it run — bare `go install .` would skip this and produce a stub), and
+// best-effort Commit (so `openkanban version` reflects the rebuild; a
+// missing commit is non-fatal and degrades to the default).
+func buildInstallCmd(ctx context.Context, sourcePath string) *exec.Cmd {
+	ldflags := fmt.Sprintf("-X github.com/techdufus/openkanban/cmd.SourcePath=%s", sourcePath)
+	ldflags += " -X github.com/techdufus/openkanban/cmd.BuildMarker=official"
+	if c, err := shortHeadSHA(ctx, sourcePath); err == nil && c != "" {
+		ldflags += fmt.Sprintf(" -X github.com/techdufus/openkanban/cmd.Commit=%s", c)
+	}
+	cmd := exec.CommandContext(ctx, "go", "install", "-ldflags", ldflags, ".")
+	cmd.Dir = sourcePath
+	return cmd
 }
 
 // syncLocalMain best-effort fast-forwards the local `main` ref toward
@@ -330,11 +370,12 @@ func CheckForUpdates(ctx context.Context) (UpdateStatus, error) {
 			// Source is at origin/main but the binary lags. ApplyUpdate
 			// will skip the (no-op) pull and just rebuild.
 			return UpdateStatus{
-				Available:   true,
-				LocalSHA:    short(localSHA),
-				RemoteSHA:   short(remoteSHA),
-				BinaryStale: true,
-				Reason:      "binary behind source — needs reinstall",
+				Available:    true,
+				LocalSHA:     short(localSHA),
+				RemoteSHA:    short(remoteSHA),
+				InstalledSHA: installedShort,
+				BinaryStale:  true,
+				Reason:       "binary behind source — needs reinstall",
 			}, nil
 		}
 		return UpdateStatus{Available: false, Reason: "up to date"}, nil

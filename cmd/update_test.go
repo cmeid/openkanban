@@ -173,6 +173,77 @@ func TestUpdateCheckForUpdates_BinaryStaleSourceAtRemote(t *testing.T) {
 		t.Errorf("expected LocalSHA == RemoteSHA (source matches origin), got local=%q remote=%q",
 			status.LocalSHA, status.RemoteSHA)
 	}
+	if status.InstalledSHA != "0000000" {
+		t.Errorf("expected InstalledSHA to carry the installed commit %q, got %q", "0000000", status.InstalledSHA)
+	}
+}
+
+// TestDisplayFromSHA covers the cosmetic bug where a binary-stale update
+// (source already at origin/main, only the installed binary lagging)
+// printed "X -> X" because LocalSHA == RemoteSHA. The left side should
+// instead show the installed binary's commit so the staleness is legible.
+func TestDisplayFromSHA(t *testing.T) {
+	// Binary-stale, source == origin: show the installed commit on the left.
+	stale := UpdateStatus{
+		BinaryStale:  true,
+		LocalSHA:     "c3bab6ae9e",
+		RemoteSHA:    "c3bab6ae9e",
+		InstalledSHA: "98f3cc1",
+	}
+	if got := stale.displayFromSHA(); got != "98f3cc1" {
+		t.Errorf("binary-stale: expected installed SHA %q on the left, got %q", "98f3cc1", got)
+	}
+
+	// Normal "behind" case: a real pull is pending, show LocalSHA.
+	behind := UpdateStatus{LocalSHA: "aaaaaaaaaa", RemoteSHA: "bbbbbbbbbb"}
+	if got := behind.displayFromSHA(); got != "aaaaaaaaaa" {
+		t.Errorf("behind: expected LocalSHA %q on the left, got %q", "aaaaaaaaaa", got)
+	}
+
+	// Binary-stale but installed commit unknown: fall back to LocalSHA
+	// rather than printing an empty left side.
+	unknown := UpdateStatus{BinaryStale: true, LocalSHA: "c3bab6ae9e", RemoteSHA: "c3bab6ae9e"}
+	if got := unknown.displayFromSHA(); got != "c3bab6ae9e" {
+		t.Errorf("unknown-installed: expected LocalSHA fallback %q, got %q", "c3bab6ae9e", got)
+	}
+}
+
+// TestBuildInstallCmd_RunsInSourceDir is the regression guard for the
+// self-update blocker: `go install` resolves the module from the
+// subprocess's working directory, so the rebuild command MUST run in the
+// source clone (cmd.Dir == SourcePath). Before the fix cmd.Dir was unset,
+// so launching openkanban from ~ made the rebuild fail with "go.mod not
+// found". It must also bake the official build marker and the post-pull
+// commit into the ldflags.
+func TestBuildInstallCmd_RunsInSourceDir(t *testing.T) {
+	_, local := setupRepos(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmd := buildInstallCmd(ctx, local)
+
+	if cmd.Dir != local {
+		t.Fatalf("install must run in the source clone; cmd.Dir = %q, want %q", cmd.Dir, local)
+	}
+	if len(cmd.Args) < 3 || cmd.Args[1] != "install" {
+		t.Fatalf("expected `go install ...`, got %v", cmd.Args)
+	}
+	if last := cmd.Args[len(cmd.Args)-1]; last != "." {
+		t.Errorf("expected install target %q (relative to Dir), got %q", ".", last)
+	}
+
+	joined := strings.Join(cmd.Args, " ")
+	if !strings.Contains(joined, "cmd.SourcePath="+local) {
+		t.Errorf("expected ldflags to bake SourcePath=%q; got args %v", local, cmd.Args)
+	}
+	if !strings.Contains(joined, "cmd.BuildMarker=official") {
+		t.Errorf("expected ldflags to mark the build official; got args %v", cmd.Args)
+	}
+	head := strings.TrimSpace(runGit(t, local, "rev-parse", "--short", "HEAD"))
+	if !strings.Contains(joined, "cmd.Commit="+head) {
+		t.Errorf("expected ldflags to bake Commit=%q; got args %v", head, cmd.Args)
+	}
 }
 
 // TestUpdateCheckForUpdates_InstalledMatchesSource verifies the

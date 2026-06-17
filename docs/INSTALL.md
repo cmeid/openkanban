@@ -207,6 +207,30 @@ openkanban update
 This is the same code path used when a real upstream update is
 available; just no `git pull` happens because there's nothing to pull.
 
+### Update fails with `go: go.mod file not found ... go install: exit status 1`
+
+Symptom — the launch-time prompt or `openkanban update` prints:
+
+```
+rebuilding <repo> (source at <sha>; installed binary ... is older)
+go: go.mod file not found in current directory or any parent directory
+update check: apply update: go install: exit status 1
+```
+
+`go install` resolves the main module from the subprocess's **working
+directory**, not from the package-path argument. The rebuild therefore
+must run *inside* the source clone (the command sets `cmd.Dir` to
+`SourcePath`, mirroring `scripts/install.sh`'s `cd "$REPO_ROOT"`). A
+binary built before that fix runs the rebuild from wherever you launched
+`openkanban` (commonly `~`), where there is no `go.mod`, so it fails.
+
+Recovery is a one-time manual reinstall to pick up the fixed binary; it
+self-heals from then on:
+
+```bash
+cd <source-clone> && ./scripts/install.sh
+```
+
 ### `openkanban version` shows `build: STUB`
 
 Your binary was built without the canonical install ldflags (most
