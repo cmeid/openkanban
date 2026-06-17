@@ -38,7 +38,7 @@ func (m *WorktreeManager) CreateWorktree(branchName, baseBranch string) (string,
 
 	if _, err := os.Stat(worktreePath); err == nil {
 		if m.isValidWorktree(worktreePath) {
-			branch, err := m.branchForWorktree(worktreePath)
+			branch, err := m.BranchForWorktree(worktreePath)
 			if err != nil {
 				return "", err
 			}
@@ -79,7 +79,7 @@ func (m *WorktreeManager) isValidWorktree(path string) bool {
 	return !info.IsDir()
 }
 
-// branchForWorktree returns the branch checked out at the given worktree path,
+// BranchForWorktree returns the branch checked out at the given worktree path,
 // as reported by `git worktree list --porcelain`. The returned name has the
 // refs/heads/ prefix stripped so callers can compare against the user-facing
 // branch name directly.
@@ -87,7 +87,7 @@ func (m *WorktreeManager) isValidWorktree(path string) bool {
 // Paths are compared after symlink resolution because git canonicalizes the
 // paths it stores (on macOS, `/var/...` becomes `/private/var/...`), and a
 // naive string compare would miss the same on-disk location.
-func (m *WorktreeManager) branchForWorktree(path string) (string, error) {
+func (m *WorktreeManager) BranchForWorktree(path string) (string, error) {
 	worktrees, err := m.ListWorktrees()
 	if err != nil {
 		return "", err
@@ -203,6 +203,28 @@ func (m *WorktreeManager) DeleteBranch(branchName string) error {
 	}
 
 	return nil
+}
+
+// DeleteMergedBranch deletes branchName only if git considers it fully
+// merged (`git branch -d`, which refuses an unmerged branch). It returns
+// (true, nil) when the branch was deleted, (false, nil) when git declined
+// because the branch has unmerged commits, and (false, err) on any other
+// failure. Use this — not DeleteBranch — for branches openkanban did not
+// itself create (e.g. a divergent branch a worktree was switched to),
+// where force-deleting could silently discard real work.
+func (m *WorktreeManager) DeleteMergedBranch(branchName string) (deleted bool, err error) {
+	cmd := exec.Command("git", "branch", "-d", branchName)
+	cmd.Dir = m.repoPath
+
+	if output, err := cmd.CombinedOutput(); err != nil {
+		out := string(output)
+		if strings.Contains(out, "not fully merged") {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to delete branch: %s: %w", out, err)
+	}
+
+	return true, nil
 }
 
 func (m *WorktreeManager) BranchExists(branchName string) bool {
