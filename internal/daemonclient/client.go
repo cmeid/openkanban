@@ -63,6 +63,20 @@ type Client struct {
 	closeCh chan struct{}
 
 	readLoopWG sync.WaitGroup
+
+	// pushCount / dropCount are diagnostic counters: total SessionEvents
+	// received from the daemon, and total dropped because a subscriber's
+	// buffer was full. Read by the TUI stall watchdog to distinguish a
+	// starved main loop (pushes arriving, Update not running) from
+	// genuine idle. See internal/ui/stallwatch.go.
+	pushCount atomic.Uint64
+	dropCount atomic.Uint64
+}
+
+// DiagCounters returns the cumulative (received, dropped) SessionEvent
+// counts. Used by the TUI stall watchdog; safe to call concurrently.
+func (c *Client) DiagCounters() (push, drop uint64) {
+	return c.pushCount.Load(), c.dropCount.Load()
 }
 
 // rawResp is what the read loop hands to a waiting RPC: the type name
@@ -321,6 +335,7 @@ func (c *Client) handlePush(payload []byte) {
 		log.Printf("openkanban client: handlePush unmarshal err: %v", err)
 		return
 	}
+	c.pushCount.Add(1)
 
 	c.subscribersMu.Lock()
 	subs := make([]chan<- daemon.SessionEvent, 0, len(c.subscribers))
@@ -334,6 +349,7 @@ func (c *Client) handlePush(payload []byte) {
 		select {
 		case ch <- ev:
 		default:
+			c.dropCount.Add(1)
 			log.Printf("openkanban client: handlePush dropped event %q (subscriber buffer full)", ev.Event)
 		}
 	}
