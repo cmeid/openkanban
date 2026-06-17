@@ -420,6 +420,58 @@ func TestRenderAgentViewWithCycleModal_StacksModalOverAgentView(t *testing.T) {
 	}
 }
 
+func TestRenderAgentView_FallsBackToCachedTitleWhenTicketMissing(t *testing.T) {
+	t.Setenv("OPENKANBAN_CONFIG_DIR", t.TempDir())
+
+	// Simulate the divergence bug: the in-memory store has transiently
+	// dropped the ticket (it is NOT added below), but the daemon session
+	// — and thus the pane — is still live and focused. Without the
+	// fallback the header would render the bare "Agent" default; with it,
+	// the pane's last-known-good ticket title is used.
+	proj := &project.Project{ID: "test-proj", Name: "TestProj", RepoPath: t.TempDir()}
+	globalStore := project.NewGlobalTicketStore(nil)
+	globalStore.AddProject(proj)
+	// Deliberately do NOT globalStore.Add(...) — Get(focusedPane) returns nil.
+
+	const cachedTitle = "enrich the counts" // distinctive; contains no "Agent"
+	pv := daemonclient.NewPaneView(nil, "T-orphan", "sid-orphan", nil)
+	pv.SetTicketTitle(cachedTitle)
+
+	sp := spinner.New()
+	sp.Spinner = spinner.Dot
+
+	m := &Model{
+		globalStore:   globalStore,
+		panes:         map[board.TicketID]*daemonclient.PaneView{"T-orphan": pv},
+		daemonViewing: map[board.TicketID]int{},
+		columns:       board.DefaultColumns(),
+		columnTickets: [][]*board.Ticket{{}, {}, {}, {}},
+		columnOffsets: []int{0, 0, 0, 0},
+		spinner:       sp,
+		width:         120,
+		height:        40,
+		mode:          ModeAgentView,
+		focusedPane:   "T-orphan",
+		config:        &config.Config{Agents: map[string]config.AgentConfig{}},
+		colors:        newUIColors(config.DefaultConfig().GetTheme()),
+	}
+
+	got := m.View()
+
+	// Primary (red/green) assertion: the distinctive cached title is the
+	// only place this string can come from. With the fallback reverted,
+	// title stays "Agent" and this fails.
+	if !strings.Contains(got, cachedTitle) {
+		t.Errorf("View() missing cached title %q; header degraded instead of falling back. got:\n%s", cachedTitle, got)
+	}
+	// Secondary: the bare default must not leak. In the ticket==nil path
+	// the agentType badge is suppressed, so "Agent" can only come from the
+	// title default, and a blank unattached pane renders no stray "Agent".
+	if strings.Contains(got, "Agent") {
+		t.Errorf("View() rendered the bare \"Agent\" default despite a cached title; got:\n%s", got)
+	}
+}
+
 func TestHandleCycleAttachPromptKey_CycleAdvances(t *testing.T) {
 	// Inside the modal, Ctrl+] continues the cycle without dropping the
 	// modal — the user can walk all peers in sequence and then commit

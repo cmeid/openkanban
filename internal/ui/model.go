@@ -573,6 +573,7 @@ func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projec
 			if info.SessionName != "" {
 				pv.SetSessionName(info.SessionName)
 			}
+			pv.SetTicketTitle(ticket.Title)
 			m.panes[ticket.ID] = pv
 			// Best-effort status read from the existing on-disk marker.
 			// PR9 will replace this with push events.
@@ -4105,6 +4106,9 @@ func (m *Model) spawnAgent() (tea.Model, tea.Cmd) {
 	}
 
 	if existing, exists := m.panes[ticket.ID]; exists {
+		// Refresh the pane's cached title on every re-focus so a later
+		// store drop still has a current title to fall back to.
+		existing.SetTicketTitle(ticket.Title)
 		switch existing.State() {
 		case daemonclient.PaneViewAttached:
 			// Already attached in this TUI — just switch to its view.
@@ -4620,6 +4624,7 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 					ticketID,
 					ownsResp.SessionID,
 					resolvedName,
+					ticket.Title,
 					worktreePath,
 					branchName,
 					baseBranch,
@@ -4826,6 +4831,7 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 		pv := daemonclient.NewPaneView(daemonClient, string(ticketID), resp.SessionID, nil)
 		pv.SetWorkdir(worktreePath)
 		pv.SetSessionName(sessionName)
+		pv.SetTicketTitle(ticket.Title)
 		pv.SetSize(width, height)
 
 		// B7: retry attach after spawn with backoff. The daemon-side
@@ -4969,6 +4975,7 @@ func attachExistingFastPath(
 	ticketID board.TicketID,
 	sessionID string,
 	sessionName string,
+	ticketTitle string,
 	worktreePath string,
 	branchName string,
 	baseBranch string,
@@ -4979,6 +4986,7 @@ func attachExistingFastPath(
 	pv := daemonclient.NewPaneView(daemonClient, string(ticketID), sessionID, nil)
 	pv.SetWorkdir(worktreePath)
 	pv.SetSessionName(sessionName)
+	pv.SetTicketTitle(ticketTitle)
 	pv.SetSize(width, height)
 
 	attachErr := attachWithRetry(pv)
