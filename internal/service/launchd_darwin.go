@@ -85,6 +85,26 @@ const plistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 </plist>
 `
 
+// PlistInstalled reports whether the LaunchAgent plist file exists on
+// disk. A true result does not mean the service is loaded by launchd —
+// use Status() for that. The distinction matters for the supervision
+// warning: a plist on disk means Install was run and the user expects
+// launchd to manage the daemon, so a tui-forked daemon is surprising.
+func PlistInstalled() (bool, error) {
+	p, err := PlistPath()
+	if err != nil {
+		return false, err
+	}
+	_, statErr := os.Stat(p)
+	if statErr == nil {
+		return true, nil
+	}
+	if os.IsNotExist(statErr) {
+		return false, nil
+	}
+	return false, statErr
+}
+
 // PlistPath returns the absolute path to the LaunchAgent plist that
 // would be created by Install.
 func PlistPath() (string, error) {
