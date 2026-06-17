@@ -141,7 +141,7 @@ state at a glance; the rest of the screen is the agent's terminal.
 | ⏱ Duration           | `time.Since(AgentSpawnedAt)` | Session age. Suppressed when status is `done` (pill carries it).   |
 | `[n/m]` pane indicator | `Running()` panes          | Position of the focused pane among all running panes.              |
 | Scroll indicator     | `pane.ViewportOffset()`      | `↑offset/total` in warning color when scrolled back.               |
-| `Ctrl+g Board`       | Static                       | The only key intercepted by `handleAgentViewMode` — exits the view.|
+| `Ctrl+g` hint        | `m.autoAttach`               | Reads `Ctrl+g board` normally, or `next waiter (Auto)` when Auto mode is on (toggle: board `a`). Ctrl+g leaves the session — to the board, or the oldest waiting session under Auto. Not the only intercepted key: `Ctrl+]`/`Ctrl+\` cycle sessions; Enter retries a failed attach.|
 
 ### Time Semantics
 
@@ -350,32 +350,45 @@ Selected:                    Error state:                  High priority:
 ### Help Modal
 
 ```
-┌─ Keyboard Shortcuts ────────────────────────────────────────────────────────┐
+┌─ Keyboard Shortcuts ─────────────────────────────────────────────────────────┐
 │                                                                              │
-│  Navigation                      Actions                                    │
-│  ──────────────────────────────  ────────────────────────────────────────  │
-│  h/l      Move between columns   n         New ticket                       │
-│  j/k      Move between tickets   Enter     Attach to agent session          │
-│  g        Go to first ticket     e         Edit ticket                      │
-│  G        Go to last ticket      d         Delete ticket (with confirm)     │
-│  1-9      Jump to column N       m         Move ticket (then h/l)           │
-│                                  Space     Quick move to next column        │
-│  Views                                                                      │
-│  ──────────────────────────────  Agent                                      │
-│  Tab      Cycle focus            ────────────────────────────────────────   │
-│  /        Search/filter          s         Spawn/restart agent              │
-│  Esc      Clear filter/cancel    S         Stop agent                       │
-│  ?        Toggle help            r         Refresh agent status             │
-│  q        Quit                   a         Change agent type                │
+│  Navigation                      Actions                                     │
+│  ──────────────────────────────  ──────────────────────────────              │
+│  h/l    Move between columns     n           New ticket                      │
+│  j/k    Move between tickets     e           Edit ticket                     │
+│  g/G    First / last ticket      d           Delete ticket (confirm)         │
+│                                  Space       Move forward                    │
+│                                  -/Bksp      Move backward                   │
+│                                  K/J         Raise / lower priority          │
 │                                                                              │
-│  Command Mode                    Git                                        │
-│  ──────────────────────────────  ────────────────────────────────────────   │
-│  :        Enter command mode     p         Create PR from ticket            │
-│  :w       Save board             b         Show git branch                  │
-│  :q       Quit                   c         Show recent commits              │
-│  :board   Switch board                                                      │
+│  Sidebar                         Agent                                       │
+│  ──────────────────────────────  ──────────────────────────────              │
+│  [      Toggle sidebar           s/Enter     Open agent                      │
+│  Tab    Focus sidebar            S           Stop agent                      │
+│  h/l    Enter / exit sidebar     Ctrl+g      Exit (Auto: jump)               │
+│  j/k    Navigate projects        Ctrl+]/\    Next / prev session             │
+│  a      Add project              C-Space     Promote + bg agent              │
+│  d      Delete project                                                       │
+│  o      Toggle open only                                                     │
 │                                                                              │
-│                                                      Press any key to close │
+│  View                            System                                      │
+│  ──────────────────────────────  ──────────────────────────────              │
+│  /      Search / filter          O           Settings                        │
+│  o      Cycle sort order         ?           Toggle help                     │
+│  w      Toggle session filter    Esc         Cancel / back                   │
+│  W      Show working (all proj)  Ctrl+R      Restart (binary updated)        │
+│  a      Auto mode: Ctrl+g jumps  q           Quit                            │
+│         to oldest waiting sess.                                              │
+│                                                                              │
+│  Ticket form                     Settings & dialogs                          │
+│  ──────────────────────────────  ──────────────────────────────              │
+│  Tab    Next field               j/k         Navigate items                  │
+│  S-Tab  Previous field           Ent/Spc     Edit / toggle                   │
+│  Ctrl+S Save                     Esc/q       Close                           │
+│  1-5    Set priority             y/n         Confirm dialog                  │
+│  Esc    Cancel form                                                          │
+│                                                                              │
+│                                                      Press any key to close  │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
