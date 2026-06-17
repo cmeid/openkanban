@@ -22,6 +22,21 @@ type daemonSessionEventMsg struct {
 	Event daemon.SessionEvent
 }
 
+// daemonSessionEventsMsg carries a BURST of SessionEvents drained from
+// the subscribe channel in a single read. The daemon's broadcastActivity
+// emits one "activity" heartbeat per actively-working session every 2s,
+// so with N live sessions a tick delivers N events near-simultaneously.
+// Coalescing them into one message means the Update loop applies the
+// whole burst in a SINGLE Update/render cycle instead of N — bubbletea
+// renders once per Update return, and a full board render is the
+// expensive part (see [[reference_openkanban_tui_stall_watchdog]] — this
+// O(N-agents) render churn is what the stall watchdog surfaced). Order
+// is preserved (drained in receive order), so events with relative
+// semantics (e.g. viewing→unviewing) still apply correctly.
+type daemonSessionEventsMsg struct {
+	Events []daemon.SessionEvent
+}
+
 // daemonSubscribeFailedMsg is returned by the subscribe tea.Cmd when
 // the initial daemonclient.Subscribe call fails (e.g. the daemon has
 // gone away between New() and Init()). The model logs and stops
@@ -62,8 +77,14 @@ func subscribeDaemonEvents(client *daemonclient.Client) (<-chan daemon.SessionEv
 }
 
 // readNextDaemonEvent returns a tea.Cmd that blocks on the next read
-// from ch. The model's Update re-arms the listener after every
-// daemonSessionEventMsg so events keep flowing.
+// from ch, then non-blockingly DRAINS any already-queued events so a
+// burst is delivered as one daemonSessionEventsMsg. The model's Update
+// re-arms the listener after every batch so events keep flowing.
+//
+// Coalescing matters because the daemon emits one "activity" heartbeat
+// per live session every 2s; without draining, N sessions cost N
+// Update/render cycles per tick. The drain is bounded by the subscribe
+// channel buffer (cap 64).
 func readNextDaemonEvent(ch <-chan daemon.SessionEvent) tea.Cmd {
 	if ch == nil {
 		log.Printf("openkanban model: readNextDaemonEvent invoked with nil channel")
@@ -76,8 +97,24 @@ func readNextDaemonEvent(ch <-chan daemon.SessionEvent) tea.Cmd {
 			log.Printf("openkanban model: readNextDaemonEvent channel closed")
 			return daemonSubscribeEndedMsg{}
 		}
-		log.Printf("openkanban model: readNextDaemonEvent got event=%q session=%s", ev.Event, ev.SessionID)
-		return daemonSessionEventMsg{Event: ev}
+		evs := []daemon.SessionEvent{ev}
+	drain:
+		for {
+			select {
+			case e, ok := <-ch:
+				if !ok {
+					// Channel closed mid-drain: deliver what we have; the
+					// re-arm read will observe the close and end the loop.
+					break drain
+				}
+				evs = append(evs, e)
+			default:
+				break drain
+			}
+		}
+		log.Printf("openkanban model: readNextDaemonEvent got %d event(s); first=%q session=%s",
+			len(evs), evs[0].Event, evs[0].SessionID)
+		return daemonSessionEventsMsg{Events: evs}
 	}
 }
 
@@ -90,9 +127,28 @@ type daemonSubscribeErr string
 
 func (e daemonSubscribeErr) Error() string { return string(e) }
 
-// handleDaemonSessionEvent applies one daemon-pushed SessionEvent to
-// the model. Returns a tea.Cmd that re-arms the listener so further
-// events flow.
+// handleDaemonSessionEvents applies a coalesced burst of events in a
+// single Update cycle, then re-arms the listener once. This is the live
+// dispatch path (see daemonSessionEventsMsg). bubbletea renders once per
+// Update return, so a burst of N "activity" heartbeats costs one render,
+// not N.
+func (m *Model) handleDaemonSessionEvents(msg daemonSessionEventsMsg) (tea.Model, tea.Cmd) {
+	for i := range msg.Events {
+		m.applyDaemonSessionEvent(msg.Events[i])
+	}
+	return m, readNextDaemonEvent(m.daemonEvents)
+}
+
+// handleDaemonSessionEvent applies a single event and re-arms. Retained
+// for the single-event call path exercised by tests.
+func (m *Model) handleDaemonSessionEvent(msg daemonSessionEventMsg) (tea.Model, tea.Cmd) {
+	m.applyDaemonSessionEvent(msg.Event)
+	return m, readNextDaemonEvent(m.daemonEvents)
+}
+
+// applyDaemonSessionEvent applies one daemon-pushed SessionEvent to the
+// model. It does NOT re-arm the listener — the caller re-arms once per
+// batch.
 //
 // The mapping is intentionally minimal:
 //
@@ -118,8 +174,7 @@ func (e daemonSubscribeErr) Error() string { return string(e) }
 // authoritatively trump the status-file poll while the daemon
 // subscription is live. The poll handler (agentStatusResultMsg) honors
 // daemonConnected.Load() so it doesn't clobber what we just wrote.
-func (m *Model) handleDaemonSessionEvent(msg daemonSessionEventMsg) (tea.Model, tea.Cmd) {
-	ev := msg.Event
+func (m *Model) applyDaemonSessionEvent(ev daemon.SessionEvent) {
 	ticketID := board.TicketID(ev.TicketID)
 
 	log.Printf("openkanban model: handleDaemonSessionEvent event=%q session=%s ticket=%s expected=%v",
@@ -224,9 +279,6 @@ func (m *Model) handleDaemonSessionEvent(msg daemonSessionEventMsg) (tea.Model, 
 			}
 		}
 	}
-
-	// Re-arm the listener so we keep draining the channel.
-	return m, readNextDaemonEvent(m.daemonEvents)
 }
 
 // handleDaemonSubscribeFailed records a subscribe failure. We log and

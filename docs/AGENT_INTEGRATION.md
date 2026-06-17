@@ -951,11 +951,11 @@ wc -l /tmp/fsusage.txt
 tail -100 ~/.cache/openkanban/tui.log
 ```
 
-The TUI logs each daemon event twice: once when the Cmd goroutine receives it, once when Update handles it:
+The TUI logs daemon events twice: once when the Cmd goroutine receives a batch (events are coalesced — one read drains a whole burst), once per event when Update applies it:
 
 ```
-<ts> openkanban model: readNextDaemonEvent got event="X" session=...
-<ts> openkanban model: handleDaemonSessionEvent event="X" ...
+<ts> openkanban model: readNextDaemonEvent got N event(s); first="X" session=...
+<ts> openkanban model: handleDaemonSessionEvent event="X" ...   (one per event in the batch)
 ```
 
 A gap **between** the two lines means bubbletea's Update goroutine was blocked processing some *other* Msg — the event is sitting in the Msg queue waiting for its turn. The handler is innocent.
