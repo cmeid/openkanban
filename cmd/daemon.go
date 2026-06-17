@@ -658,7 +658,9 @@ func mapDaemonErr(err error) error {
 		// No fixed duration in the message: the deadline that fired varies
 		// by RPC (rpcTimeout for the fast ones, a larger grace-scaled
 		// budget for shutdown/kill/ticket_done), so naming one would lie.
-		return errors.New("openkanbankd is unresponsive — try: openkanban daemon restart")
+		// UnresponsiveHint names the daemon PID + kill command when the
+		// pidfile points at a live process.
+		return errors.New(daemon.UnresponsiveHint())
 	}
 	return err
 }
