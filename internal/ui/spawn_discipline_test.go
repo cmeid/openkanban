@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -776,6 +777,140 @@ func TestSpawnErrorMsg_DuringSpawningStillClearsState(t *testing.T) {
 	}
 	if got.notification != errMsg.err {
 		t.Errorf("notification = %q, want %q", got.notification, errMsg.err)
+	}
+}
+
+// TestPrepareSpawnWith_GateRefusesForeignHeldUUID pins the 1:1
+// invariant gate at spawn: when ticket A's AgentSessionID is held by
+// the daemon for ticket B (not for ticket A), prepareSpawnWith MUST
+// refuse with a spawnErrorMsg naming the holder. Spawn must NOT be
+// called — the daemon-side session belongs to a different ticket and
+// proceeding would either silently fork or stomp ticket B's PTY.
+//
+// Mechanics:
+//   - Ticket "T-A" carries AgentSessionID = wantUUID.
+//   - Daemon stub reports Owned=true with OwnedByTicketID="T-B".
+//   - prepareSpawnWith → cmd() → must return spawnErrorMsg whose `err`
+//     names the foreign owner; Spawn count stays zero.
+func TestPrepareSpawnWith_GateRefusesForeignHeldUUID(t *testing.T) {
+	t.Setenv("OPENKANBAN_CONFIG_DIR", t.TempDir())
+	t.Setenv("HOME", t.TempDir()) // isolate from real ~/.claude/projects
+
+	proj := &project.Project{ID: "test", RepoPath: t.TempDir()}
+	globalStore := project.NewGlobalTicketStore(nil)
+	globalStore.AddProject(proj)
+
+	const wantUUID = "abcdef01-2345-6789-abcd-ef0123456789"
+	const foreignTicketID = "T-B"
+	ticket := &board.Ticket{
+		ID:             "T-A",
+		Title:          "foreign-held session",
+		ProjectID:      proj.ID,
+		Status:         board.StatusInProgress,
+		AgentSessionID: wantUUID,
+	}
+	if err := globalStore.Add(ticket); err != nil {
+		t.Fatalf("Add ticket: %v", err)
+	}
+
+	stub := &spawnDisciplineStubAPI{
+		ownsResp: daemon.OwnsResp{
+			Owned:           true,
+			SessionID:       "sid-belongs-to-T-B",
+			OwnedByTicketID: foreignTicketID,
+		},
+	}
+
+	m := &Model{
+		globalStore:  globalStore,
+		daemon:       stub,
+		panes:        map[board.TicketID]*daemonclient.PaneView{},
+		daemonClient: nil,
+		width:        120,
+		height:       40,
+		config:       &config.Config{Behavior: config.BehaviorSettings{}, Agents: map[string]config.AgentConfig{}},
+		worktreeMgrs: nil,
+	}
+
+	cmd := m.prepareSpawnWith(ticket, proj, config.AgentConfig{Command: "claude"}, spawnPlan{})
+	if cmd == nil {
+		t.Fatal("prepareSpawnWith returned nil cmd")
+	}
+	msg := cmd()
+
+	if got := stub.spawnCalls.Load(); got != 0 {
+		t.Errorf("Spawn calls = %d, want 0 (gate must refuse before Spawn)", got)
+	}
+	errMsg, ok := msg.(spawnErrorMsg)
+	if !ok {
+		t.Fatalf("msg type = %T, want spawnErrorMsg; msg = %#v", msg, msg)
+	}
+	if !strings.Contains(errMsg.err, "session in use") {
+		t.Errorf("err = %q, want substring \"session in use\"", errMsg.err)
+	}
+	if !strings.Contains(errMsg.err, foreignTicketID) {
+		t.Errorf("err = %q, want substring %q (foreign-holder identification)", errMsg.err, foreignTicketID)
+	}
+}
+
+// TestPrepareSpawnWith_GateRefusesConflict pins the multi-match path:
+// daemon Owns returns Conflict=true (1:1 invariant fractured upstream
+// with two daemon sessions claiming the same UUID). prepareSpawnWith
+// MUST refuse rather than pick one match arbitrarily — even if the
+// daemon's first-match happens to be ours.
+func TestPrepareSpawnWith_GateRefusesConflict(t *testing.T) {
+	t.Setenv("OPENKANBAN_CONFIG_DIR", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+
+	proj := &project.Project{ID: "test", RepoPath: t.TempDir()}
+	globalStore := project.NewGlobalTicketStore(nil)
+	globalStore.AddProject(proj)
+
+	const wantUUID = "fedcba98-7654-3210-fedc-ba9876543210"
+	ticket := &board.Ticket{
+		ID:             "T-CONF",
+		Title:          "conflict refuse",
+		ProjectID:      proj.ID,
+		Status:         board.StatusInProgress,
+		AgentSessionID: wantUUID,
+	}
+	if err := globalStore.Add(ticket); err != nil {
+		t.Fatalf("Add ticket: %v", err)
+	}
+
+	stub := &spawnDisciplineStubAPI{
+		ownsResp: daemon.OwnsResp{
+			Owned:              true,
+			SessionID:          "sid-first",
+			OwnedByTicketID:    "T-CONF",
+			Conflict:           true,
+			ConflictSessionIDs: []string{"sid-first", "sid-second"},
+		},
+	}
+
+	m := &Model{
+		globalStore:  globalStore,
+		daemon:       stub,
+		panes:        map[board.TicketID]*daemonclient.PaneView{},
+		daemonClient: nil,
+		width:        120,
+		height:       40,
+		config:       &config.Config{Behavior: config.BehaviorSettings{}, Agents: map[string]config.AgentConfig{}},
+		worktreeMgrs: nil,
+	}
+
+	cmd := m.prepareSpawnWith(ticket, proj, config.AgentConfig{Command: "claude"}, spawnPlan{})
+	msg := cmd()
+
+	if got := stub.spawnCalls.Load(); got != 0 {
+		t.Errorf("Spawn calls = %d, want 0 (conflict must refuse before Spawn)", got)
+	}
+	errMsg, ok := msg.(spawnErrorMsg)
+	if !ok {
+		t.Fatalf("msg type = %T, want spawnErrorMsg", msg)
+	}
+	if !strings.Contains(errMsg.err, "1:1 invariant fractured") {
+		t.Errorf("err = %q, want substring \"1:1 invariant fractured\"", errMsg.err)
 	}
 }
 
