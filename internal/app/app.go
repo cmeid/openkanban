@@ -31,9 +31,14 @@ import (
 //     forks the daemon on dial failure.
 //   - false: call daemonclient.NewNoAutostart, which dials only.
 //     Used when openkanbankd is managed by launchd / systemd, or
-//     when the user passed --no-launch-daemon. Either way the
-//     daemon-connect failure path is the same: TUI degrades to
-//     "no spawn, no daemon-owned panes" rather than aborting.
+//     when the user passed --no-launch-daemon.
+//
+// If the daemon can't be reached — dial failure, version skew, or a
+// bounded preflight List that times out against a wedged daemon — Run
+// prints an actionable PID+kill/restart hint and returns an error
+// (clean exit) rather than launching a daemon-less board. A board with
+// no daemon can't spawn or attach, and proceeding once risked hanging
+// startup on a later unbounded RPC.
 func Run(cfg *config.Config, filterPath, version string, autostartDaemon bool) error {
 	// MUST be the first statement: project.LoadGlobalTicketStore below
 	// fans out to ~11 log.Printf sites in internal/project/{tickets,
@@ -100,16 +105,31 @@ func Run(cfg *config.Config, filterPath, version string, autostartDaemon bool) e
 	}
 	daemonCancel()
 	if daemonErr != nil {
+		// Can't reach a working daemon. Don't launch a daemon-less board
+		// (no spawn, no attach), and don't risk a later unbounded RPC
+		// hanging startup — tell the user how to recover, then exit.
 		if errors.Is(daemonErr, daemonclient.ErrProtocolVersionSkew) {
-			fmt.Fprintln(os.Stderr, "openkanban: daemon version skew detected — run `openkanban daemon restart` to refresh; running in degraded mode without the daemon.")
+			fmt.Fprintln(os.Stderr, "openkanban: daemon version skew detected — run `openkanban daemon restart` to refresh.")
 		} else {
-			fmt.Fprintf(os.Stderr, "openkanban: daemon unavailable, agents cannot be spawned: %v (see `openkanban daemon status`)\n", daemonErr)
+			fmt.Fprintln(os.Stderr, daemon.UnresponsiveHint())
 		}
-		daemonClient = nil
+		return errors.New("openkanbankd unavailable")
+	}
+
+	// Preflight: a wedged daemon passes the dial + hello above but stalls
+	// on real RPCs. Probe with a bounded List BEFORE building the TUI so a
+	// wedge is caught here (message + exit) rather than hanging startup on
+	// a later unbounded call. On success the snapshot seeds NewModel — the
+	// only startup daemon RPC, now gated and bounded.
+	ownedByDaemon, perr := ui.PreflightListSessions(daemonClient)
+	if perr != nil {
+		fmt.Fprintln(os.Stderr, daemon.UnresponsiveHint())
+		_ = daemonClient.Close()
+		return errors.New("openkanbankd unresponsive")
 	}
 
 	updateChecker := update.NewChecker(version)
-	model := ui.NewModel(cfg, globalStore, registry, agentMgr, opencodeServer, filterProjectID, updateChecker, daemonClient)
+	model := ui.NewModel(cfg, globalStore, registry, agentMgr, opencodeServer, filterProjectID, updateChecker, ownedByDaemon, daemonClient)
 
 	// Arm the diagnostic stall watchdog for the real TUI (Cleanup stops
 	// it). Captures a goroutine dump if the Update/View loop freezes.

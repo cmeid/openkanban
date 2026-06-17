@@ -21,24 +21,28 @@ import (
 const daemonResyncInterval = 30 * time.Second
 
 // startupReconcileAttempts is the number of List attempts the startup
-// reconcile makes before giving up. Three attempts at a 10s timeout
-// with linear backoff give roughly 30s of headroom for a
-// slow-autostarting daemon (cold-start TUI on a host where
-// openkanbankd is launched by the same TUI invocation).
-const startupReconcileAttempts = 3
+// PREFLIGHT (PreflightListSessions, called from internal/app before the
+// TUI is built) makes before giving up. The preflight gates launch: on
+// success its snapshot seeds NewModel; on exhaustion the caller prints a
+// PID+kill hint and EXITS rather than launching a daemon-less board. That
+// exit consequence is why the budget is kept short (fast-fail a wedged
+// daemon) but not a single shot (tolerate a transiently-slow one) — the
+// dial has already waited for the daemon to come up, so a healthy daemon
+// answers the first List almost immediately.
+const startupReconcileAttempts = 2
 
 // startupReconcileTimeout is the per-attempt context timeout for the
-// List RPC. Raised from the original 2s after evidence that 2s was
-// tight enough to miss a daemon under load — the consequence (every
-// session invisible to this TUI) was disproportionate to the cost of
-// waiting longer.
-const startupReconcileTimeout = 10 * time.Second
+// preflight List RPC. Shortened from the old 10s reconcile budget: the
+// old code DEGRADED on timeout (sessions merely invisible), so a generous
+// wait was cheap; the preflight EXITS, so a wedged daemon must surface
+// fast. 3s is long enough that a healthy-but-loaded daemon answers, short
+// enough that a wedge is reported in a handful of seconds, not minutes.
+const startupReconcileTimeout = 3 * time.Second
 
-// startupReconcileBackoff is the linear backoff between failed List
-// attempts during startup. Linear (not exponential) because the
-// failure mode we're absorbing is "daemon is busy / slow" which
-// resolves on its own timescale; exponential would just push the
-// failure-surface to the user with more delay.
+// startupReconcileBackoff is the linear backoff between failed preflight
+// List attempts. Linear (not exponential) because the failure mode we're
+// absorbing is "daemon is briefly busy" which resolves on its own
+// timescale; exponential would just delay the message-and-exit.
 const startupReconcileBackoff = 500 * time.Millisecond
 
 // startupSubscribeTimeout bounds the daemon Subscribe handshake, which is
@@ -60,13 +64,6 @@ const startupSubscribeTimeout = 5 * time.Second
 // goroutine blocked for a third of the tick interval before re-arming.
 const daemonResyncRPCTimeout = 3 * time.Second
 
-// startupReconcileFailureMsg is the toast the user sees when every
-// retry failed. It points at "restart openkanban" because the rest of
-// the TUI is going to behave as if no sessions are owned by the
-// daemon (no Unattached panes will appear in m.panes), which is
-// silently wrong — better to surface the inconsistency.
-const startupReconcileFailureMsg = "Daemon reconcile failed; restart openkanban to re-sync"
-
 // daemonResyncTickMsg fires when the 30s resync timer expires. The
 // Update handler turns it into an actual List RPC via a tea.Cmd so
 // the network call doesn't block the Update goroutine.
@@ -83,9 +80,9 @@ type daemonResyncMsg struct {
 // listSessionsWithRetry calls api.List up to attempts times, with a
 // linear backoff between failures. Returns the per-TicketID map on
 // success or the last error on exhaustion. The per-attempt context
-// timeout is bounded by timeout; the outer call is synchronous —
-// designed to be invoked from NewModel where blocking briefly at
-// startup is preferable to an empty-pane window.
+// timeout is bounded by timeout; the call is synchronous — invoked from
+// the startup preflight (PreflightListSessions) where a brief bounded
+// wait is the gate that decides launch-vs-exit.
 //
 // Returned even on partial success (one attempt succeeded after
 // retries) — the caller can't tell from the result map whether retries
@@ -100,14 +97,11 @@ func listSessionsWithRetry(api daemonAPI, attempts int, timeout, backoff time.Du
 	var lastErr error
 	for i := 0; i < attempts; i++ {
 		if i == 0 {
-			// Stderr breadcrumb so a slow startup reconcile isn't a
-			// silent freeze. The worst case here is ~30s
-			// (attempts * timeout); without this line the user staring
-			// at the launching TUI has no signal that anything is
-			// happening. A real spinner UI is the right long-term fix
-			// (tracked separately as ui-spinner-for-long-running-
-			// daemon-ops) — this is the minimum the code-review pass
-			// asked for.
+			// Log breadcrumb so a slow preflight isn't a silent freeze.
+			// The worst case is attempts*timeout (a few seconds); without
+			// this line the user staring at the still-launching terminal
+			// has no signal that anything is happening before the board
+			// paints (or the message-and-exit fires).
 			log.Printf("openkanban: contacting daemon...")
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -127,6 +121,28 @@ func listSessionsWithRetry(api daemonAPI, attempts int, timeout, backoff time.Du
 		}
 	}
 	return nil, lastErr
+}
+
+// PreflightListSessions is the bounded startup probe internal/app runs
+// against a freshly-dialed daemon BEFORE constructing the TUI. It serves
+// two purposes at once:
+//
+//  1. Liveness gate: a wedged daemon (alive, accepting connections,
+//     completing hello, but not answering RPCs) passes the dial but fails
+//     this List. The caller turns a non-nil error into a PID+kill message
+//     and a clean exit — never the old blank, unbounded hang.
+//  2. Reconcile source: on success the returned snapshot is passed to
+//     NewModel, which consumes it instead of issuing its own (formerly
+//     blocking) startup List. One RPC, gated and bounded.
+//
+// nil client returns an empty snapshot and no error (degenerate/test
+// path); the caller decides whether a nil client is itself an exit
+// condition.
+func PreflightListSessions(client *daemonclient.Client) (map[board.TicketID]daemon.SessionInfo, error) {
+	if client == nil {
+		return map[board.TicketID]daemon.SessionInfo{}, nil
+	}
+	return listSessionsWithRetry(client, startupReconcileAttempts, startupReconcileTimeout, startupReconcileBackoff)
 }
 
 // scheduleDaemonResync returns a tea.Cmd that fires a
