@@ -47,6 +47,10 @@ Inside ModeAgentView, these keys are intercepted before the PTY child (claude, e
 
 The cycle-attach modal renders OVER the focused pane's agent view (chrome stays visible behind), via `renderAgentViewWithCycleModal`. Do not switch it back to `renderWithOverlay`, which uses a blank background and hides the state needed to make the cycle decision. `cycleUnattachedSession` auto-attaches the target peer if it's Unattached so the modal backdrop shows live PTY content (not just chrome); the cycle iterates ALL open peers, not just Unattached ones.
 
+While the modal is open (`cycleAttachPrompt == true`), `handleAgentViewMode` routes EVERY key to `handleCycleAttachPromptKey` before any pane dispatch — so a key the modal doesn't explicitly handle is swallowed, never reaching the PTY or the normal agent-view bindings. It handles `enter` (attach), `esc`/`ctrl+g` (exit to board), and `ctrl+]`/`ctrl+\` (keep cycling). `ctrl+g` MUST stay listed: it's the documented agent-view exit gesture, and without an explicit case the act of cycling silently disabled it until the user pressed `esc`.
+
+**Invariant: `cycleAttachPrompt` must never outlive agent-view focus.** Every path that drops `m.focusedPane` goes through the `exitToBoard()` chokepoint (sets `mode=ModeNormal`, `focusedPane=""`, `cycleAttachPrompt=false`) — the keyboard exits AND the four async daemon paths that can fire while the modal is open: session `"exited"` (`daemon_subscribe.go`), `PaneDetachedMsg`, `PaneExitMsg`, `DaemonDisconnectedMsg`. If a new focus-drop path resets `mode`/`focusedPane` inline instead of calling `exitToBoard()`, the flag strands true and resurfaces as a phantom modal on the next agent-view entry — `ctrl+g` (and every other key) swallowed though the user never cycled. Pinned by `TestDaemonExitedClearsStaleCycleAttachPrompt`.
+
 ### Keep both doc surfaces synced
 
 Every keybinding has **two doc surfaces** in `view.go`:
