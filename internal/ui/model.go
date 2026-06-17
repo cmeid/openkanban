@@ -3159,9 +3159,9 @@ func (m *Model) moveTicket(delta int) {
 // preceding newline). headerHeight() already includes its own padding/border.
 func (m *Model) boardAreaHeight() int {
 	const (
-		newlineAfterHeader      = 1
-		newlineBeforeStatusBar  = 1
-		statusBarHeight         = 1
+		newlineAfterHeader     = 1
+		newlineBeforeStatusBar = 1
+		statusBarHeight        = 1
 	)
 	return m.height - m.headerHeight() - newlineAfterHeader - newlineBeforeStatusBar - statusBarHeight
 }
