@@ -207,6 +207,63 @@ func TestContextualHints_OtherModes(t *testing.T) {
 	}
 }
 
+// TestContextualHints_AutoMode locks in the footer surfaces for Auto mode:
+// the agent-view Ctrl+G label flips to "next waiter (Auto)" when armed, and the
+// board surfaces the 'a' toggle with an on/off label. Rendered at full width so
+// the (non-pinned) board 'a' hint isn't dropped by packing.
+func TestContextualHints_AutoMode(t *testing.T) {
+	const wide = 1_000_000
+
+	t.Run("agent-view Ctrl+G label reflects Auto state", func(t *testing.T) {
+		off := hintsAt(&Model{mode: ModeAgentView}, wide)
+		if !strings.Contains(off, "board") {
+			t.Errorf("Auto off: Ctrl+G should read 'board': %q", off)
+		}
+		if strings.Contains(off, "next waiter") {
+			t.Errorf("Auto off: 'next waiter' must not appear: %q", off)
+		}
+
+		on := hintsAt(&Model{mode: ModeAgentView, autoAttach: true}, wide)
+		if !strings.Contains(on, "next waiter (Auto)") {
+			t.Errorf("Auto on: Ctrl+G should read 'next waiter (Auto)': %q", on)
+		}
+		if strings.Contains(on, "board") {
+			t.Errorf("Auto on: 'board' must not appear (Ctrl+G repurposed): %q", on)
+		}
+	})
+
+	t.Run("board surfaces 'a' toggle with on/off label", func(t *testing.T) {
+		off := hintsAt(&Model{mode: ModeNormal}, wide)
+		if !strings.Contains(off, "auto") {
+			t.Errorf("Auto off: board footer should surface the 'a' auto hint: %q", off)
+		}
+		if strings.Contains(off, "auto on") {
+			t.Errorf("Auto off: label should be 'auto', not 'auto on': %q", off)
+		}
+
+		on := hintsAt(&Model{mode: ModeNormal, autoAttach: true}, wide)
+		if !strings.Contains(on, "auto on") {
+			t.Errorf("Auto on: board footer should read 'auto on': %q", on)
+		}
+	})
+
+	t.Run("in_progress ticket branch also surfaces the auto hint", func(t *testing.T) {
+		ticket := &board.Ticket{ID: board.NewTicketID(), Status: board.StatusInProgress}
+		m := &Model{
+			mode:          ModeNormal,
+			autoAttach:    true,
+			columnTickets: [][]*board.Ticket{{ticket}},
+		}
+		out := hintsAt(m, wide)
+		if !strings.Contains(out, "spawn agent") {
+			t.Fatalf("expected the in_progress branch (anchor 'spawn agent'): %q", out)
+		}
+		if !strings.Contains(out, "auto on") {
+			t.Errorf("in_progress branch should surface 'auto on' when armed: %q", out)
+		}
+	})
+}
+
 // TestContextualHints_NormalTicketBranches covers the two ModeNormal branches
 // that depend on a selected ticket (a spawned pane vs. an in_progress ticket
 // without one). Both pin `? help`; neither carries `q quit`. These branches see
