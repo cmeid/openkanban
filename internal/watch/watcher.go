@@ -3,10 +3,18 @@
 // per-project tickets/<project_id>/<file>.md is modified.
 //
 // Design notes:
-//   - We watch DIRECTORIES, not individual files. On macOS, fsnotify
-//     uses kqueue, which would require one fd per watched file — the
-//     fsnotify maintainers explicitly recommend watching the parent
-//     dir and filtering by Event.Name. We follow that recommendation.
+//   - We call fsw.Add() on DIRECTORIES, not individual files: the
+//     fsnotify maintainers recommend this for cross-platform parity
+//     (Linux inotify Create/Remove events surface only when watching
+//     the parent dir) and we follow it. On Linux this is also cheap —
+//     one inotify fd per dir. On macOS (kqueue) it is NOT cheap:
+//     fsnotify internally opens one fd per file inside each watched
+//     dir so EVFILT_VNODE can deliver Write events, because kqueue's
+//     vnode filter only works on individual fds. So fd footprint
+//     scales with ticket count on Darwin regardless of how we Add().
+//     If that ever bumps `ulimit -n`, the fix is switching the macOS
+//     backend to FSEvents (which doesn't pay per-file fd cost), not
+//     watching files vs dirs at this layer.
 //   - Atomic-rename writes (write-tmp + rename-onto-target, used by
 //     vim/editors and openkanban itself) manifest as Create/Rename
 //     events. We accept Create/Write/Rename/Remove as "the file may
