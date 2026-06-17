@@ -1723,10 +1723,15 @@ func (m *Model) dropTicket() (tea.Model, tea.Cmd) {
 	m.refreshColumnTickets()
 	m.saveTicket(ticket)
 
-	m.activeColumn = m.dragTargetColumn
-	m.activeTicket = 0
+	// Follow the dropped ticket to its new column/position instead of
+	// blindly landing on index 0 of the target column. selectTicketByID
+	// sets activeColumn/activeTicket and handles vertical scroll
+	// (ensureTicketVisible); ensureColumnVisible covers horizontal scroll.
+	// If an active filter hides the ticket in its new status the find
+	// misses and focus stays in the source column (same clamp-degrade as
+	// the quick-move paths) — acceptable for that self-inflicted state.
+	m.selectTicketByID(ticket.ID)
 	m.ensureColumnVisible()
-	m.ensureTicketVisible()
 
 	m.notify(moveAndPromoteMsg(targetStatus, promoted))
 	m.dragging = false
@@ -2584,6 +2589,10 @@ func (m *Model) saveTicketForm(isEdit bool) (tea.Model, tea.Cmd) {
 			ticket.Touch()
 			m.saveTicket(ticket)
 			m.refreshColumnTickets()
+			// Keep focus on the edited ticket: a changed priority (or
+			// project) can reorder/relocate it, leaving the stale index
+			// pointing at a different card. Mirrors the create branch.
+			m.selectTicketByID(ticket.ID)
 			m.notify("Updated: " + title)
 		}
 	} else {
