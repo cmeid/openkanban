@@ -72,9 +72,25 @@ type stallMonitor struct {
 	// dumpPath is where stall dumps are appended.
 	dumpPath string
 
+	// recover, if set, is invoked once per stall episode for a "starved"
+	// stall — the watchdog's corrective action (detach the focused agent
+	// view to the board via program.Send). Set by Model.SetStallRecoverySink
+	// after the program exists; nil in tests / before wiring. Stored behind
+	// a pointer so the watchdog goroutine reads it lock-free. Tea-agnostic
+	// on purpose: the closure owns the msg + Send.
+	recover atomic.Pointer[func()]
+
 	stopCh   chan struct{}
 	stopOnce sync.Once
 	sigCh    chan os.Signal
+}
+
+// setRecover wires the per-episode recovery action (see the recover field).
+func (m *stallMonitor) setRecover(fn func()) {
+	if m == nil {
+		return
+	}
+	m.recover.Store(&fn)
 }
 
 const (
@@ -215,6 +231,18 @@ func (m *stallMonitor) onTick(nowNanos int64) {
 	// the dump above (its own os.File, no shared mutex) must never be
 	// starved by it.
 	log.Printf("openkanban: STALL kind=%s see %s", kind, m.dumpPath)
+
+	// Corrective action — once per episode, ONLY for "starved" stalls. In
+	// that shape the main loop is parked outside Update/View, so a
+	// program.Send is actually processed (and it's a genuine wedge, not a
+	// transient slow render — which an "in-call" stall can be, and where
+	// Send would queue unprocessed anyway). The closure detaches the
+	// focused agent view to the board; the session lives on in the daemon.
+	if kind == stallStarved {
+		if fp := m.recover.Load(); fp != nil {
+			(*fp)()
+		}
+	}
 }
 
 func (m *stallMonitor) manualDump() {

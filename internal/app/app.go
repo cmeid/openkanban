@@ -127,6 +127,13 @@ func Run(cfg *config.Config, filterPath, version string, autostartDaemon bool) e
 
 	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseAllMotion())
 
+	// Give the stall watchdog teeth: on a sustained "starved" stall it now
+	// detaches the focused agent view to the board (program.Send is the
+	// goroutine-safe entry point, same as the signal handler below). Wired
+	// here because the program must exist first; the watchdog stays
+	// diagnostic-only until this sink is set.
+	model.SetStallRecoverySink(program.Send)
+
 	// Start the file watcher; failure is non-fatal (TUI works without
 	// hot-reload, just no live updates for external edits).
 	if watcher := startFileWatcher(registry, program); watcher != nil {
