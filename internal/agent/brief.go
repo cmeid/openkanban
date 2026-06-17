@@ -87,6 +87,14 @@ func PreviewBriefMerge(ticket *board.Ticket, worktreePath string) (briefRelPath 
 // Delegates the merge computation to PreviewBriefMerge and only performs
 // I/O when the on-disk bytes would actually change.
 //
+// Concurrency contract: the openkanban store's ticket.Description is the
+// source of truth; the brief is a one-way generated view of it. This
+// function only ever rewrites the bytes between the managed-block fences
+// (see upsertManagedBlock), so any content the agent writes outside the
+// block is preserved — and is worktree-only state the store has no copy
+// of. The write is atomic (temp+rename), so a concurrent reader always
+// observes a complete brief (old or new, never torn).
+//
 // Matrix:
 //   - empty worktreePath OR empty slug                              → ("", false, nil)
 //   - file absent + description blank                                → ("", false, nil)
@@ -95,9 +103,9 @@ func PreviewBriefMerge(ticket *board.Ticket, worktreePath string) (briefRelPath 
 //   - file present + description non-blank, block exists             → REPLACE block contents; write only if content changed
 //   - file present + description non-blank, block missing            → APPEND block; write
 //
-// Errors from os.MkdirAll / os.WriteFile are returned wrapped. Read
-// errors other than IsNotExist are returned wrapped (caller decides
-// whether to ignore).
+// Errors from os.MkdirAll and the temp-file write/rename are returned
+// wrapped. Read errors other than IsNotExist are returned wrapped (caller
+// decides whether to ignore).
 func MergeTicketBrief(ticket *board.Ticket, worktreePath string) (string, bool, error) {
 	relPath, hasBrief, wouldChange, content, err := PreviewBriefMerge(ticket, worktreePath)
 	if err != nil {
@@ -107,11 +115,41 @@ func MergeTicketBrief(ticket *board.Ticket, worktreePath string) (string, bool, 
 		return relPath, hasBrief, nil
 	}
 	fullPath := filepath.Join(worktreePath, briefSubdir, BranchSlug(ticket.BranchName)+".md")
-	if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
+	dir := filepath.Dir(fullPath)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return relPath, hasBrief, fmt.Errorf("mkdir brief dir: %w", err)
 	}
-	if err := os.WriteFile(fullPath, []byte(content), 0o644); err != nil {
-		return relPath, hasBrief, fmt.Errorf("write brief %s: %w", fullPath, err)
+
+	// Atomic write via temp+rename so a concurrent reader — the spawned
+	// agent, or a second TUI re-syncing the same worktree — never sees a
+	// torn/partial brief, and two writers can't corrupt each other through
+	// a truncate window. The temp file lives in the target's own dir so the
+	// rename stays on one filesystem. Mirrors TicketStore.SaveTicket
+	// (internal/project/tickets.go), the established pattern for safe
+	// concurrent writes from multiple openkanban processes.
+	tmp, err := os.CreateTemp(dir, filepath.Base(fullPath)+".tmp-*")
+	if err != nil {
+		return relPath, hasBrief, fmt.Errorf("create tmp brief: %w", err)
+	}
+	tmpPath := tmp.Name()
+	if _, err := tmp.Write([]byte(content)); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return relPath, hasBrief, fmt.Errorf("write tmp brief: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpPath)
+		return relPath, hasBrief, fmt.Errorf("close tmp brief: %w", err)
+	}
+	// CreateTemp yields 0600; restore the 0644 the brief used before this
+	// path was atomic.
+	if err := os.Chmod(tmpPath, 0o644); err != nil {
+		os.Remove(tmpPath)
+		return relPath, hasBrief, fmt.Errorf("chmod tmp brief: %w", err)
+	}
+	if err := os.Rename(tmpPath, fullPath); err != nil {
+		os.Remove(tmpPath)
+		return relPath, hasBrief, fmt.Errorf("rename brief %s: %w", fullPath, err)
 	}
 	return relPath, hasBrief, nil
 }
