@@ -501,6 +501,14 @@ func (s *Session) Detach(ac *attachedClient) {
 // Returns nil when the pane isn't ready (no emulator). Safe to call
 // concurrently — SerializeRedraw only reads via SafeEmulator's locked
 // methods, and the modal getters on Pane take their own locks.
+// Snapshot returns a one-shot snapshot of the session's terminal state
+// without any attach side effects. Safe to call concurrently with a
+// live attacher (buildSnapshotForPane only reads via locked methods);
+// s.pane is immutable after NewSession. Used by the Peek RPC.
+func (s *Session) Snapshot() []byte {
+	return buildSnapshotForPane(s.pane)
+}
+
 func buildSnapshotForPane(p *terminal.Pane) []byte {
 	vt, cursorVisible, mouseEnabled, altScreen, title := p.SnapshotState()
 	if vt == nil {

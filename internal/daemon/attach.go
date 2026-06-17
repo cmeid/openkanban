@@ -127,6 +127,35 @@ func (s *Server) handleAttach(c *clientConn, req AttachReq) {
 	<-fanOutDone
 }
 
+// handlePeek ships a one-shot snapshot of the session's terminal state
+// WITHOUT attaching. It does not call AttemptAttach, does not resize the
+// pane, does not subscribe to PTY output, and emits no attached/detached
+// events — the current attacher (if any) is left completely undisturbed.
+// Unlike handleAttach it does NOT block: after the snapshot frames the
+// conn stays in JSON mode and dispatch returns; the client closes its
+// dedicated peek conn once it has read the snapshot. Cols/Rows in the
+// request are advisory only — the snapshot reflects the pane's current
+// geometry (no resize, since the peeker isn't the owner).
+func (s *Server) handlePeek(c *clientConn, req PeekReq) {
+	s.sessionsMu.RLock()
+	sess := s.sessions[req.SessionID]
+	s.sessionsMu.RUnlock()
+
+	if sess == nil {
+		s.writeError(c, "session_not_found", fmt.Sprintf("session %q not found", req.SessionID))
+		return
+	}
+
+	snapshot := sess.Snapshot()
+	log.Printf("openkanbankd: client %d handlePeek session=%s snapshot_bytes=%d", c.id, req.SessionID, len(snapshot))
+
+	s.writeResp(c, MsgPeekResp, PeekResp{SnapshotSize: len(snapshot)})
+
+	if err := writeSnapshotChunks(c.conn, &c.writeMu, snapshot, c.id); err != nil {
+		log.Printf("openkanbankd: client %d write peek snapshot: %v", c.id, err)
+	}
+}
+
 // writeSnapshotChunks ships data over conn as one or more
 // TypePTYOutput frames, each ≤ snapshotChunkSize bytes. writeMu is
 // taken once per chunk so other potential conn writers (none today,

@@ -52,10 +52,11 @@ the daemon does *when* it doesn't.
 
 | Task | Location |
 |------|----------|
-| RPC dispatch table | `server.go` (handleSpawn, handleKill, handleAttach, handleList, handleOwns, handleTicketDone) |
+| RPC dispatch table | `server.go` (handleSpawn, handleKill, handleAttach, handlePeek, handleList, handleOwns, handleTicketDone) |
 | Wire types | `protocol.go` (SpawnReq/Resp, KillReq/Resp, etc.) |
 | Session struct + lifecycle | `session.go` |
 | PTY attach loop | `attach.go` (handleAttach — blocking RPC) |
+| Snapshot without attach | `attach.go` (handlePeek — non-blocking; ships `Session.Snapshot()` bytes, no AttemptAttach/resize/subscribe/events; leaves the current attacher undisturbed). Client side: `PaneView.Peek`. |
 | Subscription / SessionEvent fanout | broadcastEvents in server.go |
 
 ## Anti-Patterns
