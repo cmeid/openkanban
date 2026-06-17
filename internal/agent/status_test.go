@@ -391,12 +391,14 @@ func testServerPort(t *testing.T, rawURL string) int {
 	return port
 }
 
-// TestDetectStatusWithActivity_OverridesWaiting pins the core override
-// behavior. The file-based detector returns AgentWaiting (Notification
-// hook fired); when the daemon-reported PTY activity is recent, the
-// override flips it to AgentWorking. Stale or absent activity leaves
-// the file's verdict alone.
-func TestDetectStatusWithActivity_OverridesWaiting(t *testing.T) {
+// TestDetectStatusWithActivity_NoWorkEvidenceStaysWaiting pins the core
+// of the false-"working" fix: with the file at "waiting" and NO on-screen
+// work evidence (empty grid — e.g. an unattached / bg-spawned session),
+// the verdict stays "waiting" REGARDLESS of how recent the PTY activity
+// is. This is the behavior change vs the old byte-recency override, which
+// flipped any recent-activity case to "working" and so mislabeled a
+// session parked at a prompt it was re-rendering.
+func TestDetectStatusWithActivity_NoWorkEvidenceStaysWaiting(t *testing.T) {
 	tmpDir := t.TempDir()
 	d := NewStatusDetector()
 	d.statusDirs = []string{tmpDir}
@@ -412,22 +414,24 @@ func TestDetectStatusWithActivity_OverridesWaiting(t *testing.T) {
 		want         board.AgentStatus
 	}{
 		{
-			name:         "recent activity overrides waiting",
+			// The key change: recent activity no longer promotes to working
+			// without on-screen evidence of an active turn.
+			name:         "recent activity with empty grid stays waiting",
 			lastActivity: time.Now().Add(-2 * time.Second),
-			want:         board.AgentWorking,
+			want:         board.AgentWaiting,
 		},
 		{
-			name:         "activity past TTL boundary is stale",
+			name:         "activity past TTL boundary stays waiting",
 			lastActivity: time.Now().Add(-(WaitingActivityTTL + time.Second)),
 			want:         board.AgentWaiting,
 		},
 		{
-			name:         "stale activity leaves waiting",
+			name:         "stale activity stays waiting",
 			lastActivity: time.Now().Add(-5 * time.Minute),
 			want:         board.AgentWaiting,
 		},
 		{
-			name:         "zero activity (no daemon report) leaves waiting",
+			name:         "zero activity (no daemon report) stays waiting",
 			lastActivity: time.Time{},
 			want:         board.AgentWaiting,
 		},
@@ -492,9 +496,13 @@ func TestDetectStatusWithActivity_PermissionPromptStaysWaiting(t *testing.T) {
 			want:            board.AgentWorking,
 		},
 		{
-			name:            "empty content still overrides to working",
+			// Behavior change vs the original #84: with the byte-recency
+			// catch-all removed, an empty/unavailable grid (e.g. an
+			// unattached session with no local PTY view) holds "waiting"
+			// instead of being promoted to "working" on activity alone.
+			name:            "empty content holds waiting (no work evidence)",
 			terminalContent: "",
-			want:            board.AgentWorking,
+			want:            board.AgentWaiting,
 		},
 	}
 

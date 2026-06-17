@@ -154,21 +154,21 @@ func (m *Model) handleDaemonSessionEvent(msg daemonSessionEventMsg) (tea.Model, 
 //
 //   - "started"   → AgentStatus = AgentWorking (unless already higher).
 //   - "exited"    → If ev.Expected (daemon-initiated `openkanban ticket
-//                   done`), preserve AgentCompleted; else reset to
-//                   AgentNone. PaneView (if held) is closed; the
-//                   focused-pane mode unwinds to ModeNormal when the
-//                   event lands on the focused ticket.
+//     done`), preserve AgentCompleted; else reset to
+//     AgentNone. PaneView (if held) is closed; the
+//     focused-pane mode unwinds to ModeNormal when the
+//     event lands on the focused ticket.
 //   - "attached"  → informational; no model change. PTY-stream
-//                   ownership is tracked elsewhere (PaneView state).
+//     ownership is tracked elsewhere (PaneView state).
 //   - "detached"  → informational; the local PaneView may already
-//                   have transitioned to PaneViewDetached via its
-//                   own DetachMsg path.
+//     have transitioned to PaneViewDetached via its
+//     own DetachMsg path.
 //   - "viewing"   → no AgentStatus change; increments
-//                   daemonViewing[ticketID] so the board card
-//                   renders the "TUI viewing this ticket" indicator.
+//     daemonViewing[ticketID] so the board card
+//     renders the "TUI viewing this ticket" indicator.
 //   - "unviewing" → no AgentStatus change; decrements
-//                   daemonViewing[ticketID] (guarded against
-//                   underflow).
+//     daemonViewing[ticketID] (guarded against
+//     underflow).
 //
 // Precedence rule: this handler is unconditional — push events
 // authoritatively trump the status-file poll while the daemon
@@ -199,7 +199,15 @@ func (m *Model) applyDaemonSessionEvent(ev daemon.SessionEvent) {
 			switch ev.Event {
 			case "started":
 				m.daemonOwned[ticketID] = struct{}{}
-				if ticket.SetAgentStatus(board.AgentWorking) {
+				// Prefer the daemon's resolved verdict when present; fall
+				// back to AgentWorking for an older daemon (or any event
+				// without a Status) so a freshly-spawned session still
+				// shows activity immediately.
+				if ev.Status != "" {
+					if m.applyDaemonStatus(ticket, ev.Status) {
+						m.saveTicket(ticket)
+					}
+				} else if ticket.SetAgentStatus(board.AgentWorking) {
 					m.saveTicket(ticket)
 				}
 			case "exited":
@@ -273,11 +281,55 @@ func (m *Model) applyDaemonSessionEvent(ev daemon.SessionEvent) {
 					}
 				}
 			case "activity":
-				// Pure-heartbeat event — the lastPTYActivity stamp above
-				// already absorbed the timestamp. No further state change.
+				// Heartbeat: the lastPTYActivity stamp above already
+				// absorbed the timestamp. When the daemon also resolved a
+				// status from its live PTY grid, apply it — this is the
+				// daemon-authoritative path that keeps an UNATTACHED
+				// session's card accurate. The daemon classifies the grid
+				// whether or not any TUI is attached, so a bg-spawned
+				// session that's genuinely working reads "working" here
+				// even though the client has no local grid for it.
+				if m.applyDaemonStatus(ticket, ev.Status) {
+					m.saveTicket(ticket)
+				}
 			}
 		}
 	}
+}
+
+// applyDaemonStatus applies a daemon-resolved AgentStatus (carried on
+// SessionEvent.Status) to the ticket, mirroring the file-poll's guards in
+// the agentStatusResultMsg handler:
+//
+//   - An empty or "none" value is "the daemon has no verdict" (an older
+//     daemon, or a session it doesn't classify such as opencode) — a
+//     no-op, leaving the file-poll as the source.
+//   - An unknown string is ignored defensively.
+//   - AgentCompleted is terminal: only another terminal value
+//     (Completed / Error) may displace it, so a late activity event can't
+//     knock a wrapped-up ticket back to working/waiting.
+//
+// Returns true if the ticket's AgentStatus actually changed (caller
+// persists). SetAgentStatus stamps StatusChangedAt on a real change.
+func (m *Model) applyDaemonStatus(ticket *board.Ticket, raw string) bool {
+	if ticket == nil || raw == "" {
+		return false
+	}
+	status := board.AgentStatus(raw)
+	switch status {
+	case board.AgentIdle, board.AgentWorking, board.AgentWaiting,
+		board.AgentCompleted, board.AgentError:
+		// known, applicable value
+	default:
+		// AgentNone ("no verdict") and any unknown string: leave the
+		// current status alone.
+		return false
+	}
+	if ticket.AgentStatus == board.AgentCompleted &&
+		status != board.AgentCompleted && status != board.AgentError {
+		return false
+	}
+	return ticket.SetAgentStatus(status)
 }
 
 // handleDaemonSubscribeFailed records a subscribe failure. We log and

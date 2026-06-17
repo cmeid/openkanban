@@ -376,6 +376,142 @@ func TestDropTicket_InProgressToInReview_WrapsUp(t *testing.T) {
 	}
 }
 
+// TestActivityEvent_AppliesDaemonResolvedStatus pins the
+// daemon-authoritative status path: the daemon resolves working/waiting
+// from its OWN live PTY grid (which it has for every owned session,
+// attached or not) and ships the verdict in SessionEvent.Status on its
+// activity heartbeats. The UI must apply that verdict to the ticket. This
+// is what lets a bg-spawned unattached session show the truth — the
+// daemon sees a prompt on the grid, reports "waiting", and the card
+// follows (and reports "working" when the grid shows an active turn).
+func TestActivityEvent_AppliesDaemonResolvedStatus(t *testing.T) {
+	t.Setenv("OPENKANBAN_CONFIG_DIR", t.TempDir())
+
+	const tid board.TicketID = "activity-status-1"
+	proj := &project.Project{ID: "test", RepoPath: t.TempDir()}
+	globalStore := project.NewGlobalTicketStore(nil)
+	globalStore.AddProject(proj)
+
+	now := time.Now()
+	ticket := &board.Ticket{
+		ID:             tid,
+		Title:          "t",
+		ProjectID:      "test",
+		Status:         board.StatusInProgress,
+		AgentStatus:    board.AgentWorking, // what the daemon "started" event set
+		AgentSpawnedAt: &now,
+	}
+	if err := globalStore.Add(ticket); err != nil {
+		t.Fatalf("Add ticket: %v", err)
+	}
+
+	m := &Model{
+		globalStore:     globalStore,
+		daemonOwned:     map[board.TicketID]struct{}{tid: {}},
+		daemonViewing:   map[board.TicketID]int{},
+		lastPTYActivity: map[board.TicketID]time.Time{},
+		panes:           map[board.TicketID]*daemonclient.PaneView{},
+	}
+
+	_, _ = m.handleDaemonSessionEvent(daemonSessionEventMsg{
+		Event: daemon.SessionEvent{
+			Event:          "activity",
+			TicketID:       string(tid),
+			Status:         "waiting",
+			LastActivityAt: now,
+		},
+	})
+
+	if ticket.AgentStatus != board.AgentWaiting {
+		t.Errorf("AgentStatus = %v, want %v (daemon-resolved status on the activity event must be applied)",
+			ticket.AgentStatus, board.AgentWaiting)
+	}
+}
+
+// TestActivityEvent_EmptyStatusDoesNotClobber guards the fallback path:
+// an activity event with no resolved Status (older daemon, or an opencode
+// session the daemon doesn't classify) must NOT reset the ticket's
+// AgentStatus — the file-poll remains the source for those.
+func TestActivityEvent_EmptyStatusDoesNotClobber(t *testing.T) {
+	t.Setenv("OPENKANBAN_CONFIG_DIR", t.TempDir())
+
+	const tid board.TicketID = "activity-status-2"
+	proj := &project.Project{ID: "test", RepoPath: t.TempDir()}
+	globalStore := project.NewGlobalTicketStore(nil)
+	globalStore.AddProject(proj)
+
+	ticket := &board.Ticket{
+		ID: tid, Title: "t", ProjectID: "test",
+		Status:      board.StatusInProgress,
+		AgentStatus: board.AgentWorking,
+	}
+	if err := globalStore.Add(ticket); err != nil {
+		t.Fatalf("Add ticket: %v", err)
+	}
+
+	m := &Model{
+		globalStore:     globalStore,
+		daemonOwned:     map[board.TicketID]struct{}{tid: {}},
+		daemonViewing:   map[board.TicketID]int{},
+		lastPTYActivity: map[board.TicketID]time.Time{},
+		panes:           map[board.TicketID]*daemonclient.PaneView{},
+	}
+
+	_, _ = m.handleDaemonSessionEvent(daemonSessionEventMsg{
+		Event: daemon.SessionEvent{
+			Event:          "activity",
+			TicketID:       string(tid),
+			Status:         "",
+			LastActivityAt: time.Now(),
+		},
+	})
+
+	if ticket.AgentStatus != board.AgentWorking {
+		t.Errorf("AgentStatus = %v, want %v (empty Status must not clobber)", ticket.AgentStatus, board.AgentWorking)
+	}
+}
+
+// TestActivityEvent_DoesNotDowngradeCompleted mirrors the file-poll's
+// terminal-state guard: a "completed" ticket must not be knocked back to
+// working/waiting by a late activity event racing the wrap-up.
+func TestActivityEvent_DoesNotDowngradeCompleted(t *testing.T) {
+	t.Setenv("OPENKANBAN_CONFIG_DIR", t.TempDir())
+
+	const tid board.TicketID = "activity-status-3"
+	proj := &project.Project{ID: "test", RepoPath: t.TempDir()}
+	globalStore := project.NewGlobalTicketStore(nil)
+	globalStore.AddProject(proj)
+
+	ticket := &board.Ticket{
+		ID: tid, Title: "t", ProjectID: "test",
+		Status:      board.StatusInProgress,
+		AgentStatus: board.AgentCompleted,
+	}
+	if err := globalStore.Add(ticket); err != nil {
+		t.Fatalf("Add ticket: %v", err)
+	}
+
+	m := &Model{
+		globalStore:     globalStore,
+		daemonOwned:     map[board.TicketID]struct{}{tid: {}},
+		daemonViewing:   map[board.TicketID]int{},
+		lastPTYActivity: map[board.TicketID]time.Time{},
+		panes:           map[board.TicketID]*daemonclient.PaneView{},
+	}
+
+	_, _ = m.handleDaemonSessionEvent(daemonSessionEventMsg{
+		Event: daemon.SessionEvent{
+			Event:    "activity",
+			TicketID: string(tid),
+			Status:   "working",
+		},
+	})
+
+	if ticket.AgentStatus != board.AgentCompleted {
+		t.Errorf("AgentStatus = %v, want %v (terminal state must not be downgraded)", ticket.AgentStatus, board.AgentCompleted)
+	}
+}
+
 // TestExitedEvent_ClearsAgentSessionResidueOnExpected pins the
 // post-fix contract for B21: an Expected=true "exited" event (the
 // clean wrap-up signal, fired by the daemon's handleTicketDone) must

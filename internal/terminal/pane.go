@@ -1247,7 +1247,6 @@ func (p *Pane) detectAltScreenChanges(data []byte) {
 	}
 }
 
-
 // scheduleRenderTick returns a Cmd to trigger render after throttle interval
 func (p *Pane) scheduleRenderTick() tea.Cmd {
 	p.mu.Lock()
@@ -1610,7 +1609,25 @@ func (p *Pane) translateKey(msg tea.KeyMsg) []byte {
 func (p *Pane) GetContent() string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.contentLocked()
+}
 
+// GetContentTry is a non-blocking GetContent: it returns ("", false) if
+// p.mu is currently held rather than waiting for it. Callers on a hot
+// path that must NOT block on pane teardown (e.g. the daemon's status
+// broadcaster, where a stuck Stop() holding p.mu would otherwise freeze
+// every session's heartbeat) use this and treat !ok as "no reading this
+// tick" rather than blocking.
+func (p *Pane) GetContentTry() (string, bool) {
+	if !p.mu.TryLock() {
+		return "", false
+	}
+	defer p.mu.Unlock()
+	return p.contentLocked(), true
+}
+
+// contentLocked renders the visible grid to text. Caller must hold p.mu.
+func (p *Pane) contentLocked() string {
 	if p.vt == nil {
 		return ""
 	}

@@ -4863,6 +4863,7 @@ func buildSpawnReq(in spawnReqInputs) daemon.SpawnReq {
 		Rows:                 in.rows,
 		Scrollback:           0,
 		AgentSessionUUID:     in.ticket.AgentSessionID,
+		AgentType:            in.agentType,
 		ForwardNotifications: in.forwardNotifications,
 	}
 }

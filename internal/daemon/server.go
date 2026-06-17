@@ -17,6 +17,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/techdufus/openkanban/internal/agent"
+	"github.com/techdufus/openkanban/internal/board"
 	"github.com/techdufus/openkanban/internal/config"
 	"github.com/techdufus/openkanban/internal/terminal"
 	"github.com/techdufus/openkanban/internal/update"
@@ -102,6 +104,14 @@ type Server struct {
 	// connect/disconnect cycles.
 	drainMu      sync.Mutex
 	drainPending bool
+
+	// statusDetector resolves a session's working/waiting AgentStatus
+	// from the hook status file + the live PTY grid + the pane's last
+	// output time. The daemon owns these inputs for EVERY session it
+	// runs, attached or not, so it's the one place that can classify an
+	// unattached session correctly. Safe for concurrent use (its cache is
+	// mutex-guarded); the broadcaster goroutine is the only caller.
+	statusDetector *agent.StatusDetector
 
 	// emitSessionExitFn is the seam watchSessionExit uses to publish
 	// the "exited" SessionEvent. Production leaves this nil and the
@@ -200,15 +210,75 @@ func NewServerWithOptions(sock, pidpath string, opts Options) (*Server, error) {
 	}
 
 	return &Server{
-		sock:       sock,
-		pidlock:    lock,
-		ln:         ln,
-		persistent: opts.Persistent,
-		sessions:   make(map[string]*Session),
-		clients:    make(map[uint16]*clientConn),
-		shutdown:   make(chan struct{}),
-		events:     make(chan SessionEvent, 64),
+		sock:           sock,
+		pidlock:        lock,
+		ln:             ln,
+		persistent:     opts.Persistent,
+		sessions:       make(map[string]*Session),
+		clients:        make(map[uint16]*clientConn),
+		shutdown:       make(chan struct{}),
+		events:         make(chan SessionEvent, 64),
+		statusDetector: agent.NewStatusDetector(),
 	}, nil
+}
+
+// resolveSessionStatus computes the authoritative AgentStatus for a
+// session the daemon owns, from inputs the daemon has for EVERY session
+// (attached or not): the live PTY grid, the pane's last-output time, and
+// the hook-written status file. The returned string is a board.AgentStatus
+// value, or "" when the daemon has no verdict to push — for sessions with
+// no recorded agent type (older client), for opencode (whose status the
+// UI resolves via its own HTTP API), and when the detector can't
+// determine a state. An empty return leaves the client's file-poll in
+// charge; see Model.applyDaemonStatus.
+func (s *Server) resolveSessionStatus(sess *Session) string {
+	if s == nil || sess == nil {
+		return ""
+	}
+	agentType := sess.AgentType()
+	// Cheap early-out before the grid copy: opencode and type-less
+	// (older-client) sessions get no daemon verdict.
+	if agentType == "" || agentType == "opencode" {
+		return ""
+	}
+	p := sess.Pane()
+	if p == nil {
+		return ""
+	}
+	// Non-blocking read. If the pane lock is held — notably by a Stop()
+	// whose emulator-drain teardown can hang — skip this tick instead of
+	// blocking the broadcaster goroutine. Blocking here would freeze the
+	// status/activity heartbeat for EVERY session behind one stuck
+	// teardown; the next tick retries once the lock frees.
+	content, ok := p.GetContentTry()
+	if !ok {
+		return ""
+	}
+	// running=true is sound: the broadcaster only resolves status for
+	// sessions in its alive set whose LastActivity advanced this tick, so
+	// the pane is live and emitting. Passing the constant avoids the
+	// blocking Running() lock (same Stop()-freeze hazard as GetContent).
+	return resolveStatusVerdict(
+		s.statusDetector, agentType, sess.SessionName(), sess.workdir,
+		true, content, sess.LastActivity(),
+	)
+}
+
+// resolveStatusVerdict is the pure core of resolveSessionStatus, split
+// out so it can be unit-tested without forking a real PTY session. It
+// returns a board.AgentStatus value, or "" when the daemon has no verdict
+// to push: a nil detector, a missing/opencode agent type, an empty
+// session name, or a detector result of AgentNone ("can't tell"). An
+// empty return leaves the client's file-poll in charge.
+func resolveStatusVerdict(d *agent.StatusDetector, agentType, sessionName, workdir string, running bool, content string, lastActivity time.Time) string {
+	if d == nil || agentType == "" || agentType == "opencode" || sessionName == "" {
+		return ""
+	}
+	status := d.DetectStatusWithActivity(agentType, sessionName, sessionName, workdir, 0, running, content, lastActivity)
+	if status == board.AgentNone {
+		return ""
+	}
+	return string(status)
 }
 
 // SocketPath returns the absolute path the server is listening on.
@@ -348,16 +418,16 @@ func (s *Server) Serve(ctx context.Context) error {
 //     launch (default mode) — or launchd / systemd respawn (persistent
 //     mode) — picks up the new binary.
 //   - >0 sessions: log a loud warning and keep running.
-//     - Default mode: handleLastClientDisconnect defers shutdown when
-//       the last client drops with live sessions (it no longer kills
-//       them), so the daemon stays on the stale binary until sessions
-//       drain naturally and then exits cleanly — the next launch picks
-//       up the new binary.
-//     - Persistent mode: handleLastClientDisconnect no longer exits,
-//       so the daemon stays on the stale binary until sessions drain
-//       naturally and the user explicitly runs `openkanban daemon
-//       stop` (after which launchd respawns it on the new binary,
-//       given KeepAlive={SuccessfulExit:false}).
+//   - Default mode: handleLastClientDisconnect defers shutdown when
+//     the last client drops with live sessions (it no longer kills
+//     them), so the daemon stays on the stale binary until sessions
+//     drain naturally and then exits cleanly — the next launch picks
+//     up the new binary.
+//   - Persistent mode: handleLastClientDisconnect no longer exits,
+//     so the daemon stays on the stale binary until sessions drain
+//     naturally and the user explicitly runs `openkanban daemon
+//     stop` (after which launchd respawns it on the new binary,
+//     given KeepAlive={SuccessfulExit:false}).
 //
 // We deliberately don't kill live sessions to "force" a restart —
 // that would surprise the user and orphan in-progress agent work.
@@ -606,6 +676,12 @@ func (s *Server) broadcastActivity() {
 				SessionID:      id,
 				TicketID:       sess.TicketID(),
 				LastActivityAt: la,
+				// Resolve status from the live grid here, where the daemon
+				// always has it — so the heartbeat that reports "bytes
+				// flowed" also says WHAT they were (a work spinner vs a
+				// re-rendered prompt). This is what keeps an UNATTACHED
+				// session's card accurate; the client has no grid for it.
+				Status: s.resolveSessionStatus(sess),
 			})
 		}
 	}
