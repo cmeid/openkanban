@@ -51,10 +51,10 @@ The cycle-attach modal renders OVER the focused pane's agent view (chrome stays 
 
 Every keybinding has **two doc surfaces** in `view.go`:
 
-1. `contextualHints()` — the mode-aware footer line that's always visible. Surfaces the most relevant keys for the current mode/state, packed as wide as the terminal allows.
+1. `contextualHints()` — the mode-aware footer line that's always visible. Surfaces the most relevant keys for the current mode/state. **Width-aware:** each hint is a `hintSpec{key, label, prio, pinned}` in an ordered `[]hintSpec`, and `packHints()` drops the lowest-`prio` non-`pinned` hints to fit the available width (no longer just packed-and-clipped). When anything drops, a dim `…` cue renders just before the first pinned hint (`? help`/`q quit` are pinned in ModeNormal), reading `… │ ? help │ q quit`. So adding a key here means picking its `prio` and deciding `pinned` — not just appending a hint.
 2. `renderHelp()` — the `?` modal, the canonical "every shortcut" reference. Must list every binding.
 
-When you add, remove, or rebind a key, update **both** functions in the same change. The modal must stay complete; the footer must surface the key in any mode where it's relevant. They live ~50 lines apart on purpose — see one, edit the other.
+When you add, remove, or rebind a key, update **both** functions in the same change. The modal must stay complete; the footer must surface the key (with a `prio`) in any mode where it's relevant. They live ~50 lines apart on purpose — see one, edit the other.
 
 Keys that only apply while the **sidebar is focused** have a **third** surface: a hint line rendered directly inside `renderSidebar()` (e.g. `"  j/k ⏎toggle a/d o:open"`). It's width-budgeted to `m.sidebarWidth`, so keep tokens terse (`o:open`, not `o open only`). Sidebar-focused keys (handled in `handleSidebarNav`) must update all three: this in-sidebar line, the `contextualHints()` `sidebarFocused` branch, and the `renderHelp()` Sidebar section.
 

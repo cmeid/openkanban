@@ -679,8 +679,6 @@ func (m *Model) renderStatusBar() string {
 	sep := lipgloss.NewStyle().Foreground(m.colors.overlay).Render(" │ ")
 	hintStyle := lipgloss.NewStyle().Foreground(m.colors.subtext)
 
-	hints := m.contextualHints(hintStyle, sep)
-
 	notif := ""
 	if m.notification != "" {
 		isError := strings.HasPrefix(m.notification, "Failed") ||
@@ -700,6 +698,13 @@ func (m *Model) renderStatusBar() string {
 		notif = notifBadge
 	}
 
+	// Budget for the hint line = full width minus the fixed left chrome (mode
+	// badge + its trailing separator) and the right-side notification badge.
+	// contextualHints drops the lowest-priority hints to stay within this.
+	budget := m.width - lipgloss.Width(modeStr) - lipgloss.Width(sep) - lipgloss.Width(notif)
+	budget = max(budget, 0)
+	hints := m.contextualHints(hintStyle, sep, budget)
+
 	left := lipgloss.JoinHorizontal(lipgloss.Center, modeStr, sep, hints)
 	spacing := m.width - lipgloss.Width(left) - lipgloss.Width(notif)
 	spacing = max(spacing, 0)
@@ -707,132 +712,250 @@ func (m *Model) renderStatusBar() string {
 	return lipgloss.JoinHorizontal(lipgloss.Center, left, strings.Repeat(" ", spacing), notif)
 }
 
-func (m *Model) contextualHints(hintStyle lipgloss.Style, sep string) string {
+// hintSpec is one keybinding hint in the footer line. The slice order a mode
+// builds is the *display* order (left→right, unchanged from before). `prio`
+// drives the independent *drop* order when the line won't fit: lower prio is
+// dropped first. `pinned` hints are never dropped. The two orderings are
+// separate on purpose — e.g. `q quit` renders rightmost yet is the first drop
+// candidate in modes where it isn't pinned, and `? help` renders near the end
+// yet must survive every truncation.
+type hintSpec struct {
+	key, label string
+	prio       int
+	pinned     bool
+}
+
+func (m *Model) contextualHints(hintStyle lipgloss.Style, sep string, maxWidth int) string {
 	// Every key the UI handles in this mode/state should appear here. The
 	// `?` help modal (renderHelp below) is the canonical reference; keep
-	// both surfaces in sync when adding or rebinding keys.
-	hint := func(key, label string) string {
-		return hintStyle.Render(key) + m.dimStyle().Render(" "+label)
-	}
-	join := func(parts ...string) string {
-		return strings.Join(parts, sep)
-	}
-
+	// both surfaces in sync when adding or rebinding keys. packHints drops the
+	// lowest-priority hints (never the pinned ones) to fit maxWidth.
 	switch m.mode {
 	case ModeFilter:
-		return join(
-			hint("Enter", "apply"),
-			hint("Esc", "cancel"),
-			m.dimStyle().Render("@project to filter by project"),
-		)
+		return m.packHints([]hintSpec{
+			{key: "Enter", label: "apply", prio: 3},
+			{key: "Esc", label: "cancel", prio: 2, pinned: true},
+			{label: "@project to filter by project", prio: 1},
+		}, hintStyle, sep, maxWidth)
 
 	case ModeSettings:
-		return join(
-			hint("j/k", "navigate"),
-			hint("Enter/Space", "edit"),
-			hint("Esc/q", "close"),
-		)
+		return m.packHints([]hintSpec{
+			{key: "j/k", label: "navigate", prio: 1},
+			{key: "Enter/Space", label: "edit", prio: 2},
+			{key: "Esc/q", label: "close", prio: 3, pinned: true},
+		}, hintStyle, sep, maxWidth)
 
 	case ModeCreateTicket, ModeEditTicket:
 		action := "create"
 		if m.mode == ModeEditTicket {
 			action = "save"
 		}
-		return join(
-			hint("Tab/Shift+Tab", "fields"),
-			hint("Ctrl+S", action),
-			hint("Esc", "cancel"),
-		)
+		return m.packHints([]hintSpec{
+			{key: "Tab/Shift+Tab", label: "fields", prio: 1},
+			{key: "Ctrl+S", label: action, prio: 3},
+			{key: "Esc", label: "cancel", prio: 2, pinned: true},
+		}, hintStyle, sep, maxWidth)
 
 	case ModeCreateProject:
-		return join(
-			hint("Enter", "create"),
-			hint("Esc", "cancel"),
-		)
+		return m.packHints([]hintSpec{
+			{key: "Enter", label: "create", prio: 2},
+			{key: "Esc", label: "cancel", prio: 1, pinned: true},
+		}, hintStyle, sep, maxWidth)
 
 	case ModeAgentView:
-		return join(
-			hint("Ctrl+G", "board"),
-			hint("Ctrl+]/\\", "cycle sessions"),
-			m.dimStyle().Render("Shift+click to select text"),
-		)
+		return m.packHints([]hintSpec{
+			{key: "Ctrl+G", label: "board", prio: 3, pinned: true},
+			{key: "Ctrl+]/\\", label: "cycle sessions", prio: 2},
+			{label: "Shift+click to select text", prio: 1},
+		}, hintStyle, sep, maxWidth)
 
 	case ModeNormal:
 		if m.sidebarFocused {
-			return join(
-				hint("j/k", "navigate"),
-				hint("Space/Enter", "toggle"),
-				hint("o", "open only"),
-				hint("a", "add"),
-				hint("d", "delete"),
-				hint("l/Esc", "back"),
-			)
+			return m.packHints([]hintSpec{
+				{key: "j/k", label: "navigate", prio: 5},
+				{key: "Space/Enter", label: "toggle", prio: 4},
+				{key: "o", label: "open only", prio: 1},
+				{key: "a", label: "add", prio: 2},
+				{key: "d", label: "delete", prio: 3},
+				{key: "l/Esc", label: "back", prio: 6, pinned: true},
+			}, hintStyle, sep, maxWidth)
 		}
 
 		if m.filterQuery != "" || len(m.filterProjectIDs) > 0 {
-			return join(
-				hint("Esc", "clear filter"),
-				hint("/", "edit filter"),
-				hint("h/j/k/l", "navigate"),
-				hint("?", "help"),
-			)
+			return m.packHints([]hintSpec{
+				{key: "Esc", label: "clear filter", prio: 4},
+				{key: "/", label: "edit filter", prio: 2},
+				{key: "h/j/k/l", label: "navigate", prio: 3},
+				{key: "?", label: "help", prio: 1, pinned: true},
+			}, hintStyle, sep, maxWidth)
 		}
 
 		ticket := m.selectedTicket()
 		if ticket != nil {
 			if _, hasPane := m.panes[ticket.ID]; hasPane {
-				return join(
-					hint("Enter/s", "open agent"),
-					hint("S", "stop"),
-					hint("Space/-", "move"),
-					hint("e", "edit"),
-					hint("d", "del"),
-					hint("K/J", "prio"),
-					hint("o", "sort"),
-					hint("w", "filter"),
-					hint("[", "sidebar"),
-					hint("?", "help"),
-				)
+				return m.packHints([]hintSpec{
+					{key: "Enter/s", label: "open agent", prio: 9},
+					{key: "S", label: "stop", prio: 8},
+					{key: "Space/-", label: "move", prio: 7},
+					{key: "e", label: "edit", prio: 6},
+					{key: "d", label: "del", prio: 5},
+					{key: "K/J", label: "prio", prio: 4},
+					{key: "o", label: "sort", prio: 3},
+					{key: "w", label: "filter", prio: 2},
+					{key: "[", label: "sidebar", prio: 1},
+					{key: "?", label: "help", prio: 10, pinned: true},
+				}, hintStyle, sep, maxWidth)
 			}
 			if ticket.Status == board.StatusInProgress {
-				return join(
-					hint("Enter/s", "spawn agent"),
-					hint("Space/-", "move"),
-					hint("e", "edit"),
-					hint("d", "del"),
-					hint("K/J", "prio"),
-					hint("o", "sort"),
-					hint("w", "filter"),
-					hint("[", "sidebar"),
-					hint("?", "help"),
-				)
+				return m.packHints([]hintSpec{
+					{key: "Enter/s", label: "spawn agent", prio: 8},
+					{key: "Space/-", label: "move", prio: 7},
+					{key: "e", label: "edit", prio: 6},
+					{key: "d", label: "del", prio: 5},
+					{key: "K/J", label: "prio", prio: 4},
+					{key: "o", label: "sort", prio: 3},
+					{key: "w", label: "filter", prio: 2},
+					{key: "[", label: "sidebar", prio: 1},
+					{key: "?", label: "help", prio: 9, pinned: true},
+				}, hintStyle, sep, maxWidth)
 			}
 		}
 
-		return join(
-			hint("h/j/k/l", "nav"),
-			hint("n", "new"),
-			hint("e", "edit"),
-			hint("d", "del"),
-			hint("Space/-", "move"),
-			hint("s", "spawn"),
-			hint("K/J", "prio"),
-			hint("o", "sort"),
-			hint("w", "filter"),
-			hint("W", "global"),
-			hint("/", "search"),
-			hint("[", "sidebar"),
-			hint("O", "settings"),
-			hint("?", "help"),
-			hint("q", "quit"),
-		)
+		// Drop order (lowest prio first), per the ticket brief:
+		// sidebar → settings → global → sort → filter → prio → spawn →
+		// move → search → del → edit → new → nav. `q quit` carries the
+		// lowest prio for documentation, but is pinned so it never actually
+		// drops — pinned wins. `? help` is likewise pinned.
+		return m.packHints([]hintSpec{
+			{key: "h/j/k/l", label: "nav", prio: 13},
+			{key: "n", label: "new", prio: 12},
+			{key: "e", label: "edit", prio: 11},
+			{key: "d", label: "del", prio: 10},
+			{key: "Space/-", label: "move", prio: 9},
+			{key: "s", label: "spawn", prio: 8},
+			{key: "K/J", label: "prio", prio: 7},
+			{key: "o", label: "sort", prio: 6},
+			{key: "w", label: "filter", prio: 5},
+			{key: "W", label: "global", prio: 4},
+			{key: "/", label: "search", prio: 3},
+			{key: "[", label: "sidebar", prio: 2},
+			{key: "O", label: "settings", prio: 1},
+			{key: "?", label: "help", prio: 14, pinned: true},
+			{key: "q", label: "quit", prio: 0, pinned: true},
+		}, hintStyle, sep, maxWidth)
 
 	default:
-		return join(
-			hint("Esc", "back"),
-			hint("?", "help"),
-		)
+		return m.packHints([]hintSpec{
+			{key: "Esc", label: "back", prio: 1, pinned: true},
+			{key: "?", label: "help", prio: 2, pinned: true},
+		}, hintStyle, sep, maxWidth)
 	}
+}
+
+// packHints renders the given hints joined by sep, dropping the lowest-priority
+// non-pinned hints until the line fits maxWidth. When any hint is dropped, a dim
+// `…` cue is inserted immediately before the first pinned hint (so it lands just
+// left of `? help`), signalling that more keys live in the `?` help menu. If no
+// pinned hint exists, the cue is appended at the end.
+func (m *Model) packHints(items []hintSpec, hintStyle lipgloss.Style, sep string, maxWidth int) string {
+	render := func(it hintSpec) string {
+		if it.key == "" {
+			// Plain dim helper text (e.g. "@project to filter by project").
+			return m.dimStyle().Render(it.label)
+		}
+		return hintStyle.Render(it.key) + m.dimStyle().Render(" "+it.label)
+	}
+
+	rendered := make([]string, len(items))
+	widths := make([]int, len(items))
+	for i, it := range items {
+		rendered[i] = render(it)
+		widths[i] = lipgloss.Width(rendered[i])
+	}
+	sepW := lipgloss.Width(sep)
+
+	keep := make([]bool, len(items))
+	for i := range keep {
+		keep[i] = true
+	}
+
+	// Current width of the kept set joined by sep.
+	lineWidth := func() int {
+		w, n := 0, 0
+		for i := range items {
+			if keep[i] {
+				w += widths[i]
+				n++
+			}
+		}
+		if n > 1 {
+			w += (n - 1) * sepW
+		}
+		return w
+	}
+
+	join := func() string {
+		parts := make([]string, 0, len(items))
+		for i := range items {
+			if keep[i] {
+				parts = append(parts, rendered[i])
+			}
+		}
+		return strings.Join(parts, sep)
+	}
+
+	// Fits as-is — render everything, no cue.
+	if lineWidth() <= maxWidth {
+		return join()
+	}
+
+	// Doesn't fit: reserve room for the cue (measured from the exact rendered
+	// string, not a guessed constant) and drop the lowest-prio non-pinned hints.
+	cue := m.dimStyle().Render("…")
+	cueW := lipgloss.Width(cue) + sepW
+
+	dropLowest := func() bool {
+		idx := -1
+		for i := range items {
+			if !keep[i] || items[i].pinned {
+				continue
+			}
+			// Lowest prio wins; ties resolve by display index (first scanned).
+			if idx == -1 || items[i].prio < items[idx].prio {
+				idx = i
+			}
+		}
+		if idx == -1 {
+			return false
+		}
+		keep[idx] = false
+		return true
+	}
+
+	for lineWidth()+cueW > maxWidth {
+		if !dropLowest() {
+			break // only pinned hints remain
+		}
+	}
+
+	// Insert the cue just before the first kept pinned hint (so it sits left of
+	// `? help`); if none, append at the end.
+	parts := make([]string, 0, len(items)+1)
+	cueInserted := false
+	for i := range items {
+		if !keep[i] {
+			continue
+		}
+		if items[i].pinned && !cueInserted {
+			parts = append(parts, cue)
+			cueInserted = true
+		}
+		parts = append(parts, rendered[i])
+	}
+	if !cueInserted {
+		parts = append(parts, cue)
+	}
+	return strings.Join(parts, sep)
 }
 
 func (m *Model) renderHelp() string {
