@@ -604,6 +604,12 @@ case agentStatusMsg:
 
 The embedded `agent_prompt.tmpl` is deliberately **generic about cross-cutting workflow discipline**. It points at categories of help — "code-review, validation, cross-stack risk subagents", "adversarial / multi-role doc reviewer" — without naming specific agents, plugins, or skills that may not be installed in the spawned environment. Personal subagent loadouts and named-agent guidance belong in the user's own `~/.claude/CLAUDE.md`, which the template explicitly defers to. When extending the template, prefer naming a role over naming a tool; if you want to name a specific agent, the right home is your global CLAUDE.md.
 
+The one deliberate exception is the **`finishing-an-openkanban-ticket`** skill, which the template names for the close-out. That skill is openkanban-owned (vendored at [`skills/finishing-an-openkanban-ticket/`](../skills/finishing-an-openkanban-ticket/SKILL.md) and written into `~/.claude/skills/` on launch — see "Standardized close-out" below), so it is guaranteed present in any openkanban-spawned session. The template's wrap-up section delegates the entire end-of-ticket flow to it: verify → self-evaluate readiness → one enumerated permission prompt → land via commit → PR → merge → reflective wind-down. The template itself stays generic and prose-affirmative (it describes *what* the close-out does, not a list of `NEVER` rules) so it doesn't restate the user's global push-gate.
+
+### Standardized close-out
+
+The shipped skill standardizes the two prompts a user otherwise re-types at the end of every ticket ("land the work" and "anything else / lessons learned"). Its safety model: the single permission prompt enumerates every outward action (push remote+branch, PR repo, merge target+strategy) and is only offered for a destination verified owned per the user's push-gate; the grant is scoped to the named actions; verification failures and blocking review findings stop the land (fail closed). The skill is shipped via `//go:embed` (mirroring how this template is embedded) and `EnsureFinishSkillInstalled` rewrites the global copy from the embed on launch, so `openkanban update` propagates skill changes on the next start.
+
 `validateInitPromptOverlap` (in `internal/config/validate.go`) backs this discipline up with a warning when a user-supplied `init_prompt` restates rules from their global CLAUDE.md. Its `strongRuleMarkers` are universal patterns (`HARD RULE`, `NEVER gh pr create / git push`, `\bglobal rule\b`) — not phrases lifted from any one user's CLAUDE.md.
 
 ## Environment Isolation
