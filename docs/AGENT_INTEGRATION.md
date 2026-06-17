@@ -938,16 +938,35 @@ A gap **inside** `handleDaemonSessionEvent` (no follow-up "waiting on channel" f
 
 ### 6. Get a goroutine dump (only after 1-5 captured)
 
-bubbletea's `Program` installs a SIGQUIT handler that restores the terminal and exits cleanly via its normal teardown path. **`kill -QUIT <pid>` will NOT print Go's runtime goroutine dump** — bubbletea swallows it.
+Neither bubbletea nor openkanban traps SIGQUIT. Verified against `bubbletea@v1.3.10/tea.go:286` (`signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)`, no SIGQUIT anywhere in the module) and `internal/app/app.go:122` (same pair). So the Go runtime's default SIGQUIT handler runs and prints every goroutine's stack to stderr — as designed.
 
-To force the dump: send SIGABRT instead.
+The trap is **alt-screen**. `internal/app/app.go:124` configures `tea.WithAltScreen()`, so the dump bytes are written onto the alt-screen buffer the terminal discards when the process dies. The dump is produced but invisible. SIGABRT exits via the same path with the same result.
+
+#### For the daemon (`openkanbankd`)
+
+Use the built-in handler — repeatable, doesn't kill the process:
 
 ```bash
-kill -ABRT <pid>
+kill -USR1 $(pgrep openkanbankd)
+tail -200 ~/.cache/openkanban/daemon.log
 ```
 
-bubbletea doesn't trap SIGABRT, so the Go runtime's default handler runs and prints all goroutines' stacks to the process's stderr — i.e. the terminal the TUI was attached to. Scroll up in that terminal to read it.
+Source: `internal/daemon/server.go:272-279` registers `signal.Notify(sigChan, syscall.SIGUSR1)` and on receipt does `runtime.Stack(buf, true)` followed by `log.Printf`. The daemon's stderr is redirected to `daemon.log` by `internal/daemon/autostart.go:137`, so the dump lands in the log file.
 
-Heavier alternatives:
-- `dlv attach <pid>` → `goroutines` → `bt` per goroutine (most reliable, slowest)
-- macOS `sample` for a statistical profile (no full state, but identifies hot paths)
+#### For the TUI (`openkanban`)
+
+No in-process handler. Two paths that actually work:
+
+1. **Pre-redirect stderr, then SIGQUIT.** The redirect must happen BEFORE launch; SIGQUIT can't reattach stderr after the fact.
+
+   ```bash
+   # in the terminal where you're running the TUI:
+   openkanban 2> /tmp/openkanban-stderr.log
+   # then on hang, from another terminal:
+   kill -QUIT $(pgrep -n openkanban)
+   grep -A2 -E "goroutine|techdufus/openkanban/" /tmp/openkanban-stderr.log | head -200
+   ```
+
+2. **`dlv attach <pid>`** → `goroutines` → `bt` per goroutine. Most reliable, slowest, doesn't kill the process.
+
+macOS `sample` (used in step 2 of this section) gives a statistical CPU profile but no goroutine state — fine for "what's hot," useless for "what's blocked on what."

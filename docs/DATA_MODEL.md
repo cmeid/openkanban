@@ -311,9 +311,13 @@ The `internal/watch` package runs an `fsnotify.Watcher` rooted at the
 config dir plus each project's tickets subdir. Events are debounced
 ~100ms per path, classified by parent directory + basename, and pushed
 into the Bubble Tea event loop as `ui.FsChangedMsg` via `program.Send`.
-On macOS, fsnotify uses kqueue; OpenKanban watches directories (not
-individual files) to keep the kqueue fd count bounded — one fd per
-project, not per ticket.
+On macOS, fsnotify uses kqueue. Watching a directory does NOT bound
+the fd count — fsnotify's kqueue backend opens one fd per file inside
+each watched dir so `EVFILT_VNODE` can deliver Write events (kqueue's
+vnode filter only works on individual fds). fd footprint therefore
+scales with ticket count regardless of whether we `Add()` the dir or
+each file. FSEvents is the only real fix if `ulimit -n` ever bites.
+See `internal/watch/watcher.go` package doc for the per-fd accounting.
 
 Editor swap files (`.tmp`, `.swp`, `~`, leading-dot, vim's `4913`) are
 filtered out at the classifier.
