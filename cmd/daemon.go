@@ -584,6 +584,44 @@ func stderrIsTTY() bool {
 	return (fi.Mode() & os.ModeCharDevice) != 0
 }
 
+// daemonHealthCmd dials the running daemon and prints its live health
+// counters: PID, goroutine count, active session count, and resilience
+// metrics added in the daemon-resilience hardening pass (inflight handlers,
+// inflight kills, reap failures, dispatch sequence number).
+var daemonHealthCmd = &cobra.Command{
+	Use:           "health",
+	Short:         "Show the running daemon's health counters",
+	SilenceUsage:  true,
+	SilenceErrors: false,
+	RunE: func(cmd *cobra.Command, args []string) (err error) {
+		defer func() { err = mapDaemonErr(err) }()
+		ctx, cancel := context.WithTimeout(cmd.Context(), rpcTimeout)
+		defer cancel()
+		conn, err := dialDaemon(ctx)
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+		r := bufio.NewReader(conn)
+		if _, err := exchange(ctx, conn, r, daemon.MsgHelloReq, daemon.HelloReq{
+			ProtocolVersion: daemon.ProtocolVersion, BinaryVersion: Version, ClientName: daemon.ClientNameCLI,
+		}); err != nil {
+			return fmt.Errorf("hello: %w", err)
+		}
+		raw, err := exchange(ctx, conn, r, daemon.MsgHealthReq, daemon.HealthReq{})
+		if err != nil {
+			return fmt.Errorf("health: %w", err)
+		}
+		var h daemon.HealthResp
+		if err := json.Unmarshal(raw, &h); err != nil {
+			return fmt.Errorf("decode HealthResp: %w", err)
+		}
+		fmt.Printf("pid=%d goroutines=%d sessions=%d inflight_handlers=%d inflight_kills=%d reap_failures=%d dispatch_seq=%d\n",
+			h.PID, h.Goroutines, h.Sessions, h.InflightHandlers, h.InflightKills, h.ReapFailures, h.DispatchSeq)
+		return nil
+	},
+}
+
 // daemonLogCmd replaces the current process with `tail -F <log>` so the
 // user sees a live stream of the daemon's log. We don't reimplement
 // tail in-process — exec'ing the system tool is shorter, safer, and
@@ -738,5 +776,6 @@ func init() {
 	daemonCmd.AddCommand(daemonRestartCmd)
 	daemonCmd.AddCommand(daemonCloseCmd)
 	daemonCmd.AddCommand(daemonLogCmd)
+	daemonCmd.AddCommand(daemonHealthCmd)
 	rootCmd.AddCommand(daemonCmd)
 }
