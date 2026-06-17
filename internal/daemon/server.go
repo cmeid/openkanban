@@ -68,6 +68,8 @@ type Server struct {
 
 	wg sync.WaitGroup
 
+	sem *connSem
+
 	// events fans daemon-internal SessionEvent updates out to the
 	// goroutine that pushes them to subscribed clients (PR9's
 	// broadcastEvents). Buffered so the emit-sites (handleSpawn,
@@ -227,6 +229,7 @@ func NewServerWithOptions(sock, pidpath string, opts Options) (*Server, error) {
 		shutdown:       make(chan struct{}),
 		events:         make(chan SessionEvent, 64),
 		statusDetector: agent.NewStatusDetector(),
+		sem:            newConnSem(maxConcurrentConns),
 	}, nil
 }
 
@@ -405,9 +408,17 @@ func (s *Server) Serve(ctx context.Context) error {
 		}
 
 		c := s.registerClient(conn)
+		if !s.sem.tryAcquire() {
+			log.Printf("openkanbankd: connection cap (%d) reached — rejecting client %d", maxConcurrentConns, c.id)
+			s.writeError(c, "server_busy", "daemon at connection capacity")
+			conn.Close()
+			s.unregisterClient(c)
+			continue
+		}
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
+			defer s.sem.release()
 			// Intentionally NO panic recovery here. A panic in
 			// handleConn signals protocol / wire-state corruption,
 			// not a transient telemetry hiccup like the background
