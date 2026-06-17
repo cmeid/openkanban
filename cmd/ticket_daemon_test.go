@@ -210,7 +210,7 @@ func TestTicketNew_Migrate_DaemonOwns_WithoutForce_Refuses(t *testing.T) {
 	ticketNewForce = false
 
 	ticket := board.NewTicket("t", "proj-x")
-	err := applySessionFlags(ticket)
+	err := applySessionFlags(ticket, project.NewGlobalTicketStore(nil))
 	if err == nil {
 		t.Fatalf("applySessionFlags: want error, got nil")
 	}
@@ -241,7 +241,7 @@ func TestTicketNew_Migrate_DaemonOwns_WithForce_KillsViaDaemon(t *testing.T) {
 	ticketNewForce = true
 
 	ticket := board.NewTicket("t", "proj-x")
-	if err := applySessionFlags(ticket); err != nil {
+	if err := applySessionFlags(ticket, project.NewGlobalTicketStore(nil)); err != nil {
 		t.Fatalf("applySessionFlags: %v", err)
 	}
 	if ticket.AgentSessionID != uuid {
@@ -297,7 +297,7 @@ func TestTicketNew_Migrate_DaemonUpDoesntOwn_WithoutForce_UsesLsofPath(t *testin
 	ticketNewForce = false
 
 	ticket := board.NewTicket("t", "proj-x")
-	err := applySessionFlags(ticket)
+	err := applySessionFlags(ticket, project.NewGlobalTicketStore(nil))
 	if err == nil {
 		t.Fatalf("applySessionFlags: want error, got nil")
 	}
@@ -328,7 +328,7 @@ func TestTicketNew_Migrate_DaemonUpDoesntOwn_WithForce_UsesLsofForceExit(t *test
 	ticketNewForce = true
 
 	ticket := board.NewTicket("t", "proj-x")
-	if err := applySessionFlags(ticket); err != nil {
+	if err := applySessionFlags(ticket, project.NewGlobalTicketStore(nil)); err != nil {
 		t.Fatalf("applySessionFlags: %v", err)
 	}
 
@@ -372,7 +372,7 @@ func TestTicketNew_Migrate_DaemonDown_WithoutForce_UsesLsofPath(t *testing.T) {
 	ticketNewForce = false
 
 	ticket := board.NewTicket("t", "proj-x")
-	err := applySessionFlags(ticket)
+	err := applySessionFlags(ticket, project.NewGlobalTicketStore(nil))
 	if err == nil {
 		t.Fatalf("applySessionFlags: want error, got nil")
 	}
@@ -401,7 +401,7 @@ func TestTicketNew_Migrate_DaemonDown_WithForce_UsesLsofForceExit(t *testing.T) 
 	ticketNewForce = true
 
 	ticket := board.NewTicket("t", "proj-x")
-	if err := applySessionFlags(ticket); err != nil {
+	if err := applySessionFlags(ticket, project.NewGlobalTicketStore(nil)); err != nil {
 		t.Fatalf("applySessionFlags: %v", err)
 	}
 	if ticket.AgentSessionID != uuid {
@@ -429,7 +429,7 @@ func TestTicketNew_Migrate_DaemonDown_NoHolder_Succeeds(t *testing.T) {
 	ticketNewForce = false
 
 	ticket := board.NewTicket("t", "proj-x")
-	if err := applySessionFlags(ticket); err != nil {
+	if err := applySessionFlags(ticket, project.NewGlobalTicketStore(nil)); err != nil {
 		t.Fatalf("applySessionFlags: %v", err)
 	}
 	if ticket.AgentSessionID != uuid {
