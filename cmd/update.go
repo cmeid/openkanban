@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -210,7 +212,49 @@ func ApplyUpdate(ctx context.Context, status UpdateStatus, out io.Writer) error 
 			fmt.Fprintf(out, "note: could not refresh close-out skill: %v\n", serr)
 		}
 	}
+
+	// Refresh the macOS app-bundle daemon binary. The daemon forks from
+	// ~/Applications/OpenKanban.app/Contents/MacOS/openkanbankd, so
+	// without this step daemon-side changes never deploy via `update`.
+	installedBin := filepath.Join(resolveGoBin(), "openkanban")
+	if resolveGoBin() == "" {
+		installedBin = ""
+	}
+	assembleBundle(ctx, out, runtime.GOOS, SourcePath, installedBin,
+		func(ctx context.Context, name string, args ...string) error {
+			cmd := exec.CommandContext(ctx, name, args...)
+			cmd.Stdout = out
+			cmd.Stderr = out
+			return cmd.Run()
+		})
+	fmt.Fprintln(out, "daemon binary updated — run 'openkanban daemon restart' to apply (ends running sessions)")
+
 	return nil
+}
+
+// assembleBundle refreshes the macOS .app bundle daemon binary after a
+// go install, mirroring scripts/install.sh. No-op off darwin. Non-fatal:
+// a missing/failing bundle script warns but does not fail the update
+// (the CLI is already updated; the bundle is the daemon's binary source
+// that the user can otherwise repair with ./scripts/install.sh).
+func assembleBundle(ctx context.Context, out io.Writer, goos, sourcePath, installedBin string, run func(ctx context.Context, name string, args ...string) error) {
+	if goos != "darwin" {
+		return
+	}
+	if installedBin == "" {
+		fmt.Fprintln(out, "note: could not resolve installed binary path; daemon bundle not refreshed — run ./scripts/install.sh")
+		return
+	}
+	script := filepath.Join(sourcePath, "dist", "macos", "build-bundle.sh")
+	if st, err := os.Stat(script); err != nil || st.IsDir() {
+		fmt.Fprintf(out, "note: bundle script %s not found; daemon binary not refreshed — run ./scripts/install.sh to update the daemon\n", script)
+		return
+	}
+	dest := filepath.Join(os.Getenv("HOME"), "Applications")
+	fmt.Fprintf(out, "refreshing OpenKanban.app daemon bundle (%s)\n", dest)
+	if err := run(ctx, script, installedBin, dest); err != nil {
+		fmt.Fprintf(out, "warning: bundle refresh failed (%v); daemon binary not updated — run ./scripts/install.sh\n", err)
+	}
 }
 
 // buildInstallCmd constructs the `go install` command that rebuilds and
