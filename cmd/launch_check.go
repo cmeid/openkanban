@@ -209,7 +209,7 @@ func (m updatePromptModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m updatePromptModel) View() string {
 	prefix := lipgloss.NewStyle().Bold(true).Render(
-		fmt.Sprintf("Update available: %s -> %s.", m.status.LocalSHA, m.status.RemoteSHA),
+		fmt.Sprintf("Update available: %s -> %s.", m.status.displayFromSHA(), m.status.RemoteSHA),
 	)
 	return prefix + " [Enter] apply & relaunch · [Esc] skip · [Q] quit\n"
 }
