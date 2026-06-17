@@ -1149,6 +1149,16 @@ func (s *Server) dispatch(c *clientConn, typeName string, raw json.RawMessage) {
 			s.writeError(c, "daemon_unresponsive", "set_viewing handler timed out")
 		}
 
+	case MsgHealthReq:
+		var req HealthReq
+		_ = json.Unmarshal(raw, &req)
+		var resp HealthResp
+		if s.runHandlerWithDeadline("health", func() { resp = s.handleHealth(c, req) }) {
+			s.writeResp(c, MsgHealthResp, resp)
+		} else {
+			s.writeError(c, "daemon_unresponsive", "health handler timed out")
+		}
+
 	default:
 		s.writeError(c, "unknown_message", fmt.Sprintf("unknown message type %q", typeName))
 	}
@@ -1541,6 +1551,22 @@ func (s *Server) handleSetViewing(c *clientConn, req SetViewingReq) SetViewingRe
 		s.emitEvent(SessionEvent{Event: ev, SessionID: sess.ID(), TicketID: sess.TicketID()})
 	}
 	return SetViewingResp{ViewerCount: count}
+}
+
+// handleHealth returns the daemon's runtime counters — used by
+// `openkanban daemon health` and the client's wedge diagnostics.
+func (s *Server) handleHealth(c *clientConn, req HealthReq) HealthResp {
+	seq, inflight := s.dispatchStats()
+	kills, reapFail := s.killStats()
+	return HealthResp{
+		Goroutines:       runtime.NumGoroutine(),
+		Sessions:         s.reg.len(),
+		InflightHandlers: inflight,
+		InflightKills:    kills,
+		ReapFailures:     reapFail,
+		DispatchSeq:      seq,
+		PID:              os.Getpid(),
+	}
 }
 
 // cleanupViewersForClient removes clientID from every session's

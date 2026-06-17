@@ -254,6 +254,9 @@ const (
 	MsgShutdownReq     = "shutdown.req"
 	MsgShutdownResp    = "shutdown.resp"
 
+	MsgHealthReq  = "health.req"
+	MsgHealthResp = "health.resp"
+
 	MsgErrorResp = "error.resp"
 )
 
@@ -693,4 +696,18 @@ type ShutdownResp struct {
 type ErrorResp struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+}
+
+// HealthReq requests runtime counters from the daemon.
+type HealthReq struct{}
+
+// HealthResp reports daemon runtime counters.
+type HealthResp struct {
+	Goroutines       int    `json:"goroutines"`
+	Sessions         int    `json:"sessions"`
+	InflightHandlers int64  `json:"inflight_handlers"`
+	InflightKills    int64  `json:"inflight_kills"`
+	ReapFailures     int64  `json:"reap_failures"`
+	DispatchSeq      uint64 `json:"dispatch_seq"`
+	PID              int    `json:"pid"`
 }
