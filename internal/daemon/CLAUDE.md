@@ -37,6 +37,16 @@ daemon's fate:
   `initiateShutdown` so it doesn't linger as an orphan. A future TUI may re-attach
   in the meantime.
 
+  Accepted tradeoff: there is **no drain timeout**. A session that never exits
+  (a wedged agent with no TUI to wind it down) keeps the default-mode daemon
+  alive indefinitely — by design, since a live session is real work, not
+  transient UI state. The defer is logged once at start (`deferring shutdown
+  until they exit`); recovery is a future TUI re-attaching. If a bounded
+  grace period is ever wanted, add it in `awaitSessionDrain`, not by
+  reinstating the force-kill. Re-attach is single-in-flight: a second
+  last-client-disconnect while `drainPending` is set spawns no second watcher
+  (covered by `TestServerLifecycle_DeferralIsSingleInFlightAcrossReattach`).
+
 `cleanup()` (which kills any sessions still in the registry) is therefore reached
 only via *legitimate* shutdown signals — ctx-cancel, `ShutdownReq`, binary
 staleness, or drained-to-zero — never from the last-client-disconnect-with-live
