@@ -22,7 +22,7 @@ Rationale: the old global `sessionsMu` RWMutex used writer-priority scheduling, 
 
 Access the registry via `s.reg`; never construct a bare `map[string]*Session` guarded by a hand-rolled lock.
 
-`watchSessionExit` uses `reg.deleteIf(sessID, sess)` — delete only if the stored entry is still the same pointer (guards a hypothetical re-use of the same ID).
+`watchSessionExit` uses `reg.deleteIf(sessID, sess)` — delete only if the stored entry is still the same pointer (guards a hypothetical re-use of the same ID). After `removeSession()` and `emit()`, it also calls `sess.pane.Stop()` so a naturally-exiting session (child dies on its own, no Kill/TicketDone) reclaims its master fd, drain goroutine, and scrollback emulator — closing a pre-existing leak where teardown only ran on the Kill/TicketDone paths. `Stop()` is idempotent via `teardownOnce`, so the Kill path's prior teardown is a safe no-op.
 
 ## Last-client-disconnect lifecycle (default vs persistent)
 
