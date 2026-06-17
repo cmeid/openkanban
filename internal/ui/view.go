@@ -160,7 +160,19 @@ func (m *Model) renderHeader() string {
 	helpStyle := lipgloss.NewStyle().Foreground(m.colors.muted)
 	help := helpStyle.Render("? help  q quit")
 
-	right := lipgloss.JoinHorizontal(lipgloss.Center, activity, "  ", help)
+	// macOS notification banners cover the top-right corner. Push the
+	// working/waiting activity chip left of the (disposable, constant) help
+	// text so the status stays visible while a banner is up; help keeps the
+	// covered corner. Bump chipBannerGap if banners are wider on your display.
+	const chipBannerGap = 20
+	gap := chipBannerGap
+	// Collapse the gap on narrow terminals so the right cluster never
+	// overlaps the left cluster; the floor of 2 restores the original spacing.
+	avail := m.width - lipgloss.Width(left) - lipgloss.Width(activity) - lipgloss.Width(help)
+	if gap > avail {
+		gap = max(avail, 2)
+	}
+	right := lipgloss.JoinHorizontal(lipgloss.Center, activity, strings.Repeat(" ", gap), help)
 
 	spacing := m.width - lipgloss.Width(left) - lipgloss.Width(right)
 	spacing = max(spacing, 0)

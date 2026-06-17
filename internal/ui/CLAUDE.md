@@ -65,6 +65,12 @@ Separate render methods composed in `View()`:
 All styling via lipgloss with theme-based `uiColors` struct.
 Never use raw ANSI codes in UI rendering.
 
+The board header's working/waiting **activity chip** (`renderHeader`) is intentionally pushed left
+of the right-edge help text by `const chipBannerGap` so it clears the top-right corner where macOS
+notification banners land. The resulting gap before `? help  q quit` is load-bearing — don't
+"tidy" it away; tune the constant to adjust banner clearance. Pinned by
+`TestRenderHeaderActivityChipClearsCorner`.
+
 ## Messages
 
 Custom messages for async operations:

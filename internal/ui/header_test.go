@@ -1,11 +1,81 @@
 package ui
 
 import (
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/x/ansi"
+
 	"github.com/techdufus/openkanban/internal/board"
+	"github.com/techdufus/openkanban/internal/config"
+	"github.com/techdufus/openkanban/internal/daemon"
+	"github.com/techdufus/openkanban/internal/daemonclient"
+	"github.com/techdufus/openkanban/internal/project"
 )
+
+// TestRenderHeaderActivityChipClearsCorner pins the placement fix: the
+// board header's working/waiting activity chip must sit clear of the
+// top-right corner where macOS notification banners land. We assert the
+// chip text is NOT in the rightmost columns (the banner zone) while the
+// disposable "? help q quit" text keeps the corner. With the original
+// flush-right "  " separator the chip lands ~col 104, inside the last 25
+// columns, so reverting the renderHeader edit turns this test red.
+func TestRenderHeaderActivityChipClearsCorner(t *testing.T) {
+	const tid board.TicketID = "chip-1"
+
+	proj := &project.Project{ID: "test", RepoPath: t.TempDir()}
+	globalStore := project.NewGlobalTicketStore(nil)
+	globalStore.AddProject(proj)
+
+	ticket := &board.Ticket{
+		ID:          tid,
+		Title:       "Waiting agent",
+		ProjectID:   "test",
+		Status:      board.StatusInProgress,
+		AgentStatus: board.AgentWaiting,
+	}
+	if err := globalStore.Add(ticket); err != nil {
+		t.Fatalf("Add ticket: %v", err)
+	}
+
+	// info.Running=true flips the PaneView to Unattached so pane.Running()
+	// is true without a real attach (see cycle_session_test.go).
+	info := &daemon.SessionInfo{SessionID: "sid-" + string(tid), TicketID: string(tid), Running: true, Cols: 80, Rows: 24}
+
+	m := &Model{
+		globalStore: globalStore,
+		panes:       map[board.TicketID]*daemonclient.PaneView{tid: daemonclient.NewPaneView(nil, string(tid), info.SessionID, info)},
+		spinner:     spinner.New(spinner.WithSpinner(spinner.Dot)),
+		colors:      newUIColors(config.DefaultConfig().GetTheme()),
+		width:       120,
+		height:      40,
+		config:      &config.Config{Agents: map[string]config.AgentConfig{}},
+	}
+
+	out := ansi.Strip(m.renderHeader())
+
+	var chipLine string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "waiting") {
+			chipLine = line
+			break
+		}
+	}
+	if chipLine == "" {
+		t.Fatalf("activity chip not rendered; header was:\n%s", out)
+	}
+	if !strings.Contains(chipLine, "? help") {
+		t.Errorf("help text missing from header line: %q", chipLine)
+	}
+
+	// The chip must clear the notification banner zone (rightmost 25 cols).
+	end := strings.Index(chipLine, "waiting") + len("waiting")
+	if limit := m.width - 25; end > limit {
+		t.Errorf("activity chip ends at col %d, want <= %d (clear of the top-right notification zone)\nline: %q", end, limit, chipLine)
+	}
+}
 
 func TestAgentStatusGlyph(t *testing.T) {
 	tests := []struct {
