@@ -38,7 +38,7 @@ Vim-style navigation:
 
 Inside ModeAgentView, these keys are intercepted before the PTY child (claude, etc.) sees them:
 - `Ctrl+]` / `Ctrl+\` - cycle focus to next / prev open, unattached session
-- `Ctrl+g` - exit back to the board
+- `Ctrl+g` - leave this session. Destination is parameterized by **Auto mode** (`m.autoAttach`, toggled by board key `a`): Auto off → back to the board (the default); Auto on → jump to the session that entered `waiting` longest ago (FIFO by `StatusChangedAt`), skipping sessions another TUI holds, falling through to the board when none waits. See `oldestWaitingPeer` / `focusAndPromptAttach` in `model.go` and memory `reference_openkanban_auto_mode_feature_map`.
 - `Enter` - **conditionally** intercepted via `shouldRetryAttachOnEnter`: only when the focused pane has `LastAttachErr() != nil` AND `State() != PaneViewAttached`. In that state Enter retries `attachExisting`; otherwise it falls through to the PTY child as normal. The predicate is gated the same way as `PaneView.View()`'s failure-overlay branch — keep them locked together, otherwise the user sees the "Enter retries" hint but pressing Enter does nothing.
 
 `Ctrl+[` cannot be used: in bubbletea v1.3.x (no Kitty keyboard protocol enabled here) it is bytewise indistinguishable from `Esc`. Any new ctrl-combo binding should be verified against `~/golang/pkg/mod/github.com/charmbracelet/bubbletea@<ver>/key.go` before promising it.

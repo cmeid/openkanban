@@ -283,6 +283,16 @@ type Model struct {
 	// AttachFirstMsg handshake the first time they type into the pane.
 	cycleAttachPrompt bool
 
+	// autoAttach is the "Auto" mode toggle (board key 'a'). When true,
+	// leaving the current session (Ctrl+G) does not return to the board —
+	// it jumps to the session that has been WAITING the longest (FIFO by
+	// StatusChangedAt), skipping sessions a sibling TUI is attached to. If
+	// no such waiter exists it falls through to the board (the always-
+	// available off-ramp, since the board is where the toggle lives). In-
+	// memory and session-only by design — a persisted auto-pilot is a
+	// multi-TUI footgun. See oldestWaitingPeer.
+	autoAttach bool
+
 	// daemonClient is the long-lived control connection to openkanbankd.
 	// nil when the daemon couldn't be reached at startup — every call
 	// site MUST nil-check before use (the TUI degrades to a no-spawn
@@ -1381,6 +1391,8 @@ func (m *Model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.cycleSessionFilter()
 	case "W":
 		return m.toggleAlwaysShowWorking()
+	case "a":
+		return m.toggleAutoAttach()
 
 	case "/":
 		m.filterInput.SetValue(m.filterQuery)
@@ -1905,6 +1917,20 @@ func (m *Model) handleAgentViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if result := pane.HandleKey(msg); result != nil {
 		switch r := result.(type) {
 		case terminal.ExitFocusMsg:
+			// Auto mode: instead of returning to the board, jump to the
+			// session that has been waiting the longest (skipping any held
+			// by a sibling TUI). If none qualifies we fall through to the
+			// board below — the always-available off-ramp.
+			if m.autoAttach {
+				if id, ok := m.oldestWaitingPeer(m.sessionsAttachedElsewhere()); ok {
+					// No toast: m.notification isn't painted over the agent
+					// view, and the cycle-attach modal already shows the
+					// target's title + live content, so the jump is
+					// self-evident.
+					log.Printf("openkanban model: Auto mode jump -> %s", id)
+					return m, m.focusAndPromptAttach(id)
+				}
+			}
 			log.Printf("openkanban model: ExitFocusMsg received, mode -> ModeNormal")
 			m.mode = ModeNormal
 			m.focusedPane = ""
@@ -3133,9 +3159,9 @@ func (m *Model) moveTicket(delta int) {
 // preceding newline). headerHeight() already includes its own padding/border.
 func (m *Model) boardAreaHeight() int {
 	const (
-		newlineAfterHeader      = 1
-		newlineBeforeStatusBar  = 1
-		statusBarHeight         = 1
+		newlineAfterHeader     = 1
+		newlineBeforeStatusBar = 1
+		statusBarHeight        = 1
 	)
 	return m.height - m.headerHeight() - newlineAfterHeader - newlineBeforeStatusBar - statusBarHeight
 }
@@ -3692,27 +3718,112 @@ func (m *Model) cycleUnattachedSession(delta int) (tea.Model, tea.Cmd) {
 		next = allOpen[(cur+delta+len(allOpen))%len(allOpen)]
 	}
 
-	m.focusedPane = next
-	pv, ok := m.panes[next]
+	return m, m.focusAndPromptAttach(next)
+}
+
+// focusAndPromptAttach focuses the target peer pane, opens the cycle-attach
+// modal over it, and — if the pane is Unattached — kicks off the attach so
+// the modal backdrop shows live PTY content instead of bare chrome.
+//
+// Shared by Ctrl+]/Ctrl+\ cycling (cycleUnattachedSession) and Auto mode's
+// oldest-waiter jump (the ExitFocusMsg branch in handleAgentViewMode) so the
+// SetSize(-2) sizing and the cycleAttachPrompt handshake can't drift between
+// the two entry points. Callers build target from m.panes; the defensive
+// pv==nil bail still sets the modal flag so the user sees the prompt with
+// the bare ticket title if the map raced out from under us.
+func (m *Model) focusAndPromptAttach(target board.TicketID) tea.Cmd {
+	m.focusedPane = target
+	pv, ok := m.panes[target]
 	if !ok || pv == nil {
-		// Defensive — allOpen was built from m.panes a few lines up, so
-		// this shouldn't fire. Bail with the modal flag set so the user
-		// at least sees the prompt with the bare ticket title.
 		m.cycleAttachPrompt = true
-		return m, m.maybeSetWindowTitle()
+		return m.maybeSetWindowTitle()
 	}
 	pv.SetSize(m.width, m.height-2)
 	m.cycleAttachPrompt = true
 
-	// Auto-attach if the target is Unattached so the modal backdrop
-	// shows live content. Already-Attached peers (cycled-through from
-	// a previous Ctrl+] hop, or the originally-attached pane on wrap)
-	// already have a populated vt — no new attach needed.
+	// Auto-attach if the target is Unattached so the modal backdrop shows
+	// live content. Already-Attached peers already have a populated vt.
 	var attachCmd tea.Cmd
 	if pv.State() == daemonclient.PaneViewUnattached {
-		attachCmd = m.attachExisting(next, pv)
+		attachCmd = m.attachExisting(target, pv)
 	}
-	return m, tea.Batch(attachCmd, m.maybeSetWindowTitle())
+	return tea.Batch(attachCmd, m.maybeSetWindowTitle())
+}
+
+// oldestWaitingPeer returns the open peer session that has been WAITING the
+// longest (FIFO by StatusChangedAt), for Auto mode's un-attach jump. A
+// ticket qualifies iff it has a live pane (Attached/Unattached), its
+// activity-overridden AgentStatus is "waiting" (the poll writes the
+// overridden value back onto ticket.AgentStatus, so this matches what the
+// card renders), it is not the session being left (m.focusedPane — else
+// Auto would re-attach you to the one you just left), it has a non-nil
+// StatusChangedAt, and no other TUI client holds it (attachedElsewhere,
+// built by the caller from a List snapshot — skipping these avoids
+// taking a session away from a sibling TUI). Ties on StatusChangedAt
+// resolve to board order (m.columnTickets walk order). Returns ok=false
+// when nothing qualifies, which the caller treats as "fall through to the
+// board" — the always-available off-ramp.
+func (m *Model) oldestWaitingPeer(attachedElsewhere map[board.TicketID]bool) (board.TicketID, bool) {
+	var best board.TicketID
+	var bestTime time.Time
+	found := false
+	for _, col := range m.columnTickets {
+		for _, t := range col {
+			if t == nil || t.ID == m.focusedPane {
+				continue
+			}
+			if attachedElsewhere[t.ID] {
+				continue
+			}
+			// AgentStatus here is the activity-overridden value the poll
+			// writes back (model.go agentStatusResultMsg handler), so this
+			// matches what the card renders. columnTickets holds the same
+			// *board.Ticket the store mutates, so no globalStore lookup.
+			if t.AgentStatus != board.AgentWaiting || t.StatusChangedAt == nil {
+				continue
+			}
+			pv, ok := m.panes[t.ID]
+			if !ok || pv == nil {
+				continue
+			}
+			switch pv.State() {
+			case daemonclient.PaneViewAttached, daemonclient.PaneViewUnattached:
+			default:
+				continue
+			}
+			if !found || t.StatusChangedAt.Before(bestTime) {
+				best = t.ID
+				bestTime = *t.StatusChangedAt
+				found = true
+			}
+		}
+	}
+	return best, found
+}
+
+// sessionsAttachedElsewhere returns the set of tickets whose daemon session
+// is currently held by a client other than this TUI. Built from a single
+// List snapshot (1s timeout), mirroring attachExisting's takeover check.
+// Used by Auto mode to skip sibling-TUI sessions so a jump never displaces
+// another viewer. Returns nil (empty filter) when the daemon is
+// unreachable — single-TUI behavior is then unaffected.
+func (m *Model) sessionsAttachedElsewhere() map[board.TicketID]bool {
+	if m.daemonClient == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	resp, err := m.daemonClient.List(ctx)
+	if err != nil {
+		return nil
+	}
+	out := make(map[board.TicketID]bool)
+	for _, s := range resp.Sessions {
+		if s.AttachedClient != 0 && s.AttachedClient != m.daemonClient.ClientID() {
+			out[board.TicketID(s.TicketID)] = true
+		}
+	}
+	return out
 }
 
 // cycleSortMode advances to the next sort mode and re-renders the board.
@@ -3757,6 +3868,18 @@ func (m *Model) toggleAlwaysShowWorking() (tea.Model, tea.Cmd) {
 		state = "on"
 	}
 	m.notify("Always show working: " + state)
+	return m, nil
+}
+
+// toggleAutoAttach flips Auto mode (board key 'a'). See the autoAttach
+// field doc and oldestWaitingPeer for the behavior it gates.
+func (m *Model) toggleAutoAttach() (tea.Model, tea.Cmd) {
+	m.autoAttach = !m.autoAttach
+	state := "off"
+	if m.autoAttach {
+		state = "on"
+	}
+	m.notify("Auto-attach: " + state)
 	return m, nil
 }
 
