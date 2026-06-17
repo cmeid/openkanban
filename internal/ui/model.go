@@ -35,7 +35,6 @@ type Mode string
 const (
 	ModeNormal        Mode = "NORMAL"
 	ModeInsert        Mode = "INSERT"
-	ModeCommand       Mode = "COMMAND"
 	ModeHelp          Mode = "HELP"
 	ModeConfirm       Mode = "CONFIRM"
 	ModeConfirmExit   Mode = "CONFIRM_EXIT"
@@ -1254,8 +1253,6 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch m.mode {
 	case ModeNormal:
 		return m.handleNormalMode(msg)
-	case ModeCommand:
-		return m.handleCommandMode(msg)
 	case ModeCreateTicket:
 		return m.handleCreateTicketMode(msg)
 	case ModeEditTicket:
@@ -1356,9 +1353,6 @@ func (m *Model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.cycleSessionFilter()
 	case "W":
 		return m.toggleAlwaysShowWorking()
-
-	case ":":
-		m.mode = ModeCommand
 
 	case "/":
 		m.filterInput.SetValue(m.filterQuery)
@@ -1719,16 +1713,6 @@ func (m *Model) dropTicket() (tea.Model, tea.Cmd) {
 	m.dragTargetColumn = 0
 
 	return m, wrapUpCmd
-}
-
-func (m *Model) handleCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "enter":
-		m.mode = ModeNormal
-	case "esc":
-		m.mode = ModeNormal
-	}
-	return m, nil
 }
 
 func (m *Model) handleConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
