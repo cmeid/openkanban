@@ -166,6 +166,11 @@ type spawnPlan struct {
 	SkipMerge          bool // option 'n' — don't write the brief
 	ForceFresh         bool // option 'd' — caller has already cleared AgentSpawnedAt
 	InjectResumeNotice bool // option 'u' — append a "brief updated" message after --continue
+	// Unattached (ctrl+space) spawns the session but does NOT attach: the
+	// closure builds an Unattached PaneView, skips the Owns fast-path and
+	// attachWithRetry, and returns a spawnUnattachedReadyMsg so the TUI
+	// stays on the board (ModeNormal) instead of switching to ModeAgentView.
+	Unattached bool
 }
 
 type Model struct {
@@ -935,6 +940,31 @@ func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 
+	case spawnUnattachedReadyMsg:
+		// ctrl+space spawn completed without attaching. Register the
+		// Unattached pane and stamp the ticket, mirroring the persist/
+		// bookkeeping half of the attached spawnReadyMsg handler — but
+		// WITHOUT the ModeAgentView switch, focusedPane, or pane-message
+		// listener. The TUI stays on the board; the user attaches later
+		// via s/Enter (which takes the PaneViewUnattached arm of spawnAgent).
+		ticket, _ := m.globalStore.Get(msg.ticketID)
+		if ticket != nil {
+			if ticket.AgentSpawnedAt == nil {
+				now := time.Now()
+				ticket.AgentSpawnedAt = &now
+			}
+			if msg.worktreePath != "" && ticket.WorktreePath == "" {
+				ticket.WorktreePath = msg.worktreePath
+				ticket.BranchName = msg.branchName
+				ticket.BaseBranch = msg.baseBranch
+			}
+			m.saveTicket(ticket)
+		}
+		m.panes[msg.ticketID] = msg.pane
+		m.daemonOwned[msg.ticketID] = struct{}{}
+		m.notify("Agent launched in background")
+		return m, nil
+
 	case spawnErrorMsg:
 		// Surface attach/spawn errors arriving outside ModeSpawning. The
 		// ModeSpawning case is handled in the block above (since that
@@ -1366,6 +1396,10 @@ func (m *Model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.confirmDeleteTicket()
 	case " ":
 		return m.quickMoveTicket()
+	case "ctrl+@":
+		// ctrl+space (bubbletea reports ctrl+space as "ctrl+@"): promote
+		// the ticket to in_progress and launch its agent unattached.
+		return m.promoteAndSpawnUnattached()
 	case "-", "backspace":
 		return m.quickMoveTicketBackward()
 	case "S":
@@ -3569,6 +3603,98 @@ func (m *Model) quickMoveTicket() (tea.Model, tea.Cmd) {
 	return m, wrapUpCmd
 }
 
+// promoteAndSpawnUnattached implements ctrl+space (matched as "ctrl+@"): move
+// the focused ticket to in_progress from ANY column (no-op move if already
+// there) and launch its agent session UNATTACHED — the TUI stays on the board
+// rather than switching to ModeAgentView. This is the move-forward +
+// background-spawn combo; plain Space moves without spawning, and s/Enter
+// spawns AND attaches.
+//
+// The ticket Move + column refresh run synchronously here (Update thread);
+// only daemon I/O is deferred to the returned Cmd, per the rule that tea.Cmd
+// goroutines must not touch m.globalStore / m.panes.
+func (m *Model) promoteAndSpawnUnattached() (tea.Model, tea.Cmd) {
+	ticket := m.selectedTicket()
+	if ticket == nil {
+		return m, nil
+	}
+
+	// Don't double-spawn: if this TUI already holds a pane for the ticket,
+	// a session already exists (attached or unattached) — leave it be.
+	if _, exists := m.panes[ticket.ID]; exists {
+		m.notify("Agent already running for this ticket")
+		return m, nil
+	}
+
+	// Promote into in_progress from any column (no-op when already there).
+	if ticket.Status != board.StatusInProgress {
+		if ticket.WorktreePath == "" {
+			if ticket.UseWorktree {
+				if err := m.setupWorktree(ticket); err != nil {
+					m.notify("Worktree failed: " + err.Error())
+					return m, nil
+				}
+			} else {
+				if err := m.setupMainRepoBranch(ticket); err != nil {
+					m.notify("Branch setup failed: " + err.Error())
+					return m, nil
+				}
+			}
+		}
+		m.globalStore.Move(ticket.ID, board.StatusInProgress)
+		m.refreshColumnTickets()
+		m.selectTicketByID(ticket.ID)
+		m.saveTicket(ticket)
+	}
+
+	// Resolve project + agent config. Replicated from spawnAgent (rather
+	// than extracted) to keep zero blast radius on that heavily-tested path.
+	proj := m.globalStore.GetProjectForTicket(ticket)
+	if proj == nil {
+		m.notify("Project not found for this ticket")
+		return m, nil
+	}
+	if !ticket.UseWorktree {
+		for otherID := range m.panes {
+			if otherID == ticket.ID {
+				continue
+			}
+			other, _ := m.globalStore.Get(otherID)
+			if other != nil && !other.UseWorktree {
+				otherProj := m.globalStore.GetProjectForTicket(other)
+				if otherProj != nil && otherProj.ID == proj.ID {
+					m.notify("Another main-repo agent is running in this project")
+					return m, nil
+				}
+			}
+		}
+	}
+	agentType := ticket.AgentType
+	if agentType == "" {
+		agentType = m.config.Defaults.DefaultAgent
+	}
+	agentCfg, ok := m.config.Agents[agentType]
+	if !ok {
+		m.notify("Agent '" + agentType + "' not configured")
+		return m, nil
+	}
+	if agentType == "opencode" {
+		_ = m.opencodeServer.Start() // best effort
+	}
+
+	// Persist the resolved agent type so status detection (and a later
+	// attach) see it. The attached spawn path stamps this in its
+	// spawnReadyMsg handler (via m.spawningAgent); the unattached path has
+	// no ModeSpawning bookkeeping, so stamp it here in the Update thread.
+	if ticket.AgentType != agentType {
+		ticket.AgentType = agentType
+		m.saveTicket(ticket)
+	}
+
+	// Spawn unattached — stay on the board (no ModeSpawning, no spinner).
+	return m, m.prepareSpawnWith(ticket, proj, agentCfg, spawnPlan{Unattached: true})
+}
+
 // adjustPriority shifts the active ticket's priority by delta (negative
 // = raise, positive = lower) within the valid 1..5 range. Priority 1 is
 // the highest, so "raise" maps to a smaller number. The selected ticket
@@ -4431,7 +4557,12 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 		// Guarded on ticket.AgentSessionID being set: tickets that have
 		// never had a session linked to them have no UUID to query, so
 		// the fast path is meaningless.
-		if dapi != nil && ticket.AgentSessionID != "" {
+		// The Unattached (ctrl+space) path deliberately skips the fast
+		// path: it must NEVER attach, even to an already-owned session.
+		// handleSpawn is idempotent per TicketID, so the regular Spawn
+		// call below returns the existing SessionID, which we then wrap
+		// in an Unattached PaneView.
+		if !plan.Unattached && dapi != nil && ticket.AgentSessionID != "" {
 			ownsCtx, ownsCancel := context.WithTimeout(context.Background(), ownsProbeTimeout)
 			ownsResp, ownsErr := dapi.Owns(ownsCtx, ticket.AgentSessionID)
 			ownsCancel()
@@ -4656,6 +4787,21 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 			return spawnErrorMsg{ticketID: ticketID, err: "spawn failed: " + err.Error()}
 		}
 
+		// Unattached (ctrl+space): the session is alive on the daemon, but
+		// we do NOT attach. Build an Unattached PaneView and hand it back via
+		// spawnUnattachedReadyMsg so the Update loop registers it without
+		// switching to ModeAgentView. No attachWithRetry.
+		if plan.Unattached {
+			pv := newUnattachedPane(daemonClient, ticketID, resp.SessionID, sessionName, worktreePath, width, height)
+			return spawnUnattachedReadyMsg{
+				ticketID:     ticketID,
+				pane:         pv,
+				worktreePath: worktreePath,
+				branchName:   branchName,
+				baseBranch:   baseBranch,
+			}
+		}
+
 		pv := daemonclient.NewPaneView(daemonClient, string(ticketID), resp.SessionID, nil)
 		pv.SetWorkdir(worktreePath)
 		pv.SetSessionName(sessionName)
@@ -4798,6 +4944,30 @@ func sessionNameFor(ticket *board.Ticket, branchName string) string {
 //   - The notice field carries the attach-retry diagnostic (see B7)
 //     so the user can tell a fast-path-attach-failure apart from a
 //     true daemon-unreachable state.
+// newUnattachedPane builds a daemon-owned, NOT-yet-attached PaneView for a
+// freshly-spawned session — the ctrl+space (spawnPlan.Unattached) path. It is
+// extracted from the prepareSpawnWith closure so it can be unit-tested
+// directly: the inline construction site sits after the daemonClient-nil guard
+// and is unreachable from any daemonless test, so this helper is the only
+// place the Running:true invariant can be exercised in isolation.
+//
+// Running:true is REQUIRED — NewPaneView only flips the pane to
+// PaneViewUnattached when info.Running is true (internal/daemonclient/
+// paneview.go); drop it and the pane stays PaneViewDetached, which renders a
+// "press Enter to retry" overlay instead of the unattached chrome.
+func newUnattachedPane(client *daemonclient.Client, ticketID board.TicketID, sessionID, sessionName, workdir string, cols, rows int) *daemonclient.PaneView {
+	info := daemon.SessionInfo{
+		SessionID:   sessionID,
+		TicketID:    string(ticketID),
+		SessionName: sessionName,
+		Workdir:     workdir,
+		Cols:        cols,
+		Rows:        rows,
+		Running:     true,
+	}
+	return daemonclient.NewPaneView(client, string(ticketID), sessionID, &info)
+}
+
 func attachExistingFastPath(
 	ticketID board.TicketID,
 	sessionID string,
@@ -5583,6 +5753,19 @@ type spawnReadyMsg struct {
 type spawnErrorMsg struct {
 	ticketID board.TicketID
 	err      string
+}
+
+// spawnUnattachedReadyMsg is the ctrl+space counterpart to spawnReadyMsg: the
+// daemon spawned the session but the closure did NOT attach. Its handler
+// registers the Unattached pane and leaves the TUI on the board (ModeNormal)
+// — it never switches to ModeAgentView, sets focusedPane, or starts a pane
+// message listener (the listener begins later, if the user attaches via s/Enter).
+type spawnUnattachedReadyMsg struct {
+	ticketID     board.TicketID
+	pane         *daemonclient.PaneView
+	worktreePath string
+	branchName   string
+	baseBranch   string
 }
 
 func tickAgentStatus(d time.Duration) tea.Cmd {

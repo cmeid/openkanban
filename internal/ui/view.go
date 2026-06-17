@@ -822,7 +822,8 @@ func (m *Model) contextualHints(hintStyle lipgloss.Style, sep string, maxWidth i
 			}
 			if ticket.Status == board.StatusInProgress {
 				return m.packHints([]hintSpec{
-					{key: "Enter/s", label: "spawn agent", prio: 8},
+					{key: "Enter/s", label: "spawn agent", prio: 9},
+					{key: "Ctrl+Space", label: "bg agent", prio: 8},
 					{key: "Space/-", label: "move", prio: 7},
 					{key: "e", label: "edit", prio: 6},
 					{key: "d", label: "del", prio: 5},
@@ -830,7 +831,7 @@ func (m *Model) contextualHints(hintStyle lipgloss.Style, sep string, maxWidth i
 					{key: "o", label: "sort", prio: 3},
 					{key: "w", label: "filter", prio: 2},
 					{key: "[", label: "sidebar", prio: 1},
-					{key: "?", label: "help", prio: 9, pinned: true},
+					{key: "?", label: "help", prio: 10, pinned: true},
 				}, hintStyle, sep, maxWidth)
 			}
 		}
@@ -841,12 +842,13 @@ func (m *Model) contextualHints(hintStyle lipgloss.Style, sep string, maxWidth i
 		// lowest prio for documentation, but is pinned so it never actually
 		// drops — pinned wins. `? help` is likewise pinned.
 		return m.packHints([]hintSpec{
-			{key: "h/j/k/l", label: "nav", prio: 13},
-			{key: "n", label: "new", prio: 12},
-			{key: "e", label: "edit", prio: 11},
-			{key: "d", label: "del", prio: 10},
-			{key: "Space/-", label: "move", prio: 9},
-			{key: "s", label: "spawn", prio: 8},
+			{key: "h/j/k/l", label: "nav", prio: 14},
+			{key: "n", label: "new", prio: 13},
+			{key: "e", label: "edit", prio: 12},
+			{key: "d", label: "del", prio: 11},
+			{key: "Space/-", label: "move", prio: 10},
+			{key: "s", label: "spawn", prio: 9},
+			{key: "Ctrl+Space", label: "bg agent", prio: 8},
 			{key: "K/J", label: "prio", prio: 7},
 			{key: "o", label: "sort", prio: 6},
 			{key: "w", label: "filter", prio: 5},
@@ -854,7 +856,7 @@ func (m *Model) contextualHints(hintStyle lipgloss.Style, sep string, maxWidth i
 			{key: "/", label: "search", prio: 3},
 			{key: "[", label: "sidebar", prio: 2},
 			{key: "O", label: "settings", prio: 1},
-			{key: "?", label: "help", prio: 14, pinned: true},
+			{key: "?", label: "help", prio: 15, pinned: true},
 			{key: "q", label: "quit", prio: 0, pinned: true},
 		}, hintStyle, sep, maxWidth)
 
@@ -1011,7 +1013,7 @@ func (m *Model) renderHelp() string {
 		"  " + keyStyle.Render("h/l") + descStyle.Render("   Enter / exit sidebar    ") + keyStyle.Render("Ctrl+g") + descStyle.Render("  Exit agent view") + "\n" +
 		"  " + keyStyle.Render("j/k") + descStyle.Render("   Navigate projects       ") + keyStyle.Render("Ctrl+]") + descStyle.Render("  Next session (in view)") + "\n" +
 		"  " + keyStyle.Render("a") + descStyle.Render("     Add project             ") + keyStyle.Render("Ctrl+\\") + descStyle.Render("  Prev session (in view)") + "\n" +
-		"  " + keyStyle.Render("d") + descStyle.Render("     Delete project") + "\n" +
+		"  " + keyStyle.Render("d") + descStyle.Render("     Delete project          ") + keyStyle.Render("Ctrl+Space") + descStyle.Render(" Promote + bg agent") + "\n" +
 		"  " + keyStyle.Render("o") + descStyle.Render("     Toggle open only") + "\n\n" +
 		sep + "\n" +
 		sectionStyle.Render("  👁 View") + "                       " + sectionStyle.Render("⚙ System") + "\n" +
