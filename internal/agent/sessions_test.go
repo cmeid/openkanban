@@ -986,3 +986,177 @@ func TestClaudePrimingPrefixes_MatchTemplate(t *testing.T) {
 		}
 	})
 }
+
+func TestProjectDirFor(t *testing.T) {
+	home := withFakeHome(t)
+	projects := filepath.Join(home, ".claude", "projects")
+	cases := []struct {
+		name    string
+		workdir string
+		want    string
+	}{
+		{"nested path", "/Users/cmeid/manifold/dev", filepath.Join(projects, "-Users-cmeid-manifold-dev")},
+		{"worktree path", "/Users/cmeid/manifold/dev/openkanban", filepath.Join(projects, "-Users-cmeid-manifold-dev-openkanban")},
+		// A literal `-` in the path encodes identically to a `/`, so this
+		// collides with the "nested path" case above. That lossiness is
+		// exactly why production reads the start cwd from disk rather than
+		// decoding a bucket name back to a path.
+		{"literal dash collides", "/Users/cmeid/manifold-dev", filepath.Join(projects, "-Users-cmeid-manifold-dev")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ProjectDirFor(tc.workdir)
+			if err != nil {
+				t.Fatalf("ProjectDirFor: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("ProjectDirFor(%q) = %q, want %q", tc.workdir, got, tc.want)
+			}
+		})
+	}
+}
+
+func mustExist(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("expected %s to exist: %v", path, err)
+	}
+}
+
+func mustNotExist(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("expected %s to be gone, stat err = %v", path, err)
+	}
+}
+
+func TestNormalizeSessionBucket(t *testing.T) {
+	const uuid = "7f3a9b2c-1d8e-4a5b-9c3d-2f1e0a8b9c4d"
+
+	// placeSession writes <uuid>.jsonl plus a sibling <uuid>/ artifact dir
+	// (subagents/ + tool-results/) into the bucket for `cwd`, mirroring
+	// Claude Code's on-disk session layout. Returns the bucket path.
+	placeSession := func(t *testing.T, home, cwd string) string {
+		t.Helper()
+		bucket := filepath.Join(home, ".claude", "projects", encodeWorktree(cwd))
+		writeFile(t, filepath.Join(bucket, uuid+".jsonl"), "{}\n")
+		writeFile(t, filepath.Join(bucket, uuid, "subagents", "agent-x.jsonl"), "{}\n")
+		writeFile(t, filepath.Join(bucket, uuid, "tool-results", "r.txt"), "result")
+		return bucket
+	}
+
+	t.Run("not_a_uuid", func(t *testing.T) {
+		withFakeHome(t)
+		if moved, err := NormalizeSessionBucket("nope", "/work/tree"); moved || err != nil {
+			t.Fatalf("got (moved=%v, err=%v), want (false, nil)", moved, err)
+		}
+	})
+
+	t.Run("empty_worktree", func(t *testing.T) {
+		withFakeHome(t)
+		if moved, err := NormalizeSessionBucket(uuid, ""); moved || err != nil {
+			t.Fatalf("got (moved=%v, err=%v), want (false, nil)", moved, err)
+		}
+	})
+
+	t.Run("missing_session", func(t *testing.T) {
+		withFakeHome(t)
+		if moved, err := NormalizeSessionBucket(uuid, "/work/tree"); moved || err != nil {
+			t.Fatalf("got (moved=%v, err=%v), want (false, nil)", moved, err)
+		}
+	})
+
+	t.Run("already_canonical", func(t *testing.T) {
+		home := withFakeHome(t)
+		cwd := "/work/tree"
+		bucket := placeSession(t, home, cwd)
+		if moved, err := NormalizeSessionBucket(uuid, cwd); moved || err != nil {
+			t.Fatalf("got (moved=%v, err=%v), want (false, nil)", moved, err)
+		}
+		mustExist(t, filepath.Join(bucket, uuid+".jsonl"))
+	})
+
+	t.Run("relocates_transcript_and_sidecar", func(t *testing.T) {
+		if _, err := exec.LookPath("lsof"); err != nil {
+			t.Skip("lsof not on PATH; skipping")
+		}
+		home := withFakeHome(t)
+		bornCwd := "/Users/cmeid/manifold/dev"
+		worktree := "/Users/cmeid/manifold/dev/openkanban"
+		fromBucket := placeSession(t, home, bornCwd)
+
+		moved, err := NormalizeSessionBucket(uuid, worktree)
+		if err != nil {
+			t.Fatalf("NormalizeSessionBucket: %v", err)
+		}
+		if !moved {
+			t.Fatal("moved = false, want true")
+		}
+		toBucket := filepath.Join(home, ".claude", "projects", encodeWorktree(worktree))
+		mustExist(t, filepath.Join(toBucket, uuid+".jsonl"))
+		mustExist(t, filepath.Join(toBucket, uuid, "subagents", "agent-x.jsonl"))
+		if b, err := os.ReadFile(filepath.Join(toBucket, uuid, "tool-results", "r.txt")); err != nil || string(b) != "result" {
+			t.Errorf("tool-result content = %q (err %v), want %q", string(b), err, "result")
+		}
+		mustNotExist(t, filepath.Join(fromBucket, uuid+".jsonl"))
+		mustNotExist(t, filepath.Join(fromBucket, uuid))
+	})
+
+	t.Run("live_session_skipped", func(t *testing.T) {
+		if _, err := exec.LookPath("lsof"); err != nil {
+			t.Skip("lsof not on PATH; skipping")
+		}
+		if _, err := exec.LookPath("tail"); err != nil {
+			t.Skip("tail not on PATH; skipping")
+		}
+		home := withFakeHome(t)
+		fromBucket := placeSession(t, home, "/born/elsewhere")
+		jsonlPath := filepath.Join(fromBucket, uuid+".jsonl")
+
+		cmd := exec.Command("tail", "-f", jsonlPath)
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start tail: %v", err)
+		}
+		t.Cleanup(func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() })
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if h, _ := SessionActive(uuid); h.PID != 0 {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+
+		moved, err := NormalizeSessionBucket(uuid, "/work/tree")
+		if err != nil {
+			t.Fatalf("NormalizeSessionBucket: %v", err)
+		}
+		if moved {
+			t.Fatal("moved = true, want false (a live session must be skipped)")
+		}
+		mustExist(t, jsonlPath)
+	})
+
+	t.Run("collision_refused", func(t *testing.T) {
+		if _, err := exec.LookPath("lsof"); err != nil {
+			t.Skip("lsof not on PATH; skipping")
+		}
+		home := withFakeHome(t)
+		// "/born/elsewhere" → "-born-elsewhere" sorts before
+		// "/work/tree" → "-work-tree", so SessionPath's sorted glob
+		// returns the foreign transcript first and we reach the
+		// collision check rather than the already-canonical short-circuit.
+		fromBucket := placeSession(t, home, "/born/elsewhere")
+		worktree := "/work/tree"
+		toBucket := filepath.Join(home, ".claude", "projects", encodeWorktree(worktree))
+		writeFile(t, filepath.Join(toBucket, uuid+".jsonl"), "{}\n")
+
+		moved, err := NormalizeSessionBucket(uuid, worktree)
+		if err == nil {
+			t.Fatal("expected a collision error, got nil")
+		}
+		if moved {
+			t.Fatal("moved = true on collision, want false")
+		}
+		mustExist(t, filepath.Join(fromBucket, uuid+".jsonl"))
+	})
+}

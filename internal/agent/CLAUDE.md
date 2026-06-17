@@ -22,6 +22,10 @@ Returns session ID or empty string. No error path — callers retry on the next 
 
 Four parallel funcs by design — see `feedback_openkanban_no_premature_service_abstraction`; no `SessionDiscoverer` interface until a 5th caller exists.
 
+### Session bucket normalization
+
+`claude --resume <uuid>` is scoped to the project bucket of the *launch* cwd (and that repo's worktrees) — there is no flag to resume a session filed under a different cwd. `NormalizeSessionBucket(uuid, worktreePath)` makes resume directory-independent by relocating `<uuid>.jsonl` + its sibling `<uuid>/` artifact dir into `ProjectDirFor(worktreePath)` before spawn (called from `prepareSpawnWith` once the worktree path is finalized). Idempotent (no-op when already in the right bucket or no transcript), skips sessions a live process holds open (`SessionActive`/`lsof`), refuses same-UUID collisions, moves the `.jsonl` lookup key last, non-fatal at the call site. `ProjectDirFor(path)` is the shared `/`→`-` bucket encoder (also used by `latestClaudeJSONL`). Only foreign/linked sessions move; openkanban-created sessions already start in the worktree. Full write-up: README "Changes vs upstream" §10 and `docs/AGENT_INTEGRATION.md` "Session Linking on Ticket Creation".
+
 ### Claude history.jsonl purge
 
 `PurgeClaudePrimingHistory(historyPath, uuid, prefixes...)` rewrites `~/.claude/history.jsonl` to drop entries whose `sessionId == uuid` AND whose `display` starts with one of the given prefixes. Atomic via temp file + `os.Rename`. Refuses to wildcard-purge: empty uuid OR empty prefixes returns nil.

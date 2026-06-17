@@ -152,6 +152,20 @@ The net effect: the moment Claude responds to a permission grant by emitting any
 
 See [`internal/terminal/pane.go`](internal/terminal/pane.go) (`LastActivity`, write-timestamping), [`internal/daemon/server.go`](internal/daemon/server.go) (`broadcastActivity`), [`internal/agent/status.go`](internal/agent/status.go) (`DetectStatusWithActivity`, `WaitingActivityTTL`), and [`internal/ui/daemon_subscribe.go`](internal/ui/daemon_subscribe.go) / [`internal/ui/model.go`](internal/ui/model.go) (`m.lastPTYActivity` map + override wiring).
 
+### 10. Directory-independent session resume
+
+Claude Code stores each session transcript in a project bucket keyed to the directory the session was *started* in (`~/.claude/projects/<cwd-with-slashes-as-dashes>/<uuid>.jsonl`), and `claude --resume <uuid>` only searches the bucket for the current directory and that repo's worktrees — there's no flag to resume a session from elsewhere. A session openkanban *creates* always starts in the ticket's worktree, so it resumes cleanly. But a session you started manually in some other directory and then linked to a ticket (`ticket new --session`) lives in a different bucket than the one openkanban launches the ticket from, so resuming it reported `No conversation found with session ID`.
+
+This fork makes resume directory-independent by normalizing the transcript into the launch directory's bucket on every spawn:
+
+- Before launching, `agent.NormalizeSessionBucket` relocates `<uuid>.jsonl` and its sibling `<uuid>/` artifact directory (subagent transcripts, tool-results) into the bucket for the directory openkanban is about to launch from.
+- It's idempotent (a no-op in the common case where the session already lives there), skips any session a live process is holding open (so it never yanks a transcript out from under a running `claude`), refuses to overwrite a same-UUID collision, and moves the `.jsonl` lookup key last.
+- It's non-fatal: a failure logs and degrades to the prior behavior rather than blocking the spawn. A relocation surfaces a status-bar toast.
+
+The invariant: a ticket's transcript always lives in its launch directory's bucket, so reopening a ticket resumes the exact session regardless of where it — or openkanban — was originally started.
+
+See [`internal/agent/sessions.go`](internal/agent/sessions.go) (`ProjectDirFor`, `NormalizeSessionBucket`) and the call site in [`internal/ui/model.go`](internal/ui/model.go) (`prepareSpawnWith`).
+
 ## Bugs fixed in upstream
 
 Seven correctness bugs that exist on `TechDufus/main` today are fixed in this fork. Each is verified against the upstream tree.
