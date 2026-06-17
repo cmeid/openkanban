@@ -1923,9 +1923,10 @@ func (m *Model) handleAgentViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// board below — the always-available off-ramp.
 			if m.autoAttach {
 				if id, ok := m.oldestWaitingPeer(m.sessionsAttachedElsewhere()); ok {
-					if t, _ := m.globalStore.Get(id); t != nil {
-						m.notify("Auto → " + t.Title)
-					}
+					// No toast: m.notification isn't painted over the agent
+					// view, and the cycle-attach modal already shows the
+					// target's title + live content, so the jump is
+					// self-evident.
 					log.Printf("openkanban model: Auto mode jump -> %s", id)
 					return m, m.focusAndPromptAttach(id)
 				}
@@ -3768,10 +3769,17 @@ func (m *Model) oldestWaitingPeer(attachedElsewhere map[board.TicketID]bool) (bo
 	found := false
 	for _, col := range m.columnTickets {
 		for _, t := range col {
-			if t.ID == m.focusedPane {
+			if t == nil || t.ID == m.focusedPane {
 				continue
 			}
 			if attachedElsewhere[t.ID] {
+				continue
+			}
+			// AgentStatus here is the activity-overridden value the poll
+			// writes back (model.go agentStatusResultMsg handler), so this
+			// matches what the card renders. columnTickets holds the same
+			// *board.Ticket the store mutates, so no globalStore lookup.
+			if t.AgentStatus != board.AgentWaiting || t.StatusChangedAt == nil {
 				continue
 			}
 			pv, ok := m.panes[t.ID]
@@ -3783,16 +3791,9 @@ func (m *Model) oldestWaitingPeer(attachedElsewhere map[board.TicketID]bool) (bo
 			default:
 				continue
 			}
-			ticket, _ := m.globalStore.Get(t.ID)
-			if ticket == nil || ticket.AgentStatus != board.AgentWaiting {
-				continue
-			}
-			if ticket.StatusChangedAt == nil {
-				continue
-			}
-			if !found || ticket.StatusChangedAt.Before(bestTime) {
+			if !found || t.StatusChangedAt.Before(bestTime) {
 				best = t.ID
-				bestTime = *ticket.StatusChangedAt
+				bestTime = *t.StatusChangedAt
 				found = true
 			}
 		}
