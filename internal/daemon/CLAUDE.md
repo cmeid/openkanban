@@ -121,14 +121,30 @@ Session kills run via `trackedKill` (asynchronous, accounted):
 absent). Previously only `./scripts/install.sh` refreshed the bundle, so
 daemon-side changes were silently not deployed after a plain `update`.
 
-After `openkanban update` completes, the bundle contains the new binary, but
-a running `--persistent` daemon must be restarted to load it:
+After `openkanban update` completes, the bundle contains the new binary and a
+running daemon **picks it up on its own** — `watchBinaryStaleness` →
+`stalenessStep` (server.go) polls `update.BinaryStale()` every 30 s and:
+
+- **0 live sessions** (now, or once they drain on a later tick): `initiateShutdown`,
+  so the next launch (default mode) or launchd respawn (`--persistent`, via
+  `KeepAlive={SuccessfulExit:false}`) runs the new binary.
+- **>0 sessions, `--persistent`**: keeps polling and restarts the moment the
+  registry drains to zero — it never kills live work to force the swap, and no
+  longer stays pinned on the stale binary indefinitely (the old behavior).
+- **>0 sessions, default mode**: hands the exit to the last-client-disconnect
+  path (`awaitSessionDrain`); the daemon exits when the TUI quits, next launch
+  is new.
+
+So a manual restart is only needed to apply the update to **in-progress
+sessions immediately** (which ends them):
 
 ```
 openkanban daemon restart
 ```
 
-This ends any running agent sessions, so coordinate accordingly.
+`stalenessStep` is the unit-testable per-tick core (see `staleness_step_test.go`);
+the `Server.staleCheck func() bool` field is a test seam defaulting to
+`update.BinaryStale` — never reassigned in production.
 
 ## Where to look
 

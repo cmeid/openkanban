@@ -934,3 +934,19 @@ func TestBranchSwitchAndRecheck(t *testing.T) {
 		t.Fatalf("expected OfferBranchSwitch=false after switching to main; got true")
 	}
 }
+
+// TestDaemonUpdatedMsg_AutoRestartWording asserts the post-update message
+// on the const directly. ApplyUpdate is not unit-testable (its final line
+// is reached only after a real git pull + go install + bundle refresh
+// against the live install), so the const is the assertable seam. The
+// message must convey that the daemon picks the update up automatically —
+// not that a destructive manual restart is always required — while still
+// documenting the manual path for applying it to live sessions now.
+func TestDaemonUpdatedMsg_AutoRestartWording(t *testing.T) {
+	if !strings.Contains(daemonUpdatedMsg, "automatically") {
+		t.Errorf("daemonUpdatedMsg should tell the user the daemon auto-updates; got %q", daemonUpdatedMsg)
+	}
+	if !strings.Contains(daemonUpdatedMsg, "openkanban daemon restart") {
+		t.Errorf("daemonUpdatedMsg should still mention the manual restart path; got %q", daemonUpdatedMsg)
+	}
+}

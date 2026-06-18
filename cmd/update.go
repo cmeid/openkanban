@@ -72,6 +72,14 @@ func (s UpdateStatus) displayFromSHA() string {
 	return s.LocalSHA
 }
 
+// daemonUpdatedMsg is printed after the macOS bundle refresh. It's honest
+// for both daemon modes: a running daemon picks the new binary up on its
+// own (watchBinaryStaleness restarts a persistent daemon once its sessions
+// drain, and a default-mode daemon exits when its TUI quits — the next
+// launch is new). A manual `daemon restart` is only needed to force the
+// update onto in-progress sessions immediately, which ends them.
+const daemonUpdatedMsg = "daemon binary updated — a running daemon picks this up automatically once its sessions finish; to apply now (ending sessions) run 'openkanban daemon restart'"
+
 // updateCheckOnly is bound to --check on the update subcommand.
 var updateCheckOnly bool
 
@@ -227,7 +235,7 @@ func ApplyUpdate(ctx context.Context, status UpdateStatus, out io.Writer) error 
 			cmd.Stderr = out
 			return cmd.Run()
 		})
-	fmt.Fprintln(out, "daemon binary updated — run 'openkanban daemon restart' to apply (ends running sessions)")
+	fmt.Fprintln(out, daemonUpdatedMsg)
 
 	return nil
 }

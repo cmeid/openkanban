@@ -167,6 +167,14 @@ type Server struct {
 	stalenessMu    sync.Mutex
 	pendingRestart bool
 
+	// staleCheck reports whether the on-disk binary is newer than this
+	// running process. Defaults to update.BinaryStale in the constructor;
+	// it's a field purely so tests can drive watchBinaryStaleness /
+	// stalenessStep deterministically (update.BinaryStale reads
+	// os.Executable() mtime vs a package-level start time, which a unit
+	// test can't control). Never reassigned in production.
+	staleCheck func() bool
+
 	// drainMu guards drainPending, the single-in-flight guard for the
 	// default-mode deferred-shutdown watcher (awaitSessionDrain). When
 	// the last client disconnects with live sessions, default mode no
@@ -304,6 +312,7 @@ func NewServerWithOptions(sock, pidpath string, opts Options) (*Server, error) {
 		pidlock:        lock,
 		ln:             ln,
 		persistent:     opts.Persistent,
+		staleCheck:     update.BinaryStale,
 		reg:            newSessionRegistry(),
 		clients:        make(map[uint16]*clientConn),
 		shutdown:       make(chan struct{}),
@@ -521,25 +530,12 @@ func (s *Server) Serve(ctx context.Context) error {
 // `openkanban update` from another shell). The check runs every
 // update.BinaryStaleCheckInterval and exits when s.shutdown closes.
 //
-// When the binary first goes stale, we set pendingRestart and decide
-// what to do based on the live session count:
-//   - zero sessions: initiate immediate shutdown so the next TUI
-//     launch (default mode) — or launchd / systemd respawn (persistent
-//     mode) — picks up the new binary.
-//   - >0 sessions: log a loud warning and keep running.
-//   - Default mode: handleLastClientDisconnect defers shutdown when
-//     the last client drops with live sessions (it no longer kills
-//     them), so the daemon stays on the stale binary until sessions
-//     drain naturally and then exits cleanly — the next launch picks
-//     up the new binary.
-//   - Persistent mode: handleLastClientDisconnect no longer exits,
-//     so the daemon stays on the stale binary until sessions drain
-//     naturally and the user explicitly runs `openkanban daemon
-//     stop` (after which launchd respawns it on the new binary,
-//     given KeepAlive={SuccessfulExit:false}).
+// The per-tick decision lives in stalenessStep so it's unit-testable
+// without the ticker; see that method for the restart-on-drain logic.
 //
-// We deliberately don't kill live sessions to "force" a restart —
-// that would surprise the user and orphan in-progress agent work.
+// We deliberately never kill live sessions to "force" a restart — that
+// would surprise the user and orphan in-progress agent work. A restart
+// only ever happens once the registry has drained to zero.
 //
 // Panic recovery: same rationale as broadcastEvents — a panic here used
 // to crash the whole daemon and every PTY with it. We log + exit the
@@ -557,34 +553,62 @@ func (s *Server) watchBinaryStaleness() {
 		case <-s.shutdown:
 			return
 		case <-ticker.C:
-			if !update.BinaryStale() {
-				continue
-			}
-
-			s.stalenessMu.Lock()
-			alreadyNotified := s.pendingRestart
-			s.pendingRestart = true
-			s.stalenessMu.Unlock()
-			if alreadyNotified {
-				// Already logged on first detection; don't spam.
-				continue
-			}
-
-			liveSessions := s.reg.len()
-
-			if liveSessions == 0 {
-				log.Printf("openkanbankd: binary on disk is newer than running process and no sessions are attached; shutting down so the next launch picks up the update")
-				s.initiateShutdown("binary updated on disk")
+			if s.stalenessStep() {
 				return
-			}
-
-			if s.persistent {
-				log.Printf("WARN: openkanbankd binary on disk is newer than running process (%d live session(s) still attached); persistent mode will NOT auto-restart — run `openkanban daemon restart` or rely on the wedge watchdog", liveSessions)
-			} else {
-				log.Printf("WARN: openkanbankd binary on disk is newer than running process (%d live session(s) still attached); will exit when the last client disconnects so the next launch picks up the update", liveSessions)
 			}
 		}
 	}
+}
+
+// stalenessStep performs one staleness check tick. It returns true when
+// the watcher goroutine should stop polling — either because shutdown was
+// initiated (no agent work is at risk) or because default mode has handed
+// the eventual exit off to the last-client-disconnect path.
+//
+// Behavior once the on-disk binary is newer than this process:
+//   - zero live sessions (now, or on a later tick once they drain):
+//     initiate immediate shutdown so the next launch (default mode) or
+//     launchd/systemd respawn (persistent mode, KeepAlive) picks up the
+//     new binary. Returns true.
+//   - >0 sessions, persistent mode: log once and keep polling. The daemon
+//     stays on the stale binary until the registry drains naturally, then
+//     the zero-sessions branch above restarts it. Returns false (keep
+//     polling) — this is the gap the old code left open: it went inert
+//     after the first detection and never restarted at all.
+//   - >0 sessions, default mode: log once and stop. handleLastClientDisconnect
+//     (awaitSessionDrain) owns the eventual exit when the TUI quits; we don't
+//     bounce the daemon under an idle-but-attached TUI just because its agent
+//     finished. Returns true.
+func (s *Server) stalenessStep() (stop bool) {
+	if !s.staleCheck() {
+		return false
+	}
+
+	s.stalenessMu.Lock()
+	first := !s.pendingRestart
+	s.pendingRestart = true
+	s.stalenessMu.Unlock()
+
+	live := s.reg.len() // read once; reused in the WARN below
+
+	if live == 0 {
+		log.Printf("openkanbankd: binary on disk is newer than running process and no sessions remain; shutting down so the next launch picks up the update")
+		s.initiateShutdown("binary updated on disk")
+		return true
+	}
+
+	if first {
+		if s.persistent {
+			log.Printf("WARN: openkanbankd binary on disk is newer than running process (%d live session(s) still attached); will restart once sessions drain so launchd respawns on the new binary", live)
+		} else {
+			log.Printf("WARN: openkanbankd binary on disk is newer than running process (%d live session(s) still attached); will exit when the last client disconnects so the next launch picks up the update", live)
+		}
+	}
+
+	// Persistent mode keeps polling (return false) until the registry
+	// drains and the zero-sessions branch above fires. Default mode stops
+	// (return true): its exit is owned by the last-client-disconnect path.
+	return !s.persistent
 }
 
 // drainPollInterval is how often awaitSessionDrain wakes to re-check the
