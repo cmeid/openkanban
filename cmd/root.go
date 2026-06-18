@@ -88,7 +88,7 @@ for safe parallel development.`,
 		// The CLI flag is one-way: it can only suppress autostart, never
 		// force it on. See the flag registration comment below.
 		autostartDaemon := cfg.Daemon.Autostart && !noLaunchDaemon
-		return app.Run(cfg, projectPath, Version, autostartDaemon)
+		return app.Run(cfg, projectPath, autostartDaemon)
 	},
 }
 

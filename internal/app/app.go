@@ -21,7 +21,6 @@ import (
 	"github.com/techdufus/openkanban/internal/git"
 	"github.com/techdufus/openkanban/internal/project"
 	"github.com/techdufus/openkanban/internal/ui"
-	"github.com/techdufus/openkanban/internal/update"
 	"github.com/techdufus/openkanban/internal/watch"
 )
 
@@ -39,7 +38,7 @@ import (
 // (clean exit) rather than launching a daemon-less board. A board with
 // no daemon can't spawn or attach, and proceeding once risked hanging
 // startup on a later unbounded RPC.
-func Run(cfg *config.Config, filterPath, version string, autostartDaemon bool) error {
+func Run(cfg *config.Config, filterPath string, autostartDaemon bool) error {
 	// MUST be the first statement: project.LoadGlobalTicketStore below
 	// fans out to ~11 log.Printf sites in internal/project/{tickets,
 	// migration}.go that fire on migrations and duplicate-removal. Any
@@ -141,8 +140,7 @@ func Run(cfg *config.Config, filterPath, version string, autostartDaemon bool) e
 		}
 	}
 
-	updateChecker := update.NewChecker(version)
-	model := ui.NewModel(cfg, globalStore, registry, agentMgr, opencodeServer, filterProjectID, updateChecker, ownedByDaemon, daemonClient)
+	model := ui.NewModel(cfg, globalStore, registry, agentMgr, opencodeServer, filterProjectID, ownedByDaemon, daemonClient)
 
 	// Arm the diagnostic stall watchdog for the real TUI (Cleanup stops
 	// it). Captures a goroutine dump if the Update/View loop freezes.

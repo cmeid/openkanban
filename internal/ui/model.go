@@ -413,8 +413,6 @@ type Model struct {
 	sidebarWidth    int
 	sidebarOpenOnly bool // when true, sidebar counts exclude done+archived tickets
 
-	updateChecker *update.Checker
-
 	// binaryStaleNotified records whether the user has already been
 	// shown the "binary has been updated on disk" notification for the
 	// current stale-transition. Set when the periodic check first
@@ -443,7 +441,7 @@ type Model struct {
 	lastWindowTitle string
 }
 
-func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projectRegistry *project.ProjectRegistry, agentMgr *agent.Manager, opencodeServer *agent.OpencodeServer, filterProjectID string, updateChecker *update.Checker, ownedByDaemon map[board.TicketID]daemon.SessionInfo, daemonClient *daemonclient.Client) *Model {
+func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projectRegistry *project.ProjectRegistry, agentMgr *agent.Manager, opencodeServer *agent.OpencodeServer, filterProjectID string, ownedByDaemon map[board.TicketID]daemon.SessionInfo, daemonClient *daemonclient.Client) *Model {
 	ti := textinput.New()
 	ti.Placeholder = "Enter ticket title..."
 	ti.CharLimit = 100
@@ -545,7 +543,6 @@ func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projec
 		sidebarWidth:       24,
 		hoverColumn:        -1,
 		hoverTicket:        -1,
-		updateChecker:      updateChecker,
 		daemonClient:       daemonClient,
 	}
 	if daemonClient != nil {
@@ -634,7 +631,6 @@ func (m *Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{
 		tickAgentStatus(m.agentMgr.StatusPollInterval()),
 		m.spinner.Tick,
-		m.checkForUpdates(),
 		m.maybeSetWindowTitle(),
 		checkBinaryStaleness(),
 	}
@@ -697,15 +693,6 @@ func (m *Model) maybeSetWindowTitle() tea.Cmd {
 	}
 	m.lastWindowTitle = want
 	return tea.SetWindowTitle(want)
-}
-
-func (m *Model) checkForUpdates() tea.Cmd {
-	if m.updateChecker == nil {
-		return nil
-	}
-	return func() tea.Msg {
-		return updateCheckMsg(m.updateChecker.Check())
-	}
 }
 
 // Update is the BubbleTea entry point. The actual case-dispatch lives
@@ -1259,13 +1246,6 @@ func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case notificationMsg:
 		if time.Since(m.notifyTime) > 3*time.Second {
 			m.notification = ""
-		}
-		return m, nil
-
-	case updateCheckMsg:
-		if msg.UpdateAvailable {
-			result := update.CheckResult(msg)
-			m.notify(fmt.Sprintf("Update %s available: %s", msg.LatestVersion, result.UpdateHint()))
 		}
 		return m, nil
 
@@ -6194,7 +6174,6 @@ type agentStatusMsg time.Time
 type agentStatusResultMsg map[board.TicketID]board.AgentStatus
 type notificationMsg time.Time
 type shutdownCompleteMsg struct{}
-type updateCheckMsg update.CheckResult
 
 // binaryStaleCheckMsg fires every update.BinaryStaleCheckInterval to
 // trigger a re-stat of os.Executable() against the captured process
