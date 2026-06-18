@@ -37,6 +37,13 @@ func Status() (running bool, pid int, err error) {
 	return false, 0, ErrUnsupported
 }
 
+// Start returns ErrUnsupported on non-Darwin. The autostart path reaches
+// it only when PlistInstalled reported true, which never happens off
+// Darwin, so callers always fall back to forking their own daemon.
+func Start() error {
+	return ErrUnsupported
+}
+
 // PlistInstalled returns false on non-Darwin: there is no launchd plist
 // concept, so there is no supervision concern to report.
 func PlistInstalled() (bool, error) {

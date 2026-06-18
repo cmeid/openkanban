@@ -29,6 +29,16 @@ import (
 
 	"github.com/techdufus/openkanban/internal/config"
 	"github.com/techdufus/openkanban/internal/daemon"
+	"github.com/techdufus/openkanban/internal/service"
+)
+
+// Autostart start-path seams. In production these are the real
+// implementations; tests override them to assert the launchd-vs-fork
+// decision in startDaemon without shelling out to launchctl or forking.
+var (
+	plistInstalledFn  = service.PlistInstalled
+	startSupervisedFn = service.Start
+	forkDaemonFn      = forkDaemon
 )
 
 // Environment-variable overrides — must match the ones in
@@ -153,8 +163,8 @@ func DialOrStart(ctx context.Context) (net.Conn, error) {
 		return nil, err
 	}
 
-	if ferr := forkDaemon(); ferr != nil {
-		return nil, fmt.Errorf("%w: fork: %v", ErrDaemonUnavailable, ferr)
+	if serr := startDaemon(); serr != nil {
+		return nil, fmt.Errorf("%w: start: %v", ErrDaemonUnavailable, serr)
 	}
 
 	deadline := time.Now().Add(startWait)
@@ -174,6 +184,27 @@ func DialOrStart(ctx context.Context) (net.Conn, error) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	return nil, fmt.Errorf("%w: forked daemon did not bind %s within %s", ErrDaemonUnavailable, sock, startWait)
+}
+
+// startDaemon brings up a daemon when none is listening. When the user
+// has installed the launchd service, it asks launchd to (re)start its
+// supervised instance rather than forking a tui-fork that would grab the
+// socket + pidlock and shadow launchd — the state where `daemon health`
+// warns "running tui-forked despite an installed launchd plist". Off
+// Darwin (or when no plist is installed) it forks directly.
+//
+// The launchd path is best-effort: if service.Start fails, we fall back
+// to forkDaemon so the user still gets a working daemon now (a tui-fork
+// beats no daemon at all; the health warning surfaces the shadow so it
+// can be repaired). Only when fork ALSO fails does startDaemon error.
+func startDaemon() error {
+	if installed, err := plistInstalledFn(); err == nil && installed {
+		if serr := startSupervisedFn(); serr == nil {
+			return nil
+		}
+		// launchd start failed — fall through to the fork below.
+	}
+	return forkDaemonFn()
 }
 
 // forkDaemon execs the daemon binary with `--persistent` detached in a

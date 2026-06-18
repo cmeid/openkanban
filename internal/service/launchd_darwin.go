@@ -252,6 +252,91 @@ func Status() (running bool, pid int, err error) {
 	return false, 0, nil
 }
 
+// ErrNotInstalled is returned by Start when no LaunchAgent plist is on
+// disk — the caller should fork its own daemon rather than ask launchd
+// to manage one the user never opted into.
+var ErrNotInstalled = errors.New("service: launchd plist not installed")
+
+// Start asks launchd to run the already-installed service now. It's the
+// autostart counterpart to Install: where Install (re)writes and
+// bootstraps the plist, Start assumes the plist already exists and just
+// makes launchd run it — bootstrapping it first if it isn't loaded, then
+// kickstarting to force a running instance (closing the window between a
+// crash / KeepAlive respawn and the socket actually being bound).
+//
+// This is what lets the TUI autostart path defer to launchd instead of
+// forking a tui-fork daemon that would grab the socket + pidlock and
+// shadow launchd's supervised instance. Returns ErrNotInstalled when no
+// plist is on disk (caller should fork instead) and ErrUnsupported on
+// non-Darwin.
+func Start() error {
+	installed, err := PlistInstalled()
+	if err != nil {
+		return err
+	}
+	if !installed {
+		return ErrNotInstalled
+	}
+
+	target, err := serviceTarget()
+	if err != nil {
+		return err
+	}
+
+	// Fast path: if the service is already loaded, kickstart forces a
+	// running instance now (idempotent when it's already running).
+	if ok, kerr := kickstart(target); kerr != nil {
+		return kerr
+	} else if ok {
+		return nil
+	}
+
+	// Not loaded → bootstrap the plist (RunAtLoad=true starts it), then
+	// kickstart to remove the ThrottleInterval / socket-bind race.
+	plistPath, err := PlistPath()
+	if err != nil {
+		return err
+	}
+	domain, err := domainTarget()
+	if err != nil {
+		return err
+	}
+	if _, stderr, code, runErr := runLaunchctl("bootstrap", domain, plistPath); runErr != nil {
+		return fmt.Errorf("service: launchctl bootstrap exec: %w", runErr)
+	} else if code != 0 {
+		return fmt.Errorf("service: launchctl bootstrap failed (exit %d): %s", code, strings.TrimSpace(stderr.String()))
+	}
+	if ok, kerr := kickstart(target); kerr != nil {
+		return kerr
+	} else if !ok {
+		return fmt.Errorf("service: bootstrapped %s but launchctl could not find it to kickstart", target)
+	}
+	return nil
+}
+
+// kickstart runs `launchctl kickstart <target>` (no -k: never restart a
+// running instance). Returns (true, nil) on success, (false, nil) when
+// the service isn't loaded (caller should bootstrap first), and
+// (false, err) on a real failure.
+func kickstart(target string) (bool, error) {
+	_, stderr, code, runErr := runLaunchctl("kickstart", target)
+	if runErr != nil {
+		return false, fmt.Errorf("service: launchctl kickstart exec: %w", runErr)
+	}
+	if code == 0 {
+		return true, nil
+	}
+	// We assume kickstart's "service not loaded" signature matches the one
+	// print / bootout emit (exit 3/113 or a "could not find service"
+	// string). If a future macOS returns something else here, Start treats
+	// it as a hard error and the caller falls back to forking — degraded,
+	// but the user still gets a daemon.
+	if errIndicatesNotLoaded(stderr.String(), code) {
+		return false, nil
+	}
+	return false, fmt.Errorf("service: launchctl kickstart failed (exit %d): %s", code, strings.TrimSpace(stderr.String()))
+}
+
 // --- internals ---
 
 type plistData struct {
