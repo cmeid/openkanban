@@ -324,9 +324,22 @@ type Model struct {
 	// daemonClient is the long-lived control connection to openkanbankd.
 	// nil when the daemon couldn't be reached at startup — every call
 	// site MUST nil-check before use (the TUI degrades to a no-spawn
-	// state in that case). Reconstructing the client mid-session is the
-	// job of a future PR; this PR is a single-shot New() at startup.
+	// state in that case). It is reconstructed mid-session by the
+	// reconnect path (daemon_reconnect.go) when the daemon restarts
+	// (e.g. the stale-binary upgrade respawn) and the existing client
+	// goes Closed(); both m.daemonClient and m.daemon are swapped to the
+	// fresh client in handleDaemonReconnectedMsg.
 	daemonClient *daemonclient.Client
+
+	// daemonAutostart mirrors the app.go startup choice (New vs
+	// NewNoAutostart). The reconnect path uses it so a launchd-managed /
+	// --no-launch-daemon setup is never force-autostarted by a re-dial.
+	daemonAutostart bool
+
+	// daemonReconnecting is true while an async reconnect attempt is in
+	// flight. Set AND cleared only in the Update handler (never the cmd
+	// goroutine) so the 30s resync tick can't launch overlapping dials.
+	daemonReconnecting bool
 
 	// daemonEvents is the push channel returned by
 	// daemonClient.Subscribe. nil when the daemon is unreachable or
@@ -441,7 +454,7 @@ type Model struct {
 	lastWindowTitle string
 }
 
-func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projectRegistry *project.ProjectRegistry, agentMgr *agent.Manager, opencodeServer *agent.OpencodeServer, filterProjectID string, ownedByDaemon map[board.TicketID]daemon.SessionInfo, daemonClient *daemonclient.Client) *Model {
+func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projectRegistry *project.ProjectRegistry, agentMgr *agent.Manager, opencodeServer *agent.OpencodeServer, filterProjectID string, ownedByDaemon map[board.TicketID]daemon.SessionInfo, daemonClient *daemonclient.Client, autostartDaemon bool) *Model {
 	ti := textinput.New()
 	ti.Placeholder = "Enter ticket title..."
 	ti.CharLimit = 100
@@ -544,6 +557,7 @@ func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projec
 		hoverColumn:        -1,
 		hoverTicket:        -1,
 		daemonClient:       daemonClient,
+		daemonAutostart:    autostartDaemon,
 	}
 	if daemonClient != nil {
 		m.daemon = daemonClient
@@ -1144,8 +1158,9 @@ func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case daemonclient.DaemonDisconnectedMsg:
 		// Daemon vanished mid-session. Detach every PaneView; the model
-		// keeps running but with no live attaches. PR8b/PR9 will
-		// auto-reconnect; for PR8 we just degrade gracefully.
+		// keeps running but with no live attaches. A reconnect is driven
+		// below (and, as the always-on fallback, by the resync tick) so
+		// the control conn is re-established when the daemon comes back.
 		for id, pv := range m.panes {
 			_ = pv.Close()
 			delete(m.panes, id)
@@ -1175,7 +1190,21 @@ func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.notify("Daemon disconnected")
 		}
-		return m, m.maybeSetWindowTitle()
+		// Faster-path reconnect for the attached-pane case (the resync
+		// tick is the no-pane fallback). Gated on Closed() so a transient
+		// attach-stream tear-down that left the control conn live does
+		// not replace a healthy client; if the control conn isn't dead
+		// yet, the resync tick picks it up once it is.
+		cmds := []tea.Cmd{m.maybeSetWindowTitle()}
+		if m.daemonClient != nil && m.daemonClient.Closed() {
+			if rc := m.maybeReconnectDaemon(); rc != nil {
+				cmds = append(cmds, rc)
+			}
+		}
+		return m, tea.Batch(cmds...)
+
+	case daemonReconnectedMsg:
+		return m.handleDaemonReconnectedMsg(msg)
 
 	case terminal.ExitFocusMsg:
 		m.exitToBoard()
