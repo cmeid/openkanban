@@ -140,7 +140,7 @@ func Run(cfg *config.Config, filterPath string, autostartDaemon bool) error {
 		}
 	}
 
-	model := ui.NewModel(cfg, globalStore, registry, agentMgr, opencodeServer, filterProjectID, ownedByDaemon, daemonClient)
+	model := ui.NewModel(cfg, globalStore, registry, agentMgr, opencodeServer, filterProjectID, ownedByDaemon, daemonClient, autostartDaemon)
 
 	// Arm the diagnostic stall watchdog for the real TUI (Cleanup stops
 	// it). Captures a goroutine dump if the Update/View loop freezes.

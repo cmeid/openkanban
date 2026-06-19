@@ -214,7 +214,18 @@ func (m *Model) handleDaemonResyncTick() (tea.Model, tea.Cmd) {
 func (m *Model) handleDaemonResyncMsg(msg daemonResyncMsg) (tea.Model, tea.Cmd) {
 	if msg.err != nil {
 		log.Printf("openkanban: periodic daemon resync failed: %v", msg.err)
-		return m, m.scheduleDaemonResync()
+		// The resync tick is the always-on observer of a dead control
+		// conn (it fires even with no pane attached — the exact case
+		// DaemonDisconnectedMsg misses). When the client is terminally
+		// Closed (e.g. the daemon restarted on a stale-binary upgrade),
+		// drive a reconnect alongside re-arming the tick.
+		cmds := []tea.Cmd{m.scheduleDaemonResync()}
+		if m.daemonClient != nil && m.daemonClient.Closed() {
+			if rc := m.maybeReconnectDaemon(); rc != nil {
+				cmds = append(cmds, rc)
+			}
+		}
+		return m, tea.Batch(cmds...)
 	}
 
 	owned := msg.sessions
