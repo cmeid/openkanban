@@ -129,6 +129,8 @@ Selection is by **index** (`m.activeColumn`/`m.activeTicket`), but `refreshColum
 
 Do **not** push `selectTicketByID` into `refreshColumnTickets` itself. That chokepoint is shared with filter/resync flows that intentionally rely on `selectTicketByID`'s clamp-degrade fallback to gracefully drop a selection a filter just hid. Centralizing the re-select would regress filter UX. Keep the call at the mutation call sites. `selectTicketByID` handles vertical scroll (`ensureTicketVisible`) but not horizontal — keep an explicit `ensureColumnVisible()` where the active column may change (e.g. `dropTicket`).
 
+**Interactive create reveals the new ticket through active filters.** `selectTicketByID` re-anchoring is necessary but not sufficient on create: a brand-new ticket has no daemon session and an arbitrary title, so `ticketMatchesFilter` hides it under an open-only session filter, a non-matching search query, or a project narrow — and the clamp fallback then leaves focus elsewhere. The `n`-create branch of `saveTicketForm` calls `revealThroughFilters(ticket)` first, which relaxes *only* the dimensions that would hide that ticket (clears the query, flips `SessionFilterOpen`→`All`, adds the ticket's project to a narrow rather than wiping it). This is **interactive-create only** — the async board-resync (`board_resync.go`) and CLI-create paths must never call it: an externally-arriving ticket must not yank the user's filter state out from under an active session. The edit path is also intentionally excluded.
+
 ## Terminal Panes
 
 `panes map[board.TicketID]*daemonclient.PaneView` — one per spawned agent.
