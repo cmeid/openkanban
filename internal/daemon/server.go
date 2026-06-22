@@ -501,22 +501,18 @@ func (s *Server) Serve(ctx context.Context) error {
 			select {
 			case <-s.shutdown:
 				// Listener closed by our own shutdown path —
-				// not an error. Wait for in-flight connections
-				// and exit cleanly.
-				s.wg.Wait()
-				s.cleanup()
+				// not an error. Drain and exit cleanly.
+				s.shutdownDrain()
 				return nil
 			default:
 			}
 
 			if errors.Is(err, net.ErrClosed) {
-				s.wg.Wait()
-				s.cleanup()
+				s.shutdownDrain()
 				return nil
 			}
 			log.Printf("openkanbankd: accept error: %v", err)
-			s.wg.Wait()
-			s.cleanup()
+			s.shutdownDrain()
 			return fmt.Errorf("daemon: accept: %w", err)
 		}
 
@@ -923,6 +919,10 @@ func (s *Server) checkSessionWedge(id string, sess *Session, stuckSeen map[strin
 // respawn-on-new-binary never happening. Closing the conn trips the
 // parked ReadFrame (net.ErrClosed/EOF), the goroutine returns, wg.Wait()
 // completes, cleanup runs, and the process exits so launchd respawns.
+//
+// This close is a FAST PATH for already-registered clients; shutdownDrain
+// (run when the accept loop exits) is the authoritative one — it re-closes
+// to cover a client that raced in between this snapshot and registration.
 func (s *Server) initiateShutdown(reason string) {
 	s.shutdownOnce.Do(func() {
 		log.Printf("openkanbankd: shutdown initiated (%s)", reason)
@@ -932,6 +932,23 @@ func (s *Server) initiateShutdown(reason string) {
 		}
 		s.closeClientConns()
 	})
+}
+
+// shutdownDrain is the single teardown path the accept loop runs on exit:
+// close client conns, wait for every handleConn goroutine, then cleanup.
+//
+// closeClientConns runs HERE (not only in initiateShutdown) to close an
+// accept-vs-register race: a connection accepted just before the listener
+// closed may be registered AFTER initiateShutdown's closeClientConns
+// snapshot, so that fast-path close would miss it and wg.Wait() would hang
+// on its handleConn (until the shutdown-completion backstop force-exits).
+// The accept loop is the only registrar and has already exited by the time
+// we get here, so closing now provably covers every registered client.
+// closeClientConns is idempotent, so the overlap with the fast path is free.
+func (s *Server) shutdownDrain() {
+	s.closeClientConns()
+	s.wg.Wait()
+	s.cleanup()
 }
 
 // closeClientConns force-closes every registered client connection so
