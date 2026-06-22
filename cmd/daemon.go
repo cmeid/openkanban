@@ -19,8 +19,28 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/techdufus/openkanban/internal/daemon"
+	"github.com/techdufus/openkanban/internal/daemonclient"
 	"github.com/techdufus/openkanban/internal/service"
 )
+
+// errDaemonNotRunning is the CLI-facing sentinel for "no daemon is
+// listening". dialDaemon wraps it so commands like `daemon restart` can
+// branch on not-running (errors.Is) while still printing the friendly
+// "(no socket at …)" detail to the user.
+var errDaemonNotRunning = errors.New("openkanbankd is not running")
+
+// daemonStartTimeout bounds `daemon start` / the fresh-start half of
+// `daemon restart`: it must comfortably exceed daemonclient.startWait (3s,
+// the socket-bind poll window) so a healthy-but-slow bind isn't clipped by
+// the fast rpcTimeout the RPC subcommands use.
+const daemonStartTimeout = 10 * time.Second
+
+// daemonDownTimeout bounds how long `daemon restart` waits for the old
+// daemon process to exit after a graceful shutdown before starting a fresh
+// one. The shutdown RPC has already blocked on every session kill before
+// replying, so by the time we get here the process is finishing wg.Wait()
+// + cleanup() and exit is imminent; this is slack, not the common path.
+const daemonDownTimeout = 5 * time.Second
 
 // daemonFlagPersistent controls whether the daemon stays alive when
 // the last client disconnects. Default (false) preserves the original
@@ -29,13 +49,22 @@ import (
 var daemonFlagPersistent bool
 
 // daemonCmd is the parent command for openkanbankd-related operations.
-// `openkanban daemon` itself runs the daemon in the foreground; the
-// list/stop/log subcommands are client-side helpers that dial into a
-// running daemon.
+// Bare `openkanban daemon` runs the daemon in the FOREGROUND (the entry
+// point launchd and the TUI autostart exec as `daemon --persistent`);
+// `daemon start` runs it detached. The remaining subcommands are
+// client-side helpers that dial a running daemon.
+//
+// Args is cobra.NoArgs so a mistyped subcommand (`daemon resstart`)
+// errors instead of being swallowed as a positional arg and silently
+// launching a foreground daemon that blocks the shell — the exact trap
+// that hid the missing `start` subcommand. Every foreground entry point
+// passes only the `--persistent` flag (no positional args), so NoArgs is
+// satisfied there.
 var daemonCmd = &cobra.Command{
 	Use:           "daemon",
 	Short:         "Run or query the openkanbankd daemon",
-	Long:          "openkanbankd is the per-user daemon that owns long-lived agent PTYs so the TUI can be restarted without killing in-progress agent sessions. `openkanban daemon` runs the daemon in the foreground; the subcommands list/stop/log are client-side helpers.",
+	Long:          "openkanbankd is the per-user daemon that owns long-lived agent PTYs so the TUI can be restarted without killing in-progress agent sessions. Bare `openkanban daemon` runs the daemon in the foreground (the entry point launchd and TUI autostart use); `daemon start` runs it detached in the background. The other subcommands (list/health/log/stop/restart/close) are client-side helpers that dial a running daemon.",
+	Args:          cobra.NoArgs,
 	SilenceUsage:  true,
 	SilenceErrors: false,
 	RunE:          runDaemonForeground,
@@ -165,6 +194,15 @@ var daemonStopCmd = &cobra.Command{
 
 		conn, err := dialDaemon(ctx)
 		if err != nil {
+			// `stop` is idempotent: a daemon that is already down is the
+			// desired end state, not an error. Erroring here aborts
+			// scripts (e.g. scripts/install.sh) that reach for `daemon
+			// stop` defensively, and matches `restart`'s not-running
+			// tolerance. Any other dial failure is real.
+			if errors.Is(err, errDaemonNotRunning) {
+				fmt.Println("openkanbankd is not running")
+				return nil
+			}
 			return err
 		}
 		defer conn.Close()
@@ -252,9 +290,29 @@ var daemonRestartCmd = &cobra.Command{
 
 		conn, err := dialDaemon(ctx)
 		if err != nil {
+			// "restart" against a stopped daemon is not an error — the
+			// whole point is "end with a fresh daemon running", so just
+			// bring one up. Any other dial failure is real and surfaces.
+			if errors.Is(err, errDaemonNotRunning) {
+				started, serr := startFreshDaemon(cmd.Context())
+				if serr != nil {
+					return serr
+				}
+				if started {
+					fmt.Printf("daemon restart: was not running; started a fresh daemon%s\n", pidSuffix())
+				} else {
+					fmt.Printf("daemon restart: already running%s\n", pidSuffix())
+				}
+				return nil
+			}
 			return err
 		}
 		defer conn.Close()
+
+		// Capture the running daemon's pid before we shut it down: a fresh
+		// fork must wait for the old process to release its pidlock (held
+		// until exit, past the socket unlink), or it dies "already running".
+		oldPid, _ := daemonclient.DaemonPID()
 
 		r := bufio.NewReader(conn)
 		if _, err := exchange(ctx, conn, r, daemon.MsgHelloReq, daemon.HelloReq{
@@ -300,9 +358,69 @@ var daemonRestartCmd = &cobra.Command{
 		if err := json.Unmarshal(raw, &resp); err != nil {
 			return fmt.Errorf("decode ShutdownResp: %w", err)
 		}
-		fmt.Printf("daemon restart: terminated %d session(s); next openkanban will autostart a fresh daemon\n", resp.KilledSessions)
+		fmt.Printf("daemon restart: terminated %d session(s)\n", resp.KilledSessions)
+
+		// The old daemon is exiting; wait for the process to fully release
+		// its pidlock, then start a fresh detached daemon so "restart"
+		// actually leaves one running (a clean shutdown is exit 0, which
+		// does NOT trip launchd's failure-only KeepAlive respawn).
+		if werr := daemonclient.WaitForExit(cmd.Context(), oldPid, daemonDownTimeout); werr != nil {
+			return werr
+		}
+		if _, serr := startFreshDaemon(cmd.Context()); serr != nil {
+			return serr
+		}
+		fmt.Printf("daemon restart: started a fresh daemon%s\n", pidSuffix())
 		return nil
 	},
+}
+
+// daemonStartCmd starts openkanbankd detached in the background and
+// returns once it is accepting connections (or already was). It is the
+// user-facing counterpart to bare `openkanban daemon`, which runs the
+// daemon in the FOREGROUND (the internal entry point launchd and the TUI
+// autostart exec) and blocks until the daemon exits — not what you want
+// when you just typed `daemon start` at a shell.
+var daemonStartCmd = &cobra.Command{
+	Use:           "start",
+	Short:         "Start openkanbankd detached in the background",
+	Long:          "Starts openkanbankd in the background, detached from this shell, and returns once it is accepting connections. When a launchd service is installed it kickstarts the supervised instance; otherwise it forks a persistent daemon. If a daemon is already running this is a no-op.\n\nContrast with bare `openkanban daemon`, which runs the daemon in the FOREGROUND (the internal entry point used by launchd and TUI autostart) and blocks until it exits.",
+	SilenceUsage:  true,
+	SilenceErrors: false,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx, cancel := context.WithTimeout(cmd.Context(), daemonStartTimeout)
+		defer cancel()
+		started, err := daemonclient.EnsureStarted(ctx)
+		if err != nil {
+			return err
+		}
+		if started {
+			fmt.Printf("openkanbankd: started%s\n", pidSuffix())
+		} else {
+			fmt.Printf("openkanbankd: already running%s\n", pidSuffix())
+		}
+		return nil
+	},
+}
+
+// startFreshDaemon brings up a detached daemon (launchd-preferred, else
+// fork) and reports whether it started a new one. Thin wrapper over
+// daemonclient.EnsureStarted with its own start-scaled deadline so a slow
+// socket bind isn't bounded by the caller's fast rpcTimeout.
+func startFreshDaemon(ctx context.Context) (bool, error) {
+	sctx, cancel := context.WithTimeout(ctx, daemonStartTimeout)
+	defer cancel()
+	return daemonclient.EnsureStarted(sctx)
+}
+
+// pidSuffix renders a best-effort " (pid N)" for start/restart status
+// lines by reading the daemon pidfile. Returns "" if the pid can't be
+// resolved — the message is still useful without it.
+func pidSuffix() string {
+	if pid, err := daemonclient.DaemonPID(); err == nil && pid > 0 {
+		return fmt.Sprintf(" (pid %d)", pid)
+	}
+	return ""
 }
 
 // daemonCloseFlagYes is the -y/--yes flag on `daemon close` — when set,
@@ -726,7 +844,10 @@ func dialDaemon(ctx context.Context) (net.Conn, error) {
 	conn, err := daemon.Dial(ctx, sock)
 	if err != nil {
 		if errors.Is(err, daemon.ErrDaemonNotRunning) {
-			return nil, fmt.Errorf("openkanbankd is not running (no socket at %s)", sock)
+			// Wrap the CLI sentinel (not daemon.ErrDaemonNotRunning) so
+			// callers branch on errDaemonNotRunning while the user still
+			// sees the friendly socket-path detail.
+			return nil, fmt.Errorf("%w (no socket at %s)", errDaemonNotRunning, sock)
 		}
 		return nil, err
 	}
@@ -779,6 +900,7 @@ func init() {
 	daemonCloseCmd.Flags().DurationVar(&daemonCloseFlagGrace, "grace", daemonCloseDefaultGrace, "SIGTERM-to-SIGKILL grace window when terminating the resolved session(s)")
 
 	daemonCmd.AddCommand(daemonListCmd)
+	daemonCmd.AddCommand(daemonStartCmd)
 	daemonCmd.AddCommand(daemonStopCmd)
 	daemonCmd.AddCommand(daemonRestartCmd)
 	daemonCmd.AddCommand(daemonCloseCmd)

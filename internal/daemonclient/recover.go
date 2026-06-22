@@ -12,6 +12,48 @@ import (
 	"github.com/techdufus/openkanban/internal/daemon"
 )
 
+// DaemonPID reads the daemon's recorded pid from its pidfile. Returns the
+// pid and nil when the file exists and parses; otherwise a non-nil error,
+// which callers typically treat as "pid unknown" (best-effort, e.g. the
+// "(pid N)" suffix on `daemon start`).
+func DaemonPID() (int, error) {
+	pidPath, err := daemon.PidPath()
+	if err != nil {
+		return 0, err
+	}
+	return readPidFile(pidPath)
+}
+
+// WaitForExit blocks until process pid is gone (kill(pid,0) → ESRCH) or
+// timeout elapses. `daemon restart` calls it between shutting the old
+// daemon down and starting a fresh one: the daemon unlinks its socket
+// early in shutdown (listener close) but holds its pidlock until the
+// process actually exits after cleanup(), so a fork keyed only on
+// socket-gone races the dying daemon's lock and dies with "already
+// running" — leaving nothing up. Waiting on process death closes that
+// window. pid<=0 is a no-op (nothing to wait for).
+func WaitForExit(ctx context.Context, pid int, timeout time.Duration) error {
+	if pid <= 0 {
+		return nil
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		// kill(pid, 0) probes existence without delivering a signal:
+		// nil = alive, ESRCH = gone. On the same user EPERM won't occur.
+		if err := syscall.Kill(pid, 0); err == syscall.ESRCH {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("daemonclient: daemon pid %d still alive after %s", pid, timeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
 func readPidFile(path string) (int, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
