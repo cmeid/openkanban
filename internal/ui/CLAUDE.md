@@ -150,16 +150,15 @@ The `pane.TicketTitle()` fallback exists because a `PaneView` can outlive its st
 
 When `attachWithRetry` (post-spawn or B4 fast-path) exhausts its retries, the closure calls `pv.SetLastAttachErr(err)` before returning the `spawnReadyMsg`. `PaneView.View()` then renders an actionable overlay instead of `blankPaneView` — same `cols × rows` contract so the chrome composition doesn't shift, pure ASCII so byte count == display cell count. Successful `Attach()` clears `lastAttachErr` automatically, so the overlay disappears on the next View() pass. The `shouldRetryAttachOnEnter` predicate (see Key Bindings above) gates Enter-retry on the SAME state pair, so the overlay's "Enter retries" hint is actually wired up.
 
-## Pull-back chooser
+## Brief-change chooser
 
-The brief-chooser modal in `spawnAgent` fires on TWO signals (gate is `wouldChange || pulledBack`):
+The brief-chooser modal in `spawnAgent` fires on a SINGLE signal:
 
-1. `wouldChange == true` (existing trigger) — the openkanban card's Description has diverged from the on-disk `<worktree>/tickets/<slug>.md` managed block.
-2. `pulledBack == true` (new) — `ticket.StatusChangedAt.After(*ticket.AgentSpawnedAt)`. The user explicitly moved the card back into `in_progress` AFTER the prior session ran, e.g. drag-back from `in_review` or `done`. The message is context-sensitive: "pulled back" vs "brief was updated" vs combined.
+- `wouldChange == true` — the openkanban card's Description has diverged from the on-disk `<worktree>/tickets/<slug>.md` managed block. The on-disk brief is the snapshot written at the last merge/spawn, so `wouldChange` is true exactly when the user edited the card after the session was last active. Message: "Brief was updated since this session started. What should I do?"
 
-Why the second signal exists: a shipped, pulled-back ticket typically has an empty Description (work is done) and no in-repo brief file, so `wouldChange=false`. Without the `pulledBack` arm, launching it silently `--resume`s the prior (often `/exit`-ed) JSONL with no agency over resume-vs-fresh. Routine re-attach (Ctrl+g → re-enter on the same in_progress card) doesn't trip this because `StatusChangedAt` is unchanged in that flow — confirmed by the negative-control test.
+The three choice closures (`d`/`u`/`n` → `spawnPlan{ForceFresh}`/`{InjectResumeNotice}`/`{SkipMerge}`) are unchanged.
 
-The three choice closures (`d`/`u`/`n` → `spawnPlan{ForceFresh}`/`{InjectResumeNotice}`/`{SkipMerge}`) are unchanged; only the trigger condition and the modal message vary.
+**Do NOT re-add a `StatusChangedAt`-based "pulled back" trigger.** A prior `pulledBack := ticket.AgentSpawnedAt != nil && ticket.StatusChangedAt.After(*ticket.AgentSpawnedAt)` arm was removed because it fired the chooser on *every* re-spawn of any old session: `SetAgentStatus` stamps `StatusChangedAt` on each working↔waiting flip (`internal/board/board.go`), so any session that did work has `StatusChangedAt > AgentSpawnedAt`. It is NOT a "user reopened the card" signal — agent activity bumps it constantly. (If a genuine pull-back signal is ever needed, use `StartedAt.After(*AgentSpawnedAt)` — `StartedAt` is stamped only by `SetStatus(StatusInProgress)`, never by `SetAgentStatus` — but the current design intentionally fires only on a real brief change.) The tradeoff: re-spawning a shipped, pulled-back ticket (empty Description, no brief file → `wouldChange=false`) silently `--resume`s the prior JSONL with no resume-vs-fresh prompt; this is accepted.
 
 **Esc must be routed explicitly.** The chooser is shown via `m.showChoice = true` while `m.mode` stays `ModeNormal`. In `handleKey`, the global key arms (`esc`/`q`/`ctrl+c`/`?`) run BEFORE the `m.showChoice → handleChoice` dispatch. The `ModeNormal` `esc` arm resets `mode`/`showHelp`/`showConfirm` but NOT `showChoice`, so without an explicit `if m.showChoice { return m.handleChoice(msg) }` guard at the top of the `esc` case, Esc is swallowed and the modal stays stuck open. Any future overlay shown via a bool flag (not a `Mode`) while `mode==ModeNormal` must be routed the same way in every global key arm it should answer to.
 
