@@ -313,6 +313,11 @@ type HelloResp struct {
 	BinaryVersion   string `json:"binary_version"`
 	ClientCount     int    `json:"client_count"`
 	ClientID        uint16 `json:"client_id"`
+	// SuspectedWedged is true when the daemon's wedge watchdog currently
+	// suspects dispatch is stuck. Additive field — older clients ignore it.
+	// A newly dialing TUI uses it to surface "daemon may be wedged; restart?"
+	// instead of hanging on a daemon that can't service RPCs.
+	SuspectedWedged bool `json:"suspected_wedged,omitempty"`
 }
 
 // SpawnReq asks the daemon to start a new PTY-backed session.

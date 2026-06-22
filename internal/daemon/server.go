@@ -66,7 +66,17 @@ func (s *Server) runHandlerWithDeadline(name string, fn func()) bool {
 		d = handlerDeadlineOverride
 	}
 	done := make(chan struct{})
-	go func() { defer close(done); fn() }()
+	// shortInflight is incremented for the lifetime of the handler goroutine
+	// (not just until the deadline) so a genuinely stuck short handler keeps
+	// it elevated — that, plus a frozen dispatchSeq, is the real wedge signal
+	// the watchdog samples. A handler that completes (even after abandonment)
+	// releases it.
+	s.shortInflight.Add(1)
+	go func() {
+		defer s.shortInflight.Add(-1)
+		defer close(done)
+		fn()
+	}()
 	select {
 	case <-done:
 		return true
@@ -222,11 +232,24 @@ type Server struct {
 	emitSessionExitFn func(SessionEvent)
 
 	// dispatchSeq increments at the end of every dispatch() call; inflight
-	// tracks handlers currently executing. The watchdog samples both: if
-	// inflight>0 but dispatchSeq is frozen past the wedge threshold, the
-	// daemon is stuck and must self-restart. Lock-free.
-	dispatchSeq atomic.Uint64
-	inflight    atomic.Int64
+	// tracks ALL handlers currently executing (used for health reporting).
+	// shortInflight tracks only deadline-wrapped *short* handlers — the
+	// watchdog samples THIS, not inflight, because the by-design-blocking
+	// handlers (handleAttach for the session's life, handleShutdown) are
+	// excluded from the deadline and would otherwise pin inflight>0 forever,
+	// making an idle daemon with parked attaches look wedged. Lock-free.
+	dispatchSeq   atomic.Uint64
+	inflight      atomic.Int64
+	shortInflight atomic.Int64
+
+	// suspectedWedged is set by the watchdog when dispatch appears stuck
+	// (short handlers in flight, dispatchSeq frozen past the threshold) and
+	// cleared when dispatch resumes. It is NOT a self-destruct trigger — the
+	// watchdog reports the suspicion (emits a daemon_wedged event + answers
+	// hello) and lets a connected operator decide. A dispatch wedge does not
+	// stop the PTY pumps, so running agents are unaffected; with no TUI
+	// connected the suspicion is harmless. Read lock-free by handleHello.
+	suspectedWedged atomic.Bool
 
 	// inflightKills tracks the number of in-flight session kill operations.
 	// When a kill exceeds reapTimeout, it's moved to reapFailures to surface
@@ -1310,6 +1333,7 @@ func (s *Server) handleHello(c *clientConn, req HelloReq) HelloResp {
 		BinaryVersion:   BinaryVersion,
 		ClientCount:     count,
 		ClientID:        c.id,
+		SuspectedWedged: s.suspectedWedged.Load(),
 	}
 }
 
@@ -1914,4 +1938,13 @@ func (s *Server) writeError(c *clientConn, code, message string) {
 
 func (s *Server) dispatchStats() (uint64, int64) {
 	return s.dispatchSeq.Load(), s.inflight.Load()
+}
+
+// wedgeStats is what the wedge watchdog samples: dispatchSeq plus the count
+// of *short* (deadline-wrapped) handlers in flight. Long-lived handlers
+// (handleAttach, handleShutdown) are deliberately excluded — they block by
+// design, so counting them would make an idle daemon with parked attaches
+// indistinguishable from a wedged one (the 2026-06-22 false-positive restart).
+func (s *Server) wedgeStats() (uint64, int64) {
+	return s.dispatchSeq.Load(), s.shortInflight.Load()
 }

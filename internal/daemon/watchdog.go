@@ -89,11 +89,18 @@ func (w *wedgeMonitor) evaluate(s wedgeSample) (bool, string) {
 	return false, ""
 }
 
-// runWedgeWatchdog samples dispatch stats on a ticker and force-restarts the
-// daemon if evaluate says it's wedged. Dumps every goroutine's stack to the
-// log first (the postmortem), then os.Exit(1) so launchd/systemd respawns —
-// picking up a new on-disk binary if one is present. Exits cleanly when the
-// shutdown channel closes.
+// runWedgeWatchdog samples dispatch stats on a ticker. If evaluate says the
+// daemon looks wedged (short handlers in flight, dispatchSeq frozen past the
+// threshold) it REPORTS the suspicion — sets s.suspectedWedged (answered on
+// hello), emits a daemon_wedged event to connected TUIs, and dumps goroutines
+// to the log — but does NOT force-exit. A dispatch wedge does not stop the PTY
+// pumps, so self-restarting would only destroy live agent sessions (the
+// 2026-06-22 false-positive that killed 11 sessions). Recovery is
+// operator-driven from a TUI; with no TUI connected the suspicion is harmless.
+// The suspicion is cleared when dispatch resumes. Exits cleanly when the
+// shutdown channel closes — and then hands off to awaitShutdownCompletion,
+// which IS still allowed to force-exit a hung *shutdown* (a different, genuinely
+// unrecoverable zombie state).
 func (s *Server) runWedgeWatchdog() {
 	mon := newWedgeMonitor(wedgeSeconds, staleWedgeSeconds)
 	ticker := time.NewTicker(wedgeCheckInterval)
@@ -111,26 +118,34 @@ func (s *Server) runWedgeWatchdog() {
 			s.awaitShutdownCompletion()
 			return
 		case <-ticker.C:
-			seq, inflight := s.dispatchStats()
+			seq, inflight := s.wedgeStats()
 			s.stalenessMu.Lock()
 			pending := s.pendingRestart
 			s.stalenessMu.Unlock()
-			exit, reason := mon.evaluate(wedgeSample{
+			suspect, reason := mon.evaluate(wedgeSample{
 				seq:            seq,
 				inflight:       inflight,
 				pendingRestart: pending,
 				nowNanos:       time.Now().UnixNano(),
 			})
-			if !exit {
+			if !suspect {
+				// Dispatch is progressing (or idle) — clear any prior
+				// suspicion so a newly dialing TUI isn't wrongly warned.
+				if s.suspectedWedged.Swap(false) {
+					log.Printf("openkanbankd: wedge watchdog: dispatch resumed; clearing suspected-wedge")
+				}
 				continue
 			}
-			buf := make([]byte, 1<<20)
-			n := runtime.Stack(buf, true)
-			log.Printf("openkanbankd: WEDGE WATCHDOG firing (%s); inflight=%d seq=%d. goroutine dump:\n%s",
-				reason, inflight, seq, buf[:n])
-			log.Printf("openkanbankd: exiting(1) for supervisor respawn")
-			s.forceExit(1)
-			return
+			// Suspected wedge. REPORT, do not self-destruct: emit + dump once
+			// per episode and let an operator decide via a TUI. The flag is
+			// also answered on hello so a freshly dialing TUI is told.
+			if !s.suspectedWedged.Swap(true) {
+				buf := make([]byte, 1<<20)
+				n := runtime.Stack(buf, true)
+				log.Printf("openkanbankd: WEDGE WATCHDOG suspects a wedge (%s); inflight=%d seq=%d. goroutine dump:\n%s",
+					reason, inflight, seq, buf[:n])
+				s.emitEvent(SessionEvent{Event: "daemon_wedged", Reason: reason})
+			}
 		}
 	}
 }
