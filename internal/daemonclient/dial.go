@@ -186,6 +186,62 @@ func DialOrStart(ctx context.Context) (net.Conn, error) {
 	return nil, fmt.Errorf("%w: forked daemon did not bind %s within %s", ErrDaemonUnavailable, sock, startWait)
 }
 
+// EnsureStarted brings up a detached daemon if none is already listening
+// and reports whether it had to start one. It is the explicit-CLI
+// counterpart to DialOrStart: DialOrStart exists to hand back a live
+// connection, whereas `openkanban daemon start` (and the not-running path
+// of `daemon restart`) want the daemon running in the background plus a
+// started/already-running verdict — not a conn.
+//
+// The start decision is the same launchd-preferred logic as autostart
+// (startDaemon): kickstart the supervised instance when a plist is
+// installed, else fork a detached --persistent daemon. The forked child is
+// already detached from this process (new session via Setsid +
+// Process.Release), so EnsureStarted returns as soon as the socket accepts
+// a connection — it never holds the daemon in the foreground.
+//
+// Returns (false, nil) when a daemon was already up, (true, nil) when it
+// started one, or ErrDaemonUnavailable (wrapping the cause) if a start was
+// attempted but the socket did not bind within startWait.
+func EnsureStarted(ctx context.Context) (started bool, err error) {
+	sock, err := SocketPath()
+	if err != nil {
+		return false, err
+	}
+
+	conn, derr := dial(ctx, sock)
+	if derr == nil {
+		conn.Close()
+		return false, nil
+	}
+	if !errors.Is(derr, ErrDaemonUnavailable) {
+		return false, derr
+	}
+
+	if serr := startDaemon(); serr != nil {
+		return false, fmt.Errorf("%w: start: %v", ErrDaemonUnavailable, serr)
+	}
+
+	deadline := time.Now().Add(startWait)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		default:
+		}
+		conn, derr := dial(ctx, sock)
+		if derr == nil {
+			conn.Close()
+			return true, nil
+		}
+		if !errors.Is(derr, ErrDaemonUnavailable) {
+			return false, derr
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return false, fmt.Errorf("%w: started daemon did not bind %s within %s", ErrDaemonUnavailable, sock, startWait)
+}
+
 // startDaemon brings up a daemon when none is listening. When the user
 // has installed the launchd service, it asks launchd to (re)start its
 // supervised instance rather than forking a tui-fork that would grab the

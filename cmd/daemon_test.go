@@ -42,6 +42,24 @@ func TestDaemonRestart_RegisteredOnDaemonCmd(t *testing.T) {
 	}
 }
 
+// TestDaemonStart_RegisteredOnDaemonCmd confirms `start` is wired in as a
+// subcommand of `daemon`. Without it, `openkanban daemon start` falls
+// through to daemonCmd.RunE and runs the daemon in the FOREGROUND (cobra
+// treats the unknown word "start" as a positional arg), which is exactly
+// the bug this command fixes — so guard the wiring.
+func TestDaemonStart_RegisteredOnDaemonCmd(t *testing.T) {
+	found := false
+	for _, sub := range daemonCmd.Commands() {
+		if sub.Name() == "start" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("daemon: start subcommand not registered")
+	}
+}
+
 // TestDaemonClose_HasYesFlag asserts `openkanban daemon close` exposes
 // a -y/--yes flag for skipping the interactive confirmation. Same intent
 // as TestDaemonRestart_HasForceFlag: lock the safety hatch in place.

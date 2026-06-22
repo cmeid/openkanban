@@ -204,6 +204,18 @@ sessions immediately** (which ends them):
 openkanban daemon restart
 ```
 
+`daemon restart` is self-contained: it shuts the old daemon down (if one
+is running), waits for the process to release its pidlock
+(`daemonclient.WaitForExit` keyed on the pre-shutdown pid — the socket is
+unlinked early in shutdown but the lock is held until process exit, so a
+fork keyed on socket-gone would race `ErrAlreadyLocked`), then starts a
+fresh detached daemon via `daemonclient.EnsureStarted`. It no longer
+relies on the next launch to autostart — a clean shutdown exits 0, which
+does NOT trip launchd's `KeepAlive={SuccessfulExit:false}`. Restarting a
+*stopped* daemon just runs the start half. `openkanban daemon start` is
+the same detached `EnsureStarted` start with no shutdown; bare `openkanban
+daemon` stays the FOREGROUND entry point (launchd/autostart exec it).
+
 `stalenessStep` is the unit-testable per-tick core (see `staleness_step_test.go`);
 the `Server.staleCheck func() bool` field is a test seam defaulting to
 `update.BinaryStale` — never reassigned in production.
