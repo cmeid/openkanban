@@ -59,6 +59,32 @@ path. Don't reintroduce a force-kill there. This is orthogonal to the TUI-side
 exit-guard, which is about making the guard *fire reliably*; this is about what
 the daemon does *when* it doesn't.
 
+## Shutdown must actually terminate (initiateShutdown closes client conns)
+
+`initiateShutdown` closes the shutdown channel, closes the listener, AND
+force-closes every registered client connection via `closeClientConns()`. That
+last step is **load-bearing, not cleanup politeness**: `Serve` finishes by
+blocking on `s.wg.Wait()` for every `handleConn` goroutine to return, and a
+persistent-mode TUI never disconnects on its own — its `handleConn` is parked in
+`ReadFrame` (or a blocked `handleAttach` binary loop). Closing the listener also
+*unlinks the socket file* (Go `UnixListener` default), so without closing the
+conns the daemon ends up in a **zombie state**: socket gone (`daemon list` →
+ENOENT, new TUIs can't dial) yet the process is alive and still serving the
+attached TUI, and the launchd respawn-on-new-binary never fires. Closing the
+conn trips the parked `ReadFrame` (`net.ErrClosed`/EOF) → goroutine returns →
+`wg.Wait()` completes → `cleanup()` → process exits → launchd respawns. Pinned by
+`TestServerLifecycle_ShutdownTerminatesWithAttachedClient`. `closeClientConns`
+snapshots the conns under `clientsMu` then closes them *outside* the lock (the
+close cascades into each `handleConn` defer, which re-takes `clientsMu`).
+
+`handleSpawn` is **gated on `s.shutdown`** at its entry: a daemon that has
+decided to exit must reject new spawns. The spawn RPC is reachable over an
+already-attached client's connection even after the listener is closed, and a
+fresh session both orphans agent work `cleanup()` is about to kill and
+re-populates the registry the shutdown is draining. This is the bug that let the
+wedged daemon spawn three sessions *after* "shutdown initiated". Pinned by
+`TestHandleSpawn_RejectsAfterShutdown`.
+
 ## Authoritative session status (resolveSessionStatus)
 
 The daemon owns the live PTY grid for **every** session it runs — attached or

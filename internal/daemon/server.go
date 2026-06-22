@@ -889,8 +889,21 @@ func (s *Server) checkSessionWedge(id string, sess *Session, stuckSeen map[strin
 	}()
 }
 
-// initiateShutdown closes the shutdown channel exactly once and the
-// listener so the accept loop returns. Safe to call from any goroutine.
+// initiateShutdown closes the shutdown channel exactly once, closes the
+// listener so the accept loop returns, and force-closes every registered
+// client connection. Safe to call from any goroutine.
+//
+// Closing the client conns is load-bearing, not best-effort cleanup:
+// Serve finishes shutdown by blocking on s.wg.Wait() for every handleConn
+// goroutine to return, and a persistent-mode TUI never disconnects on its
+// own — its handleConn is parked in ReadFrame (or a blocked handleAttach
+// binary loop). Without closing the conns, wg.Wait() blocks forever AFTER
+// the listener close has already unlinked the socket file, leaving a
+// "zombie" daemon: invisible to new clients (daemon list → ENOENT) yet
+// alive and still serving the attached TUI, with the launchd
+// respawn-on-new-binary never happening. Closing the conn trips the
+// parked ReadFrame (net.ErrClosed/EOF), the goroutine returns, wg.Wait()
+// completes, cleanup runs, and the process exits so launchd respawns.
 func (s *Server) initiateShutdown(reason string) {
 	s.shutdownOnce.Do(func() {
 		log.Printf("openkanbankd: shutdown initiated (%s)", reason)
@@ -898,7 +911,28 @@ func (s *Server) initiateShutdown(reason string) {
 		if s.ln != nil {
 			s.ln.Close()
 		}
+		s.closeClientConns()
 	})
+}
+
+// closeClientConns force-closes every registered client connection so
+// each handleConn read loop returns and Serve's wg.Wait() can complete.
+// Idempotent at the socket level (a double Close just errors, ignored).
+// Takes clientsMu; must not be called while holding it. The conn close
+// triggers each client's handleConn defer (unregister +
+// handleLastClientDisconnect), which is harmless during shutdown —
+// shutdownOnce makes any re-entrant initiateShutdown a no-op.
+func (s *Server) closeClientConns() {
+	s.clientsMu.Lock()
+	conns := make([]net.Conn, 0, len(s.clients))
+	for _, c := range s.clients {
+		conns = append(conns, c.conn)
+	}
+	s.clientsMu.Unlock()
+
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
 }
 
 // cleanup tears down any remaining sessions, releases the pidlock,
@@ -1232,6 +1266,22 @@ func (s *Server) handleHello(c *clientConn, req HelloReq) HelloResp {
 // loser forked is the only collateral, and it's terminated before
 // handleSpawn returns.
 func (s *Server) handleSpawn(c *clientConn, req SpawnReq) (SpawnResp, error) {
+	// Reject spawns once shutdown has begun. A daemon that has decided to
+	// exit (binary-stale self-restart, ShutdownReq, ctx-cancel) must not
+	// accept new agent work: cleanup() will kill it moments later, and —
+	// worse — a fresh session re-populates the registry the shutdown is
+	// trying to drain, so it can both orphan the agent and keep the
+	// daemon from ever finishing its exit. This is what let the wedged
+	// daemon spawn three sessions AFTER "shutdown initiated". The spawn
+	// path is the only mutating RPC reachable over an already-attached
+	// client's connection once the listener is closed, so it's the one
+	// that needs the gate.
+	select {
+	case <-s.shutdown:
+		return SpawnResp{}, fmt.Errorf("spawn: daemon is shutting down")
+	default:
+	}
+
 	// Reject anonymous spawns at the door: no TicketID means no dedup,
 	// no TicketDone routing, no cleanup path — i.e. an orphan by
 	// construction. The dispatcher surfaces this as a spawn_failed
@@ -1671,6 +1721,7 @@ func (s *Server) handlePrepareExit(c *clientConn, req PrepareExitReq) PrepareExi
 		ClientCount:        total,
 		OtherTUIClients:    otherTUIs,
 		OtherActiveClients: otherActive,
+		Persistent:         s.persistent,
 		Sessions:           infos,
 	}
 }

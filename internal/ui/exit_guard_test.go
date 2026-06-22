@@ -239,6 +239,34 @@ func TestExitGuard_LastTUI_ShowsModalEvenWithStaleClientCount(t *testing.T) {
 	}
 }
 
+// When the daemon is persistent (launchd/systemd-supervised), it OUTLIVES
+// the disconnecting TUI and keeps the sessions' PTYs alive for a future
+// re-attach. So even as the last active TUI with live sessions, quitting
+// must NOT trap the user behind the "must terminate before exit" modal —
+// it should silent-quit (detach-and-quit), leaving the sessions running.
+// That is the whole point of daemon-owned PTYs; the modal only makes sense
+// when quitting would actually destroy the sessions (default mode).
+func TestExitGuard_PersistentDaemon_SilentQuitsEvenAsLastTUIWithSessions(t *testing.T) {
+	api := newFakeGuardAPI(nil, 0)
+	api.prepareExitResp = daemon.PrepareExitResp{
+		OtherActiveClients: 0,    // we are the last active TUI
+		Persistent:         true, // but the daemon survives us
+		Sessions: []daemon.SessionInfo{
+			{SessionID: "s1", TicketID: "t1", PID: 100, Running: true},
+		},
+	}
+	m := minimalModel(api)
+
+	_, cmd := m.handleQuitRequested()
+	finalModel, msgs := runCmds(t, m, cmd)
+	if !containsQuitMsg(msgs) {
+		t.Fatalf("expected tea.Quit against a persistent daemon; got msgs=%v", msgs)
+	}
+	if finalModel.mode == ModeConfirmExit {
+		t.Errorf("expected NOT to enter ModeConfirmExit against a persistent daemon; got mode=%v", finalModel.mode)
+	}
+}
+
 func TestExitGuard_NoSessions_ExitsImmediately(t *testing.T) {
 	api := newFakeGuardAPI(nil, /*clientCount=*/ 1)
 	m := minimalModel(api)
