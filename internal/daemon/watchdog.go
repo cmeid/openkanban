@@ -130,9 +130,11 @@ func (s *Server) runWedgeWatchdog() {
 			})
 			if !suspect {
 				// Dispatch is progressing (or idle) — clear any prior
-				// suspicion so a newly dialing TUI isn't wrongly warned.
+				// suspicion so a newly dialing TUI isn't wrongly warned and a
+				// connected TUI can drop its banner.
 				if s.suspectedWedged.Swap(false) {
 					log.Printf("openkanbankd: wedge watchdog: dispatch resumed; clearing suspected-wedge")
+					s.emitEvent(SessionEvent{Event: "daemon_unwedged"})
 				}
 				continue
 			}

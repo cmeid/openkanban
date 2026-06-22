@@ -50,10 +50,11 @@ type Client struct {
 	pending   chan rawResp
 
 	helloOnce      sync.Once
-	clientID       uint16
-	protocolVer    uint16
-	binaryVer      string
-	clientCountVal atomic.Int64 // last-known count (Hello / PrepareExit)
+	clientID        uint16
+	protocolVer     uint16
+	binaryVer       string
+	suspectedWedged bool         // HelloResp.SuspectedWedged at connect time
+	clientCountVal  atomic.Int64 // last-known count (Hello / PrepareExit)
 
 	subscribersMu sync.Mutex
 	subscribers   map[chan<- daemon.SessionEvent]struct{}
@@ -166,6 +167,7 @@ func newClient(ctx context.Context, conn net.Conn) (*Client, error) {
 	c.clientID = resp.ClientID
 	c.protocolVer = resp.ProtocolVersion
 	c.binaryVer = resp.BinaryVersion
+	c.suspectedWedged = resp.SuspectedWedged
 	c.clientCountVal.Store(int64(resp.ClientCount))
 
 	return c, nil
@@ -213,6 +215,12 @@ func (c *Client) ClientID() uint16 { return c.clientID }
 
 // ProtocolVersion returns the daemon-reported protocol version.
 func (c *Client) ProtocolVersion() uint16 { return c.protocolVer }
+
+// SuspectedWedgedAtHello reports whether the daemon flagged a suspected
+// dispatch wedge in its Hello response when this client connected. A
+// connect-time snapshot only — the live signal is the daemon_wedged
+// SessionEvent pushed to subscribers.
+func (c *Client) SuspectedWedgedAtHello() bool { return c.suspectedWedged }
 
 // BinaryVersion returns the daemon-reported binary version string.
 func (c *Client) BinaryVersion() string { return c.binaryVer }

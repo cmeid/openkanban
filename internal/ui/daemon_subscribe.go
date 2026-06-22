@@ -195,6 +195,25 @@ func (m *Model) applyDaemonSessionEvent(ev daemon.SessionEvent) {
 	log.Printf("openkanban model: handleDaemonSessionEvent event=%q session=%s ticket=%s expected=%v",
 		ev.Event, ev.SessionID, ev.TicketID, ev.Expected)
 
+	// Daemon-global events (no ticket): the wedge watchdog's suspicion
+	// signal. The daemon reports a suspected wedge rather than self-restarting
+	// (that would kill live sessions), so the TUI surfaces it and lets the
+	// operator decide. Cleared when the daemon reports dispatch resumed.
+	switch ev.Event {
+	case "daemon_wedged":
+		if !m.daemonWedged {
+			log.Printf("openkanban model: daemon reports suspected wedge: %s", ev.Reason)
+		}
+		m.daemonWedged = true
+		return
+	case "daemon_unwedged":
+		if m.daemonWedged {
+			log.Printf("openkanban model: daemon wedge cleared; dropping banner")
+		}
+		m.daemonWedged = false
+		return
+	}
+
 	if ticketID != "" {
 		// Stamp the per-ticket activity timestamp from any event that
 		// carries one. The daemon seeds it on lifecycle events (started,

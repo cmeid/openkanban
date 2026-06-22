@@ -81,6 +81,15 @@ notification banners land. The resulting gap before `? help  q quit` is load-bea
 "tidy" it away; tune the constant to adjust banner clearance. Pinned by
 `TestRenderHeaderActivityChipClearsCorner`.
 
+**Daemon wedge banner.** When `m.daemonWedged`, `renderHeader` replaces the `? help q quit`
+right cluster with a red "⚠ daemon wedged — run: openkanban daemon restart" banner. It's the
+same single header line, so there's NO board-layout impact (the column-height math is unchanged).
+The flag is set by the `daemon_wedged` SessionEvent (and `HelloResp.SuspectedWedged` at startup,
+read in `NewModel`) and cleared by `daemon_unwedged` — both handled in `applyDaemonSessionEvent`
+(`daemon_subscribe.go`) before the per-ticket block since they carry no TicketID. The daemon
+does NOT self-restart on a wedge (that would kill live sessions), so recovery is operator-driven.
+Pinned by `TestApplyDaemonSessionEvent_WedgeBannerToggles` / `TestRenderHeader_ShowsWedgeBanner`.
+
 ## Messages
 
 Custom messages for async operations:

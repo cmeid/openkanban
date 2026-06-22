@@ -321,6 +321,14 @@ type Model struct {
 		pv       *daemonclient.PaneView
 	}
 
+	// daemonWedged is set when the daemon's wedge watchdog reports a
+	// suspected dispatch wedge (a "daemon_wedged" SessionEvent, or
+	// HelloResp.SuspectedWedged at startup) and cleared on "daemon_unwedged".
+	// Drives a warning banner with the recovery hint. The daemon does NOT
+	// self-restart on a wedge (that would kill live sessions), so recovery is
+	// operator-driven: `openkanban daemon restart`.
+	daemonWedged bool
+
 	// daemonClient is the long-lived control connection to openkanbankd.
 	// nil when the daemon couldn't be reached at startup — every call
 	// site MUST nil-check before use (the TUI degrades to a no-spawn
@@ -637,6 +645,13 @@ func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projec
 		diag = daemonClient.DiagCounters
 	}
 	m.monitor = newStallMonitor(diag)
+
+	// If the daemon already suspected a wedge when we dialed in, surface the
+	// banner from the first frame (the daemon_wedged push only fires on the
+	// transition, so a TUI that connects mid-episode wouldn't otherwise know).
+	if daemonClient != nil && daemonClient.SuspectedWedgedAtHello() {
+		m.daemonWedged = true
+	}
 
 	return m
 }
