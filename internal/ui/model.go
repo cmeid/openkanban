@@ -2839,8 +2839,15 @@ func (m *Model) saveTicketForm(isEdit bool) (tea.Model, tea.Cmd) {
 		}
 		ticket.Status = status
 		m.globalStore.Add(ticket)
+		// A brand-new ticket has no daemon session and an arbitrary
+		// title, so an active filter (open-only, search query, or a
+		// project narrow) would hide it — leaving selectTicketByID
+		// nothing to land on. Clear whatever would hide THIS ticket so
+		// the thing the user just created is always visible and selected.
+		m.revealThroughFilters(ticket)
 		m.refreshColumnTickets()
 		m.selectTicketByID(ticket.ID)
+		m.ensureColumnVisible()
 		m.saveTicket(ticket)
 		m.notify("Created: " + title)
 	}
@@ -5579,6 +5586,33 @@ func (m *Model) selectedTicket() *board.Ticket {
 		return nil
 	}
 	return tickets[m.activeTicket]
+}
+
+// revealThroughFilters clears any active board filter that would hide t,
+// so a ticket the user just created interactively is always visible and
+// selectable. It only relaxes the dimensions that actually hide THIS
+// ticket: a search query is cleared, the open-only session filter falls
+// back to "all", and a project narrow gains t's project (rather than
+// being wiped, preserving a deliberate multi-project view). No-op when t
+// already passes the filter.
+//
+// Scope: interactive creation only. The async board-resync / CLI-create
+// paths must NOT call this — they must never disturb the user's filter
+// state out from under an active session.
+func (m *Model) revealThroughFilters(t *board.Ticket) {
+	if t == nil || m.ticketMatchesFilter(t) {
+		return
+	}
+	if m.filterQuery != "" {
+		m.filterQuery = ""
+		m.filterInput.SetValue("")
+	}
+	if m.sessionFilter == SessionFilterOpen {
+		m.sessionFilter = SessionFilterAll
+	}
+	if len(m.filterProjectIDs) > 0 && !m.filterProjectIDs[t.ProjectID] {
+		m.filterProjectIDs[t.ProjectID] = true
+	}
 }
 
 func (m *Model) selectTicketByID(ticketID board.TicketID) {
