@@ -602,9 +602,81 @@ func TestDetectStatusWithActivity_BusyTurnNotWaiting(t *testing.T) {
 	}
 }
 
+// TestDetectStatusWithActivity_StaleWorkingDemotedOnPrompt pins the
+// stale-"working" fix. Claude's Notification hook does not reliably fire
+// for every input-needed state — an AskUserQuestion prompt was observed
+// pinning a session's status file at "working" for hours while it sat
+// blocked on the user. When the file says "working" but the live grid
+// shows a recognized approval/question prompt and NO active-turn marker,
+// the session is needs-you and must surface as "waiting". The
+// activeTurnVisible guard keeps a genuinely busy session at "working".
+//
+// The askUserQuestionGrid footer is the verbatim string Claude Code
+// renders for AskUserQuestion ("… · Esc to cancel"), captured from a live
+// daemon Peek of the specimen that motivated this fix.
+func TestDetectStatusWithActivity_StaleWorkingDemotedOnPrompt(t *testing.T) {
+	tmpDir := t.TempDir()
+	d := NewStatusDetector()
+	d.statusDirs = []string{tmpDir}
+	statusFile := filepath.Join(tmpDir, "sess.status")
+	if err := os.WriteFile(statusFile, []byte("working"), 0644); err != nil {
+		t.Fatalf("write status: %v", err)
+	}
+
+	askUserQuestionGrid := strings.Join([]string{
+		" ❯ 1. Default + visible (Recommended)",
+		"   2. Lock to project default",
+		"   3. Confirm to deviate",
+		"   4. Type something.",
+		"",
+		" Enter to select · Tab/Arrow keys to navigate · Esc to cancel",
+	}, "\n")
+
+	permissionBox := strings.Join([]string{
+		" Do you want to proceed?",
+		" ❯ 1. Yes",
+		"   2. No",
+		" Esc to cancel · Tab to amend",
+	}, "\n")
+
+	tests := []struct {
+		name            string
+		terminalContent string
+		want            board.AgentStatus
+	}{
+		// The fix: a blocked-on-user prompt on screen demotes the stale
+		// "working" file to "waiting".
+		{"AskUserQuestion prompt demotes stale working", askUserQuestionGrid, board.AgentWaiting},
+		{"permission box demotes stale working", permissionBox, board.AgentWaiting},
+		// Guards against over-demotion — these must STAY "working":
+		{"active turn alone preserves working", "⠹ Running bash command… (esc to interrupt)", board.AgentWorking},
+		{"no prompt + no marker preserves working (file authoritative)", "some streamed tool output\nrunning tests", board.AgentWorking},
+		{"empty grid preserves working (fails safe)", "", board.AgentWorking},
+		// Asymmetry vs the waiting-branch: in the working-branch the
+		// activeTurn marker GUARDS (stays working) rather than the prompt
+		// winning — the combo is impossible in Claude's real UI, and the
+		// conservative choice for a file already saying "working" is to not
+		// demote when any active-turn evidence is present.
+		{"prompt plus interrupt marker stays working (guard)", askUserQuestionGrid + "\n (esc to interrupt)", board.AgentWorking},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d.InvalidateCache("sess")
+			got := d.DetectStatusWithActivity("claude", "sess", "sess", "", 0, true, tt.terminalContent, time.Now())
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestDetectStatusWithActivity_NoDowngrade ensures the override never
-// downgrades a non-waiting status. Even when activity is present, a
-// file saying "working" / "idle" / "completed" passes through.
+// downgrades a non-waiting status WHEN NO on-screen prompt is present.
+// Even when activity is present, a file saying "working" / "idle" /
+// "completed" passes through. (The one intentional exception — a stale
+// "working" with a visible prompt → "waiting" — is pinned in
+// TestDetectStatusWithActivity_StaleWorkingDemotedOnPrompt.)
 func TestDetectStatusWithActivity_NoDowngrade(t *testing.T) {
 	tmpDir := t.TempDir()
 	d := NewStatusDetector()

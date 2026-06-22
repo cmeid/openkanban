@@ -107,6 +107,27 @@ For a session **no TUI is attached to**, the client has no grid, so the daemon
 supplies the verdict from its own live grid — see `internal/daemon`
 `resolveSessionStatus`.
 
+#### Refining a stale file-based "working" (the symmetric case)
+
+The mirror problem: the file stays pinned at `"working"` while the session is
+actually blocked on the user. Claude's `Notification` hook does **not** reliably
+fire for every input-needed state — an `AskUserQuestion` prompt was observed
+holding a session's status file at `"working"` for hours. `DetectStatusWithActivity`
+therefore also refines a file-based `"working"`: when the live grid shows a
+recognized prompt (`permissionPromptVisible`) and **no** active-turn marker
+(`activeTurnVisible`), it demotes to `"waiting"`.
+
+Note the deliberate asymmetry vs the waiting-branch precedence above:
+- **waiting-branch:** `permissionPromptVisible` wins outright (prompt-first).
+- **working-branch:** `activeTurnVisible` **guards** — any active-turn evidence
+  keeps `"working"`; only an unambiguous prompt-without-activity demotes. The
+  combo is impossible in Claude's real UI; for a file already asserting
+  `"working"`, not demoting on a coincidental prompt substring is the
+  conservative choice. An empty grid fails SAFE to `"working"`
+  (`permissionPromptVisible("")` is false), and the daemon supplies its own grid
+  for unattached sessions. Pinned by
+  `TestDetectStatusWithActivity_StaleWorkingDemotedOnPrompt`.
+
 ## OpenCode Server
 
 Lifecycle management for opencode:

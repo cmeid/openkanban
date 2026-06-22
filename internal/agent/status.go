@@ -170,6 +170,26 @@ const WaitingActivityTTL = 60 * time.Second
 // opencode HTTP API call.
 func (d *StatusDetector) DetectStatusWithActivity(agentType, fileSessionName, apiSessionID, worktreePath string, port int, processRunning bool, terminalContent string, lastActivity time.Time) board.AgentStatus {
 	status := d.DetectStatusWithPortAPI(agentType, fileSessionName, apiSessionID, worktreePath, port, processRunning, terminalContent)
+	// Stale-"working" refinement — the symmetric counterpart to the
+	// "waiting" refinement below. The hook status file can stay pinned at
+	// "working" while the session is actually blocked on the user: Claude's
+	// Notification hook does not reliably fire for every input-needed state
+	// (notably an AskUserQuestion prompt — observed pinning a session at
+	// "working" for hours), so the file is never demoted to "waiting". When
+	// the live grid shows a recognized approval/question prompt
+	// ("do you want to" / "esc to cancel") and NO active-turn marker, the
+	// session is needs-you, not working. The activeTurnVisible check is
+	// ordered as a guard so a genuinely busy session whose streamed output
+	// coincidentally contains a prompt substring is never demoted. An empty
+	// grid (unattached session with no local PTY view) fails SAFE to
+	// "working" because permissionPromptVisible("") is false — and the
+	// daemon's resolveSessionStatus supplies its own grid for that case.
+	if status == board.AgentWorking {
+		if permissionPromptVisible(terminalContent) && !activeTurnVisible(terminalContent) {
+			return board.AgentWaiting
+		}
+		return status
+	}
 	if status != board.AgentWaiting {
 		return status
 	}
