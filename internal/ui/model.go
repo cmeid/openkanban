@@ -1318,7 +1318,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.handleQuit()
 		}
 	case "esc":
-		// A choice modal (e.g. the pull-back chooser) is shown via
+		// A choice modal (e.g. the brief-change chooser) is shown via
 		// m.showChoice while m.mode stays ModeNormal. Route Esc to its
 		// handler before the ModeNormal reset arm below — that arm
 		// clears mode/help/confirm but not showChoice, so it would
@@ -4594,28 +4594,26 @@ func (m *Model) spawnAgent() (tea.Model, tea.Cmd) {
 
 		if offerChooser {
 			_, _, wouldChange, _, _ := agent.PreviewBriefMerge(ticket, ticket.WorktreePath)
-			// pulledBack catches the explicit "user reopened a card
-			// from in_review/done back to in_progress" gesture: the
-			// most recent status transition happened AFTER the prior
-			// session was spawned. That's exactly when "resume the
-			// prior session, or start fresh?" is the question worth
-			// surfacing — even (especially) when the brief itself is
-			// unchanged. On a routine re-attach (Ctrl+g → re-enter)
-			// StatusChangedAt is unchanged, so this stays false and
-			// the chooser doesn't fire spuriously.
-			pulledBack := ticket.AgentSpawnedAt != nil && ticket.StatusChangedAt.After(*ticket.AgentSpawnedAt)
-			if wouldChange || pulledBack {
+			// The chooser fires ONLY when the card description has
+			// diverged from the on-disk brief since the session was
+			// last active (wouldChange). The on-disk brief is the
+			// snapshot written at the last merge/spawn, so wouldChange
+			// is true exactly when the user edited the card after the
+			// session started — the only moment "resume, re-read, or
+			// start fresh?" is worth asking.
+			//
+			// It deliberately does NOT key off StatusChangedAt vs
+			// AgentSpawnedAt. SetAgentStatus stamps StatusChangedAt on
+			// every working↔waiting flip (internal/board/board.go), so
+			// any old session that did any work has StatusChangedAt >
+			// AgentSpawnedAt — a status-based gate fired the chooser on
+			// every re-spawn regardless of whether anything changed.
+			// See the "Brief-change chooser" note in internal/ui/CLAUDE.md.
+			if wouldChange {
 				// Capture ticket/proj/agentCfg into each callback. Each option
 				// sets its own plan and proceeds with the existing tea.Batch.
 				m.showChoice = true
-				switch {
-				case pulledBack && wouldChange:
-					m.choiceMsg = "Ticket was pulled back and the brief changed. What should I do?"
-				case pulledBack:
-					m.choiceMsg = "Ticket was pulled back into in_progress. Resume prior session or start fresh?"
-				default:
-					m.choiceMsg = "Brief was updated since this session started. What should I do?"
-				}
+				m.choiceMsg = "Brief was updated since this session started. What should I do?"
 				ticketCopy := ticket // pointer — fine, the closures don't outlive the ticket
 				projCopy := proj
 				cfgCopy := agentCfg
