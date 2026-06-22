@@ -85,6 +85,30 @@ re-populates the registry the shutdown is draining. This is the bug that let the
 wedged daemon spawn three sessions *after* "shutdown initiated". Pinned by
 `TestHandleSpawn_RejectsAfterShutdown`.
 
+### Safety nets are bound to process-exit, not shutdown-initiation
+
+The diagnostic/recovery mechanisms must survive shutdown-*initiation* and only
+go away on process *exit* — otherwise a hung shutdown is the one state you can
+neither inspect nor recover, which is exactly what happened in the field:
+
+- **SIGUSR1 goroutine-dump handler**: its teardown is a `defer` in `Serve` (runs
+  on return), NOT a `<-s.shutdown` goroutine. The old code dropped the handler
+  the instant shutdown began, so `kill -USR1` on the wedged daemon produced
+  nothing. Keep the teardown deferred so the dump works through the whole
+  shutdown + `cleanup()` window.
+- **Shutdown-completion backstop** (`runWedgeWatchdog` → `awaitShutdownCompletion`):
+  on `<-s.shutdown` the watchdog does NOT `return`; it waits for `s.serveDone`
+  (closed when `Serve` returns) and, if that doesn't arrive within
+  `shutdownCompletionDeadline` (30s), dumps goroutines and `os.Exit(1)` so
+  launchd respawns. This catches a hung shutdown — note launchd's `KeepAlive`
+  can't help on its own, since it only respawns on process *exit* and the zombie
+  never exits. The deadline can't false-fire during a default-mode
+  `awaitSessionDrain`: that path keeps the daemon alive WITHOUT closing
+  `s.shutdown`, so the backstop only arms once `initiateShutdown` has fired, by
+  which point exit should be prompt. Decision logic is the pure, unit-tested
+  `awaitCompletionOrExit` (os.Exit kept out of the tested path, mirroring
+  `wedgeMonitor.evaluate`).
+
 ## Authoritative session status (resolveSessionStatus)
 
 The daemon owns the live PTY grid for **every** session it runs — attached or

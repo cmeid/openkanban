@@ -16,7 +16,31 @@ const (
 	// staleWedgeSeconds: a stale binary (pendingRestart) that also stops
 	// completing work exits sooner — it has nothing to lose.
 	staleWedgeSeconds = 45
+	// shutdownCompletionDeadline bounds how long the daemon may take to
+	// actually exit AFTER shutdown is initiated. Healthy shutdown is
+	// sub-second (close client conns -> wg.Wait returns) plus per-session
+	// kill grace in cleanup(); this is generously above that. Past it,
+	// shutdown is wedged (the zombie-daemon failure mode: socket unlinked,
+	// process never exits), so the watchdog force-exits to let launchd
+	// respawn rather than leave an invisible-but-alive daemon. It cannot
+	// false-fire during a legitimate default-mode awaitSessionDrain: that
+	// path keeps the daemon alive WITHOUT closing s.shutdown, so this
+	// deadline only starts once initiateShutdown has actually fired, by
+	// which point exit should be prompt.
+	shutdownCompletionDeadline = 30 * time.Second
 )
+
+// awaitCompletionOrExit blocks until done is closed (clean shutdown
+// completion) or deadline elapses, whichever comes first. On deadline it
+// invokes onTimeout. Pure + injectable so the force-exit decision is
+// unit-tested without a real os.Exit, mirroring wedgeMonitor.evaluate.
+func awaitCompletionOrExit(done <-chan struct{}, deadline time.Duration, onTimeout func()) {
+	select {
+	case <-done:
+	case <-time.After(deadline):
+		onTimeout()
+	}
+}
 
 type wedgeSample struct {
 	seq            uint64
@@ -78,6 +102,14 @@ func (s *Server) runWedgeWatchdog() {
 	for {
 		select {
 		case <-s.shutdown:
+			// Shutdown initiated. Don't abandon the post — switch from
+			// dispatch-wedge detection to a shutdown-completion backstop.
+			// Returning here is what previously dismantled the safety net
+			// the moment it was most needed (a hung shutdown left an
+			// un-recoverable zombie that even launchd couldn't respawn,
+			// since the process never exited). If Serve returns within the
+			// deadline this is a no-op; otherwise we force-exit.
+			s.awaitShutdownCompletion()
 			return
 		case <-ticker.C:
 			seq, inflight := s.dispatchStats()
@@ -101,4 +133,23 @@ func (s *Server) runWedgeWatchdog() {
 			os.Exit(1)
 		}
 	}
+}
+
+// awaitShutdownCompletion is the watchdog's post-shutdown phase: once
+// shutdown is initiated the process must exit promptly, so it waits for
+// Serve to return (s.serveDone) and, if that doesn't happen within
+// shutdownCompletionDeadline, dumps goroutines and force-exits so launchd
+// respawns. This is the backstop for a hung shutdown — the failure mode
+// that left the field daemon a zombie (socket unlinked, process alive,
+// SIGUSR1 handler already gone, launchd unable to respawn a
+// still-"healthy" process).
+func (s *Server) awaitShutdownCompletion() {
+	awaitCompletionOrExit(s.serveDone, shutdownCompletionDeadline, func() {
+		buf := make([]byte, 1<<20)
+		n := runtime.Stack(buf, true)
+		log.Printf("openkanbankd: SHUTDOWN WATCHDOG firing — shutdown did not complete within %s. goroutine dump:\n%s",
+			shutdownCompletionDeadline, buf[:n])
+		log.Printf("openkanbankd: exiting(1) for supervisor respawn (hung shutdown)")
+		os.Exit(1)
+	})
 }

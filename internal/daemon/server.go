@@ -135,6 +135,15 @@ type Server struct {
 	shutdown     chan struct{}
 	shutdownOnce sync.Once
 
+	// serveDone is closed exactly once when Serve returns (process about
+	// to exit). The shutdown-completion backstop in runWedgeWatchdog
+	// waits on it: if Serve hasn't returned within a deadline AFTER
+	// shutdown was initiated, the shutdown is wedged and the watchdog
+	// force-exits so launchd respawns. Bound to process-exit, not to
+	// shutdown-initiation — see the watchdog and [[shutdown safety nets]].
+	serveDone     chan struct{}
+	serveDoneOnce sync.Once
+
 	wg sync.WaitGroup
 
 	sem *connSem
@@ -316,6 +325,7 @@ func NewServerWithOptions(sock, pidpath string, opts Options) (*Server, error) {
 		reg:            newSessionRegistry(),
 		clients:        make(map[uint16]*clientConn),
 		shutdown:       make(chan struct{}),
+		serveDone:      make(chan struct{}),
 		events:         make(chan SessionEvent, 64),
 		statusDetector: agent.NewStatusDetector(),
 		sem:            newConnSem(maxConcurrentConns),
@@ -415,6 +425,11 @@ func (s *Server) Serve(ctx context.Context) error {
 		}
 	}
 
+	// Signal Serve's return (process-exit boundary in prod, clean
+	// teardown point in tests) so the shutdown-completion backstop in
+	// runWedgeWatchdog can tell a clean exit from a hung one.
+	defer s.serveDoneOnce.Do(func() { close(s.serveDone) })
+
 	// Watch ctx in a goroutine that triggers the same shutdown path
 	// the last-client-disconnect handler uses, so both initiations
 	// converge on identical cleanup.
@@ -455,24 +470,28 @@ func (s *Server) Serve(ctx context.Context) error {
 	// Diagnostic: dump every goroutine's stack on SIGUSR1 so we can
 	// inspect the daemon's runtime state without restarting it. The
 	// handler never exits the process — only the existing shutdown
-	// paths can do that. The handler goroutine itself exits when
-	// shutdown begins, which un-registers the signal and closes the
-	// channel; without this the goroutine would leak under repeated
-	// Serve→shutdown cycles (visible only in tests, since prod runs
-	// one Server for the daemon's lifetime).
+	// paths can do that.
+	//
+	// Teardown is bound to Serve RETURNING (the deferred Stop+close
+	// below), NOT to shutdown-initiation. The old code dropped the
+	// handler the instant `s.shutdown` closed — so a hung shutdown (the
+	// zombie-daemon bug: socket already unlinked, process still alive)
+	// became un-introspectable via `kill -USR1` exactly when an operator
+	// most needs the dump. Deferring keeps it live through the entire
+	// shutdown + cleanup() window and still tears down cleanly on return,
+	// so the goroutine can't leak across repeated Serve cycles in tests.
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGUSR1)
+	defer func() {
+		signal.Stop(sigChan)
+		close(sigChan)
+	}()
 	go func() {
 		for range sigChan {
 			buf := make([]byte, 1<<20) // 1 MB; plenty for dozens of goroutines
 			n := runtime.Stack(buf, true)
 			log.Printf("openkanbankd: SIGUSR1 received, goroutine dump:\n%s", buf[:n])
 		}
-	}()
-	go func() {
-		<-s.shutdown
-		signal.Stop(sigChan)
-		close(sigChan)
 	}()
 	log.Printf("openkanbankd: SIGUSR1 goroutine-dump handler ready")
 
