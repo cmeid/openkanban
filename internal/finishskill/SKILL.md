@@ -63,6 +63,8 @@ Gather everything Chris's "Q1" used to ask for, into one proposal you'll present
 
 **Docs.** Did the change make any of these stale or under-documented? Root `CLAUDE.md`; nested `CLAUDE.md` files; `docs/*.md`; `README.md`; the ticket brief (`tickets/<slug>.md`) — but only if you found the *spec* itself wrong, never as a changelog.
 
+**Polish — the "one last thing" pass.** Looking at what you just built, are there 1–3 small, low-risk improvements *to this work* you'd otherwise be tempted to leave as a "follow-up" — a clearer name, a missing test, a doc line, an obvious edge case? If they're small and within the spirit of the work, **implement them now** so they ride this single land — don't park small in-scope polish as a backlog ticket (`[[openkanban-in-scope-ticket-pivot]]`). Larger or out-of-scope ideas are the exception — handle them in Step 6.
+
 **The land plan.** Determine the outward actions precisely (you'll enumerate them in Step 4):
 - Files to commit, and the commit messages (see Step 5 for conventions).
 - `git remote -v` → the push remote and the destination `<owner/repo>`.
@@ -119,7 +121,7 @@ Execute, in order. **Never push directly to main** (`git push origin <branch>:ma
 
 Immediately after landing, run the reflective pass. This is Chris's second question, and per `[[explicit-wind-down-review]]` it is **a real honest re-walk, not a perfunctory trailer** after the merge. Actually re-examine:
 
-- **Loose ends:** anything deferred, half-done, or worth a follow-up backlog ticket?
+- **Loose ends:** anything deferred, half-done, or a small thing you noticed you could improve? **Bias to implementing it now**, not filing it — if it's small, low-risk, and within the spirit of this work, just do it (landing the new bytes still needs a fresh prompt — see below). Reserve a backlog ticket for items that are genuinely out of scope, risky, or only worth doing once some trigger fires (`[[openkanban-deferred-item-backlog-ticket]]`).
 - **Experience to save:** any memory you under-captured in Step 3, now that the work is fully landed?
 - **Lessons:** anything about the approach, the tooling, or a recurring pattern worth recording?
 
