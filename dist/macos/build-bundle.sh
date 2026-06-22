@@ -60,6 +60,34 @@ chmod +x "${BUNDLE_DIR}/Contents/MacOS/openkanbankd"
 echo "==> Copying icon -> Contents/Resources/AppIcon.icns"
 cp "${ICON_FILE}" "${BUNDLE_DIR}/Contents/Resources/AppIcon.icns"
 
+# Re-sign the assembled bundle as one coherent unit.
+#
+# Go's linker leaves the binary ad-hoc-signed with Identifier=a.out and
+# Info.plist=not bound. macOS 26 (Tahoe) silently drops notifications
+# whose calling process has a signed identifier that doesn't match the
+# bundle ID declared in Info.plist. We re-sign here with --identifier
+# dev.cmeid.openkanban (matching CFBundleIdentifier) and --deep so the
+# whole bundle (binary + Info.plist + Resources) seals as one unit;
+# without this every install.sh run produces a notifications-broken
+# bundle even when the Go code is correct.
+#
+# --sign - is intentional ad-hoc signing for local/dev installs. When
+# we move to Developer-ID-signed + notarized builds, replace "-" with
+# the team's Developer ID Application identity and add a notarization
+# step after this block. The --options=runtime flag opts into the
+# hardened runtime, which is required for notarization and is harmless
+# for ad-hoc builds.
+echo "==> Code-signing bundle as dev.cmeid.openkanban (deep)"
+if ! codesign --force --deep --identifier dev.cmeid.openkanban \
+              --sign - --options=runtime "${BUNDLE_DIR}" 2>&1; then
+    echo "error: codesign failed; macOS may silently drop notifications from this bundle" >&2
+    exit 1
+fi
+if ! codesign --verify --deep --strict "${BUNDLE_DIR}" 2>&1; then
+    echo "error: bundle failed post-sign verification" >&2
+    exit 1
+fi
+
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 if [[ -x "${LSREGISTER}" ]]; then
     echo "==> Registering bundle with Launch Services"

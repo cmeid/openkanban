@@ -2,26 +2,58 @@
 
 // Platform backend for notify.Send on darwin.
 //
-// The notification is dispatched via NSUserNotification. The title is
-// left empty so macOS substitutes the bundle's CFBundleDisplayName from
-// the .app the binary runs from; this requires the binary be launched
-// from a registered .app bundle to surface a usable name.
+// Notifications are dispatched via UNUserNotificationCenter (the modern
+// UserNotifications.framework). NSUserNotification was deprecated in
+// macOS 11 (Big Sur, 2020) and became fully non-functional on macOS 26
+// (Tahoe) — even from a properly code-signed bundle with granted
+// permission, deliverNotification: silently dropped. Migrated 2026-06-18.
+//
+// Requirements that still apply:
+//   - The binary must be running from inside a registered .app bundle
+//     (so macOS resolves the bundle identity for permission scoping).
+//   - The user must have granted notification permission for the bundle
+//     ID at least once via System Settings → Notifications (or via the
+//     authorization prompt that the requestAuthorization call below
+//     triggers on first run).
+//   - The title is left empty so macOS uses CFBundleDisplayName from the
+//     bundle's Info.plist.
 package notify
 
 /*
 #cgo CFLAGS: -x objective-c -fobjc-arc
-#cgo LDFLAGS: -framework Foundation
+#cgo LDFLAGS: -framework Foundation -framework UserNotifications
 
 #import <Foundation/Foundation.h>
+#import <UserNotifications/UserNotifications.h>
+
+static dispatch_once_t openkanbanAuthOnce;
+static void openkanbanRequestAuth(void) {
+    dispatch_once(&openkanbanAuthOnce, ^{
+        UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+        [center requestAuthorizationWithOptions:UNAuthorizationOptionAlert
+                              completionHandler:^(BOOL granted, NSError *error) {
+            // intentionally unused — user grants via System Settings
+        }];
+    });
+}
 
 static void openkanbanSendNotification(const char *body) {
     @autoreleasepool {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        NSUserNotification *n = [[NSUserNotification alloc] init];
-        n.informativeText = [NSString stringWithUTF8String:body];
-        [[NSUserNotificationCenter defaultUserNotificationCenter] deliverNotification:n];
-#pragma clang diagnostic pop
+        openkanbanRequestAuth();
+
+        UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
+        content.body = [NSString stringWithUTF8String:body];
+
+        UNNotificationRequest *request =
+            [UNNotificationRequest requestWithIdentifier:[[NSUUID UUID] UUIDString]
+                                                 content:content
+                                                 trigger:nil];
+
+        UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+        [center addNotificationRequest:request
+                 withCompletionHandler:^(NSError *error) {
+            // fire-and-forget
+        }];
     }
 }
 */
@@ -29,14 +61,6 @@ import "C"
 
 import "unsafe"
 
-// platformSend is the darwin backend invoked by notify.Send's default.
-//
-// The notification title is left empty so macOS uses CFBundleDisplayName
-// from the .app bundle the binary runs from. The body is passed through
-// verbatim as the notification's informativeText.
-//
-// Returns nil; NSUserNotificationCenter's deliverNotification: does not
-// expose a meaningful synchronous error.
 func platformSend(body string) error {
 	cBody := C.CString(body)
 	defer C.free(unsafe.Pointer(cBody))

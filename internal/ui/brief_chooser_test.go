@@ -19,7 +19,7 @@ import (
 // writeDeadJSONL in dead_session_daemon_test.go: it emits a single
 // assistant event with real, user-visible text so the alive-content
 // scan in jsonlHasRealAssistantContent returns true. Used by the
-// pull-back chooser tests, which need shouldCleanupDeadSession to
+// brief-chooser tests, which need shouldCleanupDeadSession to
 // fall through to offerChooser=true via the IsClaudeSessionDead arm
 // (the Owns probe is skipped when AgentSessionID is empty).
 func writeAliveJSONL(t *testing.T, homeDir, worktree, uuid string) string {
@@ -53,13 +53,16 @@ func writeAliveJSONL(t *testing.T, homeDir, worktree, uuid string) string {
 	return path
 }
 
-// pulledBackFixture builds a Model + Ticket pair where the ticket has
-// previously been spawned (AgentSpawnedAt set) and the user has since
-// moved the ticket's status (StatusChangedAt set later) — the explicit
-// pull-back gesture spawnAgent should now detect. Description is empty
-// so PreviewBriefMerge reports wouldChange=false; the chooser must
-// therefore fire on the pulledBack signal alone, not on a brief change.
-func pulledBackFixture(t *testing.T, statusChangedDelta time.Duration) (*Model, *board.Ticket, string) {
+// oldSessionFixture builds a Model + Ticket pair for an already-spawned
+// ticket (AgentSpawnedAt set) whose StatusChangedAt is offset from spawn
+// by statusChangedDelta. A positive delta models the real world: any live
+// session bumps StatusChangedAt past AgentSpawnedAt every time the status
+// poll flips AgentStatus working↔waiting (SetAgentStatus stamps
+// StatusChangedAt — board.go). Description is empty and no brief file is
+// written, so PreviewBriefMerge reports wouldChange=false; the chooser
+// must therefore stay closed regardless of the delta, since it now fires
+// only on a genuine brief change.
+func oldSessionFixture(t *testing.T, statusChangedDelta time.Duration) (*Model, *board.Ticket, string) {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -114,42 +117,65 @@ func pulledBackFixture(t *testing.T, statusChangedDelta time.Duration) (*Model, 
 	return m, ticket, home
 }
 
-// TestSpawnAgent_PulledBack_FiresChooser_EvenWithUnchangedBrief pins
-// the new trigger condition: when the user pulls a ticket back into
-// in_progress AFTER its prior session ran (StatusChangedAt >
-// AgentSpawnedAt), the brief-chooser modal must fire — even if the
-// brief itself hasn't changed. The chooser's "Resume prior session or
-// start fresh?" question is exactly what the pull-back gesture is
-// asking for.
-//
-// Negative-control coverage lives in
-// TestSpawnAgent_NotPulledBack_NoChooserOnUnchangedBrief.
-func TestSpawnAgent_PulledBack_FiresChooser_EvenWithUnchangedBrief(t *testing.T) {
-	// StatusChangedAt = AgentSpawnedAt + 1h → strictly after → pulledBack=true
-	m, _, _ := pulledBackFixture(t, time.Hour)
+// TestSpawnAgent_OldSession_StatusBumpedAfterSpawn_NoChooserWhenBriefUnchanged
+// is the regression test for "old sessions always ask to update the
+// brief." An old session's StatusChangedAt is pushed past AgentSpawnedAt
+// by ordinary agent activity (SetAgentStatus stamps StatusChangedAt on
+// every working↔waiting flip). The brief-chooser must NOT fire on that
+// alone — only a genuine brief change may open it. Before the fix the
+// gate also fired on StatusChangedAt > AgentSpawnedAt, so this case (the
+// common one for any session that did work) popped the modal every
+// re-spawn.
+func TestSpawnAgent_OldSession_StatusBumpedAfterSpawn_NoChooserWhenBriefUnchanged(t *testing.T) {
+	// StatusChangedAt = AgentSpawnedAt + 1h — the state SetAgentStatus
+	// produces after any in-session status transition. Brief unchanged
+	// (empty Description, no brief file) → wouldChange=false.
+	m, _, _ := oldSessionFixture(t, time.Hour)
+
+	_, _ = m.spawnAgent()
+
+	if m.showChoice {
+		t.Errorf("showChoice = true, want false (status bumped after spawn but brief unchanged → chooser must stay closed). msg=%q", m.choiceMsg)
+	}
+}
+
+// TestSpawnAgent_BriefChanged_FiresChooser pins the positive trigger:
+// when the card description has diverged from the on-disk brief
+// (wouldChange=true), the chooser fires with the brief-change message —
+// and must NOT mention "pulled back" (the removed signal).
+func TestSpawnAgent_BriefChanged_FiresChooser(t *testing.T) {
+	m, ticket, _ := oldSessionFixture(t, time.Hour)
+	// Non-empty Description with no brief file on disk →
+	// PreviewBriefMerge case (fileAbsent && desc != "") → wouldChange=true.
+	ticket.Description = "the card description changed since this session started"
 
 	_, _ = m.spawnAgent()
 
 	if !m.showChoice {
-		t.Fatalf("showChoice = false, want true (pulled-back ticket must fire the chooser)")
+		t.Fatalf("showChoice = false, want true (brief changed → chooser must fire)")
 	}
-	if !strings.Contains(m.choiceMsg, "pulled back") {
-		t.Errorf("choiceMsg = %q, want it to mention \"pulled back\"", m.choiceMsg)
+	if !strings.Contains(m.choiceMsg, "Brief was updated") {
+		t.Errorf("choiceMsg = %q, want it to mention \"Brief was updated\"", m.choiceMsg)
+	}
+	if strings.Contains(m.choiceMsg, "pulled back") {
+		t.Errorf("choiceMsg = %q, must not mention \"pulled back\" (signal removed)", m.choiceMsg)
 	}
 	if len(m.choices) != 3 {
 		t.Errorf("choices = %d, want 3 (d/u/n)", len(m.choices))
 	}
 }
 
-// TestPullBackChooser_EscDismisses pins that Esc cancels the pull-back
-// chooser modal. The modal is shown via m.showChoice while m.mode stays
+// TestBriefChooser_EscDismisses pins that Esc cancels the brief-chooser
+// modal. The modal is shown via m.showChoice while m.mode stays
 // ModeNormal, so the global Esc arm in handleKey (which runs before the
 // showChoice dispatch) must route to handleChoice rather than swallowing
 // the keystroke and leaving the modal up. Regression guard: previously
 // the ModeNormal Esc branch reset mode/help/confirm but never cleared
-// showChoice, so Esc looked dead while the chooser was open.
-func TestPullBackChooser_EscDismisses(t *testing.T) {
-	m, _, _ := pulledBackFixture(t, time.Hour)
+// showChoice, so Esc looked dead while the chooser was open. The chooser
+// is opened here via a genuine brief change (wouldChange=true).
+func TestBriefChooser_EscDismisses(t *testing.T) {
+	m, ticket, _ := oldSessionFixture(t, time.Hour)
+	ticket.Description = "brief diverged, open the chooser"
 
 	if _, _ = m.spawnAgent(); !m.showChoice {
 		t.Fatalf("precondition: showChoice = false, want true (chooser must be open before Esc)")
@@ -166,16 +192,13 @@ func TestPullBackChooser_EscDismisses(t *testing.T) {
 	}
 }
 
-// TestSpawnAgent_NotPulledBack_NoChooserOnUnchangedBrief pins the
-// negative half: when the prior session was the most recent status
-// transition (StatusChangedAt <= AgentSpawnedAt), the chooser must NOT
-// fire on an empty brief. This is the routine re-attach case (the user
-// Ctrl+g'd back to the board and is re-entering the same in_progress
-// session) — an unsolicited modal here would be friction without
-// signal.
-func TestSpawnAgent_NotPulledBack_NoChooserOnUnchangedBrief(t *testing.T) {
-	// StatusChangedAt = AgentSpawnedAt - 1h → strictly before → pulledBack=false
-	m, _, _ := pulledBackFixture(t, -time.Hour)
+// TestSpawnAgent_UnchangedBrief_NoChooser pins the negative half from the
+// other direction: a prior status transition BEFORE spawn, brief
+// unchanged → no chooser. Together with the status-bumped-after-spawn
+// case above, this documents that the StatusChangedAt/AgentSpawnedAt
+// ordering no longer influences the gate at all — only wouldChange does.
+func TestSpawnAgent_UnchangedBrief_NoChooser(t *testing.T) {
+	m, _, _ := oldSessionFixture(t, -time.Hour)
 
 	// Without a daemon stub the spawn path would attempt a real Spawn
 	// RPC — to avoid that, we assert on m.showChoice immediately. The
@@ -185,6 +208,6 @@ func TestSpawnAgent_NotPulledBack_NoChooserOnUnchangedBrief(t *testing.T) {
 	_, _ = m.spawnAgent()
 
 	if m.showChoice {
-		t.Errorf("showChoice = true, want false (no pull-back, no brief change → chooser should not fire). msg=%q", m.choiceMsg)
+		t.Errorf("showChoice = true, want false (no brief change → chooser should not fire). msg=%q", m.choiceMsg)
 	}
 }
