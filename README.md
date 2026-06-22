@@ -289,7 +289,7 @@ openkanban daemon list      # what sessions are alive
 openkanban daemon log       # tail the daemon log
 openkanban daemon start     # start it detached in the background (no-op if already running)
 openkanban daemon restart   # restart (prompts before killing live sessions; --force to skip)
-openkanban daemon stop      # clean shutdown (prompts before killing live sessions; --force to skip)
+openkanban daemon stop      # clean shutdown (prompts before killing live sessions; --force to skip; no-op if already stopped)
 ```
 
 `daemon start` returns immediately — it backgrounds the daemon (preferring the launchd service when installed) rather than holding it in the foreground like bare `openkanban daemon` (the internal entry point launchd/autostart use). `daemon restart` works whether or not a daemon is already running: if one is up it is shut down first, and either way `restart` ends with a fresh daemon running.

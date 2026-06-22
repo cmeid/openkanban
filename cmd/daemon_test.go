@@ -1,6 +1,9 @@
 package cmd
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -57,6 +60,61 @@ func TestDaemonStart_RegisteredOnDaemonCmd(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("daemon: start subcommand not registered")
+	}
+}
+
+// TestDaemonCmd_RejectsPositionalArgs locks in cobra.NoArgs on the parent
+// `daemon` command. Without it, a mistyped subcommand (`daemon resstart`)
+// is swallowed as a positional arg and runs the daemon in the FOREGROUND,
+// blocking the shell — the trap that hid the missing `start` subcommand.
+// Bare `daemon` (and `daemon --persistent`, whose flag isn't a positional
+// arg) must still be accepted, since that's the foreground entry point.
+func TestDaemonCmd_RejectsPositionalArgs(t *testing.T) {
+	if daemonCmd.Args == nil {
+		t.Fatalf("daemon: Args validator not set; want cobra.NoArgs")
+	}
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr bool
+	}{
+		{"no args (foreground entry)", []string{}, false},
+		{"mistyped subcommand", []string{"resstart"}, true},
+		{"stray positional", []string{"foo", "bar"}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := daemonCmd.Args(daemonCmd, tt.args)
+			if tt.wantErr && err == nil {
+				t.Errorf("Args(%v): want error, got nil", tt.args)
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("Args(%v): want nil, got %v", tt.args, err)
+			}
+		})
+	}
+}
+
+// TestDaemonStop_IdempotentWhenDown asserts `daemon stop` treats a daemon
+// that's already down as success (nil error), not a failure. Erroring
+// there aborts scripts that defensively stop the daemon. Mirrors the
+// isolated-env harness from TestDaemonClose_NoDaemon.
+func TestDaemonStop_IdempotentWhenDown(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "okbt-stopdown-")
+	if err != nil {
+		t.Fatalf("mkdir tmp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+
+	t.Setenv("OPENKANBAN_DAEMON_SOCK", filepath.Join(dir, "nonexistent.sock"))
+	t.Setenv("OPENKANBAN_DAEMON_PID", filepath.Join(dir, "d.pid"))
+	t.Setenv("OPENKANBAN_DAEMON_LOG", filepath.Join(dir, "d.log"))
+	t.Setenv("OPENKANBAN_DAEMON_BINARY", "/usr/bin/true") // never fork a real daemon
+	t.Setenv("HOME", dir)                                 // no plist under fake HOME
+
+	daemonStopCmd.SetContext(context.Background())
+	if err := daemonStopCmd.RunE(daemonStopCmd, nil); err != nil {
+		t.Errorf("daemon stop with no daemon running: got error %v, want nil (idempotent)", err)
 	}
 }
 

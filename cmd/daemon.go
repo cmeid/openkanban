@@ -49,13 +49,22 @@ const daemonDownTimeout = 5 * time.Second
 var daemonFlagPersistent bool
 
 // daemonCmd is the parent command for openkanbankd-related operations.
-// `openkanban daemon` itself runs the daemon in the foreground; the
-// list/stop/log subcommands are client-side helpers that dial into a
-// running daemon.
+// Bare `openkanban daemon` runs the daemon in the FOREGROUND (the entry
+// point launchd and the TUI autostart exec as `daemon --persistent`);
+// `daemon start` runs it detached. The remaining subcommands are
+// client-side helpers that dial a running daemon.
+//
+// Args is cobra.NoArgs so a mistyped subcommand (`daemon resstart`)
+// errors instead of being swallowed as a positional arg and silently
+// launching a foreground daemon that blocks the shell — the exact trap
+// that hid the missing `start` subcommand. Every foreground entry point
+// passes only the `--persistent` flag (no positional args), so NoArgs is
+// satisfied there.
 var daemonCmd = &cobra.Command{
 	Use:           "daemon",
 	Short:         "Run or query the openkanbankd daemon",
-	Long:          "openkanbankd is the per-user daemon that owns long-lived agent PTYs so the TUI can be restarted without killing in-progress agent sessions. `openkanban daemon` runs the daemon in the foreground; the subcommands list/stop/log are client-side helpers.",
+	Long:          "openkanbankd is the per-user daemon that owns long-lived agent PTYs so the TUI can be restarted without killing in-progress agent sessions. Bare `openkanban daemon` runs the daemon in the foreground (the entry point launchd and TUI autostart use); `daemon start` runs it detached in the background. The other subcommands (list/health/log/stop/restart/close) are client-side helpers that dial a running daemon.",
+	Args:          cobra.NoArgs,
 	SilenceUsage:  true,
 	SilenceErrors: false,
 	RunE:          runDaemonForeground,
@@ -185,6 +194,15 @@ var daemonStopCmd = &cobra.Command{
 
 		conn, err := dialDaemon(ctx)
 		if err != nil {
+			// `stop` is idempotent: a daemon that is already down is the
+			// desired end state, not an error. Erroring here aborts
+			// scripts (e.g. scripts/install.sh) that reach for `daemon
+			// stop` defensively, and matches `restart`'s not-running
+			// tolerance. Any other dial failure is real.
+			if errors.Is(err, errDaemonNotRunning) {
+				fmt.Println("openkanbankd is not running")
+				return nil
+			}
 			return err
 		}
 		defer conn.Close()
