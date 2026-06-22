@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -116,15 +117,55 @@ func TestOldestWaitingPeer(t *testing.T) {
 			wantOK:       true,
 		},
 		{
-			name: "ignores non-waiting and nil-StatusChangedAt waiters",
+			name: "ignores working/none and nil-StatusChangedAt sessions",
 			cols: [][]*board.Ticket{
-				{autoTicket("T-work", board.AgentWorking, old)},  // not waiting
-				{autoTicket("T-nilts", board.AgentWaiting, nil)}, // waiting but no timestamp
-				{autoTicket("T-real", board.AgentWaiting, mid)},  // the only valid waiter
+				{autoTicket("T-work", board.AgentWorking, old), autoTicket("T-none", board.AgentNone, old)}, // not needs-attention
+				{autoTicket("T-nilts", board.AgentWaiting, nil)},                                            // waiting but no timestamp
+				{autoTicket("T-real", board.AgentIdle, mid)},                                                // the only valid needs-attention session
 				{},
 			},
-			livePaneIDs: []board.TicketID{"T-work", "T-nilts", "T-real"},
+			livePaneIDs: []board.TicketID{"T-work", "T-none", "T-nilts", "T-real"},
 			want:        "T-real",
+			wantOK:      true,
+		},
+		{
+			name: "idle counts as needs-attention (agent at rest, not working)",
+			cols: [][]*board.Ticket{
+				{autoTicket("T-work", board.AgentWorking, old)}, // excluded (active)
+				{autoTicket("T-idle", board.AgentIdle, mid)},    // the only needs-attention session
+				{},
+				{},
+			},
+			livePaneIDs: []board.TicketID{"T-work", "T-idle"},
+			want:        "T-idle",
+			wantOK:      true,
+		},
+		{
+			// idle and waiting are pooled and ranked together by StatusChangedAt:
+			// the OLDER idle beats the NEWER waiting. Anti-vacuous — if the code
+			// still preferred waiting, or didn't pool idle, this would return the
+			// waiter (or nothing).
+			name: "idle and waiting ranked together, oldest wins",
+			cols: [][]*board.Ticket{
+				{autoTicket("T-wait-new", board.AgentWaiting, newer)}, // newer waiter
+				{autoTicket("T-idle-old", board.AgentIdle, old)},      // older idle -> FIFO winner
+				{},
+				{},
+			},
+			livePaneIDs: []board.TicketID{"T-wait-new", "T-idle-old"},
+			want:        "T-idle-old",
+			wantOK:      true,
+		},
+		{
+			name: "stuck counts as needs-attention (daemon-wedged pane)",
+			cols: [][]*board.Ticket{
+				{autoTicket("T-work", board.AgentWorking, old)}, // excluded (active)
+				{autoTicket("T-stuck", board.AgentStuck, mid)},  // wedged -> needs attention
+				{},
+				{},
+			},
+			livePaneIDs: []board.TicketID{"T-work", "T-stuck"},
+			want:        "T-stuck",
 			wantOK:      true,
 		},
 		{
@@ -140,14 +181,14 @@ func TestOldestWaitingPeer(t *testing.T) {
 			wantOK:      true,
 		},
 		{
-			name: "no waiters -> not found (off-ramp to board)",
+			name: "no needs-attention sessions -> not found (off-ramp to board)",
 			cols: [][]*board.Ticket{
 				{autoTicket("T-work", board.AgentWorking, old)},
-				{autoTicket("T-idle", board.AgentIdle, mid)},
+				{autoTicket("T-none", board.AgentNone, mid)},
 				{},
 				{},
 			},
-			livePaneIDs: []board.TicketID{"T-work", "T-idle"},
+			livePaneIDs: []board.TicketID{"T-work", "T-none"},
 			wantOK:      false,
 		},
 		{
@@ -206,7 +247,7 @@ func TestAutoAttach_CtrlGBranch(t *testing.T) {
 
 	ctrlG := tea.KeyMsg{Type: tea.KeyCtrlG}
 
-	t.Run("auto on with waiter jumps instead of board", func(t *testing.T) {
+	t.Run("auto on with waiter jumps and attaches directly", func(t *testing.T) {
 		m := build(true, true)
 		model, _ := m.handleAgentViewMode(ctrlG)
 		got := model.(*Model)
@@ -216,8 +257,9 @@ func TestAutoAttach_CtrlGBranch(t *testing.T) {
 		if got.focusedPane != "T-wait" {
 			t.Errorf("focusedPane = %q, want \"T-wait\"", got.focusedPane)
 		}
-		if !got.cycleAttachPrompt {
-			t.Errorf("cycleAttachPrompt = false, want true after Auto jump")
+		// Direct attach (no preview modal): cycleAttachPrompt must NOT be set.
+		if got.cycleAttachPrompt {
+			t.Errorf("cycleAttachPrompt = true, want false (Auto attaches directly, no modal)")
 		}
 	})
 
@@ -300,4 +342,59 @@ func TestAttachedElsewhereSet(t *testing.T) {
 	if s := attachedElsewhereSet(nil, me); len(s) != 0 {
 		t.Errorf("nil sessions -> empty set, got %v", s)
 	}
+}
+
+// TestRenderAgentView_AutoBadge covers the in-session Auto indicator. The agent
+// view does NOT render contextualHints (the footer), so the Auto state must be
+// surfaced in renderAgentView's own chrome: an AUTO badge + a Ctrl+g hint that
+// reads "Next waiter" when armed, "Board" when not.
+func TestRenderAgentView_AutoBadge(t *testing.T) {
+	t.Setenv("OPENKANBAN_CONFIG_DIR", t.TempDir())
+
+	build := func(autoOn bool) *Model {
+		proj := &project.Project{ID: "test-proj", Name: "TestProj", RepoPath: t.TempDir()}
+		gs := project.NewGlobalTicketStore(nil)
+		gs.AddProject(proj)
+		tk := &board.Ticket{ID: "T-focus", Title: "FocusTicket", Status: board.StatusInProgress, ProjectID: proj.ID}
+		if err := gs.Add(tk); err != nil {
+			t.Fatalf("Add: %v", err)
+		}
+		info := &daemon.SessionInfo{SessionID: "sid-T-focus", TicketID: "T-focus", Running: true, Cols: 80, Rows: 24}
+		pv := daemonclient.NewPaneView(nil, "T-focus", info.SessionID, info)
+		return &Model{
+			globalStore:   gs,
+			panes:         map[board.TicketID]*daemonclient.PaneView{"T-focus": pv},
+			daemonViewing: map[board.TicketID]int{},
+			columns:       board.DefaultColumns(),
+			columnTickets: [][]*board.Ticket{{tk}, {}, {}, {}},
+			columnOffsets: []int{0, 0, 0, 0},
+			width:         120,
+			height:        40,
+			mode:          ModeAgentView,
+			focusedPane:   "T-focus",
+			autoAttach:    autoOn,
+			config:        &config.Config{Agents: map[string]config.AgentConfig{}},
+			colors:        newUIColors(config.DefaultConfig().GetTheme()),
+		}
+	}
+
+	t.Run("armed: AUTO badge + 'Next waiter' hint", func(t *testing.T) {
+		out := build(true).renderAgentView()
+		if !strings.Contains(out, "AUTO") {
+			t.Errorf("expected AUTO badge in agent view when armed; got:\n%s", out)
+		}
+		if !strings.Contains(out, "Next waiter") {
+			t.Errorf("expected Ctrl+g hint 'Next waiter' when armed; got:\n%s", out)
+		}
+	})
+
+	t.Run("off: no AUTO badge, Ctrl+g reads 'Board'", func(t *testing.T) {
+		out := build(false).renderAgentView()
+		if strings.Contains(out, "AUTO") {
+			t.Errorf("AUTO badge must not appear when off; got:\n%s", out)
+		}
+		if !strings.Contains(out, "Board") {
+			t.Errorf("expected Ctrl+g hint 'Board' when off; got:\n%s", out)
+		}
+	})
 }
