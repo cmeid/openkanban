@@ -59,6 +59,66 @@ path. Don't reintroduce a force-kill there. This is orthogonal to the TUI-side
 exit-guard, which is about making the guard *fire reliably*; this is about what
 the daemon does *when* it doesn't.
 
+## Shutdown must actually terminate (initiateShutdown closes client conns)
+
+`initiateShutdown` closes the shutdown channel, closes the listener, AND
+force-closes every registered client connection via `closeClientConns()`. That
+last step is **load-bearing, not cleanup politeness**: `Serve` finishes by
+blocking on `s.wg.Wait()` for every `handleConn` goroutine to return, and a
+persistent-mode TUI never disconnects on its own — its `handleConn` is parked in
+`ReadFrame` (or a blocked `handleAttach` binary loop). Closing the listener also
+*unlinks the socket file* (Go `UnixListener` default), so without closing the
+conns the daemon ends up in a **zombie state**: socket gone (`daemon list` →
+ENOENT, new TUIs can't dial) yet the process is alive and still serving the
+attached TUI, and the launchd respawn-on-new-binary never fires. Closing the
+conn trips the parked `ReadFrame` (`net.ErrClosed`/EOF) → goroutine returns →
+`wg.Wait()` completes → `cleanup()` → process exits → launchd respawns. Pinned by
+`TestServerLifecycle_ShutdownTerminatesWithAttachedClient`. `closeClientConns`
+snapshots the conns under `clientsMu` then closes them *outside* the lock (the
+close cascades into each `handleConn` defer, which re-takes `clientsMu`).
+
+`handleSpawn` is **gated on `s.shutdown`** at its entry: a daemon that has
+decided to exit must reject new spawns. The spawn RPC is reachable over an
+already-attached client's connection even after the listener is closed, and a
+fresh session both orphans agent work `cleanup()` is about to kill and
+re-populates the registry the shutdown is draining. This is the bug that let the
+wedged daemon spawn three sessions *after* "shutdown initiated". Pinned by
+`TestHandleSpawn_RejectsAfterShutdown`.
+
+### Safety nets are bound to process-exit, not shutdown-initiation
+
+The diagnostic/recovery mechanisms must survive shutdown-*initiation* and only
+go away on process *exit* — otherwise a hung shutdown is the one state you can
+neither inspect nor recover, which is exactly what happened in the field:
+
+- **SIGUSR1 goroutine-dump handler**: its teardown is a `defer` in `Serve` (runs
+  on return), NOT a `<-s.shutdown` goroutine. The old code dropped the handler
+  the instant shutdown began, so `kill -USR1` on the wedged daemon produced
+  nothing. Keep the teardown deferred so the dump works through the whole
+  shutdown + `cleanup()` window.
+- **Shutdown-completion backstop** (`runWedgeWatchdog` → `awaitShutdownCompletion`):
+  on `<-s.shutdown` the watchdog does NOT `return`; it waits for `s.serveDone`
+  (closed when `Serve` returns) and, if that doesn't arrive within
+  `shutdownCompletionDeadline` (30s), dumps goroutines and `os.Exit(1)` so
+  launchd respawns. This catches a hung shutdown — note launchd's `KeepAlive`
+  can't help on its own, since it only respawns on process *exit* and the zombie
+  never exits. The deadline can't false-fire during a default-mode
+  `awaitSessionDrain`: that path keeps the daemon alive WITHOUT closing
+  `s.shutdown`, so the backstop only arms once `initiateShutdown` has fired, by
+  which point exit should be prompt. Decision logic is the pure, unit-tested
+  `awaitCompletionOrExit` (os.Exit kept out of the tested path, mirroring
+  `wedgeMonitor.evaluate`). The watchdog's force-exit routes through the
+  `s.exitFunc` seam (default `os.Exit`, overridable in tests) and the deadline
+  through `s.shutdownDeadline` — so a test can drive the real backstop without
+  killing the test binary. Both mirror the `staleCheck` seam.
+
+`cleanup()` kills sessions **concurrently** (a local `WaitGroup` over
+`sess.Kill`, then waits). Sequential kills made total cleanup scale as
+`N × shutdownGraceSeconds`, which with many live sessions could exceed the
+backstop deadline and trip a force-exit mid-cleanup. Concurrent-and-awaited keeps
+cleanup bounded by ~one grace window regardless of N while still reaping every
+child before the socket is removed and the process exits.
+
 ## Authoritative session status (resolveSessionStatus)
 
 The daemon owns the live PTY grid for **every** session it runs — attached or

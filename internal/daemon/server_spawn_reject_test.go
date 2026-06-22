@@ -56,6 +56,45 @@ func TestHandleSpawn_RejectsEmptyTicketID(t *testing.T) {
 	// to trip, and we never dialed so there's nothing to close.
 }
 
+// TestHandleSpawn_RejectsAfterShutdown verifies that once shutdown has
+// been initiated, handleSpawn refuses new spawns rather than spinning up
+// fresh agent work the daemon is about to kill. This is the second half
+// of the zombie-daemon fix: in the field the wedged daemon spawned three
+// sessions AFTER logging "shutdown initiated", because the spawn path —
+// reachable over an already-attached client's connection even after the
+// listener is closed — had no shutdown gate. A fresh session also
+// re-populates the registry the shutdown is draining, so it could keep
+// the daemon from ever finishing its exit.
+func TestHandleSpawn_RejectsAfterShutdown(t *testing.T) {
+	srv, _ := startServer(t)
+
+	// Begin shutdown, then attempt a spawn with an otherwise-valid req.
+	srv.initiateShutdown("test: shutting down")
+
+	c := &clientConn{id: 1}
+	resp, err := srv.handleSpawn(c, SpawnReq{
+		TicketID:    "REJECT-AFTER-SHUTDOWN-1",
+		SessionName: "post-shutdown-spawn",
+		Command:     "/bin/cat",
+		Cols:        80,
+		Rows:        24,
+		Scrollback:  1000,
+	})
+	if err == nil {
+		t.Fatalf("handleSpawn after shutdown: got nil error; want rejection")
+	}
+	if !strings.Contains(err.Error(), "shutting down") {
+		t.Errorf("handleSpawn error=%q; want it to mention %q", err.Error(), "shutting down")
+	}
+	if resp.SessionID != "" || resp.PID != 0 {
+		t.Errorf("handleSpawn returned non-zero response on reject: SessionID=%q PID=%d",
+			resp.SessionID, resp.PID)
+	}
+	if got := srv.reg.len(); got != 0 {
+		t.Errorf("after rejected spawn: sessions count=%d want 0 (no half-spawned session)", got)
+	}
+}
+
 // TestHandleSpawn_AcceptsNonEmptyTicketID is the inverse defense
 // against accidental over-rejection: the same call shape with a real
 // TicketID still succeeds and lands one session in the registry.

@@ -120,12 +120,17 @@ func (m *Model) handleQuitRequested() (tea.Model, tea.Cmd) {
 // handlePrepareExitResult decides whether to exit immediately or warn
 // the user. The decision tree is:
 //
+//   - Persistent daemon → it is launchd/systemd-supervised and OUTLIVES
+//     us, keeping every session's PTY alive for a future re-attach.
+//     Quitting orphans nothing, so silent-quit (detach-and-quit). This
+//     is the whole point of daemon-owned PTYs: the TUI is disposable.
 //   - OtherActiveClients > 0 → at least one peer TUI is still attached
 //     and has NOT also called PrepareExit, so it will keep the daemon
 //     (and its sessions) alive after we leave. Silent-quit is safe.
 //   - Sessions empty → no live sessions to warn about; exit cleanly.
-//   - Otherwise → we're the last one out and sessions are at stake;
-//     open the modal.
+//   - Otherwise → default-mode daemon, we're the last one out, and
+//     quitting would take the daemon (and its sessions) down with us;
+//     open the modal so the user decides.
 //
 // Note the load-bearing field is OtherActiveClients, NOT ClientCount.
 // ClientCount races on simultaneous closes (multiple TUIs each see
@@ -147,6 +152,9 @@ func (m *Model) handleQuitRequested() (tea.Model, tea.Cmd) {
 //     modal. Same category as the above.
 func (m *Model) handlePrepareExitResult(msg prepareExitResultMsg) (tea.Model, tea.Cmd) {
 	resp := msg.Resp
+	if resp.Persistent {
+		return m, tea.Quit
+	}
 	if resp.OtherActiveClients > 0 {
 		return m, tea.Quit
 	}

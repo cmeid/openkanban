@@ -666,6 +666,17 @@ type PrepareExitResp struct {
 	// clientsMu acquisition.
 	OtherActiveClients int `json:"other_active_clients"`
 
+	// Persistent reports whether the daemon is running in persistent
+	// mode (--persistent, i.e. launchd/systemd-supervised). When true,
+	// the daemon OUTLIVES the disconnecting client: leaving the TUI does
+	// not orphan or kill its sessions — the daemon keeps the PTYs alive
+	// and a future TUI can re-attach. The exit-guard uses this to
+	// silent-quit (detach-and-quit) instead of trapping the user behind
+	// the "must terminate before exit" modal, which only makes sense
+	// when quitting would actually destroy the sessions (default mode,
+	// last client out). This is the whole point of daemon-owned PTYs.
+	Persistent bool `json:"persistent"`
+
 	Sessions []SessionInfo `json:"sessions"`
 }
 
