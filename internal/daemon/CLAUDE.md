@@ -107,7 +107,17 @@ neither inspect nor recover, which is exactly what happened in the field:
   `s.shutdown`, so the backstop only arms once `initiateShutdown` has fired, by
   which point exit should be prompt. Decision logic is the pure, unit-tested
   `awaitCompletionOrExit` (os.Exit kept out of the tested path, mirroring
-  `wedgeMonitor.evaluate`).
+  `wedgeMonitor.evaluate`). The watchdog's force-exit routes through the
+  `s.exitFunc` seam (default `os.Exit`, overridable in tests) and the deadline
+  through `s.shutdownDeadline` — so a test can drive the real backstop without
+  killing the test binary. Both mirror the `staleCheck` seam.
+
+`cleanup()` kills sessions **concurrently** (a local `WaitGroup` over
+`sess.Kill`, then waits). Sequential kills made total cleanup scale as
+`N × shutdownGraceSeconds`, which with many live sessions could exceed the
+backstop deadline and trip a force-exit mid-cleanup. Concurrent-and-awaited keeps
+cleanup bounded by ~one grace window regardless of N while still reaping every
+child before the socket is removed and the process exits.
 
 ## Authoritative session status (resolveSessionStatus)
 

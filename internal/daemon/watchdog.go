@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"log"
-	"os"
 	"runtime"
 	"time"
 )
@@ -130,7 +129,8 @@ func (s *Server) runWedgeWatchdog() {
 			log.Printf("openkanbankd: WEDGE WATCHDOG firing (%s); inflight=%d seq=%d. goroutine dump:\n%s",
 				reason, inflight, seq, buf[:n])
 			log.Printf("openkanbankd: exiting(1) for supervisor respawn")
-			os.Exit(1)
+			s.forceExit(1)
+			return
 		}
 	}
 }
@@ -144,12 +144,16 @@ func (s *Server) runWedgeWatchdog() {
 // SIGUSR1 handler already gone, launchd unable to respawn a
 // still-"healthy" process).
 func (s *Server) awaitShutdownCompletion() {
-	awaitCompletionOrExit(s.serveDone, shutdownCompletionDeadline, func() {
+	deadline := s.shutdownDeadline
+	if deadline <= 0 {
+		deadline = shutdownCompletionDeadline
+	}
+	awaitCompletionOrExit(s.serveDone, deadline, func() {
 		buf := make([]byte, 1<<20)
 		n := runtime.Stack(buf, true)
 		log.Printf("openkanbankd: SHUTDOWN WATCHDOG firing — shutdown did not complete within %s. goroutine dump:\n%s",
-			shutdownCompletionDeadline, buf[:n])
+			deadline, buf[:n])
 		log.Printf("openkanbankd: exiting(1) for supervisor respawn (hung shutdown)")
-		os.Exit(1)
+		s.forceExit(1)
 	})
 }

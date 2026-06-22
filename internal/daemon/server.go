@@ -144,6 +144,16 @@ type Server struct {
 	serveDone     chan struct{}
 	serveDoneOnce sync.Once
 
+	// shutdownDeadline bounds how long the daemon may take to exit after
+	// shutdown is initiated before the watchdog force-exits. Defaults to
+	// shutdownCompletionDeadline; a test seam (set small in tests).
+	shutdownDeadline time.Duration
+	// exitFunc is the process-exit action the watchdog uses to force a
+	// respawn (wedge or hung shutdown). Defaults to os.Exit; a test seam
+	// so a test exercising the real watchdog can observe the exit instead
+	// of killing the test binary. Mirrors the staleCheck seam.
+	exitFunc func(int)
+
 	wg sync.WaitGroup
 
 	sem *connSem
@@ -317,18 +327,20 @@ func NewServerWithOptions(sock, pidpath string, opts Options) (*Server, error) {
 	}
 
 	return &Server{
-		sock:           sock,
-		pidlock:        lock,
-		ln:             ln,
-		persistent:     opts.Persistent,
-		staleCheck:     update.BinaryStale,
-		reg:            newSessionRegistry(),
-		clients:        make(map[uint16]*clientConn),
-		shutdown:       make(chan struct{}),
-		serveDone:      make(chan struct{}),
-		events:         make(chan SessionEvent, 64),
-		statusDetector: agent.NewStatusDetector(),
-		sem:            newConnSem(maxConcurrentConns),
+		sock:             sock,
+		pidlock:          lock,
+		ln:               ln,
+		persistent:       opts.Persistent,
+		staleCheck:       update.BinaryStale,
+		reg:              newSessionRegistry(),
+		clients:          make(map[uint16]*clientConn),
+		shutdown:         make(chan struct{}),
+		serveDone:        make(chan struct{}),
+		shutdownDeadline: shutdownCompletionDeadline,
+		exitFunc:         os.Exit,
+		events:           make(chan SessionEvent, 64),
+		statusDetector:   agent.NewStatusDetector(),
+		sem:              newConnSem(maxConcurrentConns),
 	}, nil
 }
 
@@ -951,6 +963,18 @@ func (s *Server) shutdownDrain() {
 	s.cleanup()
 }
 
+// forceExit terminates the process so the supervisor (launchd/systemd)
+// respawns — the watchdog's last resort for a wedge or a hung shutdown.
+// Routed through the s.exitFunc seam (default os.Exit) so tests exercising
+// the real watchdog observe the exit instead of killing the test binary.
+func (s *Server) forceExit(code int) {
+	if s.exitFunc != nil {
+		s.exitFunc(code)
+		return
+	}
+	os.Exit(code)
+}
+
 // closeClientConns force-closes every registered client connection so
 // each handleConn read loop returns and Serve's wg.Wait() can complete.
 // Idempotent at the socket level (a double Close just errors, ignored).
@@ -977,12 +1001,25 @@ func (s *Server) closeClientConns() {
 func (s *Server) cleanup() {
 	live := s.reg.drain()
 
+	// Kill sessions concurrently and wait for all. Sequential kills meant
+	// total cleanup time scaled as N * shutdownGraceSeconds, which could
+	// exceed the shutdown-completion backstop and trip a force-exit
+	// mid-cleanup with many live sessions. Concurrent + awaited keeps
+	// total cleanup bounded by ~one grace window regardless of N, while
+	// still reaping every child before the socket is removed and the
+	// process exits (so children aren't abandoned to reparenting).
+	var killWG sync.WaitGroup
 	for _, sess := range live {
-		log.Printf("openkanbankd: shutdown-cleanup killing session %s (ticket=%s)", sess.ID(), sess.TicketID())
-		if err := sess.Kill(shutdownGraceSeconds); err != nil {
-			log.Printf("openkanbankd: kill session %s: %v", sess.ID(), err)
-		}
+		killWG.Add(1)
+		go func(sess *Session) {
+			defer killWG.Done()
+			log.Printf("openkanbankd: shutdown-cleanup killing session %s (ticket=%s)", sess.ID(), sess.TicketID())
+			if err := sess.Kill(shutdownGraceSeconds); err != nil {
+				log.Printf("openkanbankd: kill session %s: %v", sess.ID(), err)
+			}
+		}(sess)
 	}
+	killWG.Wait()
 
 	if s.pidlock != nil {
 		s.pidlock.Release()
