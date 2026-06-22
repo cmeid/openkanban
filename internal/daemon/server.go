@@ -916,25 +916,21 @@ func (s *Server) checkSessionWedge(id string, sess *Session, stuckSeen map[strin
 	}()
 }
 
-// initiateShutdown closes the shutdown channel exactly once, closes the
-// listener so the accept loop returns, and force-closes every registered
-// client connection. Safe to call from any goroutine.
+// initiateShutdown closes the shutdown channel exactly once and closes the
+// listener so the accept loop returns. Safe to call from any goroutine.
 //
-// Closing the client conns is load-bearing, not best-effort cleanup:
-// Serve finishes shutdown by blocking on s.wg.Wait() for every handleConn
-// goroutine to return, and a persistent-mode TUI never disconnects on its
-// own — its handleConn is parked in ReadFrame (or a blocked handleAttach
-// binary loop). Without closing the conns, wg.Wait() blocks forever AFTER
-// the listener close has already unlinked the socket file, leaving a
-// "zombie" daemon: invisible to new clients (daemon list → ENOENT) yet
-// alive and still serving the attached TUI, with the launchd
-// respawn-on-new-binary never happening. Closing the conn trips the
-// parked ReadFrame (net.ErrClosed/EOF), the goroutine returns, wg.Wait()
-// completes, cleanup runs, and the process exits so launchd respawns.
-//
-// This close is a FAST PATH for already-registered clients; shutdownDrain
-// (run when the accept loop exits) is the authoritative one — it re-closes
-// to cover a client that raced in between this snapshot and registration.
+// It does NOT close client conns itself. Closing the listener makes the
+// accept loop's Accept return immediately, and Serve then runs
+// shutdownDrain, which closes every registered client conn before
+// s.wg.Wait(). Doing the conn-close there (not here) is both authoritative
+// — the sole registrar, the accept loop, has provably stopped — and avoids
+// racing handleShutdown's response: handleShutdown spawns this in a
+// goroutine so its ShutdownResp flushes first, and closing the requesting
+// client's own conn here could beat that write, surfacing a spurious error
+// on `daemon stop`/`restart`. See shutdownDrain for why the close is
+// load-bearing (a persistent TUI never disconnects on its own, so without
+// it wg.Wait() blocks forever after the socket is already unlinked — the
+// zombie-daemon bug).
 func (s *Server) initiateShutdown(reason string) {
 	s.shutdownOnce.Do(func() {
 		log.Printf("openkanbankd: shutdown initiated (%s)", reason)
@@ -942,21 +938,21 @@ func (s *Server) initiateShutdown(reason string) {
 		if s.ln != nil {
 			s.ln.Close()
 		}
-		s.closeClientConns()
 	})
 }
 
 // shutdownDrain is the single teardown path the accept loop runs on exit:
 // close client conns, wait for every handleConn goroutine, then cleanup.
 //
-// closeClientConns runs HERE (not only in initiateShutdown) to close an
-// accept-vs-register race: a connection accepted just before the listener
-// closed may be registered AFTER initiateShutdown's closeClientConns
-// snapshot, so that fast-path close would miss it and wg.Wait() would hang
-// on its handleConn (until the shutdown-completion backstop force-exits).
-// The accept loop is the only registrar and has already exited by the time
-// we get here, so closing now provably covers every registered client.
-// closeClientConns is idempotent, so the overlap with the fast path is free.
+// closeClientConns runs HERE (the one authoritative place) rather than in
+// initiateShutdown. The accept loop is the only registrar of clients, and
+// it has provably stopped by the time we get here (we only reach this after
+// Accept returned post-listener-close), so closing now covers every
+// registered client — including one that connected at the instant of
+// shutdown, which an earlier in-initiateShutdown snapshot could have missed
+// (the conn would then strand wg.Wait() until the backstop force-exits).
+// Closing the conn trips each handleConn's parked ReadFrame
+// (net.ErrClosed/EOF), so it returns and wg.Wait() can complete.
 func (s *Server) shutdownDrain() {
 	s.closeClientConns()
 	s.wg.Wait()
@@ -1394,6 +1390,26 @@ func (s *Server) handleSpawn(c *clientConn, req SpawnReq) (SpawnResp, error) {
 			log.Printf("openkanbankd: cleanup of race-loser session %s: %v", sess.ID(), killErr)
 		}
 		return SpawnResp{SessionID: winner.ID(), PID: winner.pane.PID()}, nil
+	}
+
+	// Close the construct-vs-shutdown TOCTOU. The entry gate above was
+	// checked BEFORE NewSession, which forks a child and can (under the
+	// detached runHandlerWithDeadline goroutine) outlive the 10s handler
+	// deadline. If shutdown initiated during construction, cleanup() may
+	// have already drained the registry — so this freshly-stored session
+	// would be an orphan the process abandons on exit. Re-check now and
+	// undo it: kill the child and remove it from the registry. Without
+	// this, Fix B's gate only holds for spawns that finish before
+	// shutdown, not those racing it. (Narrow: requires a >10s fork.)
+	select {
+	case <-s.shutdown:
+		log.Printf("openkanbankd: client %d spawn raced shutdown ticket=%s; killing just-stored session %s", c.id, req.TicketID, sess.ID())
+		s.reg.deleteIf(sess.ID(), sess)
+		if killErr := sess.Kill(0); killErr != nil {
+			log.Printf("openkanbankd: cleanup of shutdown-raced session %s: %v", sess.ID(), killErr)
+		}
+		return SpawnResp{}, fmt.Errorf("spawn: daemon is shutting down")
+	default:
 	}
 
 	log.Printf("openkanbankd: client %d spawned session %s (ticket=%s pid=%d)", c.id, sess.ID(), sess.TicketID(), sess.pane.PID())
