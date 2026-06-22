@@ -1960,6 +1960,20 @@ func (m *Model) renderAgentView() string {
 		headerParts = append(headerParts, pill)
 	}
 
+	// Auto-mode badge: the board footer shows Auto's on/off state, but the
+	// agent view doesn't render contextualHints, so without this the user
+	// has no in-session signal that Ctrl+g will jump rather than go to the
+	// board. Shown only when armed.
+	if m.autoAttach {
+		autoBadge := lipgloss.NewStyle().
+			Foreground(m.colors.base).
+			Background(m.colors.warning).
+			Bold(true).
+			Padding(0, 1).
+			Render("AUTO")
+		headerParts = append(headerParts, autoBadge)
+	}
+
 	// Session duration ticks since AgentSpawnedAt. Suppress it when the
 	// agent has reported completion — the "✓ done" pill carries the
 	// state, and a still-ticking counter would read as "still running".
@@ -2022,10 +2036,15 @@ func (m *Model) renderAgentView() string {
 		scrollIndicator = scrollStyle.Render(fmt.Sprintf("↑%d/%d", offset, scrollbackLen)) + "  "
 	}
 
+	// Ctrl+g's destination depends on Auto mode (waiting/idle peer vs board).
+	gDest := " Board"
+	if m.autoAttach {
+		gDest = " Next waiter"
+	}
 	keyStyle := lipgloss.NewStyle().Foreground(m.colors.info)
 	hints := scrollIndicator + paneIndicator + "  " +
 		keyStyle.Render("Ctrl+\\/]") + m.dimStyle().Render(" Cycle  ") +
-		keyStyle.Render("Ctrl+g") + m.dimStyle().Render(" Board")
+		keyStyle.Render("Ctrl+g") + m.dimStyle().Render(gDest)
 
 	spacing := m.width - lipgloss.Width(header) - lipgloss.Width(hints)
 	// At least one cell of separation keeps the bar legible when content

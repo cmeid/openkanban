@@ -2042,12 +2042,25 @@ func (m *Model) handleAgentViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					elsewhere = attachedElsewhereSet(sessions, m.daemonClient.ClientID())
 				}
 				if id, ok := m.oldestWaitingPeer(elsewhere); ok {
-					// No toast: m.notification isn't painted over the agent
-					// view, and the cycle-attach modal already shows the
-					// target's title + live content, so the jump is
-					// self-evident.
-					log.Printf("openkanban model: Auto mode jump -> %s", id)
-					return m, m.focusAndPromptAttachSnap(id, sessions)
+					// Auto attaches DIRECTLY (no preview modal) — the spec is
+					// "automatically attaches". oldestWaitingPeer already
+					// filtered out sessions another TUI holds, so a plain
+					// attach is safe: it can't displace a peer. A race that
+					// lost the skip surfaces the takeover warning via
+					// attachExistingSnap's gentle probe (correct, not silent).
+					// Stay in ModeAgentView, focus the target, do NOT set
+					// cycleAttachPrompt. If the pane vanished since selection,
+					// fall through to the board.
+					if pv := m.panes[id]; pv != nil {
+						log.Printf("openkanban model: Auto mode jump -> %s", id)
+						m.focusedPane = id
+						pv.SetSize(m.width, m.height-2)
+						var cmd tea.Cmd
+						if pv.State() == daemonclient.PaneViewUnattached {
+							cmd = m.attachExistingSnap(id, pv, sessions)
+						}
+						return m, tea.Batch(cmd, m.maybeSetWindowTitle())
+					}
 				}
 			}
 			log.Printf("openkanban model: ExitFocusMsg received, mode -> ModeNormal")
@@ -4137,10 +4150,24 @@ func (m *Model) focusAndPromptAttachSnap(target board.TicketID, sessions []daemo
 	return tea.Batch(backdropCmd, m.maybeSetWindowTitle())
 }
 
-// oldestWaitingPeer returns the open peer session that has been WAITING the
-// longest (FIFO by StatusChangedAt), for Auto mode's un-attach jump. A
+// needsAttention reports whether an agent status means the session needs the
+// user: waiting (blocked on input/permission), idle (agent finished its turn
+// and is at rest), or stuck (the daemon watchdog's "pane wedged" verdict — the
+// single most attention-needing live state). It deliberately excludes
+// "working" — a session actively producing output doesn't need you yet — which
+// in a busy swarm is the common case, so targeting only "waiting" left Auto
+// with almost nothing to jump to. Also excludes none/completed/error (unknown
+// or terminal, not a live "come help me" signal). The activity override only
+// refines waiting→working; idle/stuck pass through untouched.
+func needsAttention(s board.AgentStatus) bool {
+	return s == board.AgentWaiting || s == board.AgentIdle || s == board.AgentStuck
+}
+
+// oldestWaitingPeer returns the open peer session that has NEEDED ATTENTION the
+// longest (FIFO by StatusChangedAt), for Auto mode's un-attach jump. "Needs
+// attention" = waiting OR idle (see needsAttention) — not actively working. A
 // ticket qualifies iff it has a live pane (Attached/Unattached), its
-// activity-overridden AgentStatus is "waiting" (the poll writes the
+// activity-overridden AgentStatus needs attention (the poll writes the
 // overridden value back onto ticket.AgentStatus, so this matches what the
 // card renders), it is not the session being left (m.focusedPane — else
 // Auto would re-attach you to the one you just left), it has a non-nil
@@ -4166,7 +4193,7 @@ func (m *Model) oldestWaitingPeer(attachedElsewhere map[board.TicketID]bool) (bo
 			// writes back (model.go agentStatusResultMsg handler), so this
 			// matches what the card renders. columnTickets holds the same
 			// *board.Ticket the store mutates, so no globalStore lookup.
-			if t.AgentStatus != board.AgentWaiting || t.StatusChangedAt == nil {
+			if !needsAttention(t.AgentStatus) || t.StatusChangedAt == nil {
 				continue
 			}
 			pv, ok := m.panes[t.ID]
@@ -5395,6 +5422,7 @@ func sessionNameFor(ticket *board.Ticket, branchName string) string {
 //   - The notice field carries the attach-retry diagnostic (see B7)
 //     so the user can tell a fast-path-attach-failure apart from a
 //     true daemon-unreachable state.
+//
 // newUnattachedPane builds a daemon-owned, NOT-yet-attached PaneView for a
 // freshly-spawned session — the ctrl+space (spawnPlan.Unattached) path. It is
 // extracted from the prepareSpawnWith closure so it can be unit-tested
@@ -5833,9 +5861,10 @@ func (m *Model) previousStatus(current board.TicketStatus) board.TicketStatus {
 
 // moveAndPromoteMsg formats the post-Move status-bar toast. Three
 // parts joined with " · ":
-//   1. core: "Moved to <status>" (always)
-//   2. promoted: "promoted N approval(s) to repo defaults" (when promoted>0)
-//   3. pruned: "pruned N stale entr(y/ies)" (when pruned>0)
+//  1. core: "Moved to <status>" (always)
+//  2. promoted: "promoted N approval(s) to repo defaults" (when promoted>0)
+//  3. pruned: "pruned N stale entr(y/ies)" (when pruned>0)
+//
 // Pruned entry strings are NOT inlined — they live in <repo>/.claude/.pruned-log
 // for the user to inspect. Toast is count-only to stay scannable.
 func moveAndPromoteMsg(target board.TicketStatus, promoted []string, pruned []agent.PruneRecord) string {
