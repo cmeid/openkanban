@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,8 +15,10 @@ import (
 
 	"github.com/techdufus/openkanban/internal/agent"
 	"github.com/techdufus/openkanban/internal/board"
+	"github.com/techdufus/openkanban/internal/config"
 	"github.com/techdufus/openkanban/internal/daemon"
 	"github.com/techdufus/openkanban/internal/daemonclient"
+	"github.com/techdufus/openkanban/internal/git"
 	"github.com/techdufus/openkanban/internal/project"
 	"github.com/techdufus/openkanban/internal/ticketsvc"
 )
@@ -29,6 +32,8 @@ var (
 	ticketNewLabels          string
 	ticketNewPriority        int
 	ticketNewNoWorktree      bool
+	ticketNewWorktree        bool
+	ticketNewJSON            bool
 	ticketNewAllowMigration  bool
 	ticketNewSession         string
 	ticketNewMigrate         bool
@@ -53,11 +58,21 @@ path to a child session for context.`,
 var ticketNewCmd = &cobra.Command{
 	Use:   "new",
 	Short: "Create a new ticket",
-	Long: `Create a new ticket in a project and print the path to the resulting .md file.
+	Long: `Create a new ticket in a project.
+
+Output (plain): an "id=<uuid>" line, then (if --worktree) a
+"worktree=<path>" line, then the .md file path as the FINAL line so
+existing consumers that captured stdout as the path keep working. Use
+--json for a stable machine-readable object instead.
 
 The --project flag accepts an exact project name, an exact UUID, or a
 unique UUID prefix of at least 4 characters. On ambiguous prefix the
 command exits non-zero and lists the candidates.
+
+--worktree provisions the git worktree + branch immediately (the same
+derivation the TUI uses at spawn, so spawn reuses it). This differs
+from --no-worktree, which only flips a lazy spawn-time hint and
+provisions nothing; passing both is an error.
 
 If the project still uses legacy single-file storage (tickets/<id>.json),
 ticket new refuses to migrate it on its own so it can't race a running
@@ -88,6 +103,9 @@ Description sources (mutually exclusive, in priority order):
 			default:
 				return fmt.Errorf("--status %q is not one of: backlog, in_progress, in_review, done, archived", ticketNewStatus)
 			}
+		}
+		if ticketNewWorktree && ticketNewNoWorktree {
+			return fmt.Errorf("--worktree and --no-worktree are contradictory")
 		}
 
 		registry, err := project.LoadRegistry()
@@ -150,7 +168,42 @@ Description sources (mutually exclusive, in priority order):
 			return err
 		}
 
+		// Opt-in worktree provisioning (sibling ticket 954ed3e8). Done
+		// BEFORE SaveTicket so a provisioning failure leaves no ticket
+		// behind — either the worktree-backed ticket is created whole, or
+		// nothing is. The branch name comes from the SAME derivation the
+		// TUI spawn path uses (project.BranchNameForTitle), so spawn later
+		// reuses this worktree instead of creating a duplicate.
+		if ticketNewWorktree {
+			cfg, cerr := config.Load("")
+			if cerr != nil {
+				return fmt.Errorf("load config: %w", cerr)
+			}
+			mgr := git.NewWorktreeManager(proj)
+			base, _ := mgr.GetDefaultBranch()
+			branch := project.BranchNameForTitle(ticket.Title, proj, cfg.Defaults)
+			wtPath, werr := mgr.CreateWorktree(branch, base)
+			if werr != nil {
+				return fmt.Errorf("provision worktree for %s: %w", ticket.ID, werr)
+			}
+			if serr := agent.SeedClaudeSettings(wtPath, proj.RepoPath); serr != nil {
+				fmt.Fprintf(os.Stderr, "openkanban: seed claude settings (%s): %v\n", wtPath, serr)
+			}
+			ticket.WorktreePath = wtPath
+			ticket.BranchName = branch
+			ticket.BaseBranch = base
+		}
+
 		if err := store.SaveTicket(ticket); err != nil {
+			// If we provisioned a worktree above, roll it back so a
+			// failed save doesn't leave an orphaned worktree+branch with
+			// no ticket referencing it (keeps the "all or nothing"
+			// guarantee true for SaveTicket failures too).
+			if ticket.WorktreePath != "" {
+				if rerr := git.NewWorktreeManager(proj).RemoveWorktree(ticket.WorktreePath); rerr != nil {
+					fmt.Fprintf(os.Stderr, "openkanban: roll back worktree %s: %v\n", ticket.WorktreePath, rerr)
+				}
+			}
 			return fmt.Errorf("save ticket: %w", err)
 		}
 
@@ -161,9 +214,50 @@ Description sources (mutually exclusive, in priority order):
 			return err
 		}
 		path := filepath.Join(ticketsRoot, proj.ID, project.TicketFilename(ticket))
+
+		result := ticketNewResult{
+			ID:           string(ticket.ID),
+			Path:         path,
+			Slug:         board.Slugify(ticket.Title, 40),
+			Status:       string(ticket.Status),
+			ProjectID:    proj.ID,
+			WorktreePath: ticket.WorktreePath,
+			BranchName:   ticket.BranchName,
+			BaseBranch:   ticket.BaseBranch,
+		}
+		if ticketNewJSON {
+			enc, jerr := json.MarshalIndent(result, "", "  ")
+			if jerr != nil {
+				return fmt.Errorf("marshal json: %w", jerr)
+			}
+			fmt.Println(string(enc))
+			return nil
+		}
+
+		// Human/scripted output. The ticket id is emitted first; the .md
+		// path stays the FINAL line for back-compat with consumers that
+		// captured stdout as the path.
+		fmt.Printf("id=%s\n", ticket.ID)
+		if ticket.WorktreePath != "" {
+			fmt.Printf("worktree=%s\n", ticket.WorktreePath)
+		}
 		fmt.Println(path)
 		return nil
 	},
+}
+
+// ticketNewResult is the stable --json schema for `ticket new`. Every field is
+// always present (no omitempty); worktree_path/branch_name/base_branch are
+// empty strings unless --worktree provisioned a worktree.
+type ticketNewResult struct {
+	ID           string `json:"id"`
+	Path         string `json:"path"`
+	Slug         string `json:"slug"`
+	Status       string `json:"status"`
+	ProjectID    string `json:"project_id"`
+	WorktreePath string `json:"worktree_path"`
+	BranchName   string `json:"branch_name"`
+	BaseBranch   string `json:"base_branch"`
 }
 
 var ticketDeleteCmd = &cobra.Command{
@@ -214,9 +308,9 @@ remain quiet when the daemon happens to be down.`,
 		if err != nil {
 			return fmt.Errorf("load ticket store: %w", err)
 		}
-		t, err := store.Get(board.TicketID(ticketDeleteID))
+		t, err := resolveTicket(store, registry, ticketDeleteID)
 		if err != nil {
-			return fmt.Errorf("ticket %s: %w", ticketDeleteID, err)
+			return err
 		}
 
 		// Daemon-side cleanup BEFORE the file-system delete: if we
@@ -256,10 +350,10 @@ remain quiet when the daemon happens to be down.`,
 			fmt.Fprintf(os.Stderr, "openkanbankd: ticket_done for %s: %v\n", t.ID, derr)
 		}
 
-		if err := store.Delete(board.TicketID(ticketDeleteID)); err != nil {
+		if err := store.Delete(t.ID); err != nil {
 			return fmt.Errorf("delete ticket: %w", err)
 		}
-		fmt.Printf("deleted %s\n", ticketDeleteID)
+		fmt.Printf("deleted %s\n", t.ID)
 		return nil
 	},
 }
@@ -311,6 +405,98 @@ func formatProjectMatches(ps []*project.Project) string {
 		lines = append(lines, fmt.Sprintf("  %s  %s", shortID(p.ID), p.Name))
 	}
 	return strings.Join(lines, "\n")
+}
+
+// resolveTicket selects a ticket from an already-resolved project's store.
+// Because the delete path always has --project, resolution is scoped to one
+// project — there is no cross-project ambiguity.
+//
+// Match precedence (mirrors resolveProject):
+//  1. exact ticket id
+//  2. unique id prefix (>=4 chars; this also covers the filename short-hash,
+//     which is just the first 8 chars of the id)
+//  3. unique title slug (board.Slugify of the title)
+//
+// On no match, if the arg looks like a PROJECT id (the common footgun — the
+// directory UUID in the printed .md path is the project id, not the ticket
+// id), the error says so and points at `ticket list`.
+func resolveTicket(store *project.TicketStore, registry *project.ProjectRegistry, arg string) (*board.Ticket, error) {
+	if arg == "" {
+		return nil, fmt.Errorf("--id value is empty")
+	}
+	all := store.All()
+
+	for _, t := range all {
+		if string(t.ID) == arg {
+			return t, nil
+		}
+	}
+
+	var idPrefix, slugMatch []*board.Ticket
+	if len(arg) >= 4 {
+		for _, t := range all {
+			if strings.HasPrefix(string(t.ID), arg) {
+				idPrefix = append(idPrefix, t)
+			}
+		}
+	}
+	lowerArg := strings.ToLower(arg)
+	for _, t := range all {
+		if board.Slugify(t.Title, 40) == lowerArg {
+			slugMatch = append(slugMatch, t)
+		}
+	}
+
+	for _, tier := range []struct {
+		kind    string
+		matches []*board.Ticket
+	}{
+		{"id prefix", idPrefix},
+		{"title slug", slugMatch},
+	} {
+		switch len(tier.matches) {
+		case 1:
+			return tier.matches[0], nil
+		case 0:
+			// fall through to the next tier
+		default:
+			return nil, fmt.Errorf("%q matches %d tickets by %s; pass the full id:\n%s",
+				arg, len(tier.matches), tier.kind, formatTicketMatches(tier.matches))
+		}
+	}
+
+	if hint := projectIDHint(registry, arg); hint != "" {
+		return nil, fmt.Errorf("%s", hint)
+	}
+	return nil, fmt.Errorf("no ticket matches %q in this project; run 'openkanban ticket list --project %s' to see ticket ids",
+		arg, ticketDeleteProject)
+}
+
+func formatTicketMatches(ts []*board.Ticket) string {
+	lines := make([]string, 0, len(ts))
+	for _, t := range ts {
+		lines = append(lines, fmt.Sprintf("  %s  %s", shortID(string(t.ID)), t.Title))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// projectIDHint returns a corrective message when arg is (or uniquely
+// prefixes) a known PROJECT id rather than a ticket id; empty string
+// otherwise.
+func projectIDHint(registry *project.ProjectRegistry, arg string) string {
+	for _, p := range registry.List() {
+		if p.ID == arg {
+			return fmt.Sprintf("%s is a project id, not a ticket id — run 'openkanban ticket list --project %s' to find ticket ids", arg, arg)
+		}
+	}
+	if len(arg) >= 4 {
+		for _, p := range registry.List() {
+			if strings.HasPrefix(p.ID, arg) {
+				return fmt.Sprintf("%q looks like a project id prefix, not a ticket id — run 'openkanban ticket list --project %s' to find ticket ids", arg, arg)
+			}
+		}
+	}
+	return ""
 }
 
 func shortID(id string) string {
@@ -611,7 +797,11 @@ func init() {
 	ticketNewCmd.Flags().IntVar(&ticketNewPriority, "priority", 0,
 		"Priority 1-5 (0 = use default, which is 3)")
 	ticketNewCmd.Flags().BoolVar(&ticketNewNoWorktree, "no-worktree", false,
-		"Don't use a git worktree for this ticket")
+		"Mark the ticket so its agent spawn won't use a git worktree (a lazy hint; provisions nothing now)")
+	ticketNewCmd.Flags().BoolVar(&ticketNewWorktree, "worktree", false,
+		"Provision the git worktree + branch now (not lazily at spawn) and print its path; contradicts --no-worktree")
+	ticketNewCmd.Flags().BoolVar(&ticketNewJSON, "json", false,
+		"Emit a JSON object {id, path, slug, status, project_id, worktree_path, branch_name, base_branch} instead of plain lines")
 	ticketNewCmd.Flags().BoolVar(&ticketNewAllowMigration, "allow-migration", false,
 		"Allow migrating legacy single-file ticket storage instead of refusing")
 	ticketNewCmd.Flags().StringVar(&ticketNewSession, "session", "",
