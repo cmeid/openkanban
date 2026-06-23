@@ -186,6 +186,12 @@ The shared funnel is `internal/ticketsvc`: a small package of free functions (`L
 
 See [`internal/ticketsvc/svc.go`](internal/ticketsvc/svc.go), [`internal/agent/CLAUDE.md`](internal/agent/CLAUDE.md), and the bug ticket `enforce-1-1-ticket-session` for the multi-vector analysis.
 
+### 12. Per-project Claude selection (work vs personal)
+
+If you run more than one Claude Code install — e.g. a work account and a personal one, distinguished only by `CLAUDE_CONFIG_DIR` — OpenKanban can launch the right one per project. Two presets ship by default, **Claude (Default)** and **Claude (Custom)**; the custom one carries a `CLAUDE_CONFIG_DIR` env you point at your alternate config dir (any agent's `env` is now injected at spawn, with a leading `~/` expanded).
+
+Selection is **per project and nowhere else** — there is no per-ticket or global agent picker. Focus a project in the sidebar and press `g` to cycle its pinned agent; the pin shows under the project name and governs every spawn (including `Ctrl+Space` background spawns). A project with no pin **refuses to spawn** with an actionable message — so you can't accidentally launch the wrong Claude as long as you stay in your projects. See [Configuration → Agents](./docs/CONFIGURATION.md#agents).
+
 ## Bugs fixed in upstream
 
 Seven correctness bugs that exist on `TechDufus/main` today are fixed in this fork. Each is verified against the upstream tree.

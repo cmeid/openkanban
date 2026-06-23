@@ -149,8 +149,7 @@ const (
 	formFieldLabels      = 4
 	formFieldPriority    = 5
 	formFieldWorktree    = 6
-	formFieldAgent       = 7
-	formFieldBlockedBy   = 8
+	formFieldBlockedBy   = 7
 )
 
 type choiceItem struct {
@@ -261,13 +260,10 @@ type Model struct {
 	labelsInput        textinput.Model
 	ticketPriority     int
 	ticketUseWorktree  bool
-	ticketAgent        string
-	agentListIndex     int
 	projectInput       textinput.Model
 	ticketFormField    int
 	editingTicketID    board.TicketID
 	branchLocked       bool
-	agentLocked        bool
 	selectedProject    *project.Project
 	projectListIndex   int
 	showAddProjectForm bool
@@ -1599,11 +1595,55 @@ func (m *Model) handleSidebarNav(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "o":
 		m.sidebarOpenOnly = !m.sidebarOpenOnly
+	case "g":
+		if m.sidebarIndex > 0 && m.sidebarIndex <= len(projects) {
+			m.cycleProjectAgent(projects[m.sidebarIndex-1])
+		}
+		return m, nil
 	case "esc":
 		m.sidebarFocused = false
 	}
 
 	return m, nil
+}
+
+// cycleProjectAgent advances a project's pinned agent to the next configured
+// agent (by config key) and persists it to the registry. The per-project pin is
+// the ONLY place agent identity is chosen, and it governs every spawn in the
+// project (an unpinned project refuses to spawn — see resolveSpawnAgent). The
+// status-bar toast names the agent's Label so the binding is visible.
+func (m *Model) cycleProjectAgent(proj *project.Project) {
+	if proj == nil {
+		return
+	}
+	names := m.getAgentNames()
+	if len(names) == 0 {
+		return
+	}
+	next := names[0]
+	for i, n := range names {
+		if n == proj.Settings.DefaultAgent {
+			next = names[(i+1)%len(names)]
+			break
+		}
+	}
+	proj.Settings.DefaultAgent = next
+	if err := m.projectRegistry.Update(proj); err != nil {
+		m.notify("Failed to save project agent: " + err.Error())
+		return
+	}
+	m.notify("Project agent: " + m.agentLabel(next))
+}
+
+// agentLabel returns the human-facing label for an agent key, falling back to
+// the key itself when the config has no Label.
+func (m *Model) agentLabel(name string) string {
+	if m.config != nil {
+		if cfg, ok := m.config.Agents[name]; ok && cfg.Label != "" {
+			return cfg.Label
+		}
+	}
+	return name
 }
 
 // sidebarTicketCount counts tickets for the sidebar. projectID=="" counts
@@ -2452,10 +2492,6 @@ func (m *Model) handleTicketForm(msg tea.KeyMsg, isEdit bool) (tea.Model, tea.Cm
 		cmd = m.handlePriorityNav(msg)
 	case formFieldWorktree:
 		cmd = m.handleWorktreeToggle(msg)
-	case formFieldAgent:
-		if !m.agentLocked {
-			cmd = m.handleAgentNav(msg)
-		}
 	case formFieldBlockedBy:
 		cmd = m.handleBlockerNav(msg)
 	case formFieldProject:
@@ -2495,28 +2531,6 @@ func (m *Model) handleWorktreeToggle(msg tea.KeyMsg) tea.Cmd {
 	case "n", "N":
 		m.ticketUseWorktree = false
 	}
-	return nil
-}
-
-func (m *Model) handleAgentNav(msg tea.KeyMsg) tea.Cmd {
-	agents := m.getAgentNames()
-	if len(agents) == 0 {
-		return nil
-	}
-
-	switch msg.String() {
-	case "j", "down", "l", "right":
-		m.agentListIndex++
-		if m.agentListIndex >= len(agents) {
-			m.agentListIndex = 0
-		}
-	case "k", "up", "h", "left":
-		m.agentListIndex--
-		if m.agentListIndex < 0 {
-			m.agentListIndex = len(agents) - 1
-		}
-	}
-	m.ticketAgent = agents[m.agentListIndex]
 	return nil
 }
 
@@ -2722,8 +2736,9 @@ func (m *Model) createProjectFromPath() (tea.Model, tea.Cmd) {
 	name := filepath.Base(absPath)
 
 	newProject := project.NewProject(name, absPath)
-	// Project settings only store explicit user overrides.
-	// Empty values cascade to global config via getDefaultAgent() and GetBranchPrefix().
+	// Project settings only store explicit user overrides; empty string/int
+	// values cascade to global config via GetBranchPrefix() etc. (Agent identity
+	// does NOT cascade — it is pinned per project via the sidebar 'g' key.)
 
 	if err := m.projectRegistry.Add(newProject); err != nil {
 		m.notify("Failed to save: " + err.Error())
@@ -2757,10 +2772,6 @@ func (m *Model) nextFormField(isEdit bool) *Model {
 			m.ticketFormField++
 			continue
 		}
-		if m.ticketFormField == formFieldAgent && m.agentLocked {
-			m.ticketFormField++
-			continue
-		}
 		break
 	}
 	m.focusCurrentField()
@@ -2776,10 +2787,6 @@ func (m *Model) prevFormField(isEdit bool) *Model {
 			m.ticketFormField = formFieldBlockedBy
 		}
 		if m.ticketFormField == formFieldBranch && m.branchLocked {
-			m.ticketFormField--
-			continue
-		}
-		if m.ticketFormField == formFieldAgent && m.agentLocked {
 			m.ticketFormField--
 			continue
 		}
@@ -2863,9 +2870,6 @@ func (m *Model) saveTicketForm(isEdit bool) (tea.Model, tea.Cmd) {
 			ticket.Labels = labels
 			ticket.Priority = m.ticketPriority
 			ticket.UseWorktree = m.ticketUseWorktree
-			if !m.agentLocked {
-				ticket.AgentType = m.ticketAgent
-			}
 			ticket.BlockedBy = blockedBy
 			ticket.Touch()
 			m.saveTicket(ticket)
@@ -2883,7 +2887,6 @@ func (m *Model) saveTicketForm(isEdit bool) (tea.Model, tea.Cmd) {
 		ticket.Labels = labels
 		ticket.Priority = m.ticketPriority
 		ticket.UseWorktree = m.ticketUseWorktree
-		ticket.AgentType = m.ticketAgent
 		ticket.BlockedBy = blockedBy
 		// in_review and done are "outbound" columns — landing a brand new
 		// ticket there is almost never intentional, so fall back to
@@ -2938,7 +2941,6 @@ type settingsField struct {
 
 var settingsFields = []settingsField{
 	{"theme", "Theme", "theme", "Color theme for the UI"},
-	{"default_agent", "Default Agent", "agent", "Agent to spawn for new tickets (opencode, claude, aider)"},
 	{"confirm_quit", "Confirm Quit", "toggle", "Prompt before quitting with running agents"},
 	{"branch_prefix", "Branch Prefix", "text", "Prefix for auto-generated branch names (e.g. task/, feature/)"},
 	{"delete_worktree", "Delete Worktree", "toggle", "Remove git worktree when deleting tickets"},
@@ -3102,22 +3104,6 @@ func (m *Model) enterSettingsEdit() (tea.Model, tea.Cmd) {
 		m.settingsEditing = true
 		return m, nil
 
-	case "agent":
-		agents := m.getAgentNames()
-		current := m.config.Defaults.DefaultAgent
-		currentIndex := 0
-		for i, a := range agents {
-			if a == current {
-				currentIndex = i
-				break
-			}
-		}
-		nextIndex := (currentIndex + 1) % len(agents)
-		nextAgent := agents[nextIndex]
-		m.applySettingsValue(field.key, nextAgent)
-		m.notify("Default agent: " + nextAgent)
-		return m, nil
-
 	case "text":
 		m.settingsEditing = true
 		m.settingsInput.SetValue(m.getSettingsValue(field.key))
@@ -3136,8 +3122,6 @@ func (m *Model) getSettingsValue(key string) string {
 	switch key {
 	case "theme":
 		return m.config.UI.Theme
-	case "default_agent":
-		return m.config.Defaults.DefaultAgent
 	case "confirm_quit":
 		if m.config.Behavior.ConfirmQuitWithAgents {
 			return "On"
@@ -3181,9 +3165,6 @@ func (m *Model) applySettingsValue(key, value string) {
 		m.config.UI.Theme = value
 		m.theme = m.config.GetTheme()
 		m.colors = newUIColors(m.theme)
-		m.config.Save("")
-	case "default_agent":
-		m.config.Defaults.DefaultAgent = value
 		m.config.Save("")
 	case "confirm_quit":
 		m.config.Behavior.ConfirmQuitWithAgents = !m.config.Behavior.ConfirmQuitWithAgents
@@ -3479,7 +3460,6 @@ func (m *Model) createNewTicket() (tea.Model, tea.Cmd) {
 	m.ticketFormField = formFieldTitle
 	m.editingTicketID = ""
 	m.branchLocked = false
-	m.agentLocked = false
 	m.showAddProjectForm = false
 
 	if len(m.filterProjectIDs) == 1 {
@@ -3503,9 +3483,6 @@ func (m *Model) createNewTicket() (tea.Model, tea.Cmd) {
 			}
 		}
 	}
-
-	m.ticketAgent = m.getDefaultAgent()
-	m.agentListIndex = m.getAgentIndex(m.ticketAgent)
 
 	m.titleInput.Reset()
 	m.descInput.Reset()
@@ -3536,7 +3513,6 @@ func (m *Model) editTicket() (tea.Model, tea.Cmd) {
 	m.ticketFormField = formFieldTitle
 	m.editingTicketID = ticket.ID
 	m.branchLocked = ticket.WorktreePath != ""
-	m.agentLocked = ticket.AgentSpawnedAt != nil
 	m.selectedProject = m.globalStore.GetProjectForTicket(ticket)
 	m.projectListIndex = 0
 	if m.selectedProject != nil {
@@ -3561,12 +3537,6 @@ func (m *Model) editTicket() (tea.Model, tea.Cmd) {
 		m.ticketPriority = 3
 	}
 	m.ticketUseWorktree = ticket.UseWorktree
-	if ticket.AgentType != "" {
-		m.ticketAgent = ticket.AgentType
-	} else {
-		m.ticketAgent = m.getDefaultAgent()
-	}
-	m.agentListIndex = m.getAgentIndex(m.ticketAgent)
 
 	m.initBlockerCandidates(ticket.ID)
 	m.selectedBlockers = make(map[board.TicketID]bool)
@@ -3947,29 +3917,10 @@ func (m *Model) promoteAndSpawnUnattached() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Promote into in_progress from any column (no-op when already there).
-	if ticket.Status != board.StatusInProgress {
-		if ticket.WorktreePath == "" {
-			if ticket.UseWorktree {
-				if err := m.setupWorktree(ticket); err != nil {
-					m.notify("Worktree failed: " + err.Error())
-					return m, nil
-				}
-			} else {
-				if err := m.setupMainRepoBranch(ticket); err != nil {
-					m.notify("Branch setup failed: " + err.Error())
-					return m, nil
-				}
-			}
-		}
-		m.globalStore.Move(ticket.ID, board.StatusInProgress)
-		m.refreshColumnTickets()
-		m.selectTicketByID(ticket.ID)
-		m.saveTicket(ticket)
-	}
-
-	// Resolve project + agent config. Replicated from spawnAgent (rather
-	// than extracted) to keep zero blast radius on that heavily-tested path.
+	// Resolve project + pinned agent BEFORE any promotion side effects, so an
+	// unpinned project (or an unknown agent) refuses cleanly without creating a
+	// worktree or moving the ticket out of its column. Replicated from spawnAgent
+	// (rather than extracted) to keep zero blast radius on that heavily-tested path.
 	proj := m.globalStore.GetProjectForTicket(ticket)
 	if proj == nil {
 		m.notify("Project not found for this ticket")
@@ -3990,9 +3941,10 @@ func (m *Model) promoteAndSpawnUnattached() (tea.Model, tea.Cmd) {
 			}
 		}
 	}
-	agentType := ticket.AgentType
-	if agentType == "" {
-		agentType = m.config.Defaults.DefaultAgent
+	agentType, agentErr := m.resolveSpawnAgent(ticket, proj)
+	if agentErr != nil {
+		m.notify(noProjectAgentMsg)
+		return m, nil
 	}
 	agentCfg, ok := m.config.Agents[agentType]
 	if !ok {
@@ -4001,6 +3953,27 @@ func (m *Model) promoteAndSpawnUnattached() (tea.Model, tea.Cmd) {
 	}
 	if agentType == "opencode" {
 		_ = m.opencodeServer.Start() // best effort
+	}
+
+	// Promote into in_progress from any column (no-op when already there).
+	if ticket.Status != board.StatusInProgress {
+		if ticket.WorktreePath == "" {
+			if ticket.UseWorktree {
+				if err := m.setupWorktree(ticket); err != nil {
+					m.notify("Worktree failed: " + err.Error())
+					return m, nil
+				}
+			} else {
+				if err := m.setupMainRepoBranch(ticket); err != nil {
+					m.notify("Branch setup failed: " + err.Error())
+					return m, nil
+				}
+			}
+		}
+		m.globalStore.Move(ticket.ID, board.StatusInProgress)
+		m.refreshColumnTickets()
+		m.selectTicketByID(ticket.ID)
+		m.saveTicket(ticket)
 	}
 
 	// Persist the resolved agent type so status detection (and a later
@@ -4601,9 +4574,10 @@ func (m *Model) spawnAgent() (tea.Model, tea.Cmd) {
 		}
 	}
 
-	agentType := ticket.AgentType
-	if agentType == "" {
-		agentType = m.config.Defaults.DefaultAgent
+	agentType, agentErr := m.resolveSpawnAgent(ticket, proj)
+	if agentErr != nil {
+		m.notify(noProjectAgentMsg)
+		return m, nil
 	}
 	agentCfg, ok := m.config.Agents[agentType]
 	if !ok {
@@ -4785,7 +4759,8 @@ type spawnReqInputs struct {
 	cols           int
 	rows           int
 	agentType      string
-	cleanArgs      []string // agentCfg.Args with empty entries stripped
+	agentEnv       map[string]string // per-agent Env (config.AgentConfig.Env), injected at spawn with leading "~/" expanded
+	cleanArgs      []string          // agentCfg.Args with empty entries stripped
 	isNewSession   bool
 	promptTemplate string
 	ctxData        agent.ContextData
@@ -4800,6 +4775,45 @@ type spawnReqInputs struct {
 	// terminal.Pane gates its OSC 9 → desktop-notification handler on
 	// this per session, rather than relying on a process-wide global.
 	forwardNotifications bool
+}
+
+// noProjectAgentMsg is shown when a spawn is attempted in a project with no
+// pinned agent. Agent identity is chosen at the project level (sidebar 'g');
+// there is no global fallback by design — this guards against accidentally
+// launching the wrong agent in an unpinned project.
+const noProjectAgentMsg = "Pin a Claude for this project first — press g in the sidebar"
+
+// errNoProjectAgent signals a spawn was attempted in a project with no pinned agent.
+var errNoProjectAgent = errors.New("no project agent pinned")
+
+// resolveSpawnAgent returns the agent key to spawn for a ticket. A ticket that
+// already carries an AgentType keeps it (resume continuity); otherwise the
+// project's pinned DefaultAgent is authoritative. An unpinned project returns
+// errNoProjectAgent and the caller must refuse the spawn (no global fallback).
+func (m *Model) resolveSpawnAgent(ticket *board.Ticket, proj *project.Project) (string, error) {
+	if ticket != nil && ticket.AgentType != "" {
+		return ticket.AgentType, nil
+	}
+	if proj != nil && proj.Settings.DefaultAgent != "" {
+		return proj.Settings.DefaultAgent, nil
+	}
+	return "", errNoProjectAgent
+}
+
+// expandLeadingTilde expands a leading "~/" in an env value to the user's
+// home directory. Only a leading "~/" is expanded; "~user" and mid-string
+// "~" are left untouched. Returns the input unchanged if HOME can't resolve.
+// Used so a per-agent env like CLAUDE_CONFIG_DIR=~/.claude-personal points at
+// a real path (environment variables are not shell-expanded).
+func expandLeadingTilde(v string) string {
+	if !strings.HasPrefix(v, "~/") {
+		return v
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return v
+	}
+	return filepath.Join(home, v[2:])
 }
 
 // buildSpawnReq constructs the daemon.SpawnReq for a ticket given the
@@ -4942,6 +4956,16 @@ func buildSpawnReq(in spawnReqInputs) daemon.SpawnReq {
 	ticketIDStr := string(in.ticket.ID)
 	if ticketIDStr != "" {
 		env = append(env, "OPENKANBAN_TICKET_ID="+ticketIDStr)
+	}
+	// Per-agent Env (e.g. CLAUDE_CONFIG_DIR for a custom Claude profile).
+	// Appended after the OPENKANBAN_* vars; the daemon's buildCleanEnv strips
+	// inherited CLAUDE_*/GEMINI_*/etc. before appending SpawnReq.Env, so these
+	// survive. A leading "~/" is expanded to $HOME (env vars don't shell-expand).
+	for k, v := range in.agentEnv {
+		if k == "" {
+			continue
+		}
+		env = append(env, k+"="+expandLeadingTilde(v))
 	}
 
 	return daemon.SpawnReq{
@@ -5290,6 +5314,7 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 			cols:                 width,
 			rows:                 height,
 			agentType:            agentType,
+			agentEnv:             agentCfg.Env,
 			cleanArgs:            cleanArgs,
 			isNewSession:         isNewSession,
 			promptTemplate:       promptTemplate,
@@ -6040,24 +6065,40 @@ func (m *Model) getAgentNames() []string {
 		names = append(names, name)
 	}
 	if len(names) == 0 {
-		return []string{"opencode", "claude", "gemini", "codex", "aider"}
+		return []string{"opencode", "claude", "claude-custom", "gemini", "codex", "aider"}
 	}
 	sort.Strings(names)
 	return names
 }
 
-func (m *Model) getDefaultAgent() string {
-	return m.config.Defaults.DefaultAgent
+func (m *Model) getBranchPrefix(proj *project.Project) string {
+	if proj != nil && proj.Settings.BranchPrefix != "" {
+		return proj.Settings.BranchPrefix
+	}
+	if m.config.Defaults.BranchPrefix != "" {
+		return m.config.Defaults.BranchPrefix
+	}
+	return "task/"
 }
 
-func (m *Model) getAgentIndex(agentName string) int {
-	agents := m.getAgentNames()
-	for i, name := range agents {
-		if name == agentName {
-			return i
-		}
+func (m *Model) getBranchTemplate(proj *project.Project) string {
+	if proj != nil && proj.Settings.BranchTemplate != "" {
+		return proj.Settings.BranchTemplate
 	}
-	return 0
+	if m.config.Defaults.BranchTemplate != "" {
+		return m.config.Defaults.BranchTemplate
+	}
+	return "{prefix}{slug}"
+}
+
+func (m *Model) getSlugMaxLength(proj *project.Project) int {
+	if proj != nil && proj.Settings.SlugMaxLength > 0 {
+		return proj.Settings.SlugMaxLength
+	}
+	if m.config.Defaults.SlugMaxLength > 0 {
+		return m.config.Defaults.SlugMaxLength
+	}
+	return 40
 }
 
 // T2 of the integration plan removed maybeAutoStopCompletedPane.

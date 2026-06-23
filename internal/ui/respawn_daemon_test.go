@@ -242,6 +242,41 @@ func TestBuildSpawnReq_EnvCarriesSessionAndTicketID(t *testing.T) {
 	}
 }
 
+// TestBuildSpawnReq_InjectsAgentEnv pins the per-agent Env injection — the
+// mechanism that lets a "Claude (Custom)" preset carry CLAUDE_CONFIG_DIR so a
+// project launches a different Claude profile. A leading "~/" must be expanded
+// to $HOME (env vars are not shell-expanded). Red-before-green: revert the
+// agentEnv loop in buildSpawnReq and the custom-preset case fails.
+func TestBuildSpawnReq_InjectsAgentEnv(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	t.Run("custom_preset_injects_expanded_config_dir", func(t *testing.T) {
+		in := baseClaudeInputs(t, "TICK-CFGDIR", "task/cfgdir")
+		in.agentEnv = map[string]string{"CLAUDE_CONFIG_DIR": "~/.claude-personal"}
+
+		req := buildSpawnReq(in)
+
+		want := "CLAUDE_CONFIG_DIR=" + filepath.Join(home, ".claude-personal")
+		if !envHas(req.Env, want) {
+			t.Errorf("env missing %q, got %v", want, req.Env)
+		}
+	})
+
+	t.Run("default_preset_no_config_dir", func(t *testing.T) {
+		in := baseClaudeInputs(t, "TICK-NOCFG", "task/nocfg")
+		// The "Claude (Default)" preset carries no Env.
+
+		req := buildSpawnReq(in)
+
+		for _, e := range req.Env {
+			if strings.HasPrefix(e, "CLAUDE_CONFIG_DIR=") {
+				t.Errorf("unexpected CLAUDE_CONFIG_DIR in env: %v", req.Env)
+			}
+		}
+	})
+}
+
 // TestBuildSpawnReq_ForceFresh_AgentSpawnedAtNilAtConstruction asserts
 // the ForceFresh invariant: by the time buildSpawnReq runs, the
 // caller (the Discard option's Fn closure in spawnAgent) must have

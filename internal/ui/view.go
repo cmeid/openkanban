@@ -884,6 +884,7 @@ func (m *Model) contextualHints(hintStyle lipgloss.Style, sep string, maxWidth i
 				{key: "o", label: "open only", prio: 1},
 				{key: "a", label: "add", prio: 2},
 				{key: "d", label: "delete", prio: 3},
+				{key: "g", label: "pin agent", prio: 4},
 				{key: "l/Esc", label: "back", prio: 6, pinned: true},
 			}, hintStyle, sep, maxWidth)
 		}
@@ -1124,7 +1125,8 @@ func (m *Model) renderHelp() string {
 		"  " + keyStyle.Render("j/k") + descStyle.Render("   Navigate projects       ") + keyStyle.Render("Ctrl+]") + descStyle.Render("  Next session (in view)") + "\n" +
 		"  " + keyStyle.Render("a") + descStyle.Render("     Add project             ") + keyStyle.Render("Ctrl+\\") + descStyle.Render("  Prev session (in view)") + "\n" +
 		"  " + keyStyle.Render("d") + descStyle.Render("     Delete project          ") + keyStyle.Render("Ctrl+Space") + descStyle.Render(" Promote + bg agent") + "\n" +
-		"  " + keyStyle.Render("o") + descStyle.Render("     Toggle open only        ") + keyStyle.Render("r") + descStyle.Render("       Recover/destroy stuck session") + "\n\n" +
+		"  " + keyStyle.Render("o") + descStyle.Render("     Toggle open only        ") + keyStyle.Render("r") + descStyle.Render("       Recover/destroy stuck session") + "\n" +
+		"  " + keyStyle.Render("g") + descStyle.Render("     Pin project agent") + "\n\n" +
 		sep + "\n" +
 		sectionStyle.Render("  👁 View") + "                       " + sectionStyle.Render("⚙ System") + "\n" +
 		sep + "\n" +
@@ -1472,7 +1474,6 @@ func (m *Model) renderTicketForm() string {
 	labelsLabel := labelStyle
 	priorityLabel := labelStyle
 	worktreeLabel := labelStyle
-	agentLabel := labelStyle
 	blockerLabel := labelStyle
 	projectLabel := labelStyle
 
@@ -1492,8 +1493,6 @@ func (m *Model) renderTicketForm() string {
 		priorityLabel = activeLabelStyle
 	case formFieldWorktree:
 		worktreeLabel = activeLabelStyle
-	case formFieldAgent:
-		agentLabel = activeLabelStyle
 	case formFieldBlockedBy:
 		blockerLabel = activeLabelStyle
 	case formFieldProject:
@@ -1513,7 +1512,6 @@ func (m *Model) renderTicketForm() string {
 
 	priorityField := m.renderPrioritySelector()
 	worktreeField := m.renderWorktreeSelector()
-	agentField := m.renderAgentSelector()
 	blockerField := m.renderBlockerSelector()
 	projectField := m.renderProjectSelector()
 
@@ -1529,7 +1527,7 @@ func (m *Model) renderTicketForm() string {
 	focusIndicator := lipgloss.NewStyle().Foreground(m.colors.info).Render("▸ ")
 	noFocus := "  "
 
-	titleFocus, descFocus, branchFocus, labelsFocus, priorityFocus, worktreeFocus, agentFocus, blockerFocus, projectFocus := noFocus, noFocus, noFocus, noFocus, noFocus, noFocus, noFocus, noFocus, noFocus
+	titleFocus, descFocus, branchFocus, labelsFocus, priorityFocus, worktreeFocus, blockerFocus, projectFocus := noFocus, noFocus, noFocus, noFocus, noFocus, noFocus, noFocus, noFocus
 	switch m.ticketFormField {
 	case formFieldTitle:
 		titleFocus = focusIndicator
@@ -1543,8 +1541,6 @@ func (m *Model) renderTicketForm() string {
 		priorityFocus = focusIndicator
 	case formFieldWorktree:
 		worktreeFocus = focusIndicator
-	case formFieldAgent:
-		agentFocus = focusIndicator
 	case formFieldBlockedBy:
 		blockerFocus = focusIndicator
 	case formFieldProject:
@@ -1614,14 +1610,6 @@ func (m *Model) renderTicketForm() string {
 	lines = append(lines, "  "+worktreeField)
 	lines = append(lines, "")
 	fieldEndLines[formFieldWorktree] = len(lines) - 1
-	currentLine = len(lines)
-
-	fieldStartLines[formFieldAgent] = currentLine
-	lines = append(lines, agentFocus+agentLabel.Render("Agent"))
-	lines = append(lines, "  "+descriptionStyle.Render("AI agent to use for this ticket"))
-	lines = append(lines, "  "+agentField)
-	lines = append(lines, "")
-	fieldEndLines[formFieldAgent] = len(lines) - 1
 	currentLine = len(lines)
 
 	fieldStartLines[formFieldBlockedBy] = currentLine
@@ -1777,33 +1765,6 @@ func (m *Model) renderWorktreeSelector() string {
 	}
 
 	return worktreeOption + "  " + mainOption + hint
-}
-
-func (m *Model) renderAgentSelector() string {
-	agents := m.getAgentNames()
-	if len(agents) == 0 {
-		return m.dimStyle().Render("No agents configured")
-	}
-
-	var parts []string
-	for _, agent := range agents {
-		style := lipgloss.NewStyle().Foreground(m.colors.primary)
-		if m.ticketAgent == agent {
-			style = style.Bold(true).Background(m.colors.surface).Padding(0, 1)
-			parts = append(parts, style.Render("● "+agent))
-		} else {
-			parts = append(parts, style.Render("○ "+agent))
-		}
-	}
-
-	hint := ""
-	if m.ticketFormField == formFieldAgent && !m.agentLocked {
-		hint = "  " + m.dimStyle().Render("← → to select")
-	} else if m.agentLocked {
-		hint = "  " + m.dimStyle().Render("(locked - agent already spawned)")
-	}
-
-	return strings.Join(parts, "  ") + hint
 }
 
 func (m *Model) renderBlockerSelector() string {
@@ -2520,6 +2481,18 @@ func (m *Model) renderSidebar() string {
 		} else {
 			lines = append(lines, uncheckStyle.Render(label))
 		}
+
+		// Pinned agent (which Claude profile launches here). Visible so the
+		// guard is legible; "unpinned" warns that spawning will refuse.
+		pinStyle := lipgloss.NewStyle().Foreground(m.colors.muted).Italic(true)
+		var pin string
+		if p.Settings.DefaultAgent == "" {
+			pinStyle = lipgloss.NewStyle().Foreground(m.colors.warning)
+			pin = "↳ unpinned · g"
+		} else {
+			pin = "↳ " + m.agentLabel(p.Settings.DefaultAgent)
+		}
+		lines = append(lines, "  "+pinStyle.Render(truncateMiddle(pin, m.sidebarWidth-2)))
 	}
 
 	lines = append(lines, "")
@@ -2537,7 +2510,7 @@ func (m *Model) renderSidebar() string {
 
 	hintStyle := lipgloss.NewStyle().Foreground(m.colors.muted).Italic(true)
 	if m.sidebarFocused {
-		lines = append(lines, hintStyle.Render("  j/k ⏎toggle a/d o:open"))
+		lines = append(lines, hintStyle.Render("  ⏎tog a/d g:agt o:open"))
 	} else {
 		lines = append(lines, hintStyle.Render("  h→focus  [hide"))
 	}

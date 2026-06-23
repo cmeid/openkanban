@@ -123,7 +123,7 @@ func TestSpawnUnattachedReadyMsg_StaysOnBoard(t *testing.T) {
 func TestPromoteAndSpawnUnattached_MovesToInProgress(t *testing.T) {
 	t.Setenv("OPENKANBAN_CONFIG_DIR", t.TempDir())
 
-	proj := &project.Project{ID: "test", RepoPath: t.TempDir()}
+	proj := &project.Project{ID: "test", RepoPath: t.TempDir(), Settings: project.ProjectSettings{DefaultAgent: "claude"}}
 	globalStore := project.NewGlobalTicketStore(nil)
 	globalStore.AddProject(proj)
 
