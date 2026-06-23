@@ -75,6 +75,16 @@ Separate render methods composed in `View()`:
 All styling via lipgloss with theme-based `uiColors` struct.
 Never use raw ANSI codes in UI rendering.
 
+**Ticket card border color** (`renderTicket` → `ticketBorderColor`) is resolved
+by precedence, highest first: **stuck** (red) > **selected** (column color) >
+**viewed in another TUI** (amber, `m.daemonViewing[id] > 0` — same signal as the
+`◉` badge) > **hovered** (overlay) > default (surface). It is NOT gated on
+`pane.Running()` — that stale-on-the-board flag drove a removed green
+"running" border (see git log `drop green running-session card border`). The
+left-edge accent (`BorderLeftForeground`) is a separate signal driven by
+`ticket.AgentStatus` (working=warning, waiting, idle, …). Precedence is pinned by
+`TestTicketBorderColor`.
+
 The board header **activity chip** (`renderHeader`) shows `<icon> N sessions · <breakdown>` —
 the total `N` is the number of **open sessions** and the breakdown lists every non-zero status
 bucket (working/waiting/idle/starting/stuck/error/done), so the counts always sum to `N`.
