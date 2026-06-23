@@ -280,6 +280,15 @@ chosen **per project, and nowhere else**. The mechanism:
   treatment; they differ only by `Env` (`CLAUDE_CONFIG_DIR`). Per-agent `Env` is
   injected at spawn with a leading `~/` expanded (`expandLeadingTilde`).
 
+Every claude-class spawn also gets `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false`
+appended to `SpawnReq.Env` in `buildSpawnReq` (before the per-agent `Env` loop, so
+an `AgentConfig.Env` override still wins). This kills Claude Code's model-generated
+"Prompt suggestions" — the next-prompt drafts it drops into the input box after
+each turn — which are noise in a ticket-scoped agent. The env var wins over Claude's
+`promptSuggestionEnabled` setting and rides the same `req.Env` path that survives the
+daemon's `buildCleanEnv` `CLAUDE_*` strip. This is unrelated to the up-arrow history
+ring / `PurgeClaudePrimingHistory` (a separate surface).
+
 Do NOT reintroduce a ticket-form agent picker or a global Default-Agent setting
 — that reopens the accidental-wrong-Claude path the project pin closes.
 `TestNoGlobalDefaultAgentInSpawnPath` (a static guard) fails if `model.go`
