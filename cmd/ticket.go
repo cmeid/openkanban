@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,8 +15,10 @@ import (
 
 	"github.com/techdufus/openkanban/internal/agent"
 	"github.com/techdufus/openkanban/internal/board"
+	"github.com/techdufus/openkanban/internal/config"
 	"github.com/techdufus/openkanban/internal/daemon"
 	"github.com/techdufus/openkanban/internal/daemonclient"
+	"github.com/techdufus/openkanban/internal/git"
 	"github.com/techdufus/openkanban/internal/project"
 	"github.com/techdufus/openkanban/internal/ticketsvc"
 )
@@ -29,6 +32,8 @@ var (
 	ticketNewLabels          string
 	ticketNewPriority        int
 	ticketNewNoWorktree      bool
+	ticketNewWorktree        bool
+	ticketNewJSON            bool
 	ticketNewAllowMigration  bool
 	ticketNewSession         string
 	ticketNewMigrate         bool
@@ -53,11 +58,21 @@ path to a child session for context.`,
 var ticketNewCmd = &cobra.Command{
 	Use:   "new",
 	Short: "Create a new ticket",
-	Long: `Create a new ticket in a project and print the path to the resulting .md file.
+	Long: `Create a new ticket in a project.
+
+Output (plain): an "id=<uuid>" line, then (if --worktree) a
+"worktree=<path>" line, then the .md file path as the FINAL line so
+existing consumers that captured stdout as the path keep working. Use
+--json for a stable machine-readable object instead.
 
 The --project flag accepts an exact project name, an exact UUID, or a
 unique UUID prefix of at least 4 characters. On ambiguous prefix the
 command exits non-zero and lists the candidates.
+
+--worktree provisions the git worktree + branch immediately (the same
+derivation the TUI uses at spawn, so spawn reuses it). This differs
+from --no-worktree, which only flips a lazy spawn-time hint and
+provisions nothing; passing both is an error.
 
 If the project still uses legacy single-file storage (tickets/<id>.json),
 ticket new refuses to migrate it on its own so it can't race a running
@@ -88,6 +103,9 @@ Description sources (mutually exclusive, in priority order):
 			default:
 				return fmt.Errorf("--status %q is not one of: backlog, in_progress, in_review, done, archived", ticketNewStatus)
 			}
+		}
+		if ticketNewWorktree && ticketNewNoWorktree {
+			return fmt.Errorf("--worktree and --no-worktree are contradictory")
 		}
 
 		registry, err := project.LoadRegistry()
@@ -150,6 +168,32 @@ Description sources (mutually exclusive, in priority order):
 			return err
 		}
 
+		// Opt-in worktree provisioning (sibling ticket 954ed3e8). Done
+		// BEFORE SaveTicket so a provisioning failure leaves no ticket
+		// behind — either the worktree-backed ticket is created whole, or
+		// nothing is. The branch name comes from the SAME derivation the
+		// TUI spawn path uses (project.BranchNameForTitle), so spawn later
+		// reuses this worktree instead of creating a duplicate.
+		if ticketNewWorktree {
+			cfg, cerr := config.Load("")
+			if cerr != nil {
+				return fmt.Errorf("load config: %w", cerr)
+			}
+			mgr := git.NewWorktreeManager(proj)
+			base, _ := mgr.GetDefaultBranch()
+			branch := project.BranchNameForTitle(ticket.Title, proj, cfg.Defaults)
+			wtPath, werr := mgr.CreateWorktree(branch, base)
+			if werr != nil {
+				return fmt.Errorf("provision worktree for %s: %w", ticket.ID, werr)
+			}
+			if serr := agent.SeedClaudeSettings(wtPath, proj.RepoPath); serr != nil {
+				fmt.Fprintf(os.Stderr, "openkanban: seed claude settings (%s): %v\n", wtPath, serr)
+			}
+			ticket.WorktreePath = wtPath
+			ticket.BranchName = branch
+			ticket.BaseBranch = base
+		}
+
 		if err := store.SaveTicket(ticket); err != nil {
 			return fmt.Errorf("save ticket: %w", err)
 		}
@@ -161,9 +205,50 @@ Description sources (mutually exclusive, in priority order):
 			return err
 		}
 		path := filepath.Join(ticketsRoot, proj.ID, project.TicketFilename(ticket))
+
+		result := ticketNewResult{
+			ID:           string(ticket.ID),
+			Path:         path,
+			Slug:         board.Slugify(ticket.Title, 40),
+			Status:       string(ticket.Status),
+			ProjectID:    proj.ID,
+			WorktreePath: ticket.WorktreePath,
+			BranchName:   ticket.BranchName,
+			BaseBranch:   ticket.BaseBranch,
+		}
+		if ticketNewJSON {
+			enc, jerr := json.MarshalIndent(result, "", "  ")
+			if jerr != nil {
+				return fmt.Errorf("marshal json: %w", jerr)
+			}
+			fmt.Println(string(enc))
+			return nil
+		}
+
+		// Human/scripted output. The ticket id is emitted first; the .md
+		// path stays the FINAL line for back-compat with consumers that
+		// captured stdout as the path.
+		fmt.Printf("id=%s\n", ticket.ID)
+		if ticket.WorktreePath != "" {
+			fmt.Printf("worktree=%s\n", ticket.WorktreePath)
+		}
 		fmt.Println(path)
 		return nil
 	},
+}
+
+// ticketNewResult is the stable --json schema for `ticket new`. Every field is
+// always present (no omitempty); worktree_path/branch_name/base_branch are
+// empty strings unless --worktree provisioned a worktree.
+type ticketNewResult struct {
+	ID           string `json:"id"`
+	Path         string `json:"path"`
+	Slug         string `json:"slug"`
+	Status       string `json:"status"`
+	ProjectID    string `json:"project_id"`
+	WorktreePath string `json:"worktree_path"`
+	BranchName   string `json:"branch_name"`
+	BaseBranch   string `json:"base_branch"`
 }
 
 var ticketDeleteCmd = &cobra.Command{
@@ -611,7 +696,11 @@ func init() {
 	ticketNewCmd.Flags().IntVar(&ticketNewPriority, "priority", 0,
 		"Priority 1-5 (0 = use default, which is 3)")
 	ticketNewCmd.Flags().BoolVar(&ticketNewNoWorktree, "no-worktree", false,
-		"Don't use a git worktree for this ticket")
+		"Mark the ticket so its agent spawn won't use a git worktree (a lazy hint; provisions nothing now)")
+	ticketNewCmd.Flags().BoolVar(&ticketNewWorktree, "worktree", false,
+		"Provision the git worktree + branch now (not lazily at spawn) and print its path; contradicts --no-worktree")
+	ticketNewCmd.Flags().BoolVar(&ticketNewJSON, "json", false,
+		"Emit a JSON object {id, path, slug, status, project_id, worktree_path, branch_name, base_branch} instead of plain lines")
 	ticketNewCmd.Flags().BoolVar(&ticketNewAllowMigration, "allow-migration", false,
 		"Allow migrating legacy single-file ticket storage instead of refusing")
 	ticketNewCmd.Flags().StringVar(&ticketNewSession, "session", "",

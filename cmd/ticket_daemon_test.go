@@ -181,6 +181,8 @@ func resetTicketNewFlags() {
 	ticketNewMigrate = false
 	ticketNewForce = false
 	ticketNewCreatedBy = ""
+	ticketNewWorktree = false
+	ticketNewJSON = false
 }
 
 // requireLsof skips when lsof isn't installed. The daemon-owns matrix
