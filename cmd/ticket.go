@@ -299,9 +299,9 @@ remain quiet when the daemon happens to be down.`,
 		if err != nil {
 			return fmt.Errorf("load ticket store: %w", err)
 		}
-		t, err := store.Get(board.TicketID(ticketDeleteID))
+		t, err := resolveTicket(store, registry, ticketDeleteID)
 		if err != nil {
-			return fmt.Errorf("ticket %s: %w", ticketDeleteID, err)
+			return err
 		}
 
 		// Daemon-side cleanup BEFORE the file-system delete: if we
@@ -341,10 +341,10 @@ remain quiet when the daemon happens to be down.`,
 			fmt.Fprintf(os.Stderr, "openkanbankd: ticket_done for %s: %v\n", t.ID, derr)
 		}
 
-		if err := store.Delete(board.TicketID(ticketDeleteID)); err != nil {
+		if err := store.Delete(t.ID); err != nil {
 			return fmt.Errorf("delete ticket: %w", err)
 		}
-		fmt.Printf("deleted %s\n", ticketDeleteID)
+		fmt.Printf("deleted %s\n", t.ID)
 		return nil
 	},
 }
@@ -396,6 +396,98 @@ func formatProjectMatches(ps []*project.Project) string {
 		lines = append(lines, fmt.Sprintf("  %s  %s", shortID(p.ID), p.Name))
 	}
 	return strings.Join(lines, "\n")
+}
+
+// resolveTicket selects a ticket from an already-resolved project's store.
+// Because the delete path always has --project, resolution is scoped to one
+// project — there is no cross-project ambiguity.
+//
+// Match precedence (mirrors resolveProject):
+//  1. exact ticket id
+//  2. unique id prefix (>=4 chars; this also covers the filename short-hash,
+//     which is just the first 8 chars of the id)
+//  3. unique title slug (board.Slugify of the title)
+//
+// On no match, if the arg looks like a PROJECT id (the common footgun — the
+// directory UUID in the printed .md path is the project id, not the ticket
+// id), the error says so and points at `ticket list`.
+func resolveTicket(store *project.TicketStore, registry *project.ProjectRegistry, arg string) (*board.Ticket, error) {
+	if arg == "" {
+		return nil, fmt.Errorf("--id value is empty")
+	}
+	all := store.All()
+
+	for _, t := range all {
+		if string(t.ID) == arg {
+			return t, nil
+		}
+	}
+
+	var idPrefix, slugMatch []*board.Ticket
+	if len(arg) >= 4 {
+		for _, t := range all {
+			if strings.HasPrefix(string(t.ID), arg) {
+				idPrefix = append(idPrefix, t)
+			}
+		}
+	}
+	lowerArg := strings.ToLower(arg)
+	for _, t := range all {
+		if board.Slugify(t.Title, 40) == lowerArg {
+			slugMatch = append(slugMatch, t)
+		}
+	}
+
+	for _, tier := range []struct {
+		kind    string
+		matches []*board.Ticket
+	}{
+		{"id prefix", idPrefix},
+		{"title slug", slugMatch},
+	} {
+		switch len(tier.matches) {
+		case 1:
+			return tier.matches[0], nil
+		case 0:
+			// fall through to the next tier
+		default:
+			return nil, fmt.Errorf("%q matches %d tickets by %s; pass the full id:\n%s",
+				arg, len(tier.matches), tier.kind, formatTicketMatches(tier.matches))
+		}
+	}
+
+	if hint := projectIDHint(registry, arg); hint != "" {
+		return nil, fmt.Errorf("%s", hint)
+	}
+	return nil, fmt.Errorf("no ticket matches %q in this project; run 'openkanban ticket list --project %s' to see ticket ids",
+		arg, ticketDeleteProject)
+}
+
+func formatTicketMatches(ts []*board.Ticket) string {
+	lines := make([]string, 0, len(ts))
+	for _, t := range ts {
+		lines = append(lines, fmt.Sprintf("  %s  %s", shortID(string(t.ID)), t.Title))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// projectIDHint returns a corrective message when arg is (or uniquely
+// prefixes) a known PROJECT id rather than a ticket id; empty string
+// otherwise.
+func projectIDHint(registry *project.ProjectRegistry, arg string) string {
+	for _, p := range registry.List() {
+		if p.ID == arg {
+			return fmt.Sprintf("%s is a project id, not a ticket id — run 'openkanban ticket list --project %s' to find ticket ids", arg, arg)
+		}
+	}
+	if len(arg) >= 4 {
+		for _, p := range registry.List() {
+			if strings.HasPrefix(p.ID, arg) {
+				return fmt.Sprintf("%q looks like a project id prefix, not a ticket id — run 'openkanban ticket list --project %s' to find ticket ids", arg, arg)
+			}
+		}
+	}
+	return ""
 }
 
 func shortID(id string) string {
