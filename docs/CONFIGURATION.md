@@ -87,6 +87,51 @@ Define any CLI-based agent. The command runs in the ticket's worktree directory.
 }
 ```
 
+Each agent supports:
+
+- `command` — the binary to run (looked up on `PATH`). Multiple agents may share the same `command`.
+- `args` — default CLI arguments.
+- `env` — environment variables injected into the agent's process. A leading `~/` in a value is expanded to your home directory.
+- `label` — display name shown in the sidebar and status toasts (defaults to the config key).
+- `status_file` — where the agent writes status, relative to the worktree.
+- `init_prompt` — a per-agent prompt template override.
+
+Argument wrapping and status detection are keyed off `command`, so an agent whose `command` is `claude` is treated as Claude regardless of its config key.
+
+### Multiple Claude profiles (e.g. work vs personal)
+
+Claude Code selects its account/config via the `CLAUDE_CONFIG_DIR` environment variable. To manage projects for two Claude installs, define two agents that share `command: "claude"` and differ only by `env`:
+
+```json
+{
+  "agents": {
+    "claude": {
+      "label": "Claude (Default)",
+      "command": "claude",
+      "args": ["--dangerously-skip-permissions"],
+      "status_file": ".claude/status.json"
+    },
+    "claude-custom": {
+      "label": "Claude (Custom)",
+      "command": "claude",
+      "args": ["--dangerously-skip-permissions"],
+      "env": { "CLAUDE_CONFIG_DIR": "~/.claude-personal" },
+      "status_file": ".claude/status.json"
+    }
+  }
+}
+```
+
+Both presets ship by default; edit `claude-custom`'s `CLAUDE_CONFIG_DIR` to point at your alternate config directory. New built-in agents are merged into an existing `config.json` on load, so the second preset appears automatically after an upgrade.
+
+### Per-project agent (the pin)
+
+Which agent launches is chosen **per project, and nowhere else** — there is no per-ticket or global agent picker. Focus a project in the sidebar (`Tab`, then `j`/`k`) and press `g` to cycle its pinned agent; the choice is saved to the project and shown beneath its name. Every ticket in that project — including background spawns (`Ctrl+Space`) — launches the pinned agent.
+
+A project with **no pin refuses to spawn** (`Pin a Claude for this project first — press g in the sidebar`). This is deliberate: it makes it impossible to accidentally launch the wrong Claude as long as you stay within your projects. Pin each project once.
+
+`defaults.default_agent` is no longer used to choose the spawn agent; it is auto-detected from `PATH` and only influences whether the OpenCode server is pre-started.
+
 ### Init Prompt Variables
 
 When spawning an agent, OpenKanban can inject ticket context:
@@ -289,7 +334,6 @@ Press `O` to open the settings menu. You can configure these options without edi
 | Setting | Description |
 |---------|-------------|
 | Theme | Color theme (use j/k to navigate, live preview) |
-| Default Agent | Which agent to spawn (opencode, claude, gemini, codex, aider) |
 | Confirm Quit | Prompt before quitting with running agents |
 | Branch Prefix | Prefix for auto-generated branch names |
 | Delete Worktree | Remove git worktree when deleting tickets |
@@ -417,6 +461,10 @@ All keybindings are shown in-app with `?`. Custom keybindings coming soon.
 | `l` | Return to board |
 | `j/k` | Navigate projects |
 | `enter` | Select project filter |
+| `g` | Pin / cycle the project's agent (which Claude launches) |
+| `a` | Add project |
+| `d` | Delete project |
+| `o` | Toggle open-only ticket counts |
 
 ### Agent View
 

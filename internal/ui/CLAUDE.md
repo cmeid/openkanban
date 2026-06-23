@@ -236,6 +236,30 @@ Discipline:
 
 The race detector only catches observed concurrency. A test that drives the cmd synchronously (`cmd()` inline) will miss the race. See `board_resync.go` for the canonical shape — goroutine loads its own `*ProjectRegistry`; the handler reloads the model's registry. `daemon_resync.go` follows the same rule: its goroutine reads only `api` (externally synchronized) and never touches `m`.
 
+## Agent identity is project-pinned (no per-ticket / global picker)
+
+Which agent (and thus which Claude profile / `CLAUDE_CONFIG_DIR`) launches is
+chosen **per project, and nowhere else**. The mechanism:
+
+- `project.Settings.DefaultAgent` is the pin. The sidebar `g` key cycles it
+  (`cycleProjectAgent`) and persists via `registry.Update`.
+- Every spawn site resolves through `Model.resolveSpawnAgent(ticket, proj)`:
+  `ticket.AgentType` (resume continuity) → `proj.Settings.DefaultAgent` →
+  `errNoProjectAgent`. There is **no** fallback to `config.Defaults.DefaultAgent`.
+  An unpinned project refuses to spawn — that's the guard against accidentally
+  launching the wrong Claude.
+- Behavior (arg wrapping at `buildSpawnReq`'s `switch`, daemon status) keys off
+  `agentCfg.Command` (basename), not the config map key. So two presets with
+  `command: "claude"` (e.g. `claude` + `claude-custom`) both get Claude
+  treatment; they differ only by `Env` (`CLAUDE_CONFIG_DIR`). Per-agent `Env` is
+  injected at spawn with a leading `~/` expanded (`expandLeadingTilde`).
+
+Do NOT reintroduce a ticket-form agent picker or a global Default-Agent setting
+— that reopens the accidental-wrong-Claude path the project pin closes.
+`TestNoGlobalDefaultAgentInSpawnPath` (a static guard) fails if `model.go`
+reads `Defaults.DefaultAgent` again. The struct field still exists and is read
+by `internal/app` only for the OpenCode-server autostart decision.
+
 ## Anti-Patterns
 
 - Don't block in Update() - use Cmd for async
