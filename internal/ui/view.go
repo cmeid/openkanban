@@ -80,6 +80,9 @@ func (m *Model) View() string {
 	if m.mode == ModeCreateProject {
 		return m.renderWithOverlay(m.renderCreateProjectForm())
 	}
+	if m.mode == ModeEditProject {
+		return m.renderWithOverlay(m.renderProjectEditForm())
+	}
 
 	b.WriteString("\n")
 	b.WriteString(m.renderStatusBar())
@@ -901,6 +904,7 @@ func (m *Model) contextualHints(hintStyle lipgloss.Style, sep string, maxWidth i
 				{key: "o", label: "open only", prio: 1},
 				{key: "a", label: "add", prio: 2},
 				{key: "d", label: "delete", prio: 3},
+				{key: "e", label: "edit project", prio: 5},
 				{key: "g", label: "pin agent", prio: 4},
 				{key: "l/Esc", label: "back", prio: 6, pinned: true},
 			}, hintStyle, sep, maxWidth)
@@ -1143,6 +1147,7 @@ func (m *Model) renderHelp() string {
 		"  " + keyStyle.Render("a") + descStyle.Render("     Add project             ") + keyStyle.Render("Ctrl+\\") + descStyle.Render("  Prev session (in view)") + "\n" +
 		"  " + keyStyle.Render("d") + descStyle.Render("     Delete project          ") + keyStyle.Render("Ctrl+Space") + descStyle.Render(" Promote + bg agent") + "\n" +
 		"  " + keyStyle.Render("o") + descStyle.Render("     Toggle open only        ") + keyStyle.Render("r") + descStyle.Render("       Recover/destroy stuck session") + "\n" +
+		"  " + keyStyle.Render("e") + descStyle.Render("     Edit project + agents") + "\n" +
 		"  " + keyStyle.Render("g") + descStyle.Render("     Pin project agent") + "\n\n" +
 		sep + "\n" +
 		sectionStyle.Render("  👁 View") + "                       " + sectionStyle.Render("⚙ System") + "\n" +
@@ -2531,7 +2536,7 @@ func (m *Model) renderSidebar() string {
 
 	hintStyle := lipgloss.NewStyle().Foreground(m.colors.muted).Italic(true)
 	if m.sidebarFocused {
-		lines = append(lines, hintStyle.Render("  ⏎tog a/d g:agt o:open"))
+		lines = append(lines, hintStyle.Render("  a/d/e g:agt o:open"))
 	} else {
 		lines = append(lines, hintStyle.Render("  h→focus  [hide"))
 	}

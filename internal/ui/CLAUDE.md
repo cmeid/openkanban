@@ -257,7 +257,18 @@ Which agent (and thus which Claude profile / `CLAUDE_CONFIG_DIR`) launches is
 chosen **per project, and nowhere else**. The mechanism:
 
 - `project.Settings.DefaultAgent` is the pin. The sidebar `g` key cycles it
-  (`cycleProjectAgent`) and persists via `registry.Update`.
+  (`cycleProjectAgent`, over `enabledAgentNames()`) and persists via `registry.Update`.
+- The sidebar `e` key opens `ModeEditProject` (`internal/ui/project_edit.go`) — a
+  unified editor for the project (name + pin → projects.json) AND the shared
+  agent registry (label/command/args/env/enabled → config.json via `config.Save`).
+  Editing two config files in one screen is intentional. It uses ONE reused
+  `peInput` bound to the focused text field with a working copy (`peAgents`);
+  `peSyncFromField`/`peSyncToField` move values in/out on field change.
+- Agent availability: `config.AgentConfig.IsEnabled()` is a tri-state — `Enabled
+  *bool` override (`&true`/`&false`) else PATH auto-detect (`exec.LookPath`).
+  `enabledAgentNames()` filters the pin cycle so uninstalled agents don't clutter
+  it (falls back to all if none qualify). A disabled agent a project is pinned to
+  still spawns — disabled only hides it from selection.
 - Every spawn site resolves through `Model.resolveSpawnAgent(ticket, proj)`:
   `ticket.AgentType` (resume continuity) → `proj.Settings.DefaultAgent` →
   `errNoProjectAgent`. There is **no** fallback to `config.Defaults.DefaultAgent`.

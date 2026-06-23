@@ -132,6 +132,26 @@ A project with **no pin refuses to spawn** (`Pin a Claude for this project first
 
 `defaults.default_agent` is no longer used to choose the spawn agent; it is auto-detected from `PATH` and only influences whether the OpenCode server is pre-started.
 
+### Editing agents in the TUI (`e`)
+
+Focus a project in the sidebar and press **`e`** for a unified editor that edits **both** the project (name + pinned agent → `projects.json`) **and** the shared agent registry (→ `config.json`) in one screen. Per agent you can edit the **label, command, args, and env** (e.g. point `claude-custom`'s `CLAUDE_CONFIG_DIR` at a different directory) and set its **enabled** state. `Tab`/`↑`/`↓` move between fields, `←`/`→` toggle selectors (the pin and each agent's enabled state), `Ctrl+S` saves, `Esc` cancels. (`g` remains a quick one-press cycle of just the pin.)
+
+### Enabling / disabling agents
+
+Each agent has an `enabled` tri-state controlling whether it's offered in the pin cycle and editor:
+
+- omitted / `auto` (default) — shown only when its `command` resolves on `PATH`, so agents you haven't installed (aider, codex, …) don't clutter the picker.
+- `true` — always shown, even if the command isn't on `PATH`.
+- `false` — always hidden.
+
+Set it in the `e` editor (the enabled selector) or by hand:
+
+```json
+{ "agents": { "aider": { "command": "aider", "enabled": false } } }
+```
+
+A project pinned to a disabled agent still spawns it (disabled only hides it from selection).
+
 ### Init Prompt Variables
 
 When spawning an agent, OpenKanban can inject ticket context:
@@ -462,6 +482,7 @@ All keybindings are shown in-app with `?`. Custom keybindings coming soon.
 | `j/k` | Navigate projects |
 | `enter` | Select project filter |
 | `g` | Pin / cycle the project's agent (which Claude launches) |
+| `e` | Edit project + agents (unified editor) |
 | `a` | Add project |
 | `d` | Delete project |
 | `o` | Toggle open-only ticket counts |

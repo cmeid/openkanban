@@ -49,6 +49,7 @@ const (
 	ModeSpawning      Mode = "SPAWNING"
 	ModeFilter        Mode = "FILTER"
 	ModeCreateProject Mode = "NEW_PROJECT"
+	ModeEditProject   Mode = "EDIT_PROJECT"
 )
 
 // SortMode controls the order tickets appear within each column.
@@ -276,6 +277,16 @@ type Model struct {
 
 	formScrollOffset int
 	formFieldLines   map[int]int
+
+	// Project-edit form (ModeEditProject): unified editor for project name +
+	// pin (projects.json) and the shared agent registry (config.json).
+	editingProjectID string
+	peName           string
+	peProjectAgent   string
+	peAgents         []peAgentRow
+	peField          int
+	peScrollOffset   int
+	peInput          textinput.Model
 
 	notification string
 	notifyTime   time.Time
@@ -1393,6 +1404,8 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleCreateTicketMode(msg)
 	case ModeEditTicket:
 		return m.handleEditTicketMode(msg)
+	case ModeEditProject:
+		return m.handleProjectEditForm(msg)
 	case ModeAgentView:
 		return m.handleAgentViewMode(msg)
 	case ModeSettings:
@@ -1600,6 +1613,11 @@ func (m *Model) handleSidebarNav(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.cycleProjectAgent(projects[m.sidebarIndex-1])
 		}
 		return m, nil
+	case "e":
+		if m.sidebarIndex > 0 && m.sidebarIndex <= len(projects) {
+			return m.editProject(projects[m.sidebarIndex-1])
+		}
+		return m, nil
 	case "esc":
 		m.sidebarFocused = false
 	}
@@ -1616,7 +1634,7 @@ func (m *Model) cycleProjectAgent(proj *project.Project) {
 	if proj == nil {
 		return
 	}
-	names := m.getAgentNames()
+	names := m.enabledAgentNames()
 	if len(names) == 0 {
 		return
 	}
@@ -6077,6 +6095,25 @@ func (m *Model) getAgentNames() []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// enabledAgentNames returns the configured agent keys that are enabled
+// (PATH-auto-detected or explicitly overridden via AgentConfig.Enabled), sorted.
+// This is the set offered in the per-project pin cycle, so uninstalled agents
+// don't clutter it. Falls back to all configured agents if none qualify (so a
+// machine with an unusual PATH never strands the user with an empty cycle).
+func (m *Model) enabledAgentNames() []string {
+	all := m.getAgentNames()
+	enabled := make([]string, 0, len(all))
+	for _, name := range all {
+		if cfg, ok := m.config.Agents[name]; ok && cfg.IsEnabled() {
+			enabled = append(enabled, name)
+		}
+	}
+	if len(enabled) == 0 {
+		return all
+	}
+	return enabled
 }
 
 func (m *Model) getBranchPrefix(proj *project.Project) string {
