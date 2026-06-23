@@ -144,13 +144,13 @@ const (
 
 	formFieldTitle       = 0
 	formFieldDescription = 1
-	formFieldBranch      = 2
-	formFieldLabels      = 3
-	formFieldPriority    = 4
-	formFieldWorktree    = 5
-	formFieldAgent       = 6
-	formFieldBlockedBy   = 7
-	formFieldProject     = 8
+	formFieldProject     = 2
+	formFieldBranch      = 3
+	formFieldLabels      = 4
+	formFieldPriority    = 5
+	formFieldWorktree    = 6
+	formFieldAgent       = 7
+	formFieldBlockedBy   = 8
 )
 
 type choiceItem struct {
@@ -2309,6 +2309,13 @@ func (m *Model) handleTicketFormMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	formTop := (m.height - 28) / 2
 	relY := msg.Y - formTop
 
+	// Bands map screen rows to form fields in VISUAL order (see
+	// renderTicketForm). Project sits between Description and Branch. These
+	// fixed bands are a best-effort convenience for clicking-to-focus the
+	// upper fields; keyboard navigation (Tab / arrows / Enter) is the
+	// canonical, layout-accurate path. Because Project's list is
+	// variable-height once focused, clicks on list entries below its band
+	// are not resolved here — use the keyboard to pick a project.
 	var clickedField int = -1
 	switch {
 	case relY >= 3 && relY <= 4:
@@ -2316,13 +2323,13 @@ func (m *Model) handleTicketFormMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	case relY >= 6 && relY <= 9:
 		clickedField = formFieldDescription
 	case relY >= 11 && relY <= 13:
-		clickedField = formFieldBranch
-	case relY >= 15 && relY <= 17:
-		clickedField = formFieldLabels
-	case relY >= 19 && relY <= 21:
-		clickedField = formFieldPriority
-	case relY >= 23:
 		clickedField = formFieldProject
+	case relY >= 15 && relY <= 17:
+		clickedField = formFieldBranch
+	case relY >= 19 && relY <= 21:
+		clickedField = formFieldLabels
+	case relY >= 23:
+		clickedField = formFieldPriority
 	}
 
 	if clickedField >= 0 && msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
@@ -2332,7 +2339,9 @@ func (m *Model) handleTicketFormMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 
 		if clickedField == formFieldProject && !m.showAddProjectForm {
 			projects := m.globalStore.Projects()
-			projectRelY := relY - 24
+			// Project label is at relY 11, its description at 12, so the
+			// first project list row renders at 13 → maps to index 0.
+			projectRelY := relY - 13
 			if projectRelY >= 0 && projectRelY <= len(projects) {
 				m.projectListIndex = projectRelY
 				if projectRelY == len(projects) {
@@ -2737,7 +2746,7 @@ func (m *Model) nextFormField(isEdit bool) *Model {
 	m.ticketFormField++
 
 	for {
-		if m.ticketFormField > formFieldProject {
+		if m.ticketFormField > formFieldBlockedBy {
 			m.ticketFormField = formFieldTitle
 		}
 		if m.ticketFormField == formFieldBranch && m.branchLocked {
@@ -2760,7 +2769,7 @@ func (m *Model) prevFormField(isEdit bool) *Model {
 
 	for {
 		if m.ticketFormField < formFieldTitle {
-			m.ticketFormField = formFieldProject
+			m.ticketFormField = formFieldBlockedBy
 		}
 		if m.ticketFormField == formFieldBranch && m.branchLocked {
 			m.ticketFormField--
