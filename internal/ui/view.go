@@ -731,22 +731,11 @@ func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, w
 	}
 
 	border := ticketBorder
-	borderColor := m.colors.surface
-
-	if isHovered && !isSelected {
-		borderColor = m.colors.overlay
-	}
-
 	if isSelected {
 		border = ticketBorderSelected
-		borderColor = columnColor
 	}
-
-	// A stuck session's border is RED and wins over the selection
-	// color so the wedge stands out on the board.
-	if effectiveStatus == board.AgentStuck {
-		borderColor = m.colors.err
-	}
+	viewedElsewhere := m.daemonViewing[ticket.ID] > 0
+	borderColor := m.ticketBorderColor(effectiveStatus, isSelected, isHovered, viewedElsewhere, columnColor)
 
 	cardStyle := lipgloss.NewStyle().
 		Border(border).
@@ -757,6 +746,32 @@ func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, w
 		Width(width)
 
 	return cardStyle.Render(content)
+}
+
+// ticketBorderColor resolves a card's full-border color by precedence,
+// highest first:
+//   - stuck wedge  → error (red), so it stands out on the board
+//   - selected     → column color, preserving navigation feedback
+//   - viewedElsewhere (another TUI instance has this session open) → warning
+//     (amber), the same signal as the ◉ badge
+//   - hovered      → overlay
+//   - otherwise    → surface (blends into the card)
+//
+// The left-edge accent (BorderLeftForeground) is resolved separately from
+// the agent status and is unaffected by this.
+func (m *Model) ticketBorderColor(status board.AgentStatus, isSelected, isHovered, viewedElsewhere bool, columnColor lipgloss.Color) lipgloss.Color {
+	switch {
+	case status == board.AgentStuck:
+		return m.colors.err
+	case isSelected:
+		return columnColor
+	case viewedElsewhere:
+		return m.colors.warning
+	case isHovered:
+		return m.colors.overlay
+	default:
+		return m.colors.surface
+	}
 }
 
 func (m *Model) renderStatusBar() string {
