@@ -577,7 +577,7 @@ func TestAgentPriority(t *testing.T) {
 		t.Errorf("AgentPriority[0] = %q; want %q", AgentPriority[0], "opencode")
 	}
 
-	expected := []string{"opencode", "claude", "gemini", "codex", "aider"}
+	expected := []string{"opencode", "claude", "claude-custom", "gemini", "codex", "aider"}
 	if len(AgentPriority) != len(expected) {
 		t.Errorf("AgentPriority has %d items; want %d", len(AgentPriority), len(expected))
 	}
@@ -585,6 +585,63 @@ func TestAgentPriority(t *testing.T) {
 		if AgentPriority[i] != name {
 			t.Errorf("AgentPriority[%d] = %q; want %q", i, AgentPriority[i], name)
 		}
+	}
+}
+
+// TestMergeAgentDefaults_AddsNewBuiltin verifies that a user config lacking
+// "claude-custom" receives the built-in preset after mergeAgentDefaults runs.
+// Fixture A: agents map contains only "claude"; "claude-custom" is absent.
+func TestMergeAgentDefaults_AddsNewBuiltin(t *testing.T) {
+	cfg := &Config{
+		Agents: map[string]AgentConfig{
+			"claude": {
+				Command: "claude",
+				Args:    []string{"--dangerously-skip-permissions"},
+			},
+		},
+	}
+
+	// Confirm the precondition: claude-custom is absent before the merge.
+	if _, exists := cfg.Agents["claude-custom"]; exists {
+		t.Fatal("precondition failed: claude-custom should be absent before merge")
+	}
+
+	cfg.mergeAgentDefaults()
+
+	got, exists := cfg.Agents["claude-custom"]
+	if !exists {
+		t.Fatal("claude-custom was not added by mergeAgentDefaults")
+	}
+	if got.Command != "claude" {
+		t.Errorf("claude-custom.Command = %q; want %q", got.Command, "claude")
+	}
+	if got.Env["CLAUDE_CONFIG_DIR"] == "" {
+		t.Errorf("claude-custom.Env[CLAUDE_CONFIG_DIR] is empty; want non-empty")
+	}
+}
+
+// TestMergeAgentDefaults_BackfillsLabel verifies that a user "claude" entry
+// with an empty Label receives the default Label after mergeAgentDefaults runs.
+// Fixture B: user has "claude" with no Label set.
+func TestMergeAgentDefaults_BackfillsLabel(t *testing.T) {
+	cfg := &Config{
+		Agents: map[string]AgentConfig{
+			"claude": {
+				Command: "claude",
+				// Label deliberately left empty to exercise backfill.
+			},
+		},
+	}
+
+	// Confirm the precondition: Label is empty before the merge.
+	if cfg.Agents["claude"].Label != "" {
+		t.Fatalf("precondition failed: claude.Label = %q; want empty before merge", cfg.Agents["claude"].Label)
+	}
+
+	cfg.mergeAgentDefaults()
+
+	if got := cfg.Agents["claude"].Label; got != "Claude (Default)" {
+		t.Errorf("claude.Label after merge = %q; want %q", got, "Claude (Default)")
 	}
 }
 

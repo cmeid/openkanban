@@ -51,7 +51,7 @@ This is your assigned task. Implement what the description specifies.`
 
 // AgentPriority defines the order in which agents are preferred when auto-detecting.
 // The first available agent in this list becomes the default.
-var AgentPriority = []string{"opencode", "claude", "gemini", "codex", "aider"}
+var AgentPriority = []string{"opencode", "claude", "claude-custom", "gemini", "codex", "aider"}
 
 // DetectAvailableAgent returns the first agent from the priority list
 // whose command is available in PATH. Falls back to the first priority
@@ -103,6 +103,7 @@ type BoardSettings struct {
 
 // AgentConfig defines how to spawn and monitor an AI agent
 type AgentConfig struct {
+	Label      string            `json:"label,omitempty"`
 	Command    string            `json:"command"`
 	Args       []string          `json:"args"`
 	Env        map[string]string `json:"env"`
@@ -148,13 +149,23 @@ type DaemonSettings struct {
 func defaultAgents() map[string]AgentConfig {
 	return map[string]AgentConfig{
 		"claude": {
+			Label:      "Claude (Default)",
 			Command:    "claude",
 			Args:       []string{"--dangerously-skip-permissions"},
 			Env:        map[string]string{},
 			StatusFile: ".claude/status.json",
 			InitPrompt: defaultAgentPrompt,
 		},
+		"claude-custom": {
+			Label:      "Claude (Custom)",
+			Command:    "claude",
+			Args:       []string{"--dangerously-skip-permissions"},
+			Env:        map[string]string{"CLAUDE_CONFIG_DIR": "~/.claude-personal"},
+			StatusFile: ".claude/status.json",
+			InitPrompt: defaultAgentPrompt,
+		},
 		"opencode": {
+			Label:      "OpenCode",
 			Command:    "opencode",
 			Args:       []string{},
 			Env:        map[string]string{},
@@ -162,6 +173,7 @@ func defaultAgents() map[string]AgentConfig {
 			InitPrompt: defaultAgentPrompt,
 		},
 		"aider": {
+			Label:      "Aider",
 			Command:    "aider",
 			Args:       []string{"--yes"},
 			Env:        map[string]string{},
@@ -169,6 +181,7 @@ func defaultAgents() map[string]AgentConfig {
 			InitPrompt: defaultAiderPrompt,
 		},
 		"gemini": {
+			Label:      "Gemini",
 			Command:    "gemini",
 			Args:       []string{"--yolo"},
 			Env:        map[string]string{},
@@ -176,6 +189,7 @@ func defaultAgents() map[string]AgentConfig {
 			InitPrompt: defaultAgentPrompt,
 		},
 		"codex": {
+			Label:      "Codex",
 			Command:    "codex",
 			Args:       []string{"--full-auto"},
 			Env:        map[string]string{},
@@ -355,8 +369,16 @@ func (c *Config) ReloadFromDisk() error {
 func (c *Config) mergeAgentDefaults() {
 	defaults := DefaultConfig()
 
+	if c.Agents == nil {
+		c.Agents = make(map[string]AgentConfig)
+	}
+
 	for name, defaultCfg := range defaults.Agents {
 		if userCfg, exists := c.Agents[name]; exists {
+			// Backfill missing sub-fields for existing user agents.
+			if userCfg.Label == "" {
+				userCfg.Label = defaultCfg.Label
+			}
 			if userCfg.StatusFile == "" {
 				userCfg.StatusFile = defaultCfg.StatusFile
 			}
@@ -367,6 +389,9 @@ func (c *Config) mergeAgentDefaults() {
 				userCfg.InitPrompt = defaultCfg.InitPrompt
 			}
 			c.Agents[name] = userCfg
+		} else {
+			// Add brand-new default agent keys missing from the user config.
+			c.Agents[name] = defaultCfg
 		}
 	}
 }
