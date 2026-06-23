@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -75,6 +77,108 @@ func TestRenderHeaderActivityChipClearsCorner(t *testing.T) {
 	if limit := m.width - 25; end > limit {
 		t.Errorf("activity chip ends at col %d, want <= %d (clear of the top-right notification zone)\nline: %q", end, limit, chipLine)
 	}
+}
+
+// TestRenderHeaderActivityChipCountsAllOpenSessions pins the fix for the chip
+// undercounting open sessions. The chip total must equal the number of open
+// sessions (panes), with EVERY status bucketed in the breakdown — regardless of
+// (a) a stale pane.Running()==false on an unattached pane and (b) statuses the
+// old switch didn't credit (error/none/stuck/completed). Reverting either part
+// of the renderHeader fix turns this red.
+func TestRenderHeaderActivityChipCountsAllOpenSessions(t *testing.T) {
+	proj := &project.Project{ID: "test", RepoPath: t.TempDir()}
+	globalStore := project.NewGlobalTicketStore(nil)
+	globalStore.AddProject(proj)
+
+	cases := []struct {
+		id      string
+		status  board.AgentStatus
+		running bool // pane.Running(); false simulates a stale unattached pane
+	}{
+		{"w1", board.AgentWorking, true},
+		{"w2", board.AgentWorking, false}, // stale Running — previously dropped
+		{"wait1", board.AgentWaiting, true},
+		{"idle1", board.AgentIdle, true},
+		{"err1", board.AgentError, true},      // previously uncredited by the switch
+		{"stuck1", board.AgentStuck, true},    // previously uncredited by the switch
+		{"done1", board.AgentCompleted, true}, // previously uncredited by the switch
+		{"none1", board.AgentNone, true},      // spawned, no status yet -> "starting"
+	}
+
+	panes := map[board.TicketID]*daemonclient.PaneView{}
+	for _, c := range cases {
+		tid := board.TicketID(c.id)
+		ticket := &board.Ticket{
+			ID: tid, Title: c.id, ProjectID: "test",
+			Status: board.StatusInProgress, AgentStatus: c.status,
+		}
+		if err := globalStore.Add(ticket); err != nil {
+			t.Fatalf("Add %s: %v", c.id, err)
+		}
+		info := &daemon.SessionInfo{SessionID: "sid-" + c.id, TicketID: c.id, Running: c.running, Cols: 80, Rows: 24}
+		panes[tid] = daemonclient.NewPaneView(nil, c.id, info.SessionID, info)
+	}
+
+	m := &Model{
+		globalStore: globalStore,
+		panes:       panes,
+		spinner:     spinner.New(spinner.WithSpinner(spinner.Dot)),
+		colors:      newUIColors(config.DefaultConfig().GetTheme()),
+		width:       200,
+		height:      40,
+		config:      &config.Config{Agents: map[string]config.AgentConfig{}},
+	}
+
+	out := ansi.Strip(m.renderHeader())
+
+	// Total equals open-session count (8 panes), independent of status / stale Running.
+	if !strings.Contains(out, "8 sessions") {
+		t.Errorf("chip total: want %q (one per open pane); header was:\n%s", "8 sessions", out)
+	}
+	// Every non-zero bucket surfaces — including stuck/done, the switch branches
+	// the original fixture never exercised.
+	for _, want := range []string{"2 working", "1 waiting", "1 idle", "1 error", "1 stuck", "1 done", "1 starting"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("breakdown missing %q; header was:\n%s", want, out)
+		}
+	}
+
+	// Structural invariant: the breakdown counts must SUM to the announced total —
+	// pins "every status buckets, nothing double-counts or leaks" rather than just
+	// the specific statuses in this fixture. Parse the chip line.
+	var chipLine string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "sessions") {
+			chipLine = line
+			break
+		}
+	}
+	if chipLine == "" {
+		t.Fatalf("chip line not found; header was:\n%s", out)
+	}
+	total := mustAtoi(t, regexp.MustCompile(`(\d+) sessions`).FindStringSubmatch(chipLine), "total")
+	sum := 0
+	for _, m := range regexp.MustCompile(`(\d+) (?:working|waiting|idle|starting|stuck|error|done)`).FindAllStringSubmatch(chipLine, -1) {
+		sum += mustAtoi(t, m, "bucket")
+	}
+	if sum != total {
+		t.Errorf("breakdown sum %d != announced total %d; chip line: %q", sum, total, chipLine)
+	}
+	if total != len(cases) {
+		t.Errorf("announced total %d != open panes %d; chip line: %q", total, len(cases), chipLine)
+	}
+}
+
+func mustAtoi(t *testing.T, match []string, what string) int {
+	t.Helper()
+	if len(match) < 2 {
+		t.Fatalf("could not parse %s from chip", what)
+	}
+	n, err := strconv.Atoi(match[1])
+	if err != nil {
+		t.Fatalf("parse %s %q: %v", what, match[1], err)
+	}
+	return n
 }
 
 func TestAgentStatusGlyph(t *testing.T) {

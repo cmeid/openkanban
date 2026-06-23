@@ -114,16 +114,29 @@ func (m *Model) renderHeader() string {
 
 	left := lipgloss.JoinHorizontal(lipgloss.Center, logo, "  ", filterSection, "  ", stats)
 
-	workingCount, waitingCount, idleCount := 0, 0, 0
-	for ticketID, pane := range m.panes {
-		if !pane.Running() {
-			continue
-		}
+	// Activity chip. One entry per OPEN session — membership in m.panes IS the
+	// open-session signal (panes are Close()d + deleted on every "exited" event,
+	// expected or not; see daemon_subscribe.go). We deliberately do NOT gate on
+	// pane.Running(): for an unattached pane that flag is the cached lastInfo.Running
+	// from the last attach/list, which goes stale while the user sits on the board
+	// and dropped genuinely-live sessions from the count. The cards render status
+	// straight from ticket.AgentStatus (renderTicket) with no such gate, so the
+	// chip diverged below the card count.
+	//
+	// Every status is bucketed so the chip total always equals the number of open
+	// sessions, with a breakdown of the non-zero buckets. Pinned by the
+	// TestRenderHeaderActivityChip* tests.
+	var (
+		workingCount, waitingCount, idleCount int
+		stuckCount, errorCount, doneCount     int
+		startingCount, total                  int
+	)
+	for ticketID := range m.panes {
 		ticket, _ := m.globalStore.Get(ticketID)
 		if ticket == nil {
 			continue
 		}
-
+		total++
 		switch ticket.AgentStatus {
 		case board.AgentWorking:
 			workingCount++
@@ -131,6 +144,35 @@ func (m *Model) renderHeader() string {
 			waitingCount++
 		case board.AgentIdle:
 			idleCount++
+		case board.AgentStuck:
+			stuckCount++
+		case board.AgentError:
+			errorCount++
+		case board.AgentCompleted:
+			doneCount++
+		default: // AgentNone — spawned, not yet reported a status
+			startingCount++
+		}
+	}
+
+	// Breakdown buckets, ordered by salience. Only non-zero buckets render, and
+	// their counts always sum to total.
+	breakdownBuckets := []struct {
+		n     int
+		label string
+	}{
+		{workingCount, "working"},
+		{waitingCount, "waiting"},
+		{idleCount, "idle"},
+		{startingCount, "starting"},
+		{stuckCount, "stuck"},
+		{errorCount, "error"},
+		{doneCount, "done"},
+	}
+	var breakdownParts []string
+	for _, b := range breakdownBuckets {
+		if b.n > 0 {
+			breakdownParts = append(breakdownParts, fmt.Sprintf("%d %s", b.n, b.label))
 		}
 	}
 
@@ -138,22 +180,33 @@ func (m *Model) renderHeader() string {
 	var bgColor, fgColor lipgloss.Color
 	fgColor = m.colors.base
 
-	if waitingCount > 0 {
-		bgColor = m.colors.secondary
-		statusText = fmt.Sprintf("◐ %d waiting", waitingCount)
-		if workingCount > 0 {
-			statusText = fmt.Sprintf("◐ %d waiting, %d working", waitingCount, workingCount)
-		}
-	} else if workingCount > 0 {
-		bgColor = m.colors.warning
-		statusText = fmt.Sprintf("%s %d working", m.spinner.View(), workingCount)
-	} else if idleCount > 0 {
-		bgColor = m.colors.primary
-		statusText = fmt.Sprintf("◆ %d idle", idleCount)
-	} else {
+	if total == 0 {
 		bgColor = m.colors.surface
 		fgColor = m.colors.muted
 		statusText = "○ 0 sessions"
+	} else {
+		// Chip icon + color reflect the highest-priority state present:
+		// waiting (needs input) > stuck/error (problem) > working > idle > rest.
+		var icon string
+		switch {
+		case waitingCount > 0:
+			bgColor, icon = m.colors.secondary, "◐"
+		case stuckCount > 0:
+			bgColor, icon = m.colors.err, "⚠"
+		case errorCount > 0:
+			bgColor, icon = m.colors.err, "✗"
+		case workingCount > 0:
+			bgColor, icon = m.colors.warning, m.spinner.View()
+		case idleCount > 0:
+			bgColor, icon = m.colors.primary, "◆"
+		default: // starting / done only
+			bgColor, icon = m.colors.primary, "○"
+		}
+		noun := "sessions"
+		if total == 1 {
+			noun = "session"
+		}
+		statusText = fmt.Sprintf("%s %d %s · %s", icon, total, noun, strings.Join(breakdownParts, " "))
 	}
 
 	activity := lipgloss.NewStyle().

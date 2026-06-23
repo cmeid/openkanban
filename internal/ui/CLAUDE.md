@@ -75,11 +75,26 @@ Separate render methods composed in `View()`:
 All styling via lipgloss with theme-based `uiColors` struct.
 Never use raw ANSI codes in UI rendering.
 
-The board header's working/waiting **activity chip** (`renderHeader`) is intentionally pushed left
-of the right-edge help text by `const chipBannerGap` so it clears the top-right corner where macOS
-notification banners land. The resulting gap before `? help  q quit` is load-bearing — don't
-"tidy" it away; tune the constant to adjust banner clearance. Pinned by
-`TestRenderHeaderActivityChipClearsCorner`.
+The board header **activity chip** (`renderHeader`) shows `<icon> N sessions · <breakdown>` —
+the total `N` is the number of **open sessions** and the breakdown lists every non-zero status
+bucket (working/waiting/idle/starting/stuck/error/done), so the counts always sum to `N`.
+
+- **Count by `m.panes` membership, NOT `pane.Running()`.** A pane exists in `m.panes` iff the
+  daemon session is open (panes are `Close()`d + deleted on every `"exited"` event — see
+  `daemon_subscribe.go`). `pane.Running()` is the *cached* `lastInfo.Running` for an unattached
+  pane; it goes stale while the user sits on the board (it isn't refreshed without an attach/list)
+  and previously dropped genuinely-live sessions from the chip while their cards still rendered
+  `working` (cards read `ticket.AgentStatus` directly, with no liveness gate). Do NOT reintroduce
+  a `Running()` gate here. Pinned by `TestRenderHeaderActivityChipCountsAllOpenSessions` (its
+  `w2` case is a stale-`Running()==false` working pane that must still count).
+- **Bucket every status.** The old `switch` only credited working/waiting/idle, silently dropping
+  live sessions in error/none/stuck/completed. The total must equal open sessions, so unknown/none
+  maps to `starting`.
+- The chip is intentionally pushed left of the right-edge help text by `const chipBannerGap` so it
+  clears the top-right corner where macOS notification banners land. The chip is **right-anchored**
+  (right edge = `width - help - gap`), so a longer breakdown grows leftward and the gap before
+  `? help  q quit` is preserved. That gap is load-bearing — don't "tidy" it away; tune the constant
+  to adjust banner clearance. Pinned by `TestRenderHeaderActivityChipClearsCorner`.
 
 **Daemon wedge banner.** When `m.daemonWedged`, `renderHeader` replaces the `? help q quit`
 right cluster with a red "⚠ daemon wedged — run: openkanban daemon restart" banner. It's the
