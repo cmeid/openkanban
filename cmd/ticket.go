@@ -195,6 +195,15 @@ Description sources (mutually exclusive, in priority order):
 		}
 
 		if err := store.SaveTicket(ticket); err != nil {
+			// If we provisioned a worktree above, roll it back so a
+			// failed save doesn't leave an orphaned worktree+branch with
+			// no ticket referencing it (keeps the "all or nothing"
+			// guarantee true for SaveTicket failures too).
+			if ticket.WorktreePath != "" {
+				if rerr := git.NewWorktreeManager(proj).RemoveWorktree(ticket.WorktreePath); rerr != nil {
+					fmt.Fprintf(os.Stderr, "openkanban: roll back worktree %s: %v\n", ticket.WorktreePath, rerr)
+				}
+			}
 			return fmt.Errorf("save ticket: %w", err)
 		}
 

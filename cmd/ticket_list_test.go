@@ -149,7 +149,11 @@ func TestTicketList_InvalidStatusErrors(t *testing.T) {
 func TestTicketList_JSONStableSchema(t *testing.T) {
 	listTestEnv(t)
 	proj := registerListProject(t, "alpha")
-	addListTicket(t, proj, "no labels", board.StatusBacklog) // nil labels
+	// NOTE: store-loaded tickets always have Labels normalized to [] (by
+	// board.NewTicket + Unmarshal), so this path can't exercise the nil
+	// guard in newTicketListItem — TestNewTicketListItem_NilLabels does
+	// that directly. This test pins the on-the-wire shape end-to-end.
+	addListTicket(t, proj, "a ticket", board.StatusBacklog)
 
 	out, _, err := runTicketListCapture(t, "", nil, "", true)
 	if err != nil {
@@ -173,6 +177,30 @@ func TestTicketList_JSONStableSchema(t *testing.T) {
 	}
 	if string(raw[0]["labels"]) != "[]" {
 		t.Errorf("labels = %s, want [] (never null)", raw[0]["labels"])
+	}
+}
+
+// TestNewTicketListItem_NilLabels exercises the labels guard directly,
+// bypassing the store round-trip (which would normalize nil -> []). This
+// is the non-vacuous proof of the "labels is always an array" contract: a
+// ticket whose Labels field is explicitly nil must still serialize as [].
+func TestNewTicketListItem_NilLabels(t *testing.T) {
+	tk := board.NewTicket("x", "p")
+	tk.Labels = nil // force the field the store would otherwise normalize
+
+	item := newTicketListItem(tk)
+	if item.Labels == nil {
+		t.Fatal("newTicketListItem left Labels nil; want non-nil empty slice")
+	}
+	if len(item.Labels) != 0 {
+		t.Errorf("Labels = %v, want empty", item.Labels)
+	}
+	enc, err := json.Marshal(item)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(enc), `"labels":[]`) {
+		t.Errorf("json = %s, want labels:[]", enc)
 	}
 }
 
