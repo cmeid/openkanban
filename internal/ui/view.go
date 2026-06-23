@@ -1497,6 +1497,17 @@ func (m *Model) renderTicketForm() string {
 	fieldEndLines[formFieldDescription] = len(lines) - 1
 	currentLine = len(lines)
 
+	fieldStartLines[formFieldProject] = currentLine
+	lines = append(lines, projectFocus+projectLabel.Render("Project"))
+	lines = append(lines, "  "+descriptionStyle.Render("Repository where this ticket belongs"))
+	projectLines := strings.Split(projectField, "\n")
+	for _, pl := range projectLines {
+		lines = append(lines, "  "+pl)
+	}
+	lines = append(lines, "")
+	fieldEndLines[formFieldProject] = len(lines) - 1
+	currentLine = len(lines)
+
 	fieldStartLines[formFieldBranch] = currentLine
 	lines = append(lines, branchFocus+branchLabel.Render("Branch"))
 	lines = append(lines, "  "+branchDesc)
@@ -1546,17 +1557,6 @@ func (m *Model) renderTicketForm() string {
 	}
 	fieldEndLines[formFieldBlockedBy] = len(lines) - 1
 	currentLine = len(lines)
-
-	lines = append(lines, "")
-	currentLine = len(lines)
-	fieldStartLines[formFieldProject] = currentLine
-	lines = append(lines, projectFocus+projectLabel.Render("Project"))
-	lines = append(lines, "  "+descriptionStyle.Render("Repository where this ticket belongs"))
-	projectLines := strings.Split(projectField, "\n")
-	for _, pl := range projectLines {
-		lines = append(lines, "  "+pl)
-	}
-	fieldEndLines[formFieldProject] = len(lines) - 1
 
 	m.formFieldLines = fieldStartLines
 
