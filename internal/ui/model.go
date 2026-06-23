@@ -149,8 +149,7 @@ const (
 	formFieldLabels      = 4
 	formFieldPriority    = 5
 	formFieldWorktree    = 6
-	formFieldAgent       = 7
-	formFieldBlockedBy   = 8
+	formFieldBlockedBy   = 7
 )
 
 type choiceItem struct {
@@ -261,13 +260,10 @@ type Model struct {
 	labelsInput        textinput.Model
 	ticketPriority     int
 	ticketUseWorktree  bool
-	ticketAgent        string
-	agentListIndex     int
 	projectInput       textinput.Model
 	ticketFormField    int
 	editingTicketID    board.TicketID
 	branchLocked       bool
-	agentLocked        bool
 	selectedProject    *project.Project
 	projectListIndex   int
 	showAddProjectForm bool
@@ -2452,10 +2448,6 @@ func (m *Model) handleTicketForm(msg tea.KeyMsg, isEdit bool) (tea.Model, tea.Cm
 		cmd = m.handlePriorityNav(msg)
 	case formFieldWorktree:
 		cmd = m.handleWorktreeToggle(msg)
-	case formFieldAgent:
-		if !m.agentLocked {
-			cmd = m.handleAgentNav(msg)
-		}
 	case formFieldBlockedBy:
 		cmd = m.handleBlockerNav(msg)
 	case formFieldProject:
@@ -2498,27 +2490,6 @@ func (m *Model) handleWorktreeToggle(msg tea.KeyMsg) tea.Cmd {
 	return nil
 }
 
-func (m *Model) handleAgentNav(msg tea.KeyMsg) tea.Cmd {
-	agents := m.getAgentNames()
-	if len(agents) == 0 {
-		return nil
-	}
-
-	switch msg.String() {
-	case "j", "down", "l", "right":
-		m.agentListIndex++
-		if m.agentListIndex >= len(agents) {
-			m.agentListIndex = 0
-		}
-	case "k", "up", "h", "left":
-		m.agentListIndex--
-		if m.agentListIndex < 0 {
-			m.agentListIndex = len(agents) - 1
-		}
-	}
-	m.ticketAgent = agents[m.agentListIndex]
-	return nil
-}
 
 func (m *Model) handleProjectListNav(msg tea.KeyMsg) tea.Cmd {
 	projects := m.globalStore.Projects()
@@ -2757,10 +2728,6 @@ func (m *Model) nextFormField(isEdit bool) *Model {
 			m.ticketFormField++
 			continue
 		}
-		if m.ticketFormField == formFieldAgent && m.agentLocked {
-			m.ticketFormField++
-			continue
-		}
 		break
 	}
 	m.focusCurrentField()
@@ -2776,10 +2743,6 @@ func (m *Model) prevFormField(isEdit bool) *Model {
 			m.ticketFormField = formFieldBlockedBy
 		}
 		if m.ticketFormField == formFieldBranch && m.branchLocked {
-			m.ticketFormField--
-			continue
-		}
-		if m.ticketFormField == formFieldAgent && m.agentLocked {
 			m.ticketFormField--
 			continue
 		}
@@ -2863,9 +2826,6 @@ func (m *Model) saveTicketForm(isEdit bool) (tea.Model, tea.Cmd) {
 			ticket.Labels = labels
 			ticket.Priority = m.ticketPriority
 			ticket.UseWorktree = m.ticketUseWorktree
-			if !m.agentLocked {
-				ticket.AgentType = m.ticketAgent
-			}
 			ticket.BlockedBy = blockedBy
 			ticket.Touch()
 			m.saveTicket(ticket)
@@ -2883,7 +2843,6 @@ func (m *Model) saveTicketForm(isEdit bool) (tea.Model, tea.Cmd) {
 		ticket.Labels = labels
 		ticket.Priority = m.ticketPriority
 		ticket.UseWorktree = m.ticketUseWorktree
-		ticket.AgentType = m.ticketAgent
 		ticket.BlockedBy = blockedBy
 		// in_review and done are "outbound" columns — landing a brand new
 		// ticket there is almost never intentional, so fall back to
@@ -2938,7 +2897,6 @@ type settingsField struct {
 
 var settingsFields = []settingsField{
 	{"theme", "Theme", "theme", "Color theme for the UI"},
-	{"default_agent", "Default Agent", "agent", "Agent to spawn for new tickets (opencode, claude, aider)"},
 	{"confirm_quit", "Confirm Quit", "toggle", "Prompt before quitting with running agents"},
 	{"branch_prefix", "Branch Prefix", "text", "Prefix for auto-generated branch names (e.g. task/, feature/)"},
 	{"delete_worktree", "Delete Worktree", "toggle", "Remove git worktree when deleting tickets"},
@@ -3102,22 +3060,6 @@ func (m *Model) enterSettingsEdit() (tea.Model, tea.Cmd) {
 		m.settingsEditing = true
 		return m, nil
 
-	case "agent":
-		agents := m.getAgentNames()
-		current := m.config.Defaults.DefaultAgent
-		currentIndex := 0
-		for i, a := range agents {
-			if a == current {
-				currentIndex = i
-				break
-			}
-		}
-		nextIndex := (currentIndex + 1) % len(agents)
-		nextAgent := agents[nextIndex]
-		m.applySettingsValue(field.key, nextAgent)
-		m.notify("Default agent: " + nextAgent)
-		return m, nil
-
 	case "text":
 		m.settingsEditing = true
 		m.settingsInput.SetValue(m.getSettingsValue(field.key))
@@ -3136,8 +3078,6 @@ func (m *Model) getSettingsValue(key string) string {
 	switch key {
 	case "theme":
 		return m.config.UI.Theme
-	case "default_agent":
-		return m.config.Defaults.DefaultAgent
 	case "confirm_quit":
 		if m.config.Behavior.ConfirmQuitWithAgents {
 			return "On"
@@ -3181,9 +3121,6 @@ func (m *Model) applySettingsValue(key, value string) {
 		m.config.UI.Theme = value
 		m.theme = m.config.GetTheme()
 		m.colors = newUIColors(m.theme)
-		m.config.Save("")
-	case "default_agent":
-		m.config.Defaults.DefaultAgent = value
 		m.config.Save("")
 	case "confirm_quit":
 		m.config.Behavior.ConfirmQuitWithAgents = !m.config.Behavior.ConfirmQuitWithAgents
@@ -3479,7 +3416,6 @@ func (m *Model) createNewTicket() (tea.Model, tea.Cmd) {
 	m.ticketFormField = formFieldTitle
 	m.editingTicketID = ""
 	m.branchLocked = false
-	m.agentLocked = false
 	m.showAddProjectForm = false
 
 	if len(m.filterProjectIDs) == 1 {
@@ -3503,9 +3439,6 @@ func (m *Model) createNewTicket() (tea.Model, tea.Cmd) {
 			}
 		}
 	}
-
-	m.ticketAgent = m.getDefaultAgent()
-	m.agentListIndex = m.getAgentIndex(m.ticketAgent)
 
 	m.titleInput.Reset()
 	m.descInput.Reset()
@@ -3536,7 +3469,6 @@ func (m *Model) editTicket() (tea.Model, tea.Cmd) {
 	m.ticketFormField = formFieldTitle
 	m.editingTicketID = ticket.ID
 	m.branchLocked = ticket.WorktreePath != ""
-	m.agentLocked = ticket.AgentSpawnedAt != nil
 	m.selectedProject = m.globalStore.GetProjectForTicket(ticket)
 	m.projectListIndex = 0
 	if m.selectedProject != nil {
@@ -3561,12 +3493,6 @@ func (m *Model) editTicket() (tea.Model, tea.Cmd) {
 		m.ticketPriority = 3
 	}
 	m.ticketUseWorktree = ticket.UseWorktree
-	if ticket.AgentType != "" {
-		m.ticketAgent = ticket.AgentType
-	} else {
-		m.ticketAgent = m.getDefaultAgent()
-	}
-	m.agentListIndex = m.getAgentIndex(m.ticketAgent)
 
 	m.initBlockerCandidates(ticket.ID)
 	m.selectedBlockers = make(map[board.TicketID]bool)
@@ -3990,9 +3916,10 @@ func (m *Model) promoteAndSpawnUnattached() (tea.Model, tea.Cmd) {
 			}
 		}
 	}
-	agentType := ticket.AgentType
-	if agentType == "" {
-		agentType = m.config.Defaults.DefaultAgent
+	agentType, agentErr := m.resolveSpawnAgent(ticket, proj)
+	if agentErr != nil {
+		m.notify(noProjectAgentMsg)
+		return m, nil
 	}
 	agentCfg, ok := m.config.Agents[agentType]
 	if !ok {
@@ -4601,9 +4528,10 @@ func (m *Model) spawnAgent() (tea.Model, tea.Cmd) {
 		}
 	}
 
-	agentType := ticket.AgentType
-	if agentType == "" {
-		agentType = m.config.Defaults.DefaultAgent
+	agentType, agentErr := m.resolveSpawnAgent(ticket, proj)
+	if agentErr != nil {
+		m.notify(noProjectAgentMsg)
+		return m, nil
 	}
 	agentCfg, ok := m.config.Agents[agentType]
 	if !ok {
@@ -4801,6 +4729,29 @@ type spawnReqInputs struct {
 	// terminal.Pane gates its OSC 9 → desktop-notification handler on
 	// this per session, rather than relying on a process-wide global.
 	forwardNotifications bool
+}
+
+// noProjectAgentMsg is shown when a spawn is attempted in a project with no
+// pinned agent. Agent identity is chosen at the project level (sidebar 'g');
+// there is no global fallback by design — this guards against accidentally
+// launching the wrong agent in an unpinned project.
+const noProjectAgentMsg = "Pin a Claude for this project first — press g in the sidebar"
+
+// errNoProjectAgent signals a spawn was attempted in a project with no pinned agent.
+var errNoProjectAgent = errors.New("no project agent pinned")
+
+// resolveSpawnAgent returns the agent key to spawn for a ticket. A ticket that
+// already carries an AgentType keeps it (resume continuity); otherwise the
+// project's pinned DefaultAgent is authoritative. An unpinned project returns
+// errNoProjectAgent and the caller must refuse the spawn (no global fallback).
+func (m *Model) resolveSpawnAgent(ticket *board.Ticket, proj *project.Project) (string, error) {
+	if ticket != nil && ticket.AgentType != "" {
+		return ticket.AgentType, nil
+	}
+	if proj != nil && proj.Settings.DefaultAgent != "" {
+		return proj.Settings.DefaultAgent, nil
+	}
+	return "", errNoProjectAgent
 }
 
 // expandLeadingTilde expands a leading "~/" in an env value to the user's
@@ -6074,18 +6025,35 @@ func (m *Model) getAgentNames() []string {
 	return names
 }
 
-func (m *Model) getDefaultAgent() string {
-	return m.config.Defaults.DefaultAgent
+
+func (m *Model) getBranchPrefix(proj *project.Project) string {
+	if proj != nil && proj.Settings.BranchPrefix != "" {
+		return proj.Settings.BranchPrefix
+	}
+	if m.config.Defaults.BranchPrefix != "" {
+		return m.config.Defaults.BranchPrefix
+	}
+	return "task/"
 }
 
-func (m *Model) getAgentIndex(agentName string) int {
-	agents := m.getAgentNames()
-	for i, name := range agents {
-		if name == agentName {
-			return i
-		}
+func (m *Model) getBranchTemplate(proj *project.Project) string {
+	if proj != nil && proj.Settings.BranchTemplate != "" {
+		return proj.Settings.BranchTemplate
 	}
-	return 0
+	if m.config.Defaults.BranchTemplate != "" {
+		return m.config.Defaults.BranchTemplate
+	}
+	return "{prefix}{slug}"
+}
+
+func (m *Model) getSlugMaxLength(proj *project.Project) int {
+	if proj != nil && proj.Settings.SlugMaxLength > 0 {
+		return proj.Settings.SlugMaxLength
+	}
+	if m.config.Defaults.SlugMaxLength > 0 {
+		return m.config.Defaults.SlugMaxLength
+	}
+	return 40
 }
 
 // T2 of the integration plan removed maybeAutoStopCompletedPane.

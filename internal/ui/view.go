@@ -1419,7 +1419,6 @@ func (m *Model) renderTicketForm() string {
 	labelsLabel := labelStyle
 	priorityLabel := labelStyle
 	worktreeLabel := labelStyle
-	agentLabel := labelStyle
 	blockerLabel := labelStyle
 	projectLabel := labelStyle
 
@@ -1439,8 +1438,6 @@ func (m *Model) renderTicketForm() string {
 		priorityLabel = activeLabelStyle
 	case formFieldWorktree:
 		worktreeLabel = activeLabelStyle
-	case formFieldAgent:
-		agentLabel = activeLabelStyle
 	case formFieldBlockedBy:
 		blockerLabel = activeLabelStyle
 	case formFieldProject:
@@ -1460,7 +1457,6 @@ func (m *Model) renderTicketForm() string {
 
 	priorityField := m.renderPrioritySelector()
 	worktreeField := m.renderWorktreeSelector()
-	agentField := m.renderAgentSelector()
 	blockerField := m.renderBlockerSelector()
 	projectField := m.renderProjectSelector()
 
@@ -1476,7 +1472,7 @@ func (m *Model) renderTicketForm() string {
 	focusIndicator := lipgloss.NewStyle().Foreground(m.colors.info).Render("▸ ")
 	noFocus := "  "
 
-	titleFocus, descFocus, branchFocus, labelsFocus, priorityFocus, worktreeFocus, agentFocus, blockerFocus, projectFocus := noFocus, noFocus, noFocus, noFocus, noFocus, noFocus, noFocus, noFocus, noFocus
+	titleFocus, descFocus, branchFocus, labelsFocus, priorityFocus, worktreeFocus, blockerFocus, projectFocus := noFocus, noFocus, noFocus, noFocus, noFocus, noFocus, noFocus, noFocus
 	switch m.ticketFormField {
 	case formFieldTitle:
 		titleFocus = focusIndicator
@@ -1490,8 +1486,6 @@ func (m *Model) renderTicketForm() string {
 		priorityFocus = focusIndicator
 	case formFieldWorktree:
 		worktreeFocus = focusIndicator
-	case formFieldAgent:
-		agentFocus = focusIndicator
 	case formFieldBlockedBy:
 		blockerFocus = focusIndicator
 	case formFieldProject:
@@ -1561,14 +1555,6 @@ func (m *Model) renderTicketForm() string {
 	lines = append(lines, "  "+worktreeField)
 	lines = append(lines, "")
 	fieldEndLines[formFieldWorktree] = len(lines) - 1
-	currentLine = len(lines)
-
-	fieldStartLines[formFieldAgent] = currentLine
-	lines = append(lines, agentFocus+agentLabel.Render("Agent"))
-	lines = append(lines, "  "+descriptionStyle.Render("AI agent to use for this ticket"))
-	lines = append(lines, "  "+agentField)
-	lines = append(lines, "")
-	fieldEndLines[formFieldAgent] = len(lines) - 1
 	currentLine = len(lines)
 
 	fieldStartLines[formFieldBlockedBy] = currentLine
@@ -1726,32 +1712,6 @@ func (m *Model) renderWorktreeSelector() string {
 	return worktreeOption + "  " + mainOption + hint
 }
 
-func (m *Model) renderAgentSelector() string {
-	agents := m.getAgentNames()
-	if len(agents) == 0 {
-		return m.dimStyle().Render("No agents configured")
-	}
-
-	var parts []string
-	for _, agent := range agents {
-		style := lipgloss.NewStyle().Foreground(m.colors.primary)
-		if m.ticketAgent == agent {
-			style = style.Bold(true).Background(m.colors.surface).Padding(0, 1)
-			parts = append(parts, style.Render("● "+agent))
-		} else {
-			parts = append(parts, style.Render("○ "+agent))
-		}
-	}
-
-	hint := ""
-	if m.ticketFormField == formFieldAgent && !m.agentLocked {
-		hint = "  " + m.dimStyle().Render("← → to select")
-	} else if m.agentLocked {
-		hint = "  " + m.dimStyle().Render("(locked - agent already spawned)")
-	}
-
-	return strings.Join(parts, "  ") + hint
-}
 
 func (m *Model) renderBlockerSelector() string {
 	if len(m.blockerCandidates) == 0 {

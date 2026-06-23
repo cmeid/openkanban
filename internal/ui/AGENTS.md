@@ -62,7 +62,7 @@ const (
     formFieldLabels      = 3
     formFieldPriority    = 4
     formFieldWorktree    = 5
-    formFieldAgent       = 6
+    formFieldBlockedBy   = 6
     formFieldProject     = 7
 )
 ```

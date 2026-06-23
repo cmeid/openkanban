@@ -25,6 +25,7 @@ type Project struct {
 type ProjectSettings struct {
 	AutoSpawnAgent   bool   `json:"auto_spawn_agent"`
 	AutoCreateBranch bool   `json:"auto_create_branch"`
+	DefaultAgent     string `json:"default_agent,omitempty"` // pinned agent key (config.Agents key); empty = unpinned
 	BranchPrefix     string `json:"branch_prefix,omitempty"`
 	BranchNaming     string `json:"branch_naming,omitempty"`   // "template" | "ai" | "prompt"
 	BranchTemplate   string `json:"branch_template,omitempty"` // e.g., "{prefix}{slug}"
