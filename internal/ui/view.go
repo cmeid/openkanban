@@ -502,8 +502,7 @@ func (m *Model) renderColumn(colIdx int, col board.Column, tickets []*board.Tick
 }
 
 func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, width int, columnColor lipgloss.Color, index, total int) string {
-	pane, hasPane := m.panes[ticket.ID]
-	isRunning := hasPane && pane.Running()
+	_, hasPane := m.panes[ticket.ID]
 
 	effectiveStatus := ticket.AgentStatus
 
@@ -730,11 +729,6 @@ func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, w
 	case board.AgentStuck:
 		accentColor = m.colors.err
 	}
-	if isRunning && effectiveStatus != board.AgentStuck {
-		// A stuck session's pane is still "running", but its red accent
-		// must win over the running-green so the wedge is visible.
-		accentColor = m.colors.success
-	}
 
 	border := ticketBorder
 	borderColor := m.colors.surface
@@ -748,12 +742,8 @@ func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, w
 		borderColor = columnColor
 	}
 
-	if isRunning {
-		borderColor = m.colors.success
-	}
-
-	// A stuck session's border is RED and wins over the running-green
-	// and selection color so the wedge stands out on the board.
+	// A stuck session's border is RED and wins over the selection
+	// color so the wedge stands out on the board.
 	if effectiveStatus == board.AgentStuck {
 		borderColor = m.colors.err
 	}
