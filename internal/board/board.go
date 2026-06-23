@@ -73,6 +73,16 @@ const (
 	// handles it like any other value; the TUI surfaces it as a red card
 	// with a recover/destroy modal.
 	AgentStuck AgentStatus = "stuck"
+	// AgentSubagents marks a foreground agent that is idle but occupied:
+	// it spawned background sub-agents and is awaiting them (Claude Code's
+	// "✻ Waiting for N background agent(s) to finish"). It is NOT blocked on
+	// the user — distinct from AgentWaiting — so the UI renders it calm/gray
+	// and Auto-mode (needsAttention) deliberately skips it. Detection-derived
+	// from the live screen (no hook writes it); not a terminal state. If
+	// Claude's status-line wording drifts, detection fails safe back to
+	// today's AgentWaiting behavior — see backgroundAgentSignatures in
+	// internal/agent/status.go.
+	AgentSubagents AgentStatus = "subagents"
 )
 
 type Ticket struct {

@@ -128,6 +128,7 @@ func (m *Model) renderHeader() string {
 	// TestRenderHeaderActivityChip* tests.
 	var (
 		workingCount, waitingCount, idleCount int
+		subagentsCount                        int
 		stuckCount, errorCount, doneCount     int
 		startingCount, total                  int
 	)
@@ -144,6 +145,8 @@ func (m *Model) renderHeader() string {
 			waitingCount++
 		case board.AgentIdle:
 			idleCount++
+		case board.AgentSubagents:
+			subagentsCount++
 		case board.AgentStuck:
 			stuckCount++
 		case board.AgentError:
@@ -164,6 +167,7 @@ func (m *Model) renderHeader() string {
 		{workingCount, "working"},
 		{waitingCount, "waiting"},
 		{idleCount, "idle"},
+		{subagentsCount, "sub-agents"},
 		{startingCount, "starting"},
 		{stuckCount, "stuck"},
 		{errorCount, "error"},
@@ -186,7 +190,8 @@ func (m *Model) renderHeader() string {
 		statusText = "○ 0 sessions"
 	} else {
 		// Chip icon + color reflect the highest-priority state present:
-		// waiting (needs input) > stuck/error (problem) > working > idle > rest.
+		// waiting (needs input) > stuck/error (problem) > working >
+		// sub-agents (occupied, not on you) > idle > rest.
 		var icon string
 		switch {
 		case waitingCount > 0:
@@ -197,6 +202,8 @@ func (m *Model) renderHeader() string {
 			bgColor, icon = m.colors.err, "✗"
 		case workingCount > 0:
 			bgColor, icon = m.colors.warning, m.spinner.View()
+		case subagentsCount > 0:
+			bgColor, icon = m.colors.muted, "⊟"
 		case idleCount > 0:
 			bgColor, icon = m.colors.primary, "◆"
 		default: // starting / done only
@@ -519,6 +526,10 @@ func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, w
 				Foreground(m.colors.primary).
 				Render("◆")
 		}
+	case board.AgentSubagents:
+		sessionBadge = lipgloss.NewStyle().
+			Foreground(m.colors.muted).
+			Render("⊟")
 	case board.AgentCompleted:
 		sessionBadge = lipgloss.NewStyle().
 			Foreground(m.colors.success).
@@ -641,6 +652,10 @@ func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, w
 			statusIcon = "◆"
 			statusText = "idle"
 			statusColor = m.colors.primary
+		case board.AgentSubagents:
+			statusIcon = "⊟"
+			statusText = "sub-agents"
+			statusColor = m.colors.muted
 		case board.AgentWorking:
 			statusIcon = m.spinner.View()
 			statusText = "working"
@@ -702,6 +717,8 @@ func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, w
 		if hasPane {
 			accentColor = m.colors.primary
 		}
+	case board.AgentSubagents:
+		accentColor = m.colors.muted
 	case board.AgentCompleted:
 		accentColor = m.colors.success
 	case board.AgentError:
@@ -2157,6 +2174,8 @@ func agentStatusGlyph(s board.AgentStatus) (icon, label string) {
 		return "◐", "waiting"
 	case board.AgentIdle:
 		return "◆", "idle"
+	case board.AgentSubagents:
+		return "⊟", "sub-agents"
 	case board.AgentCompleted:
 		return "✓", "done"
 	case board.AgentError:
@@ -2170,7 +2189,7 @@ func agentStatusGlyph(s board.AgentStatus) (icon, label string) {
 // renderAgentStatusPill returns a styled "<icon> <label>" pill for the
 // embedded-session title bar, or "" for AgentNone. Color tracks status
 // severity (working=success, waiting=warning, completed=success-dim,
-// error=err, idle=muted).
+// error=err, idle=muted, subagents=muted).
 func (m *Model) renderAgentStatusPill(s board.AgentStatus) string {
 	icon, label := agentStatusGlyph(s)
 	if icon == "" {
@@ -2183,6 +2202,8 @@ func (m *Model) renderAgentStatusPill(s board.AgentStatus) string {
 	case board.AgentWaiting:
 		color = m.colors.warning
 	case board.AgentIdle:
+		color = m.colors.muted
+	case board.AgentSubagents:
 		color = m.colors.muted
 	case board.AgentCompleted:
 		color = m.colors.success

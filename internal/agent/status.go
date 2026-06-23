@@ -170,6 +170,26 @@ const WaitingActivityTTL = 60 * time.Second
 // opencode HTTP API call.
 func (d *StatusDetector) DetectStatusWithActivity(agentType, fileSessionName, apiSessionID, worktreePath string, port int, processRunning bool, terminalContent string, lastActivity time.Time) board.AgentStatus {
 	status := d.DetectStatusWithPortAPI(agentType, fileSessionName, apiSessionID, worktreePath, port, processRunning, terminalContent)
+	// Terminal states are authoritative — never override them with a screen
+	// heuristic. (Guard ordered first so the background-wait check below can't
+	// resurrect a completed/errored session that happens to still show the
+	// line in scrollback.)
+	if status == board.AgentCompleted || status == board.AgentError {
+		return status
+	}
+	// Background-sub-agent wait wins over a stale file value. When a Claude
+	// turn delegates to background sub-agents, NO hook fires for the wait, so
+	// the status file stays pinned at whatever it last was ("working", or
+	// "waiting" from the delegating turn's permission prompt) — and the leading
+	// "Waiting for ..." text would otherwise classify as AgentWaiting (orange,
+	// needs-you). The screen is the discriminator: the foreground agent is
+	// idle-but-occupied, not blocked on the user. Placed ABOVE the working/
+	// waiting branches (the working branch below returns) so it applies
+	// regardless of file status. Empty grid → backgroundWaitVisible is false →
+	// existing logic unchanged.
+	if backgroundWaitVisible(terminalContent) {
+		return board.AgentSubagents
+	}
 	// Stale-"working" refinement — the symmetric counterpart to the
 	// "waiting" refinement below. The hook status file can stay pinned at
 	// "working" while the session is actually blocked on the user: Claude's
@@ -241,6 +261,40 @@ func (d *StatusDetector) DetectStatusWithActivity(agentType, fileSessionName, ap
 var permissionPromptSignatures = []string{
 	"do you want to",
 	"esc to cancel",
+}
+
+// backgroundAgentSignatures are substrings that appear only on Claude
+// Code's "✻ Waiting for N background agent(s) to finish" status line — the
+// foreground agent has delegated to sub-agents and is idle-but-occupied,
+// NOT blocked on the user. Deliberately narrow (the full status-line tail,
+// including "to finish") so an agent that merely mentions "background agent"
+// in its own output — e.g. an agent working on THIS feature — is not
+// mislabeled. Same fail-safe stance as activeTurnMarkers: if the wording
+// drifts, matching stops and detection falls back to today's behavior.
+var backgroundAgentSignatures = []string{
+	"background agent to finish",
+	"background agents to finish",
+}
+
+// backgroundWaitVisible reports whether the tail of the PTY content shows
+// the background-sub-agent wait line. Scoped to the last lines (mirrors
+// permissionPromptVisible) so a line that has scrolled off doesn't pin the
+// status.
+func backgroundWaitVisible(content string) bool {
+	if content == "" {
+		return false
+	}
+	lines := strings.Split(content, "\n")
+	if len(lines) > 15 {
+		lines = lines[len(lines)-15:]
+	}
+	tail := strings.ToLower(strings.Join(lines, "\n"))
+	for _, sig := range backgroundAgentSignatures {
+		if strings.Contains(tail, sig) {
+			return true
+		}
+	}
+	return false
 }
 
 // permissionPromptVisible reports whether the tail of the PTY content
@@ -331,6 +385,18 @@ func (d *StatusDetector) detectFromTerminalContent(agentType, content string) bo
 }
 
 func (d *StatusDetector) detectCodingAgentStatus(recentLower, fullLower string) board.AgentStatus {
+	// Background-sub-agent wait first — it must beat the "waiting for" keyword
+	// below, which would otherwise classify "Waiting for N background agent to
+	// finish" as AgentWaiting (needs-you). This terminal-content path is only
+	// reached when there is NO status file (a hookless agent); a hooked Claude
+	// session short-circuits in DetectStatusWithPortAPI and is handled by the
+	// high-precedence block in DetectStatusWithActivity instead.
+	for _, sig := range backgroundAgentSignatures {
+		if strings.Contains(recentLower, sig) {
+			return board.AgentSubagents
+		}
+	}
+
 	waitingPatterns := []string{
 		"waiting for",
 		"do you want",

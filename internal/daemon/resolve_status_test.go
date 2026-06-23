@@ -83,6 +83,19 @@ func TestResolveStatusVerdict(t *testing.T) {
 			want:         "working",
 		},
 		{
+			// A bg-spawned session awaiting its own sub-agents resolves to
+			// the distinct "subagents" verdict (idle-but-occupied), NOT the
+			// "waiting" the file is pinned at — exactly the unattached case
+			// the daemon exists to classify.
+			name:         "claude awaiting background sub-agents resolves subagents",
+			detector:     d,
+			agentType:    "claude",
+			sessionName:  name,
+			content:      "✻ Waiting for 2 background agents to finish",
+			lastActivity: recent,
+			want:         "subagents",
+		},
+		{
 			name:        "opencode yields no daemon verdict",
 			detector:    d,
 			agentType:   "opencode",

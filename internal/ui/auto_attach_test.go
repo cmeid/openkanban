@@ -58,6 +58,36 @@ func newAutoTestModel(cols [][]*board.Ticket, livePaneIDs []board.TicketID) *Mod
 	}
 }
 
+// TestNeedsAttention pins the Auto-mode jump-target predicate across the
+// whole enum. The load-bearing row is AgentSubagents == false: a foreground
+// agent awaiting its own background sub-agents is occupied, not blocked on
+// the user, so Auto-mode (Ctrl+g) must NOT jump to it. Before the status
+// existed the same session was AgentWaiting (== true) and Auto DID jump — the
+// bug this status fixes. A future "helpful" edit that adds it here would
+// silently reintroduce that.
+func TestNeedsAttention(t *testing.T) {
+	tests := []struct {
+		status board.AgentStatus
+		want   bool
+	}{
+		{board.AgentWaiting, true},
+		{board.AgentIdle, true},
+		{board.AgentStuck, true},
+		{board.AgentSubagents, false}, // the point of the ticket
+		{board.AgentWorking, false},
+		{board.AgentNone, false},
+		{board.AgentCompleted, false},
+		{board.AgentError, false},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.status), func(t *testing.T) {
+			if got := needsAttention(tt.status); got != tt.want {
+				t.Errorf("needsAttention(%q) = %v, want %v", tt.status, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestOldestWaitingPeer(t *testing.T) {
 	base := time.Date(2026, 6, 17, 12, 0, 0, 0, time.UTC)
 	old := waitingAt(base, 0)             // entered waiting first (oldest)

@@ -4179,6 +4179,14 @@ func (m *Model) focusAndPromptAttachSnap(target board.TicketID, sessions []daemo
 // with almost nothing to jump to. Also excludes none/completed/error (unknown
 // or terminal, not a live "come help me" signal). The activity override only
 // refines waiting→working; idle/stuck pass through untouched.
+//
+// Deliberately also excludes AgentSubagents: a foreground agent awaiting its
+// own background sub-agents is idle-but-occupied and needs nothing from the
+// user, so Auto-mode must NOT jump to it. (Before that status existed the
+// same session was classified AgentWaiting and Auto DID jump to it — the bug
+// this status fixes.) It shares idle's muted color but NOT idle's needs-you
+// semantics; when the sub-agents finish, detection re-derives a real status
+// (working/idle/waiting) and this picks it up then. Do not add it here.
 func needsAttention(s board.AgentStatus) bool {
 	return s == board.AgentWaiting || s == board.AgentIdle || s == board.AgentStuck
 }

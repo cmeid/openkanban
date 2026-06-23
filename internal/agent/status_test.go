@@ -82,6 +82,29 @@ func TestDetectCodingAgentStatus(t *testing.T) {
 			expected:    board.AgentWaiting,
 		},
 		{
+			// The core regression: the leading "waiting for" must NOT win —
+			// a foreground agent awaiting background sub-agents is occupied,
+			// not blocked on the user.
+			name:        "background agent wait (singular)",
+			recentLower: "✻ waiting for 1 background agent to finish",
+			fullLower:   "",
+			expected:    board.AgentSubagents,
+		},
+		{
+			name:        "background agents wait (plural)",
+			recentLower: "✻ waiting for 3 background agents to finish",
+			fullLower:   "",
+			expected:    board.AgentSubagents,
+		},
+		{
+			// Precision guard: "background agent" mentioned in prose without
+			// the "to finish" status-line tail must NOT trigger sub-agents.
+			name:        "prose mention of background agent is not the status line",
+			recentLower: "i'll spawn a background agent to handle the search",
+			fullLower:   "",
+			expected:    board.AgentNone,
+		},
+		{
 			name:        "permission request",
 			recentLower: "approve this change?",
 			fullLower:   "",
@@ -662,6 +685,69 @@ func TestDetectStatusWithActivity_StaleWorkingDemotedOnPrompt(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			d.InvalidateCache("sess")
+			got := d.DetectStatusWithActivity("claude", "sess", "sess", "", 0, true, tt.terminalContent, time.Now())
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestDetectStatusWithActivity_BackgroundAgentWait pins the sub-agents
+// status. A foreground Claude turn that delegated to background sub-agents
+// shows "✻ Waiting for N background agent(s) to finish" while NO hook fires
+// for the wait — so the status file stays pinned at its last value
+// ("working" from the turn, or "waiting" from the delegating turn's
+// permission prompt). The leading "Waiting for ..." would otherwise classify
+// as AgentWaiting (orange, needs-you). The screen is the discriminator: this
+// is idle-but-occupied, not blocked on the user. The check is placed ABOVE
+// the working/waiting branches so it wins regardless of the file value, but
+// MUST NOT override a terminal completed/error.
+//
+// These cases seed a real status file + processRunning=true so
+// DetectStatusWithPortAPI returns the file status and the new high-precedence
+// block is the thing under test (not a coincidental AgentNone fallthrough).
+func TestDetectStatusWithActivity_BackgroundAgentWait(t *testing.T) {
+	bgWaitGrid := strings.Join([]string{
+		"  Spawning helpers…",
+		"",
+		" ✻ Waiting for 1 background agent to finish (esc to interrupt)",
+	}, "\n")
+	bgWaitPlural := " ✻ Waiting for 3 background agents to finish"
+
+	tests := []struct {
+		name            string
+		fileBody        string
+		terminalContent string
+		want            board.AgentStatus
+	}{
+		// (a) file=waiting + bg line → subagents (the primary production case:
+		// the delegating turn left a "waiting" permission verdict behind).
+		{"waiting file plus bg line is subagents", "waiting", bgWaitGrid, board.AgentSubagents},
+		// (b) file=working + bg line → subagents. Proves the new block sits
+		// ABOVE the working-branch return; otherwise this would stay working.
+		{"working file plus bg line is subagents", "working", bgWaitGrid, board.AgentSubagents},
+		{"working file plus plural bg line is subagents", "working", bgWaitPlural, board.AgentSubagents},
+		// (c) GUARD: a terminal status is authoritative even with the bg line
+		// still in scrollback. processRunning=true so it's the new terminal
+		// guard doing the work, not the not-running short-circuit.
+		{"completed file is not overridden", "completed", bgWaitGrid, board.AgentCompleted},
+		{"error file is not overridden", "error", bgWaitGrid, board.AgentError},
+		// (d) GUARD: prose mentioning "background agent" without the "to
+		// finish" status-line tail must NOT trigger sub-agents.
+		{"prose mention does not trigger", "working", "i'll use a background agent for this", board.AgentWorking},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			d := NewStatusDetector()
+			d.statusDirs = []string{tmpDir}
+			statusFile := filepath.Join(tmpDir, "sess.status")
+			if err := os.WriteFile(statusFile, []byte(tt.fileBody), 0644); err != nil {
+				t.Fatalf("write status: %v", err)
+			}
 			d.InvalidateCache("sess")
 			got := d.DetectStatusWithActivity("claude", "sess", "sess", "", 0, true, tt.terminalContent, time.Now())
 			if got != tt.want {
