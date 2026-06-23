@@ -41,7 +41,6 @@ func TestFormFieldTabOrder(t *testing.T) {
 		formFieldLabels,
 		formFieldPriority,
 		formFieldWorktree,
-		formFieldAgent,
 		formFieldBlockedBy,
 	}
 
