@@ -27,7 +27,7 @@ Uses `github.com/charmbracelet/x/vt` (`SafeEmulator`) for escape sequence parsin
 - Cursor management
 - Cell-based rendering
 - Color/attribute handling
-- Scroll regions, alt-screen, scrollback (we use our own scrollback ring, not charm's)
+- Scroll regions, alt-screen, scrollback — the daemon-side `Pane` uses its own `ScrollbackBuffer` ring (populated by `CaptureTopRow`/`PushScrolledLine`). NOTE: the **client** `daemonclient.PaneView` does NOT — it reads charm's native scrollback directly (`vt.ScrollbackLen`/`ScrollbackCellAt` via `RenderVTNativeScrollback`). The ring's row-0-snapshot producer under-captured multi-row scrolls (multi-line frames, soft-wrapped over-long lines); the emulator already wraps correctly, so the client trusts it. Don't "harmonize" the client back onto the ring.
 
 charm/x/vt emits *responses* (DA queries, cursor reports, etc.) through `Emulator.Read()`. We MUST spawn a goroutine that loops `Read()` → writes to the PTY, or the emulator deadlocks on the first query. See `Pane.startDrainUnlocked` and `stopDrainUnlocked`.
 

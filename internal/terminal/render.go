@@ -43,6 +43,88 @@ func RenderVT(vt *xvt.SafeEmulator, scrollback *ScrollbackBuffer, viewportOffset
 	return renderLiveScreen(vt, cursorVisible, selection, cols, rows)
 }
 
+// RenderVTNativeScrollback renders like RenderVT but uses the emulator's
+// OWN scrollback buffer (vt.ScrollbackLen / vt.ScrollbackCellAt) as the
+// history source instead of a separate ScrollbackBuffer.
+//
+// This matters for fidelity: the emulator performs line wrapping, so its
+// scrollback already contains every row that scrolled off the top —
+// including the wrapped rows produced by an over-long line with no
+// newline. The ScrollbackBuffer producer (CaptureTopRow/PushScrolledLine)
+// snapshots only one row per write and so cannot capture those, which left
+// gaps when scrolling back through agent output. Only the visible window
+// is read per frame, so this stays cheap regardless of history depth.
+//
+// daemonclient.PaneView uses this; the daemon-side terminal.Pane still
+// uses RenderVT with its own ScrollbackBuffer.
+func RenderVTNativeScrollback(vt *xvt.SafeEmulator, viewportOffset int, cursorVisible bool, selection *SelectionState) string {
+	if vt == nil {
+		return "Terminal not initialized"
+	}
+
+	cols := vt.Width()
+	rows := vt.Height()
+	if cols <= 0 || rows <= 0 {
+		return ""
+	}
+
+	if viewportOffset > 0 {
+		return renderScrolledViewNative(vt, viewportOffset, cursorVisible, selection, cols, rows)
+	}
+
+	return renderLiveScreen(vt, cursorVisible, selection, cols, rows)
+}
+
+// renderScrolledViewNative mirrors renderScrolledView but reads scrollback
+// rows from the emulator's native scrollback. The row/logical-row math is
+// identical so selection hit-testing stays consistent with the live path.
+func renderScrolledViewNative(vt *xvt.SafeEmulator, viewportOffset int, cursorVisible bool, selection *SelectionState, cols, rows int) string {
+	scrollbackLen := vt.ScrollbackLen()
+	offset := viewportOffset
+	if offset > scrollbackLen {
+		offset = scrollbackLen
+	}
+
+	var result strings.Builder
+	result.Grow(rows * cols * 2)
+
+	scrollbackRowsVisible := offset
+	if scrollbackRowsVisible > rows {
+		scrollbackRowsVisible = rows
+	}
+
+	scrollbackStart := scrollbackLen - offset
+
+	for viewRow := 0; viewRow < rows; viewRow++ {
+		if viewRow > 0 {
+			result.WriteByte('\n')
+		}
+
+		if viewRow < scrollbackRowsVisible {
+			scrollbackIdx := scrollbackStart + viewRow
+			logicalRow := scrollbackIdx - scrollbackLen
+			result.WriteString(renderNativeScrollbackLine(vt, scrollbackIdx, cols, logicalRow, selection))
+		} else {
+			liveRow := viewRow - scrollbackRowsVisible
+			result.WriteString(renderLiveRow(vt, cursorVisible, selection, cols, liveRow, liveRow))
+		}
+	}
+
+	return result.String()
+}
+
+// renderNativeScrollbackLine materializes scrollback line `idx` (0 =
+// oldest) from the emulator's native scrollback into Glyphs and renders it
+// via the shared renderGlyphLine path. Out-of-range columns read back as
+// nil cells, which CellToGlyph maps to blanks.
+func renderNativeScrollbackLine(vt *xvt.SafeEmulator, idx, cols, logicalRow int, selection *SelectionState) string {
+	line := make([]Glyph, cols)
+	for col := 0; col < cols; col++ {
+		line[col] = CellToGlyph(vt.ScrollbackCellAt(col, idx))
+	}
+	return renderGlyphLine(line, cols, logicalRow, selection)
+}
+
 // renderScrolledView renders a viewport that includes scrollback history
 // at the top and live content below. viewportOffset is the number of
 // lines we've scrolled back from the live view.
