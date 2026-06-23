@@ -928,7 +928,9 @@ func (s *Server) checkSessionWedge(id string, sess *Session, stuckSeen map[strin
 
 	// Best-effort desktop notification, fired in its own goroutine so it
 	// can never block the tick. Errors are logged, never fatal — the
-	// macOS bundle may be absent (notify is a no-op off-bundle). The
+	// macOS bundle may be absent (notify is a guarded no-op off-bundle;
+	// see the bundleIdentifier guard in notify_darwin.go — without it the
+	// off-bundle path abort()s the process, not a silent no-op). The
 	// primary surfaces are the WARN log + the "stuck" SessionEvent → TUI
 	// red card; the notification is a bonus.
 	ticketID := sess.TicketID()

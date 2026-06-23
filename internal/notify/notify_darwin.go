@@ -39,6 +39,17 @@ static void openkanbanRequestAuth(void) {
 
 static void openkanbanSendNotification(const char *body) {
     @autoreleasepool {
+        // UNUserNotificationCenter requires a bundle identity: from a
+        // non-bundled process (a CLI/test binary, a $PATH or tui-fork
+        // daemon) [UNUserNotificationCenter currentNotificationCenter]
+        // raises an NSInternalInconsistencyException and abort()s the
+        // whole process. Off-bundle we cannot deliver anyway, so no-op —
+        // restoring the silent-off-bundle contract the NSUserNotification
+        // backend had (and that notify_other.go documents). bundleIdentifier
+        // is nil iff we're off-bundle; non-nil in the .app (dev.cmeid.openkanban).
+        if ([[NSBundle mainBundle] bundleIdentifier] == nil) {
+            return;
+        }
         openkanbanRequestAuth();
 
         UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
