@@ -159,7 +159,7 @@ See [`internal/terminal/pane.go`](internal/terminal/pane.go) (`LastActivity`, wr
 
 ### 10. Directory-independent session resume
 
-Claude Code stores each session transcript in a project bucket keyed to the directory the session was *started* in (`~/.claude/projects/<cwd-with-slashes-as-dashes>/<uuid>.jsonl`), and `claude --resume <uuid>` only searches the bucket for the current directory and that repo's worktrees — there's no flag to resume a session from elsewhere. A session openkanban *creates* always starts in the ticket's worktree, so it resumes cleanly. But a session you started manually in some other directory and then linked to a ticket (`ticket new --session`) lives in a different bucket than the one openkanban launches the ticket from, so resuming it reported `No conversation found with session ID`.
+Claude Code stores each session transcript in a project bucket keyed to the directory the session was *started* in (`~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`, where the CLI encodes the cwd by replacing every non-alphanumeric character with `-`), and `claude --resume <uuid>` only searches the bucket for the current directory and that repo's worktrees — there's no flag to resume a session from elsewhere. A session openkanban *creates* always starts in the ticket's worktree, so it resumes cleanly. But a session you started manually in some other directory and then linked to a ticket (`ticket new --session`) lives in a different bucket than the one openkanban launches the ticket from, so resuming it reported `No conversation found with session ID`.
 
 This fork makes resume directory-independent by normalizing the transcript into the launch directory's bucket on every spawn:
 
