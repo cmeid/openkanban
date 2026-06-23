@@ -103,12 +103,28 @@ type BoardSettings struct {
 
 // AgentConfig defines how to spawn and monitor an AI agent
 type AgentConfig struct {
-	Label      string            `json:"label,omitempty"`
-	Command    string            `json:"command"`
-	Args       []string          `json:"args"`
+	Label   string   `json:"label,omitempty"`
+	Command string   `json:"command"`
+	Args    []string `json:"args"`
+	// Enabled is a tri-state override of PATH auto-detection: nil = auto (show
+	// when Command is on PATH), &true = force-shown, &false = force-hidden.
+	// Controls whether the agent appears in the per-project pin cycle / editor.
+	Enabled    *bool             `json:"enabled,omitempty"`
 	Env        map[string]string `json:"env"`
 	StatusFile string            `json:"status_file"`
 	InitPrompt string            `json:"init_prompt"`
+}
+
+// IsEnabled reports whether this agent should be offered for selection. An
+// explicit Enabled override wins; otherwise it's auto-detected by whether
+// Command resolves on PATH (so uninstalled agents like aider/codex don't
+// clutter the picker).
+func (a AgentConfig) IsEnabled() bool {
+	if a.Enabled != nil {
+		return *a.Enabled
+	}
+	_, err := exec.LookPath(a.Command)
+	return err == nil
 }
 
 // UIConfig holds UI-related preferences
@@ -132,9 +148,9 @@ type CleanupSettings struct {
 
 // BehaviorSettings controls application behavior preferences
 type BehaviorSettings struct {
-	ConfirmQuitWithAgents     bool `json:"confirm_quit_with_agents"`      // Prompt before quitting with running agents
-	CheckForUpdatesOnLaunch   bool `json:"check_for_updates_on_launch"`   // Quick update check before entering the TUI
-	ForwardAgentNotifications bool `json:"forward_agent_notifications"`   // Re-emit OSC 9 notifications from wrapped agents to the host terminal
+	ConfirmQuitWithAgents     bool `json:"confirm_quit_with_agents"`    // Prompt before quitting with running agents
+	CheckForUpdatesOnLaunch   bool `json:"check_for_updates_on_launch"` // Quick update check before entering the TUI
+	ForwardAgentNotifications bool `json:"forward_agent_notifications"` // Re-emit OSC 9 notifications from wrapped agents to the host terminal
 }
 
 // DaemonSettings controls how the TUI interacts with openkanbankd at
