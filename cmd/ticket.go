@@ -99,9 +99,9 @@ Description sources (mutually exclusive, in priority order):
 		}
 		if ticketNewStatus != "" {
 			switch board.TicketStatus(ticketNewStatus) {
-			case board.StatusBacklog, board.StatusInProgress, board.StatusInReview, board.StatusDone, board.StatusArchived:
+			case board.StatusBacklog, board.StatusNext, board.StatusInProgress, board.StatusInReview, board.StatusDone, board.StatusArchived:
 			default:
-				return fmt.Errorf("--status %q is not one of: backlog, in_progress, in_review, done, archived", ticketNewStatus)
+				return fmt.Errorf("--status %q is not one of: backlog, next, in_progress, in_review, done, archived", ticketNewStatus)
 			}
 		}
 		if ticketNewWorktree && ticketNewNoWorktree {
@@ -791,7 +791,7 @@ func init() {
 	ticketNewCmd.Flags().StringVar(&ticketNewDescriptionFile, "description-file", "",
 		"Read description from this file path instead of --description")
 	ticketNewCmd.Flags().StringVar(&ticketNewStatus, "status", "",
-		"Initial status: backlog (default), in_progress, in_review, done, archived")
+		"Initial status: backlog (default), next, in_progress, in_review, done, archived")
 	ticketNewCmd.Flags().StringVar(&ticketNewLabels, "labels", "",
 		"Comma-separated labels")
 	ticketNewCmd.Flags().IntVar(&ticketNewPriority, "priority", 0,

@@ -421,7 +421,7 @@ openkanban ticket new \
     --project <name|uuid|prefix> \
     --title "<title>" \
     [--description "<text>" | --description-file <path>] \
-    [--status backlog|in_progress|done|archived] \
+    [--status backlog|next|in_progress|in_review|done|archived] \
     [--labels foo,bar] \
     [--priority 1-5] \
     [--no-worktree] \

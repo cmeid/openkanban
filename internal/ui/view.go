@@ -328,6 +328,7 @@ func (m *Model) renderColumn(colIdx int, col board.Column, tickets []*board.Tick
 
 	columnIcons := map[board.TicketStatus]string{
 		board.StatusBacklog:    "📋",
+		board.StatusNext:       "⏭️",
 		board.StatusInProgress: "⚡",
 		board.StatusInReview:   "👀",
 		board.StatusDone:       "✅",
@@ -2662,6 +2663,8 @@ func (m *Model) columnColor(status board.TicketStatus) lipgloss.Color {
 	switch status {
 	case board.StatusBacklog:
 		return m.colors.primary
+	case board.StatusNext:
+		return m.colors.info
 	case board.StatusInProgress:
 		return m.colors.warning
 	case board.StatusInReview:

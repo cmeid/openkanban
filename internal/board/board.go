@@ -50,6 +50,7 @@ type TicketStatus string
 
 const (
 	StatusBacklog    TicketStatus = "backlog"
+	StatusNext       TicketStatus = "next"
 	StatusInProgress TicketStatus = "in_progress"
 	StatusInReview   TicketStatus = "in_review"
 	StatusDone       TicketStatus = "done"
@@ -194,6 +195,7 @@ type Column struct {
 func DefaultColumns() []Column {
 	return []Column{
 		{ID: "backlog", Name: "Backlog", Status: StatusBacklog, Color: "#89b4fa", Limit: 0},
+		{ID: "next", Name: "Next", Status: StatusNext, Color: "#94e2d5", Limit: 0},
 		{ID: "in-progress", Name: "In Progress", Status: StatusInProgress, Color: "#f9e2af", Limit: 3},
 		{ID: "in-review", Name: "In Review", Status: StatusInReview, Color: "#cba6f7", Limit: 0},
 		{ID: "done", Name: "Done", Status: StatusDone, Color: "#a6e3a1", Limit: 0},

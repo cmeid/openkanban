@@ -73,8 +73,8 @@ is the value the --id verbs (e.g. ticket delete) expect.
 
 Filters:
   --project          name, UUID, or unique 4+ char UUID prefix
-  --status           one or more of backlog,in_progress,in_review,done,
-                     archived (comma-separated or repeated)
+  --status           one or more of backlog,next,in_progress,in_review,
+                     done,archived (comma-separated or repeated)
   --title-contains   case-insensitive substring match on the title
 
 This command is READ-ONLY: it never migrates a project. Projects whose
@@ -95,10 +95,10 @@ same keys (Labels is always an array, timestamps are RFC3339).`,
 				continue
 			}
 			switch board.TicketStatus(s) {
-			case board.StatusBacklog, board.StatusInProgress, board.StatusInReview, board.StatusDone, board.StatusArchived:
+			case board.StatusBacklog, board.StatusNext, board.StatusInProgress, board.StatusInReview, board.StatusDone, board.StatusArchived:
 				statusFilter[board.TicketStatus(s)] = true
 			default:
-				return fmt.Errorf("--status %q is not one of: backlog, in_progress, in_review, done, archived", s)
+				return fmt.Errorf("--status %q is not one of: backlog, next, in_progress, in_review, done, archived", s)
 			}
 		}
 
@@ -220,7 +220,7 @@ func init() {
 	ticketListCmd.Flags().StringVar(&ticketListProject, "project", "",
 		"Filter by project: name, UUID, or unique 4+ char UUID prefix")
 	ticketListCmd.Flags().StringSliceVar(&ticketListStatus, "status", nil,
-		"Filter by status (comma-separated or repeated): backlog,in_progress,in_review,done,archived")
+		"Filter by status (comma-separated or repeated): backlog,next,in_progress,in_review,done,archived")
 	ticketListCmd.Flags().StringVar(&ticketListTitleContains, "title-contains", "",
 		"Filter to tickets whose title contains this substring (case-insensitive)")
 	ticketListCmd.Flags().BoolVar(&ticketListJSON, "json", false,
