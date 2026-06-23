@@ -22,12 +22,18 @@ var validStatuses = map[board.TicketStatus]bool{
 	board.StatusArchived:   true,
 }
 
-// validAgentStatuses mirrors board.AgentStatus enum.
+// validAgentStatuses mirrors board.AgentStatus enum — every value that may be
+// persisted to frontmatter and survive a reload must be listed here, or
+// parseTicketMarkdown hard-errors the whole ticket. (board.AgentStuck is
+// intentionally absent: it is a transient daemon-only verdict never written to
+// disk. board.AgentSubagents IS listed because the daemon/poll paths set it
+// in-memory and a subsequent save would serialize it.)
 var validAgentStatuses = map[board.AgentStatus]bool{
 	board.AgentNone:      true,
 	board.AgentIdle:      true,
 	board.AgentWorking:   true,
 	board.AgentWaiting:   true,
+	board.AgentSubagents: true,
 	board.AgentCompleted: true,
 	board.AgentError:     true,
 }
@@ -273,7 +279,7 @@ func validateFrontmatter(fm *ticketFrontmatter) error {
 	if fm.AgentStatus == "" {
 		fm.AgentStatus = board.AgentNone
 	} else if !validAgentStatuses[fm.AgentStatus] {
-		return fmt.Errorf("invalid agent_status %q (allowed: none, idle, working, waiting, completed, error)", fm.AgentStatus)
+		return fmt.Errorf("invalid agent_status %q (allowed: none, idle, working, waiting, subagents, completed, error)", fm.AgentStatus)
 	}
 
 	if !validAgentTypes[fm.AgentType] {

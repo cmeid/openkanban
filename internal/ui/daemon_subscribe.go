@@ -362,7 +362,8 @@ func (m *Model) applyDaemonStatus(ticket *board.Ticket, raw string) bool {
 	status := board.AgentStatus(raw)
 	switch status {
 	case board.AgentIdle, board.AgentWorking, board.AgentWaiting,
-		board.AgentCompleted, board.AgentError, board.AgentStuck:
+		board.AgentSubagents, board.AgentCompleted, board.AgentError,
+		board.AgentStuck:
 		// known, applicable value
 	default:
 		// AgentNone ("no verdict") and any unknown string: leave the

@@ -191,6 +191,7 @@ func TestAgentStatusGlyph(t *testing.T) {
 		{"working", board.AgentWorking, "●", "working"},
 		{"waiting", board.AgentWaiting, "◐", "waiting"},
 		{"idle", board.AgentIdle, "◆", "idle"},
+		{"subagents", board.AgentSubagents, "⊟", "sub-agents"},
 		{"completed", board.AgentCompleted, "✓", "done"},
 		{"error", board.AgentError, "✗", "error"},
 		{"none -> empty", board.AgentNone, "", ""},
@@ -207,6 +208,64 @@ func TestAgentStatusGlyph(t *testing.T) {
 				t.Errorf("label: got %q, want %q", label, tt.wantLbl)
 			}
 		})
+	}
+}
+
+// TestRenderHeaderSubagentsChip pins the header activity chip for the
+// sub-agents status: a session awaiting background sub-agents shows the calm
+// "⊟ N sub-agents" chip (NOT the orange "waiting"), and a genuine needs-you
+// "waiting" session still wins the single chip when both are present.
+func TestRenderHeaderSubagentsChip(t *testing.T) {
+	proj := &project.Project{ID: "test", RepoPath: t.TempDir()}
+	globalStore := project.NewGlobalTicketStore(nil)
+	globalStore.AddProject(proj)
+
+	panes := map[board.TicketID]*daemonclient.PaneView{}
+	add := func(id board.TicketID, st board.AgentStatus) {
+		ticket := &board.Ticket{ID: id, Title: string(id), ProjectID: "test", Status: board.StatusInProgress, AgentStatus: st}
+		if err := globalStore.Add(ticket); err != nil {
+			t.Fatalf("Add ticket %s: %v", id, err)
+		}
+		info := &daemon.SessionInfo{SessionID: "sid-" + string(id), TicketID: string(id), Running: true, Cols: 80, Rows: 24}
+		panes[id] = daemonclient.NewPaneView(nil, string(id), info.SessionID, info)
+	}
+
+	newM := func() *Model {
+		return &Model{
+			globalStore: globalStore,
+			panes:       panes,
+			spinner:     spinner.New(spinner.WithSpinner(spinner.Dot)),
+			colors:      newUIColors(config.DefaultConfig().GetTheme()),
+			width:       120,
+			height:      40,
+			config:      &config.Config{Agents: map[string]config.AgentConfig{}},
+		}
+	}
+
+	// Only a sub-agents session → calm "⊟" leading icon + a "sub-agents"
+	// breakdown bucket, and crucially NOT classified as "waiting".
+	add("sub-1", board.AgentSubagents)
+	out := ansi.Strip(newM().renderHeader())
+	if !strings.Contains(out, "⊟") {
+		t.Errorf("header missing sub-agents ⊟ icon; got:\n%s", out)
+	}
+	if !strings.Contains(out, "1 sub-agents") {
+		t.Errorf("header missing sub-agents breakdown bucket; got:\n%s", out)
+	}
+	if strings.Contains(out, "waiting") {
+		t.Errorf("sub-agents session must not render as waiting; got:\n%s", out)
+	}
+
+	// Add a genuine needs-you waiting session → waiting wins the leading
+	// icon (◐), but the sub-agents session must still be bucketed in the
+	// breakdown (not dropped — the chip total must account for every pane).
+	add("wait-1", board.AgentWaiting)
+	out = ansi.Strip(newM().renderHeader())
+	if !strings.Contains(out, "◐") {
+		t.Errorf("waiting must win the leading icon when present; got:\n%s", out)
+	}
+	if !strings.Contains(out, "1 waiting") || !strings.Contains(out, "1 sub-agents") {
+		t.Errorf("breakdown must list both waiting and sub-agents; got:\n%s", out)
 	}
 }
 

@@ -70,6 +70,16 @@ func TestAgentStatusResultMsgAppliesToDaemonOwnedTickets(t *testing.T) {
 		}
 	})
 
+	t.Run("daemon-owned ticket reflects subagents verdict", func(t *testing.T) {
+		// The sub-agents verdict (daemon-broadcast or file-poll) is a normal
+		// non-terminal transition and must land on a daemon-owned ticket,
+		// like working/idle/waiting — it must not be dropped as unknown.
+		m, ticket := newModel(board.AgentWorking, true)
+		if _, _ = m.Update(agentStatusResultMsg{tid: board.AgentSubagents}); ticket.AgentStatus != board.AgentSubagents {
+			t.Errorf("AgentStatus = %v, want %v", ticket.AgentStatus, board.AgentSubagents)
+		}
+	})
+
 	t.Run("AgentNone from poll does not clobber set state", func(t *testing.T) {
 		// The poll returns AgentNone when it can't determine status
 		// (no file, no terminal hits). That isn't a transition — don't
@@ -121,4 +131,25 @@ func TestAgentStatusResultMsgAppliesToDaemonOwnedTickets(t *testing.T) {
 				ticket.AgentStatus, board.AgentIdle)
 		}
 	})
+}
+
+// TestApplyDaemonStatusAcceptsSubagents pins the daemon-verdict allowlist arm:
+// a broadcast "subagents" verdict must be applied (not dropped as unknown),
+// while a genuinely unknown string is still rejected so the allowlist stays
+// meaningful.
+func TestApplyDaemonStatusAcceptsSubagents(t *testing.T) {
+	m := &Model{}
+
+	ticket := &board.Ticket{ID: "t", AgentStatus: board.AgentWorking}
+	if !m.applyDaemonStatus(ticket, "subagents") {
+		t.Fatalf("applyDaemonStatus returned false for the subagents verdict")
+	}
+	if ticket.AgentStatus != board.AgentSubagents {
+		t.Errorf("AgentStatus = %v, want %v", ticket.AgentStatus, board.AgentSubagents)
+	}
+
+	other := &board.Ticket{ID: "t2", AgentStatus: board.AgentWorking}
+	if m.applyDaemonStatus(other, "bogus") {
+		t.Errorf("applyDaemonStatus accepted an unknown verdict (allowlist breached)")
+	}
 }

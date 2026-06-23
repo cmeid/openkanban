@@ -111,6 +111,20 @@ func TestUnmarshalRejectsInvalidAgentStatus(t *testing.T) {
 	}
 }
 
+// TestUnmarshalAcceptsSubagentsAgentStatus pins that the detection-derived
+// "subagents" status round-trips through frontmatter. The daemon/poll paths
+// set it in-memory and a later save serializes it; without it in
+// validAgentStatuses, reload would hard-error the whole ticket.
+func TestUnmarshalAcceptsSubagentsAgentStatus(t *testing.T) {
+	tk, err := UnmarshalTicket(makeFrontmatter(t, map[string]string{"agent_status": "subagents"}))
+	if err != nil {
+		t.Fatalf("unexpected error for agent_status=subagents: %v", err)
+	}
+	if tk.AgentStatus != board.AgentSubagents {
+		t.Errorf("got %q, want %q", tk.AgentStatus, board.AgentSubagents)
+	}
+}
+
 func TestUnmarshalAcceptsValidAgentTypes(t *testing.T) {
 	for _, good := range []string{"claude", "opencode", "aider", "gemini", "codex", ""} {
 		label := good

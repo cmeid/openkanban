@@ -107,6 +107,32 @@ For a session **no TUI is attached to**, the client has no grid, so the daemon
 supplies the verdict from its own live grid — see `internal/daemon`
 `resolveSessionStatus`.
 
+#### Background-sub-agent wait wins above all refinements (`AgentSubagents`)
+
+Before the waiting/working refinements above, `DetectStatusWithActivity` runs
+two top-precedence checks on the freshly-read `status`:
+
+1. **terminal guard** — `AgentCompleted`/`AgentError` return immediately
+   (authoritative; never overridden by a screen heuristic).
+2. **`backgroundWaitVisible`** — when the live grid's tail shows Claude's
+   `"✻ Waiting for N background agent(s) to finish"` line (signatures
+   `"background agent to finish"` / `"background agents to finish"`, 15-line
+   tail like `permissionPromptVisible`), return `board.AgentSubagents`. The
+   foreground agent is idle-but-occupied — it delegated to sub-agents and is
+   NOT blocked on the user. NO hook fires for this wait, so the file stays
+   pinned at "working"/"waiting"; the leading "Waiting for…" text would
+   otherwise classify as `AgentWaiting` (orange, needs-you). This check sits
+   ABOVE the working-branch (which returns) so it wins regardless of the file
+   value. Same fail-safe stance as `activeTurnMarkers`: if the wording drifts
+   it stops matching and degrades to today's `AgentWaiting`.
+
+`AgentSubagents` is deliberately excluded from `needsAttention` (Auto-mode
+must not jump to it) and renders calm/gray. The `detectCodingAgentStatus`
+terminal-content path carries the same signature arm before its `"waiting for"`
+keyword scan, for hookless agents with no status file. See
+[[reference_openkanban_subagents_status]] and the new-status surface map
+[[reference_openkanban_agent_status_surface_map]].
+
 #### Refining a stale file-based "working" (the symmetric case)
 
 The mirror problem: the file stays pinned at `"working"` while the session is
