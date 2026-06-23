@@ -165,6 +165,17 @@ func (m *Model) renderHeader() string {
 
 	helpStyle := lipgloss.NewStyle().Foreground(m.colors.muted)
 	help := helpStyle.Render("? help  q quit")
+	// Daemon wedge warning takes over the right cluster (same line height, so
+	// no board-layout impact). The daemon reports a suspected wedge instead of
+	// self-restarting, so the user drives recovery.
+	if m.daemonWedged {
+		help = lipgloss.NewStyle().
+			Foreground(m.colors.base).
+			Background(m.colors.err).
+			Bold(true).
+			Padding(0, 1).
+			Render("⚠ daemon wedged — run: openkanban daemon restart")
+	}
 
 	// macOS notification banners cover the top-right corner. Push the
 	// working/waiting activity chip left of the (disposable, constant) help

@@ -321,6 +321,14 @@ type Model struct {
 		pv       *daemonclient.PaneView
 	}
 
+	// daemonWedged is set when the daemon's wedge watchdog reports a
+	// suspected dispatch wedge (a "daemon_wedged" SessionEvent, or
+	// HelloResp.SuspectedWedged at startup) and cleared on "daemon_unwedged".
+	// Drives a warning banner with the recovery hint. The daemon does NOT
+	// self-restart on a wedge (that would kill live sessions), so recovery is
+	// operator-driven: `openkanban daemon restart`.
+	daemonWedged bool
+
 	// daemonClient is the long-lived control connection to openkanbankd.
 	// nil when the daemon couldn't be reached at startup — every call
 	// site MUST nil-check before use (the TUI degrades to a no-spawn
@@ -637,6 +645,13 @@ func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projec
 		diag = daemonClient.DiagCounters
 	}
 	m.monitor = newStallMonitor(diag)
+
+	// If the daemon already suspected a wedge when we dialed in, surface the
+	// banner from the first frame (the daemon_wedged push only fires on the
+	// transition, so a TUI that connects mid-episode wouldn't otherwise know).
+	if daemonClient != nil && daemonClient.SuspectedWedgedAtHello() {
+		m.daemonWedged = true
+	}
 
 	return m
 }
@@ -1973,6 +1988,20 @@ func shouldRetryAttachOnEnter(pane *daemonclient.PaneView) bool {
 // phantom modal on the next agent-view entry, swallowing Ctrl+g though
 // the user never cycled.
 func (m *Model) exitToBoard() {
+	// Release the daemon attach when leaving a session's agent view. The
+	// daemon allows ONE attached client per session, and attach used to be
+	// held for the connection's whole life — so a TUI that merely backed out
+	// to the board kept the slot hostage and a second TUI got ErrAlreadyAttached
+	// and a blank pane (the 2026-06-22 report). Detaching here couples attach
+	// to viewing: re-entering re-attaches with a fresh snapshot. Detach() is
+	// non-blocking and a no-op when the pane isn't attached, so the async
+	// focus-drop paths (session exited, pane detached/exited, daemon
+	// disconnected) that also funnel through here are unaffected.
+	if m.focusedPane != "" {
+		if pv := m.panes[m.focusedPane]; pv != nil {
+			_ = pv.Detach()
+		}
+	}
 	m.mode = ModeNormal
 	m.focusedPane = ""
 	m.cycleAttachPrompt = false
@@ -3603,6 +3632,11 @@ func (m *Model) doAttach(ticketID board.TicketID, pv *daemonclient.PaneView, tak
 		}
 		if err != nil {
 			if !takeover && errors.Is(err, daemonclient.ErrAlreadyAttached) {
+				// Record the error so the agent-view backdrop behind the
+				// takeover modal renders the actionable overlay ("attached in
+				// another TUI") instead of a blank pane. A successful Takeover
+				// clears it automatically.
+				pv.SetLastAttachErr(err)
 				return attachConflictMsg{ticketID: id, pv: pv}
 			}
 			return spawnErrorMsg{ticketID: id, err: "attach failed: " + err.Error()}
@@ -5472,6 +5506,10 @@ func attachExistingFastPath(
 		// notice. Carry the freshly-built pv so the Update handler can
 		// register it (it isn't in m.panes yet) and arm the modal.
 		if errors.Is(attachErr, daemonclient.ErrAlreadyAttached) {
+			// Record the error so the backdrop behind the takeover modal
+			// shows the actionable overlay, not a blank pane (the "nothing
+			// visible in the session" report). Cleared on a successful Takeover.
+			pv.SetLastAttachErr(attachErr)
 			return attachConflictMsg{ticketID: ticketID, pv: pv}
 		}
 		log.Printf("openkanban model: fast-path attach failed ticket=%s session=%s err=%v",

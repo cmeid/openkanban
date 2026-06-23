@@ -23,6 +23,16 @@ import (
 // large too, keeping output cadence smooth.
 const snapshotChunkSize = 64 * 1024
 
+// attachReadKeepalive bounds how long binaryLoop blocks on a quiet attach
+// conn before probing it. A half-open client (process gone without a FIN, or
+// a local conn the kernel hasn't torn down) would otherwise pin the session's
+// single attach slot forever (the latent leak: a quiet ReadFrame never
+// returns). On timeout we probe with a zero-length output frame — a dead conn
+// fails the write and we release the slot; an idle-but-alive conn absorbs it
+// (the client skips zero-length TypePTYOutput) and we keep reading. Long
+// enough that a normal idle session almost never probes.
+const attachReadKeepalive = 60 * time.Second
+
 // handleAttach drives the Attach RPC. It runs synchronously on the
 // dispatcher goroutine and BLOCKS until the binary stream ends; that
 // way handleConn's outer JSON read loop sees a clean conn shutdown
@@ -293,6 +303,10 @@ func (s *Server) binaryLoop(c *clientConn, sess *Session, ac *attachedClient) {
 	}()
 
 	for {
+		// Bound the blocking read so a half-open conn can't pin the attach
+		// slot forever. The watcher also trips this deadline (to a past
+		// instant) on an external detach.
+		_ = c.conn.SetReadDeadline(time.Now().Add(attachReadKeepalive))
 		typ, payload, err := ReadFrame(c.r)
 		if err != nil {
 			if err == io.EOF || errors.Is(err, net.ErrClosed) {
@@ -309,6 +323,19 @@ func (s *Server) binaryLoop(c *clientConn, sess *Session, ac *attachedClient) {
 					return
 				default:
 				}
+				// Not a detach — our keepalive interval elapsed with no
+				// client input. Probe liveness: a zero-length output frame
+				// the client skips. If the write fails the conn is dead, so
+				// release the slot; otherwise reset the deadline and keep
+				// reading.
+				ac.WriteMu.Lock()
+				kerr := WriteFrame(ac.Conn, TypePTYOutput, nil)
+				ac.WriteMu.Unlock()
+				if kerr != nil {
+					log.Printf("openkanbankd: client %d keepalive probe failed; releasing attach: %v", c.id, kerr)
+					return
+				}
+				continue
 			}
 			log.Printf("openkanbankd: client %d binary read: %v", c.id, err)
 			return

@@ -81,6 +81,15 @@ notification banners land. The resulting gap before `? help  q quit` is load-bea
 "tidy" it away; tune the constant to adjust banner clearance. Pinned by
 `TestRenderHeaderActivityChipClearsCorner`.
 
+**Daemon wedge banner.** When `m.daemonWedged`, `renderHeader` replaces the `? help q quit`
+right cluster with a red "⚠ daemon wedged — run: openkanban daemon restart" banner. It's the
+same single header line, so there's NO board-layout impact (the column-height math is unchanged).
+The flag is set by the `daemon_wedged` SessionEvent (and `HelloResp.SuspectedWedged` at startup,
+read in `NewModel`) and cleared by `daemon_unwedged` — both handled in `applyDaemonSessionEvent`
+(`daemon_subscribe.go`) before the per-ticket block since they carry no TicketID. The daemon
+does NOT self-restart on a wedge (that would kill live sessions), so recovery is operator-driven.
+Pinned by `TestApplyDaemonSessionEvent_WedgeBannerToggles` / `TestRenderHeader_ShowsWedgeBanner`.
+
 ## Messages
 
 Custom messages for async operations:
@@ -136,6 +145,8 @@ Do **not** push `selectTicketByID` into `refreshColumnTickets` itself. That chok
 `panes map[board.TicketID]*daemonclient.PaneView` — one per spawned agent.
 
 PaneView is the client-side handle; the PTY itself lives in openkanbankd. Lifecycle is daemon-driven: `Spawn` happens server-side at construction time, `Attach` / `Detach` swap which TUI is the one attached client, and `daemonclient.PaneViewAttached` vs `PaneViewUnattached` describe what this TUI sees, not whether the agent is alive (the agent can be alive in the daemon while every TUI is `Unattached`). Methods preserve the old `*terminal.Pane` surface — see `internal/daemonclient/paneview.go` for the full 13-method shape and the unattached-state behavior table.
+
+**Attach is coupled to viewing, not session-lifetime.** `exitToBoard()` calls `pane.Detach()` on the focused pane when leaving the agent view, so a TUI sitting on the board does NOT hold the session's single daemon attach slot. Before this, a backgrounded TUI kept the slot for its whole connection life, so a second TUI got `ErrAlreadyAttached` and (with no `lastAttachErr` set) a blank pane — the 2026-06-22 report. Re-entering the view re-attaches with a fresh snapshot. `Detach()` is a no-op on an unattached pane, so the async focus-drop paths (session exited, pane detached/exited, daemon disconnected) that also funnel through `exitToBoard` are unaffected. NOTE: session→session focus switches (cycle / Auto) do not yet detach the previous pane — tracked as a follow-up.
 
 `Detach()` and `Close()` are non-blocking as of 2026-06-16. State mutations (state=Unattached, emulator teardown, detachCh swap) happen eagerly under `p.mu`; the underlying `attachLoopWG.Wait` runs in a goroutine with a 5s warning / 30s deadline watchdog. `PaneDetachedMsg` arrives whenever the read loop actually drains (not synchronously with the caller). `emitTeaMsg` and `Close` are serialised by a `teaMu sync.Mutex` so the goroutine can't send on a closed `teaMsgs` channel. Required reading before any teardown edit: memory [[reference_openkanban_paneview_detach_concurrency]].
 
