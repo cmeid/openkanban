@@ -419,6 +419,10 @@ type Model struct {
 
 	spawningTicketID board.TicketID
 	spawningAgent    string
+	// spawnStartedAt marks when the current spawn entered ModeSpawning.
+	// renderSpawning reads it to flip the overlay label from "Starting"
+	// to "Attaching" once the spawn RPC's bounded window has elapsed.
+	spawnStartedAt time.Time
 
 	settingsIndex   int
 	settingsEditing bool
@@ -4976,6 +4980,14 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 	baseBranch := ticket.BaseBranch
 	useWorktree := ticket.UseWorktree
 	width, height := m.width, m.height-2
+
+	// Stamp the spawn-overlay start time here — the single chokepoint all
+	// four ModeSpawning entry points funnel through — so the label-flip
+	// clock can't drift across call sites. Unattached (ctrl+space) spawns
+	// show no overlay, so they don't need it.
+	if !plan.Unattached {
+		m.spawnStartedAt = time.Now()
+	}
 
 	agentType := agentCfg.Command
 	if strings.Contains(agentType, "/") {

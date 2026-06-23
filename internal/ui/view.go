@@ -1334,6 +1334,24 @@ func (m *Model) renderShuttingDown() string {
 	)
 }
 
+// spawnAttachLabelDelay is how long the spawn overlay shows "Starting"
+// before switching to "Attaching". It matches the 5s spawn-RPC timeout
+// (the spawnCtx in prepareSpawnWith): once we've been in ModeSpawning
+// longer than that, the Spawn call has almost certainly returned (a
+// slower one times out into spawnErrorMsg), so the remaining wait is
+// attachWithRetry's ~8.6s window. "Almost" because spawnStartedAt is
+// stamped in the Update-thread prologue, a hair before the goroutine
+// arms spawnCtx — so right at the boundary the label can read "Attaching"
+// for a fraction of a second while a maximally-slow Spawn is still
+// resolving (worst case: a brief "Attaching" just before a spawn-failed
+// toast). Cosmetic; stamping inside the Cmd would tie it to the real RPC
+// clock but is a goroutine write to m, which the package forbids. Spawn
+// and attach run inside one tea.Cmd, so the Update loop never observes
+// the boundary — this time-based heuristic surfaces it in the View layer.
+// The spinner.TickMsg that re-renders ModeSpawning each tick makes the
+// label flip on its own with no extra plumbing.
+const spawnAttachLabelDelay = 5 * time.Second
+
 func (m *Model) renderSpawning() string {
 	agentName := m.spawningAgent
 	if agentName == "" {
@@ -1344,7 +1362,12 @@ func (m *Model) renderSpawning() string {
 		Foreground(m.colors.success).
 		Bold(true)
 
-	content := titleStyle.Render(m.spinner.View()+" Starting "+agentName) + "\n\n" +
+	label := "Starting " + agentName
+	if !m.spawnStartedAt.IsZero() && time.Since(m.spawnStartedAt) >= spawnAttachLabelDelay {
+		label = "Attaching to " + agentName + "…"
+	}
+
+	content := titleStyle.Render(m.spinner.View()+" "+label) + "\n\n" +
 		"  " + m.dimStyle().Render("[Esc] Cancel")
 
 	dialog := lipgloss.NewStyle().

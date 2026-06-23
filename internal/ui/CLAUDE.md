@@ -122,6 +122,35 @@ wedged daemon blocked startup forever (before the bubbletea loop, so the
 TUI never painted and the stall watchdog never armed). **Never reintroduce
 a synchronous or `context.Background()` daemon call on the startup path.**
 
+## Spawn overlay label (Starting → Attaching)
+
+`renderSpawning` flips its label from "Starting <agent>" to "Attaching to
+<agent>…" once the spawn has been in `ModeSpawning` longer than
+`spawnAttachLabelDelay` (= the 5s `spawnCtx` timeout in `prepareSpawnWith`).
+Rationale: Spawn and `attachWithRetry` (~8.6s) run inside **one** tea.Cmd,
+so the Update loop never sees the Spawn→Attach boundary; past the 5s spawn
+budget the RPC has almost certainly returned, so the remaining wait is
+attach (the clock is stamped a hair before spawnCtx is armed, so the
+boundary is heuristic, not exact — see the const comment in view.go).
+The flip is a **View-layer time heuristic** — `m.spawnStartedAt` is stamped
+in `prepareSpawnWith`'s synchronous prologue (the one chokepoint all four
+ModeSpawning entry points funnel through; skipped for unattached spawns)
+and read in `renderSpawning`. `spinner.TickMsg` already re-renders
+ModeSpawning each tick, so the label flips with no extra plumbing.
+
+**Deliberately NOT built** (ticket `ui-spinner-for-long-running-daemon-ops`,
+after advisor + scope red-team): the generalized `inflightOps` map, the
+periodic-resync footer breadcrumb, and splitting the spawn closure into two
+Cmds for an exact (vs. heuristic) phase signal. The map had one consumer;
+the resync is an invisible 3s-bounded background reconcile (`daemon_resync.go`)
+with no user-perceived symptom; the closure split risked the dense
+ModeSpawning race switch (`model.go` ~814-940) for a label the user can't
+distinguish from the heuristic. The ticket's original headline item —
+async startup-reconcile spinner — was already obsoleted by the
+preflight-and-exit work (see "Startup daemon calls must stay bounded"
+above). If real long-running ops or observed resync stalls appear later,
+revisit with that evidence rather than re-deriving the map from scratch.
+
 ## Column Viewport Scopes
 
 Vertical scroll per column lives in `m.columnOffsets[i]`. Three functions touch it, each with a different scope — don't confuse them:
