@@ -13,24 +13,26 @@ import (
 )
 
 // TestNewTicketStatusFromActiveColumn pins where a new ticket lands when
-// the user presses "n" from each of the four default columns. The rule:
-// in_review and done route to in_progress; backlog and in_progress keep
-// the user's focused column. Authored as a guard against accidentally
+// the user presses "n" from each of the default columns. The rule:
+// in_review and done route to in_progress; backlog, next, and in_progress
+// keep the user's focused column. Authored as a guard against accidentally
 // creating tickets in "outbound" columns (in_review, done) where they
-// would be invisible to the normal create-then-work flow.
+// would be invisible to the normal create-then-work flow. Column indices
+// are resolved by status (not literals) so the test survives column reorder.
 func TestNewTicketStatusFromActiveColumn(t *testing.T) {
 	t.Setenv("OPENKANBAN_CONFIG_DIR", t.TempDir())
 
 	cases := []struct {
-		name           string
-		activeColumn   int
-		wantStatus     board.TicketStatus
-		focusFollows   bool // for in_review/done, focus should land on in_progress column
+		name         string
+		fromStatus   board.TicketStatus
+		wantStatus   board.TicketStatus
+		focusFollows bool // for in_review/done, focus should land on in_progress column
 	}{
-		{name: "from backlog stays in backlog", activeColumn: 0, wantStatus: board.StatusBacklog},
-		{name: "from in_progress stays in in_progress", activeColumn: 1, wantStatus: board.StatusInProgress},
-		{name: "from in_review routes to in_progress", activeColumn: 2, wantStatus: board.StatusInProgress, focusFollows: true},
-		{name: "from done routes to in_progress", activeColumn: 3, wantStatus: board.StatusInProgress, focusFollows: true},
+		{name: "from backlog stays in backlog", fromStatus: board.StatusBacklog, wantStatus: board.StatusBacklog},
+		{name: "from next stays in next", fromStatus: board.StatusNext, wantStatus: board.StatusNext},
+		{name: "from in_progress stays in in_progress", fromStatus: board.StatusInProgress, wantStatus: board.StatusInProgress},
+		{name: "from in_review routes to in_progress", fromStatus: board.StatusInReview, wantStatus: board.StatusInProgress, focusFollows: true},
+		{name: "from done routes to in_progress", fromStatus: board.StatusDone, wantStatus: board.StatusInProgress, focusFollows: true},
 	}
 
 	for _, tc := range cases {
@@ -46,25 +48,25 @@ func TestNewTicketStatusFromActiveColumn(t *testing.T) {
 
 			cols := board.DefaultColumns()
 			m := &Model{
-				globalStore:      globalStore,
-				panes:            map[board.TicketID]*daemonclient.PaneView{},
-				columns:          cols,
-				columnTickets:    make([][]*board.Ticket, len(cols)),
-				columnOffsets:    make([]int, len(cols)),
-				mode:             ModeCreateTicket,
-				activeColumn:     tc.activeColumn,
-				activeTicket:     0,
-				width:            120,
-				height:           40,
-				config:           &config.Config{Agents: map[string]config.AgentConfig{}},
-				selectedProject:  proj,
-				titleInput:       ti,
-				descInput:        di,
-				branchInput:      bi,
-				labelsInput:      li,
-				ticketPriority:   3,
+				globalStore:       globalStore,
+				panes:             map[board.TicketID]*daemonclient.PaneView{},
+				columns:           cols,
+				columnTickets:     make([][]*board.Ticket, len(cols)),
+				columnOffsets:     make([]int, len(cols)),
+				mode:              ModeCreateTicket,
+				activeColumn:      columnIndexOfStatus(cols, tc.fromStatus),
+				activeTicket:      0,
+				width:             120,
+				height:            40,
+				config:            &config.Config{Agents: map[string]config.AgentConfig{}},
+				selectedProject:   proj,
+				titleInput:        ti,
+				descInput:         di,
+				branchInput:       bi,
+				labelsInput:       li,
+				ticketPriority:    3,
 				ticketUseWorktree: true,
-				selectedBlockers: map[board.TicketID]bool{},
+				selectedBlockers:  map[board.TicketID]bool{},
 			}
 			m.refreshColumnTickets()
 

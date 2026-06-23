@@ -15,7 +15,9 @@ type TicketStatus string
 
 const (
     StatusBacklog    TicketStatus = "backlog"
+    StatusNext       TicketStatus = "next"
     StatusInProgress TicketStatus = "in_progress"
+    StatusInReview   TicketStatus = "in_review"
     StatusDone       TicketStatus = "done"
     StatusArchived   TicketStatus = "archived"
 )

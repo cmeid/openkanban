@@ -250,6 +250,23 @@ func TestTicket_SetStatus(t *testing.T) {
 		}
 	})
 
+	// Regression guard: Next is a benign staging status, so SetStatus must
+	// NOT stamp StartedAt/CompletedAt for it (only in_progress/done do).
+	// This passes with SetStatus unchanged; it fails only if a future edit
+	// wrongly adds a `case StatusNext` that stamps a timestamp.
+	t.Run("transition to next does not set timestamps", func(t *testing.T) {
+		ticket := NewTicket("Test", "project-1")
+		ticket.SetStatus(StatusNext)
+
+		if ticket.StartedAt != nil {
+			t.Error("StartedAt should remain nil for next status")
+		}
+
+		if ticket.CompletedAt != nil {
+			t.Error("CompletedAt should remain nil for next status")
+		}
+	})
+
 	t.Run("updates UpdatedAt", func(t *testing.T) {
 		ticket := NewTicket("Test", "project-1")
 		originalUpdatedAt := ticket.UpdatedAt
@@ -343,8 +360,8 @@ func TestTicket_SetAgentStatus(t *testing.T) {
 func TestDefaultColumns(t *testing.T) {
 	columns := DefaultColumns()
 
-	if len(columns) != 4 {
-		t.Fatalf("DefaultColumns() returned %d columns; want 4", len(columns))
+	if len(columns) != 5 {
+		t.Fatalf("DefaultColumns() returned %d columns; want 5", len(columns))
 	}
 
 	expected := []struct {
@@ -353,6 +370,7 @@ func TestDefaultColumns(t *testing.T) {
 		status TicketStatus
 	}{
 		{"backlog", "Backlog", StatusBacklog},
+		{"next", "Next", StatusNext},
 		{"in-progress", "In Progress", StatusInProgress},
 		{"in-review", "In Review", StatusInReview},
 		{"done", "Done", StatusDone},
@@ -391,6 +409,9 @@ func TestErrTicketNotFound(t *testing.T) {
 func TestTicketStatus_Constants(t *testing.T) {
 	if StatusBacklog != "backlog" {
 		t.Errorf("StatusBacklog = %q; want %q", StatusBacklog, "backlog")
+	}
+	if StatusNext != "next" {
+		t.Errorf("StatusNext = %q; want %q", StatusNext, "next")
 	}
 	if StatusInProgress != "in_progress" {
 		t.Errorf("StatusInProgress = %q; want %q", StatusInProgress, "in_progress")

@@ -5952,6 +5952,8 @@ func (m *Model) ticketMatchesFilter(t *board.Ticket) bool {
 func (m *Model) nextStatus(current board.TicketStatus) board.TicketStatus {
 	switch current {
 	case board.StatusBacklog:
+		return board.StatusNext
+	case board.StatusNext:
 		return board.StatusInProgress
 	case board.StatusInProgress:
 		return board.StatusInReview
@@ -5969,6 +5971,8 @@ func (m *Model) previousStatus(current board.TicketStatus) board.TicketStatus {
 	case board.StatusInReview:
 		return board.StatusInProgress
 	case board.StatusInProgress:
+		return board.StatusNext
+	case board.StatusNext:
 		return board.StatusBacklog
 	default:
 		return current
