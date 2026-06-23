@@ -4785,6 +4785,7 @@ type spawnReqInputs struct {
 	cols           int
 	rows           int
 	agentType      string
+	agentEnv       map[string]string // per-agent Env (config.AgentConfig.Env), injected at spawn with leading "~/" expanded
 	cleanArgs      []string // agentCfg.Args with empty entries stripped
 	isNewSession   bool
 	promptTemplate string
@@ -4800,6 +4801,22 @@ type spawnReqInputs struct {
 	// terminal.Pane gates its OSC 9 → desktop-notification handler on
 	// this per session, rather than relying on a process-wide global.
 	forwardNotifications bool
+}
+
+// expandLeadingTilde expands a leading "~/" in an env value to the user's
+// home directory. Only a leading "~/" is expanded; "~user" and mid-string
+// "~" are left untouched. Returns the input unchanged if HOME can't resolve.
+// Used so a per-agent env like CLAUDE_CONFIG_DIR=~/.claude-personal points at
+// a real path (environment variables are not shell-expanded).
+func expandLeadingTilde(v string) string {
+	if !strings.HasPrefix(v, "~/") {
+		return v
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return v
+	}
+	return filepath.Join(home, v[2:])
 }
 
 // buildSpawnReq constructs the daemon.SpawnReq for a ticket given the
@@ -4942,6 +4959,16 @@ func buildSpawnReq(in spawnReqInputs) daemon.SpawnReq {
 	ticketIDStr := string(in.ticket.ID)
 	if ticketIDStr != "" {
 		env = append(env, "OPENKANBAN_TICKET_ID="+ticketIDStr)
+	}
+	// Per-agent Env (e.g. CLAUDE_CONFIG_DIR for a custom Claude profile).
+	// Appended after the OPENKANBAN_* vars; the daemon's buildCleanEnv strips
+	// inherited CLAUDE_*/GEMINI_*/etc. before appending SpawnReq.Env, so these
+	// survive. A leading "~/" is expanded to $HOME (env vars don't shell-expand).
+	for k, v := range in.agentEnv {
+		if k == "" {
+			continue
+		}
+		env = append(env, k+"="+expandLeadingTilde(v))
 	}
 
 	return daemon.SpawnReq{
@@ -5290,6 +5317,7 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 			cols:                 width,
 			rows:                 height,
 			agentType:            agentType,
+			agentEnv:             agentCfg.Env,
 			cleanArgs:            cleanArgs,
 			isNewSession:         isNewSession,
 			promptTemplate:       promptTemplate,
