@@ -4983,6 +4983,17 @@ func buildSpawnReq(in spawnReqInputs) daemon.SpawnReq {
 	if ticketIDStr != "" {
 		env = append(env, "OPENKANBAN_TICKET_ID="+ticketIDStr)
 	}
+	// Disable Claude Code's model-generated "Prompt suggestions" — the
+	// next-prompt drafts it drops into the input box after each turn — for
+	// openkanban-spawned sessions, where they're noise in a ticket-scoped agent.
+	// Env name verified against the claude 2.1.177 binary; the env var wins over
+	// the promptSuggestionEnabled setting. Emitted before the per-agent Env loop
+	// so a user's explicit override in AgentConfig.Env takes precedence, and it
+	// survives the daemon's buildCleanEnv CLAUDE_* strip for the same reason the
+	// per-agent vars below do (req.Env is appended after the strip).
+	if in.agentType == "claude" {
+		env = append(env, "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false")
+	}
 	// Per-agent Env (e.g. CLAUDE_CONFIG_DIR for a custom Claude profile).
 	// Appended after the OPENKANBAN_* vars; the daemon's buildCleanEnv strips
 	// inherited CLAUDE_*/GEMINI_*/etc. before appending SpawnReq.Env, so these

@@ -603,6 +603,44 @@ func TestBuildSpawnReq_InvalidAgentSessionID_FallsBackToContinue(t *testing.T) {
 	}
 }
 
+// TestBuildSpawnReq_DisablesPromptSuggestionForClaude pins the fix for
+// "remove the suggestions that are inserted into claude's input box": every
+// claude-class spawn (new or resumed) must carry
+// CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false in SpawnReq.Env so Claude Code's
+// model-generated next-prompt drafts never appear. Non-claude agents must NOT
+// get the CLAUDE_* var. (buildSpawnReq takes agentType already-resolved to the
+// command basename — see model.go's agentType = filepath.Base(agentCfg.Command);
+// this test exercises the gate, not that derivation.)
+func TestBuildSpawnReq_DisablesPromptSuggestionForClaude(t *testing.T) {
+	const want = "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false"
+
+	t.Run("claude_resume", func(t *testing.T) {
+		req := buildSpawnReq(baseClaudeInputs(t, "TICK-PS-R", "task/ps-r"))
+		if !envHas(req.Env, want) {
+			t.Errorf("resumed claude spawn must carry %q, got env=%v", want, req.Env)
+		}
+	})
+
+	t.Run("claude_new_session", func(t *testing.T) {
+		in := baseClaudeInputs(t, "TICK-PS-N", "task/ps-n")
+		in.isNewSession = true
+		req := buildSpawnReq(in)
+		if !envHas(req.Env, want) {
+			t.Errorf("new claude spawn must carry %q, got env=%v", want, req.Env)
+		}
+	})
+
+	t.Run("non_claude_excluded", func(t *testing.T) {
+		in := baseClaudeInputs(t, "TICK-PS-G", "task/ps-g")
+		in.agentType = "gemini"
+		in.command = "gemini"
+		req := buildSpawnReq(in)
+		if envHas(req.Env, want) {
+			t.Errorf("non-claude spawn must NOT carry %q, got env=%v", want, req.Env)
+		}
+	})
+}
+
 // TestBuildSpawnReq_UserConfigContinue_NotOverridden asserts the user-
 // config escape hatch: if --continue or --resume is already in the
 // caller's cleanArgs (from a user's agent config), buildSpawnReq must
