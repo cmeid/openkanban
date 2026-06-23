@@ -230,11 +230,17 @@ func TestServerLifecycle_SpawnEcho(t *testing.T) {
 	r := bufio.NewReader(conn)
 	helloAndUnpack(t, conn, r)
 
+	// Use a long-lived child (/bin/cat blocks on stdin) rather than a
+	// fast-exiting one. The daemon auto-reaps a naturally-exited session
+	// (watchSessionExit → removeSession), so an instant-exit child like
+	// /bin/echo races that reaper: under load (notably -race) the session
+	// is gone before the List RPC below arrives, and the list assertion
+	// flakes ("not in list (got 0 sessions)"). A live child makes the
+	// spawn → list → kill lifecycle deterministic; the explicit Kill ends it.
 	writeReq(t, conn, MsgSpawnReq, SpawnReq{
 		TicketID:    "TEST-1",
-		SessionName: "spawn-echo",
-		Command:     "/bin/echo",
-		Args:        []string{"hi"},
+		SessionName: "spawn-cat",
+		Command:     "/bin/cat",
 		Cols:        80,
 		Rows:        24,
 		Scrollback:  1000,
@@ -255,9 +261,7 @@ func TestServerLifecycle_SpawnEcho(t *testing.T) {
 		t.Errorf("SpawnResp.PID is 0")
 	}
 
-	// List should include the session (it may or may not have
-	// already exited; the daemon does not currently auto-remove on
-	// exit — that's an explicit Kill).
+	// List must include the still-live session.
 	writeReq(t, conn, MsgListReq, ListReq{})
 	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	name, raw = readResp(t, r)
@@ -281,7 +285,7 @@ func TestServerLifecycle_SpawnEcho(t *testing.T) {
 		t.Errorf("spawned session %s not in list (got %d sessions)", spawn.SessionID, len(list.Sessions))
 	}
 
-	// Best-effort Kill regardless of whether echo already exited.
+	// Kill tears down the still-live child (SIGTERM, 1s grace).
 	writeReq(t, conn, MsgKillReq, KillReq{SessionID: spawn.SessionID, GraceSeconds: 1})
 	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	name, _ = readResp(t, r)
