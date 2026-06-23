@@ -2736,8 +2736,9 @@ func (m *Model) createProjectFromPath() (tea.Model, tea.Cmd) {
 	name := filepath.Base(absPath)
 
 	newProject := project.NewProject(name, absPath)
-	// Project settings only store explicit user overrides.
-	// Empty values cascade to global config via getDefaultAgent() and GetBranchPrefix().
+	// Project settings only store explicit user overrides; empty string/int
+	// values cascade to global config via GetBranchPrefix() etc. (Agent identity
+	// does NOT cascade — it is pinned per project via the sidebar 'g' key.)
 
 	if err := m.projectRegistry.Add(newProject); err != nil {
 		m.notify("Failed to save: " + err.Error())
@@ -3916,29 +3917,10 @@ func (m *Model) promoteAndSpawnUnattached() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Promote into in_progress from any column (no-op when already there).
-	if ticket.Status != board.StatusInProgress {
-		if ticket.WorktreePath == "" {
-			if ticket.UseWorktree {
-				if err := m.setupWorktree(ticket); err != nil {
-					m.notify("Worktree failed: " + err.Error())
-					return m, nil
-				}
-			} else {
-				if err := m.setupMainRepoBranch(ticket); err != nil {
-					m.notify("Branch setup failed: " + err.Error())
-					return m, nil
-				}
-			}
-		}
-		m.globalStore.Move(ticket.ID, board.StatusInProgress)
-		m.refreshColumnTickets()
-		m.selectTicketByID(ticket.ID)
-		m.saveTicket(ticket)
-	}
-
-	// Resolve project + agent config. Replicated from spawnAgent (rather
-	// than extracted) to keep zero blast radius on that heavily-tested path.
+	// Resolve project + pinned agent BEFORE any promotion side effects, so an
+	// unpinned project (or an unknown agent) refuses cleanly without creating a
+	// worktree or moving the ticket out of its column. Replicated from spawnAgent
+	// (rather than extracted) to keep zero blast radius on that heavily-tested path.
 	proj := m.globalStore.GetProjectForTicket(ticket)
 	if proj == nil {
 		m.notify("Project not found for this ticket")
@@ -3971,6 +3953,27 @@ func (m *Model) promoteAndSpawnUnattached() (tea.Model, tea.Cmd) {
 	}
 	if agentType == "opencode" {
 		_ = m.opencodeServer.Start() // best effort
+	}
+
+	// Promote into in_progress from any column (no-op when already there).
+	if ticket.Status != board.StatusInProgress {
+		if ticket.WorktreePath == "" {
+			if ticket.UseWorktree {
+				if err := m.setupWorktree(ticket); err != nil {
+					m.notify("Worktree failed: " + err.Error())
+					return m, nil
+				}
+			} else {
+				if err := m.setupMainRepoBranch(ticket); err != nil {
+					m.notify("Branch setup failed: " + err.Error())
+					return m, nil
+				}
+			}
+		}
+		m.globalStore.Move(ticket.ID, board.StatusInProgress)
+		m.refreshColumnTickets()
+		m.selectTicketByID(ticket.ID)
+		m.saveTicket(ticket)
 	}
 
 	// Persist the resolved agent type so status detection (and a later
@@ -6062,7 +6065,7 @@ func (m *Model) getAgentNames() []string {
 		names = append(names, name)
 	}
 	if len(names) == 0 {
-		return []string{"opencode", "claude", "gemini", "codex", "aider"}
+		return []string{"opencode", "claude", "claude-custom", "gemini", "codex", "aider"}
 	}
 	sort.Strings(names)
 	return names

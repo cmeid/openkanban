@@ -1,11 +1,14 @@
 package ui
 
 import (
+	"errors"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/techdufus/openkanban/internal/board"
 	"github.com/techdufus/openkanban/internal/config"
+	"github.com/techdufus/openkanban/internal/daemonclient"
 	"github.com/techdufus/openkanban/internal/project"
 )
 
@@ -59,5 +62,79 @@ func TestCycleProjectAgent_PersistsPin(t *testing.T) {
 	m.handleSidebarNav(keyG)
 	if proj.Settings.DefaultAgent != "claude-custom" {
 		t.Fatalf("after second cycle DefaultAgent = %q, want %q", proj.Settings.DefaultAgent, "claude-custom")
+	}
+}
+
+// TestResolveSpawnAgent pins the core guard: agent identity comes from the
+// ticket (resume) or the project pin, with NO global fallback. An unpinned
+// project yields errNoProjectAgent so the caller refuses the spawn.
+func TestResolveSpawnAgent(t *testing.T) {
+	m := &Model{}
+	pinned := &project.Project{Settings: project.ProjectSettings{DefaultAgent: "claude-custom"}}
+	unpinned := &project.Project{}
+
+	if _, err := m.resolveSpawnAgent(&board.Ticket{}, unpinned); !errors.Is(err, errNoProjectAgent) {
+		t.Errorf("unpinned project: got err %v, want errNoProjectAgent", err)
+	}
+	if got, err := m.resolveSpawnAgent(&board.Ticket{}, pinned); err != nil || got != "claude-custom" {
+		t.Errorf("pinned project: got (%q, %v), want (claude-custom, nil)", got, err)
+	}
+	// A ticket already carrying AgentType wins (resume continuity) even over the pin.
+	if got, err := m.resolveSpawnAgent(&board.Ticket{AgentType: "claude"}, pinned); err != nil || got != "claude" {
+		t.Errorf("ticket with AgentType: got (%q, %v), want (claude, nil)", got, err)
+	}
+}
+
+// TestPromoteAndSpawnUnattached_UnpinnedRefuses pins the require-pin guard on
+// the ctrl+space path: an unpinned project refuses to spawn AND the refusal
+// precedes promotion, so the ticket is not stamped, not paned, and not moved
+// out of backlog. Reverting the refuse-before-promote ordering fails the
+// status assertion; reverting the resolver fails the AgentType/pane assertions.
+func TestPromoteAndSpawnUnattached_UnpinnedRefuses(t *testing.T) {
+	t.Setenv("OPENKANBAN_CONFIG_DIR", t.TempDir())
+
+	proj := &project.Project{ID: "test", RepoPath: t.TempDir()} // unpinned: no DefaultAgent
+	globalStore := project.NewGlobalTicketStore(nil)
+	globalStore.AddProject(proj)
+
+	ticket := &board.Ticket{
+		ID: "T-unpinned", Title: "x", ProjectID: "test",
+		Status: board.StatusBacklog, WorktreePath: "/already/set",
+	}
+	if err := globalStore.Add(ticket); err != nil {
+		t.Fatalf("Add ticket: %v", err)
+	}
+
+	cols := board.DefaultColumns()
+	backlogIdx := columnIndexOfStatus(cols, board.StatusBacklog)
+	m := &Model{
+		globalStore:   globalStore,
+		panes:         map[board.TicketID]*daemonclient.PaneView{},
+		daemonOwned:   map[board.TicketID]struct{}{},
+		columns:       cols,
+		columnTickets: make([][]*board.Ticket, len(cols)),
+		columnOffsets: make([]int, len(cols)),
+		mode:          ModeNormal,
+		width:         120,
+		height:        40,
+		config: &config.Config{
+			Agents: map[string]config.AgentConfig{"claude": {Command: "claude"}},
+		},
+		selectedProject: proj,
+	}
+	m.refreshColumnTickets()
+	m.activeColumn = backlogIdx
+	m.activeTicket = 0
+
+	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlAt}) // ctrl+space
+
+	if ticket.AgentType != "" {
+		t.Errorf("unpinned project stamped AgentType = %q, want empty", ticket.AgentType)
+	}
+	if ticket.Status != board.StatusBacklog {
+		t.Errorf("unpinned ticket moved to %q, want backlog (refusal must precede promotion)", ticket.Status)
+	}
+	if _, ok := m.panes[ticket.ID]; ok {
+		t.Errorf("unpinned project created a pane; spawn should have been refused")
 	}
 }
