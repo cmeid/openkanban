@@ -20,9 +20,9 @@ Errors are returned but rarely actionable from the caller — the daemon logs th
 
 ## Critical: must run from inside an .app bundle
 
-NSUserNotification on macOS 26 silently no-ops if the calling process is not running from a registered `.app` bundle. The daemon process must be launched from `~/Applications/OpenKanban.app/Contents/MacOS/openkanbankd` (or `/Applications/...` once signed) — NOT from `$PATH`. The lookup that ensures this lives in `internal/daemon/binary.go::ResolveBinary` and is shared by both `autostart` and the launchd service installer.
+The darwin backend is now `UNUserNotificationCenter` (migrated 2026-06-18; see `notify_darwin.go`). It only delivers from a process running inside a registered `.app` bundle, so the daemon must be launched from `~/Applications/OpenKanban.app/Contents/MacOS/openkanbankd` (or `/Applications/...` once signed) — NOT from `$PATH`. The lookup that ensures this lives in `internal/daemon/binary.go::ResolveBinary` and is shared by both `autostart` and the launchd service installer.
 
-If you call `Send` from a binary that's running outside the bundle, the function returns `nil` (no API error) but the user sees nothing. There's no way to detect this from inside the cgo call — Apple deliberately keeps it silent.
+**Off-bundle is FATAL unless guarded — and it is.** Unlike the old `NSUserNotification` (which silently no-op'd off-bundle), `[UNUserNotificationCenter currentNotificationCenter]` raises an `NSInternalInconsistencyException` and `abort()`s the **whole process** when there is no bundle identity. From a `$PATH`/tui-fork daemon that would crash the daemon (killing every live session) the first time a notification fires; from a `go test` binary it SIGABRTs the suite. So `openkanbanSendNotification` early-returns when `[[NSBundle mainBundle] bundleIdentifier] == nil`, restoring the silent-off-bundle contract: `Send` returns `nil` (no API error) but the user sees nothing. **Do not remove that guard** — it is load-bearing, not politeness.
 
 Bundle assembly contract lives in `dist/macos/`. See:
 - `dist/macos/Info.plist` — `CFBundleIdentifier=dev.cmeid.openkanban`, `LSUIElement=true`
@@ -45,5 +45,5 @@ The package's own e2e test (`notify_darwin_test.go`) is opt-in via `OPENKANBAN_N
 
 - Don't add a title argument — the bundle's display name IS the title, by design (1:1 passthrough of the agent's OSC 9 payload)
 - Don't construct enriched notification text (e.g. prepending ticket name) — that's the daemon's caller decision, not this package's
-- Don't try to detect "running outside bundle" — there's no reliable cross-macOS-version way to do it; ResolveBinary in `internal/daemon` is the single chokepoint
+- Don't remove the `bundleIdentifier == nil` guard in `openkanbanSendNotification`. (This reverses the old "don't detect outside-bundle" guidance, which applied to NSUserNotification's *silent* off-bundle no-op — detection bought nothing then. `UNUserNotificationCenter` instead `abort()`s off-bundle, so the check is now mandatory; and `bundleIdentifier == nil` is reliable here because it is the exact precondition the framework itself aborts on, one call earlier.) `ResolveBinary` in `internal/daemon` remains the chokepoint for launching *from* the bundle; the guard is the backstop for when we aren't.
 - Don't add UNUserNotificationCenter while keeping NSUserNotification — when migrating, swap fully; the async authorization dance changes the public API
