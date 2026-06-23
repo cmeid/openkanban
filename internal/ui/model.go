@@ -5158,6 +5158,17 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 		// failure logs and degrades to the prior launch-from-worktree
 		// behavior.
 		relocatedSession := false
+		// resumeUnresolved is set when we're about to launch
+		// `claude --resume <uuid>` but the transcript is NOT resolvable in
+		// the launch cwd's bucket — either missing entirely (a genuinely
+		// lost session) or a relocation that was skipped/failed just above.
+		// Claude then prints "No conversation found" and exits within ~2s;
+		// the daemon records that as an unexpected exit with no captured
+		// output, so the failure is otherwise invisible. We surface a
+		// visible notice (below) but still spawn — non-aborting, because a
+		// blank session is recoverable while a silent 2s death is not
+		// diagnosable.
+		resumeUnresolved := false
 		if agentType == "claude" && agent.SessionUUIDPattern.MatchString(ticket.AgentSessionID) {
 			moved, nerr := agent.NormalizeSessionBucket(ticket.AgentSessionID, worktreePath)
 			if nerr != nil {
@@ -5165,6 +5176,7 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 					ticket.AgentSessionID, worktreePath, nerr)
 			}
 			relocatedSession = moved
+			resumeUnresolved = !agent.ResumeResolvable(ticket.AgentSessionID, worktreePath)
 		}
 
 		// Session name for terminal identification (priority:
@@ -5226,6 +5238,14 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 		}
 		if relocatedSession {
 			msg := "Relocated session transcript to this ticket's directory."
+			if readyNotice != "" {
+				readyNotice = msg + " " + readyNotice
+			} else {
+				readyNotice = msg
+			}
+		}
+		if resumeUnresolved {
+			msg := fmt.Sprintf("Resume target %s not found in this directory's Claude bucket — session may start blank.", ticket.AgentSessionID)
 			if readyNotice != "" {
 				readyNotice = msg + " " + readyNotice
 			} else {

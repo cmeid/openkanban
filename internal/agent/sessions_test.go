@@ -191,9 +191,12 @@ func writeJSONL(t *testing.T, dir, name string, events []map[string]any) string 
 }
 
 // encodeWorktree mirrors the encoding claude-code does for its
-// per-project session directory name.
+// per-project session directory name. Delegates to the production
+// encoder so setup-side bucket paths in these tests stay in lockstep
+// with ProjectDirFor (the encoder's own assertions in TestProjectDirFor
+// use literal expected strings, not this helper — see that test).
 func encodeWorktree(p string) string {
-	return strings.ReplaceAll(p, "/", "-")
+	return EncodeClaudeBucket(p)
 }
 
 func TestIsClaudeSessionDead(t *testing.T) {
@@ -1002,6 +1005,14 @@ func TestProjectDirFor(t *testing.T) {
 		// exactly why production reads the start cwd from disk rather than
 		// decoding a bucket name back to a path.
 		{"literal dash collides", "/Users/cmeid/manifold-dev", filepath.Join(projects, "-Users-cmeid-manifold-dev")},
+		// Underscores encode to `-` — the exact regression that broke
+		// resume when the Claude CLI changed its encoding (sessions filed
+		// under the old `_`-preserving bucket became unreachable). `want`
+		// is a hardcoded literal, NOT computed via any encoder helper, so
+		// this asserts the rule rather than tautologically restating it.
+		{"underscore path", "/Users/cmeid/manifold/dev/sa_csm_program", filepath.Join(projects, "-Users-cmeid-manifold-dev-sa-csm-program")},
+		{"dot in path", "/Users/cmeid/repo.v2", filepath.Join(projects, "-Users-cmeid-repo-v2")},
+		{"space in path", "/Users/cmeid/my project", filepath.Join(projects, "-Users-cmeid-my-project")},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1014,6 +1025,53 @@ func TestProjectDirFor(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestResumeResolvable(t *testing.T) {
+	const uuid = "7f3a9b2c-1d8e-4a5b-9c3d-2f1e0a8b9c4d"
+	worktree := "/Users/cmeid/manifold/dev/sa_csm_program"
+
+	t.Run("present_in_launch_bucket", func(t *testing.T) {
+		home := withFakeHome(t)
+		// Literal NEW (dash) bucket = what the live CLI and ProjectDirFor use.
+		bucket := filepath.Join(home, ".claude", "projects", "-Users-cmeid-manifold-dev-sa-csm-program")
+		writeFile(t, filepath.Join(bucket, uuid+".jsonl"), "{}\n")
+		if !ResumeResolvable(uuid, worktree) {
+			t.Fatal("ResumeResolvable = false, want true (transcript is in the launch bucket)")
+		}
+	})
+
+	t.Run("missing_entirely", func(t *testing.T) {
+		withFakeHome(t)
+		if ResumeResolvable(uuid, worktree) {
+			t.Fatal("ResumeResolvable = true, want false (no transcript anywhere — lost session)")
+		}
+	})
+
+	t.Run("only_in_old_encoding_bucket", func(t *testing.T) {
+		home := withFakeHome(t)
+		// Literal OLD (underscore) bucket: the live CLI won't look here, so
+		// resume is NOT resolvable until NormalizeSessionBucket relocates it.
+		oldBucket := filepath.Join(home, ".claude", "projects", "-Users-cmeid-manifold-dev-sa_csm_program")
+		writeFile(t, filepath.Join(oldBucket, uuid+".jsonl"), "{}\n")
+		if ResumeResolvable(uuid, worktree) {
+			t.Fatal("ResumeResolvable = true, want false (transcript only in the stale underscore bucket)")
+		}
+	})
+
+	t.Run("not_a_uuid", func(t *testing.T) {
+		withFakeHome(t)
+		if ResumeResolvable("nope", worktree) {
+			t.Fatal("ResumeResolvable = true, want false (non-UUID ref)")
+		}
+	})
+
+	t.Run("empty_worktree", func(t *testing.T) {
+		withFakeHome(t)
+		if ResumeResolvable(uuid, "") {
+			t.Fatal("ResumeResolvable = true, want false (no launch cwd)")
+		}
+	})
 }
 
 func mustExist(t *testing.T, path string) {
@@ -1100,6 +1158,49 @@ func TestNormalizeSessionBucket(t *testing.T) {
 		}
 		mustNotExist(t, filepath.Join(fromBucket, uuid+".jsonl"))
 		mustNotExist(t, filepath.Join(fromBucket, uuid))
+	})
+
+	t.Run("relocates_across_cli_encoding_change", func(t *testing.T) {
+		if _, err := exec.LookPath("lsof"); err != nil {
+			t.Skip("lsof not on PATH; skipping")
+		}
+		home := withFakeHome(t)
+		// Reproduces the live resume regression. The transcript was filed by
+		// an older Claude CLI under the OLD bucket encoding (underscores
+		// preserved); the current CLI — and the fixed ProjectDirFor — read the
+		// NEW bucket (underscores → '-'). NormalizeSessionBucket must relocate
+		// across that rename so `claude --resume` finds it.
+		//
+		// Both bucket names are HARDCODED LITERALS, deliberately decoupled from
+		// EncodeClaudeBucket/ProjectDirFor. If this test seeded via the encoder
+		// helper, reverting the encoder fix would move the seed in lockstep with
+		// the canonical target, the relocation would short-circuit as
+		// "already canonical", and the test would pass vacuously. With literals,
+		// reverting ProjectDirFor to the old '/'-only encoding makes canonicalDir
+		// equal the underscore seed bucket → no-op → this test FAILS (red).
+		worktree := "/Users/cmeid/manifold/dev/sa_csm_program"
+		projects := filepath.Join(home, ".claude", "projects")
+		oldBucket := filepath.Join(projects, "-Users-cmeid-manifold-dev-sa_csm_program")
+		newBucket := filepath.Join(projects, "-Users-cmeid-manifold-dev-sa-csm-program")
+
+		writeFile(t, filepath.Join(oldBucket, uuid+".jsonl"), "{}\n")
+		writeFile(t, filepath.Join(oldBucket, uuid, "subagents", "agent-x.jsonl"), "{}\n")
+		writeFile(t, filepath.Join(oldBucket, uuid, "tool-results", "r.txt"), "result")
+
+		moved, err := NormalizeSessionBucket(uuid, worktree)
+		if err != nil {
+			t.Fatalf("NormalizeSessionBucket: %v", err)
+		}
+		if !moved {
+			t.Fatal("moved = false, want true (transcript must relocate from the old underscore bucket to the new dash bucket)")
+		}
+		mustExist(t, filepath.Join(newBucket, uuid+".jsonl"))
+		mustExist(t, filepath.Join(newBucket, uuid, "subagents", "agent-x.jsonl"))
+		if b, err := os.ReadFile(filepath.Join(newBucket, uuid, "tool-results", "r.txt")); err != nil || string(b) != "result" {
+			t.Errorf("tool-result content = %q (err %v), want %q", string(b), err, "result")
+		}
+		mustNotExist(t, filepath.Join(oldBucket, uuid+".jsonl"))
+		mustNotExist(t, filepath.Join(oldBucket, uuid))
 	})
 
 	t.Run("live_session_skipped", func(t *testing.T) {

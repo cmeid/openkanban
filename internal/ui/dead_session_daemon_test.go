@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/techdufus/openkanban/internal/agent"
 	"github.com/techdufus/openkanban/internal/board"
 	"github.com/techdufus/openkanban/internal/daemon"
 )
@@ -50,11 +51,11 @@ func (s *ownsStubAPI) Owns(ctx context.Context, sessionUUID string) (daemon.Owns
 }
 
 // encodeWorktreeForTest mirrors the encoding claude-code does for its
-// per-project session directory name. Duplicated from the agent
-// package's test helper because Go's test files don't expose helpers
-// across package boundaries.
+// per-project session directory name. Delegates to the production
+// encoder (agent.EncodeClaudeBucket) so these setup-side bucket paths
+// stay in lockstep with what spawn/resume actually computes.
 func encodeWorktreeForTest(p string) string {
-	return strings.ReplaceAll(p, "/", "-")
+	return agent.EncodeClaudeBucket(p)
 }
 
 // writeDeadJSONL creates a JSONL transcript in the fake home that

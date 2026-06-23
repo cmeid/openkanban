@@ -51,19 +51,62 @@ func claudeProjectsRoot() (string, error) {
 	return filepath.Join(home, ".claude", "projects"), nil
 }
 
+// EncodeClaudeBucket encodes a working-directory path into the directory
+// name Claude Code uses for that cwd's session bucket: every byte that is
+// not ASCII `[A-Za-z0-9]` becomes `-`, per character, with no run-collapsing
+// (e.g. `/a_b.c d` → `-a-b-c-d`). This mirrors the Claude Code CLI's own
+// cwd→bucket encoding as of 2.1.177; an earlier CLI replaced only `/`, which
+// is why a session filed under the old encoding (underscores preserved) can
+// no longer be found by `claude --resume` after the CLI updated. Verified
+// empirically against the live binary, not assumed.
+func EncodeClaudeBucket(workdir string) string {
+	var b strings.Builder
+	b.Grow(len(workdir))
+	for i := 0; i < len(workdir); i++ {
+		c := workdir[i]
+		switch {
+		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+			b.WriteByte(c)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	return b.String()
+}
+
 // ProjectDirFor returns the Claude Code per-project session directory
 // for a working-directory path: `~/.claude/projects/<encoded>`, where
-// <encoded> is the path with every `/` replaced by `-`. This is the
-// encoding Claude Code uses to key session storage by the cwd a session
-// was started in, and the directory `claude --resume` searches when
-// launched from that cwd. Honors $HOME via claudeProjectsRoot so tests
-// can redirect with t.Setenv.
+// <encoded> is EncodeClaudeBucket(workdir). This is the encoding Claude Code
+// uses to key session storage by the cwd a session was started in, and the
+// directory `claude --resume` searches when launched from that cwd. Honors
+// $HOME via claudeProjectsRoot so tests can redirect with t.Setenv.
 func ProjectDirFor(workdir string) (string, error) {
 	root, err := claudeProjectsRoot()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(root, strings.ReplaceAll(workdir, "/", "-")), nil
+	return filepath.Join(root, EncodeClaudeBucket(workdir)), nil
+}
+
+// ResumeResolvable reports whether `claude --resume <uuid>` launched from
+// worktreePath would actually find its transcript: i.e. whether
+// `<uuid>.jsonl` exists in ProjectDirFor(worktreePath) — the only bucket the
+// CLI searches for that launch cwd. It returns false when the transcript is
+// missing entirely (a genuinely lost session) or filed under a different
+// bucket (a relocation that was skipped or failed). A non-UUID ref, empty
+// worktree, or ProjectDirFor error returns false. Callers use this to warn
+// before launching a doomed resume that would otherwise exit in ~2s with no
+// captured output.
+func ResumeResolvable(uuid, worktreePath string) bool {
+	if !SessionUUIDPattern.MatchString(uuid) || worktreePath == "" {
+		return false
+	}
+	dir, err := ProjectDirFor(worktreePath)
+	if err != nil {
+		return false
+	}
+	_, statErr := os.Stat(filepath.Join(dir, uuid+".jsonl"))
+	return statErr == nil
 }
 
 // SessionPath returns the on-disk JSONL path for the given session
