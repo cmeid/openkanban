@@ -49,7 +49,7 @@ func NewProject(name, repoPath string) *Project {
 			AutoSpawnAgent:   true,
 			AutoCreateBranch: true,
 			// String/int settings left empty to cascade to global config.
-			// Use Model.getBranchPrefix(), getBranchTemplate(), getSlugMaxLength() for resolution.
+			// Use BranchNameForTitle (branch.go) for cascade-aware resolution.
 		},
 	}
 }

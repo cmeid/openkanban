@@ -4428,16 +4428,7 @@ func (m *Model) setupMainRepoBranch(ticket *board.Ticket) error {
 }
 
 func (m *Model) generateBranchNameFromTitle(title string, proj *project.Project) string {
-	maxLen := m.getSlugMaxLength(proj)
-	slug := board.Slugify(title, maxLen)
-
-	template := m.getBranchTemplate(proj)
-	prefix := m.getBranchPrefix(proj)
-
-	result := strings.ReplaceAll(template, "{prefix}", prefix)
-	result = strings.ReplaceAll(result, "{slug}", slug)
-
-	return result
+	return project.BranchNameForTitle(title, proj, m.config.Defaults)
 }
 
 func (m *Model) generateBranchName(ticket *board.Ticket, proj *project.Project) string {
@@ -5125,12 +5116,7 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 
 		generatedBranch := branchName
 		if generatedBranch == "" {
-			maxLen := m.getSlugMaxLength(proj)
-			slug := board.Slugify(ticket.Title, maxLen)
-			template := m.getBranchTemplate(proj)
-			prefix := m.getBranchPrefix(proj)
-			generatedBranch = strings.ReplaceAll(template, "{prefix}", prefix)
-			generatedBranch = strings.ReplaceAll(generatedBranch, "{slug}", slug)
+			generatedBranch = m.generateBranchNameFromTitle(ticket.Title, proj)
 		}
 
 		base, _ := mgr.GetDefaultBranch()
@@ -6062,36 +6048,6 @@ func (m *Model) getAgentNames() []string {
 
 func (m *Model) getDefaultAgent() string {
 	return m.config.Defaults.DefaultAgent
-}
-
-func (m *Model) getBranchPrefix(proj *project.Project) string {
-	if proj != nil && proj.Settings.BranchPrefix != "" {
-		return proj.Settings.BranchPrefix
-	}
-	if m.config.Defaults.BranchPrefix != "" {
-		return m.config.Defaults.BranchPrefix
-	}
-	return "task/"
-}
-
-func (m *Model) getBranchTemplate(proj *project.Project) string {
-	if proj != nil && proj.Settings.BranchTemplate != "" {
-		return proj.Settings.BranchTemplate
-	}
-	if m.config.Defaults.BranchTemplate != "" {
-		return m.config.Defaults.BranchTemplate
-	}
-	return "{prefix}{slug}"
-}
-
-func (m *Model) getSlugMaxLength(proj *project.Project) int {
-	if proj != nil && proj.Settings.SlugMaxLength > 0 {
-		return proj.Settings.SlugMaxLength
-	}
-	if m.config.Defaults.SlugMaxLength > 0 {
-		return m.config.Defaults.SlugMaxLength
-	}
-	return 40
 }
 
 func (m *Model) getAgentIndex(agentName string) int {
