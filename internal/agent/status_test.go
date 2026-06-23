@@ -514,6 +514,15 @@ func TestDetectStatusWithActivity_PermissionPromptStaysWaiting(t *testing.T) {
 			want:            board.AgentWaiting,
 		},
 		{
+			name: "plan-approval prompt holds waiting",
+			terminalContent: strings.Join([]string{
+				" Claude has written up a plan and is ready to execute. Would you like to proceed?",
+				" ❯ 1. Yes, and auto-accept edits",
+				"   2. No, keep planning",
+			}, "\n"),
+			want: board.AgentWaiting,
+		},
+		{
 			name:            "running tool (no prompt) still overrides to working",
 			terminalContent: "⠹ Running bash command… (esc to interrupt)",
 			want:            board.AgentWorking,
@@ -662,6 +671,17 @@ func TestDetectStatusWithActivity_StaleWorkingDemotedOnPrompt(t *testing.T) {
 		" Esc to cancel · Tab to amend",
 	}, "\n")
 
+	// The ExitPlanMode / plan-approval prompt. Note it carries neither
+	// "do you want to" nor an "esc to cancel" footer — its only stable
+	// signature is the body text "Would you like to proceed?", so this
+	// case fails unless that string is in permissionPromptSignatures.
+	planApprovalGrid := strings.Join([]string{
+		" Claude has written up a plan and is ready to execute. Would you like to proceed?",
+		" ❯ 1. Yes, and auto-accept edits",
+		"   2. Yes, and manually approve edits",
+		"   3. No, keep planning",
+	}, "\n")
+
 	tests := []struct {
 		name            string
 		terminalContent string
@@ -671,6 +691,7 @@ func TestDetectStatusWithActivity_StaleWorkingDemotedOnPrompt(t *testing.T) {
 		// "working" file to "waiting".
 		{"AskUserQuestion prompt demotes stale working", askUserQuestionGrid, board.AgentWaiting},
 		{"permission box demotes stale working", permissionBox, board.AgentWaiting},
+		{"plan-approval prompt demotes stale working", planApprovalGrid, board.AgentWaiting},
 		// Guards against over-demotion — these must STAY "working":
 		{"active turn alone preserves working", "⠹ Running bash command… (esc to interrupt)", board.AgentWorking},
 		{"no prompt + no marker preserves working (file authoritative)", "some streamed tool output\nrunning tests", board.AgentWorking},
