@@ -139,21 +139,25 @@ type PaneView struct {
 
 	// Local rendering state. Mirrors the corresponding fields on
 	// terminal.Pane so View/GetContent can reuse the same render code.
-	width, height   int
-	vt              *xvt.SafeEmulator
-	scrollback      *terminal.ScrollbackBuffer
-	selection       *terminal.SelectionState
-	viewportOffset  int
-	cachedView      string
-	dirty           bool
-	cursorHidden    atomic.Bool
+	width, height int
+	vt            *xvt.SafeEmulator
+	// scrollback history is the emulator's OWN native scrollback
+	// (vt.ScrollbackLen / vt.ScrollbackCellAt), read directly by the
+	// render/scroll paths — see RenderVTNativeScrollback. We do not keep a
+	// parallel ScrollbackBuffer here: its row-snapshot producer could not
+	// capture wrapped rows, which left gaps when scrolling back.
+	selection      *terminal.SelectionState
+	viewportOffset int
+	cachedView     string
+	dirty          bool
+	cursorHidden   atomic.Bool
 	// cursorAppMode tracks DECCKM (application cursor keys mode). When
 	// the inner agent enables it via ESC[?1h, arrow keys must be encoded
 	// as SS3 (ESC O A/B/C/D) instead of CSI (ESC [ A/B/C/D). The flag is
 	// written from the EnableMode/DisableMode callbacks below, which fire
 	// SYNCHRONOUSLY inside vt.Write — must stay lock-free re: p.mu, hence
 	// the atomic.
-	cursorAppMode   atomic.Bool
+	cursorAppMode atomic.Bool
 	// bracketedPasteActive tracks the child's bracketed-paste mode
 	// (DECSET 2004, ESC[?2004h/l). When set, a paste KeyMsg is forwarded
 	// wrapped in ESC[200~ … ESC[201~ so the child (e.g. claude) ingests it
@@ -163,12 +167,8 @@ type PaneView struct {
 	// translateKey (which runs after p.mu is released), so atomic — same
 	// lock-free convention as cursorAppMode.
 	bracketedPasteActive atomic.Bool
-	mouseEnabled    bool
-	altScreenActive bool
-	// lastTopRow is the row-0 snapshot taken inside applyOutput just
-	// before vt.Write; PushScrolledLine compares against it after the
-	// write and pushes to scrollback if the row scrolled off.
-	lastTopRow []terminal.Glyph
+	mouseEnabled         bool
+	altScreenActive      bool
 	// cachedTitle is touched from BOTH applyOutput's OSC handler (which
 	// runs INSIDE p.vt.Write while applyOutput holds p.mu) AND from the
 	// Title() accessor. If it were a plain string guarded by p.mu, the
@@ -485,15 +485,15 @@ func (p *PaneView) Size() (int, int) {
 	return p.width, p.height
 }
 
-// ScrollbackLen returns the number of lines in the local scrollback
-// buffer. 0 when not attached.
+// ScrollbackLen returns the number of lines in the emulator's native
+// scrollback. 0 when not attached.
 func (p *PaneView) ScrollbackLen() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.scrollback == nil {
+	if p.vt == nil {
 		return 0
 	}
-	return p.scrollback.Len()
+	return p.vt.ScrollbackLen()
 }
 
 // ViewportOffset returns how many lines the local viewport is scrolled
@@ -516,8 +516,9 @@ func (p *PaneView) TeaMessages() <-chan tea.Msg {
 
 // --- Local emulator setup ---
 
-// initEmulatorLocked allocates the local emulator and scrollback for
-// PaneViewAttached. Must be called with p.mu held.
+// initEmulatorLocked allocates the local emulator (whose native
+// scrollback, default 10k lines, is our scrollback history) and the
+// selection state for PaneViewAttached. Must be called with p.mu held.
 func (p *PaneView) initEmulatorLocked() {
 	if p.vt != nil {
 		return
@@ -556,7 +557,6 @@ func (p *PaneView) initEmulatorLocked() {
 	// subsequent output silently. Resetting at emulator (re)init severs
 	// that cross-lifecycle coupling.
 	p.renderSignalPending.Store(false)
-	p.scrollback = terminal.NewScrollbackBuffer(10000)
 	p.selection = terminal.NewSelectionState()
 	titleHandler := func(data []byte) bool {
 		// IMPORTANT: this callback runs SYNCHRONOUSLY inside vt.Write,
@@ -636,41 +636,38 @@ func (p *PaneView) teardownEmulatorLocked() {
 	wg := &p.drainWG
 	go wg.Wait()
 	p.vt = nil
-	p.scrollback = nil
 	p.selection = nil
 	p.cachedView = ""
 }
 
 // freshEmulatorLocked prepares the emulator for a snapshot replay. A
-// prior Peek (or re-attach) can leave a populated scrollback ring;
-// replaying a fresh authoritative snapshot into the same ring would
-// double the \r\n-terminated history rows (the on-grid redraw itself is
-// idempotent via CUP positioning, so only the ring needs clearing).
+// prior Peek (or re-attach) can leave populated scrollback; replaying a
+// fresh authoritative snapshot on top would double the \r\n-terminated
+// history rows (the on-grid redraw itself is idempotent via CUP
+// positioning, so only the scrollback needs clearing).
 //
-// When the emulator already exists we RESET the ring in place rather
-// than tearing the emulator down: teardownEmulatorLocked wakes the drain
-// goroutine via an InputPipe sentinel write, which blocks on a
-// snapshot-only emulator that has no live attach loop draining its input
-// (the pre-existing teardown-hang). Reusing the live vt + its single
-// drain goroutine sidesteps that entirely. On the common first-attach
-// path (vt == nil) it just initializes. Must hold p.mu.
+// When the emulator already exists we RESET it in place rather than
+// tearing it down: teardownEmulatorLocked wakes the drain goroutine via
+// an InputPipe sentinel write, which blocks on a snapshot-only emulator
+// that has no live attach loop draining its input (the pre-existing
+// teardown-hang). Reusing the live vt + its single drain goroutine
+// sidesteps that entirely. On the common first-attach path (vt == nil) it
+// just initializes. Must hold p.mu.
 func (p *PaneView) freshEmulatorLocked() {
 	if p.vt == nil {
 		p.initEmulatorLocked()
 		return
 	}
-	// Reset the existing emulator in place. RIS (ESC c) clears the grid,
-	// the emulator's own scrollback, and resets modes — so a replayed
-	// snapshot lands on an empty screen exactly as a brand-new emulator
-	// would, without leaking the prior peek's grid rows into our ring.
-	// We pair it with a fresh scrollback ring + cleared tracking state.
-	// This is the same p.vt.Write path applySnapshotChunk uses; it does
-	// NOT touch the InputPipe, so it can't hit the teardown sentinel hang.
+	// Reset the existing emulator in place. RIS (ESC c) clears the grid
+	// and resets modes via the same p.vt.Write path applySnapshotChunk
+	// uses (it does NOT touch the InputPipe, so it can't hit the teardown
+	// sentinel hang). RIS does NOT clear charm/x/vt's native scrollback,
+	// though, so we clear that explicitly — otherwise the prior peek's
+	// history would leak in behind the replayed snapshot.
 	p.vt.Write([]byte("\x1bc"))
-	p.scrollback = terminal.NewScrollbackBuffer(10000)
+	p.vt.ClearScrollback()
 	p.viewportOffset = 0
 	p.altScreenActive = false
-	p.lastTopRow = nil
 	p.cursorHidden.Store(false)
 	p.cursorAppMode.Store(false)
 	p.cachedView = ""
@@ -844,14 +841,14 @@ func (p *PaneView) attach(ctx context.Context, takeover bool) (err error) {
 			continue
 		}
 		// The snapshot byte stream is scrollback history (each row
-		// terminated by \r\n) followed by a SerializeRedraw. Drive
-		// local scrollback capture so the history lines land in the
-		// ring as the emulator scrolls them off the top of the grid.
-		// The redraw portion uses CUP positioning rather than \n
-		// scrolling, so it does not push extra rows; and if the
-		// redraw flips alt-screen on, applySnapshotChunk's
-		// altScreenActive tracking keeps subsequent rows out of the
-		// primary-screen scrollback (matches the live-mode contract).
+		// terminated by \r\n) followed by a SerializeRedraw. Writing it
+		// scrolls the history rows into the emulator's native scrollback
+		// as they leave the top of the grid; the render path reads them
+		// back. The redraw portion uses CUP positioning rather than \n
+		// scrolling, so it adds no extra scrollback rows; and if the
+		// redraw flips alt-screen on, its content goes to the alternate
+		// screen, leaving the primary scrollback untouched (matches the
+		// live-mode contract).
 		p.applySnapshotChunk(payload)
 		remaining -= len(payload)
 		if remaining < 0 {
@@ -1175,95 +1172,32 @@ func (p *PaneView) handleAttachExit(err error, cleanExit bool) {
 	p.emitTeaMsg(PaneDetachedMsg{PaneID: p.id})
 }
 
-// applySnapshotChunk feeds one snapshot payload into the local
-// emulator while driving scrollback capture in the same shape as
-// applyOutput. The daemon ships scrollback history as a \r\n-
-// terminated byte stream BEFORE the SerializeRedraw; we split on
-// \r\n so each history row's scroll-off triggers a CaptureTopRow /
-// PushScrolledLine pair and lands in the ring. Once the redraw
-// flips alt-screen on (\x1b[?1049h), subsequent rows do not
-// contribute to scrollback — matching the live-mode contract
-// enforced by CaptureTopRow/PushScrolledLine.
+// applySnapshotChunk feeds one snapshot payload into the local emulator.
+// The daemon ships scrollback history as a \r\n-terminated byte stream
+// BEFORE the SerializeRedraw; as those rows exceed the grid they scroll
+// into the emulator's native scrollback, which the render path reads
+// back. Once the redraw flips alt-screen on (\x1b[?1049h), content goes
+// to the alternate screen and does not touch the primary scrollback —
+// matching the live-mode contract.
 func (p *PaneView) applySnapshotChunk(data []byte) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.vt == nil {
 		return
 	}
-	for _, segment := range splitAfterCRLF(data) {
-		if hasSeq(segment, altScreenEnableSeqs) {
-			p.altScreenActive = true
-			p.viewportOffset = 0
-		}
-		if hasSeq(segment, altScreenDisableSeqs) {
-			p.altScreenActive = false
-		}
-		if hasSeq(segment, mouseEnableSeqs) {
-			p.mouseEnabled = true
-		}
-		if hasSeq(segment, mouseDisableSeqs) {
-			p.mouseEnabled = false
-		}
-		if hasSeq(segment, bracketedPasteEnableSeqs) {
-			p.bracketedPasteActive.Store(true)
-		}
-		if hasSeq(segment, bracketedPasteDisableSeqs) {
-			p.bracketedPasteActive.Store(false)
-		}
-		p.lastTopRow = terminal.CaptureTopRow(p.vt, p.altScreenActive)
-		p.vt.Write(segment)
-		terminal.PushScrolledLine(p.vt, p.altScreenActive, p.lastTopRow, p.scrollback)
-		p.lastTopRow = nil
-	}
-	p.dirty = true
-	p.cachedView = ""
+	p.applyBytesLocked(data)
 }
 
-// splitAfterCRLF splits data into segments ending after each "\r\n"
-// boundary (with the trailing remainder if any). Used by
-// applySnapshotChunk so each scrolled-off row triggers its own
-// scrollback push.
-func splitAfterCRLF(data []byte) [][]byte {
-	var out [][]byte
-	for {
-		idx := indexCRLF(data)
-		if idx < 0 {
-			if len(data) > 0 {
-				out = append(out, data)
-			}
-			return out
-		}
-		end := idx + 2
-		out = append(out, data[:end])
-		data = data[end:]
-	}
-}
-
-// indexCRLF returns the index of the first "\r\n" in data, or -1.
-func indexCRLF(data []byte) int {
-	for i := 0; i+1 < len(data); i++ {
-		if data[i] == '\r' && data[i+1] == '\n' {
-			return i
-		}
-	}
-	return -1
-}
-
-// applyOutput feeds bytes into the local emulator and updates the
-// scroll/alt-screen detectors. Mirrors the relevant subset of
-// terminal.Pane.handleOutput — selection / clipboard pieces are not
-// duplicated because they're driven by client-side input, not by
-// inbound bytes.
-func (p *PaneView) applyOutput(data []byte) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.vt == nil {
-		return
-	}
-	// Minimal mode detection — alt-screen and mouse-enable flips ride
-	// on the byte stream too. We don't need the full sequence-detection
-	// machine of terminal.Pane (subscribers, ModeEvent) here; the
-	// flags are read locally by SetSize and HandleMouse.
+// applyBytesLocked detects mode flips and writes data to the emulator.
+// Must be called with p.mu held and p.vt non-nil. Scrollback is NOT
+// captured here: the emulator maintains its own native scrollback as
+// content scrolls off the top (handling line wrapping, multi-row scrolls,
+// and redraw-in-place correctly), and the render/scroll paths read it
+// directly via RenderVTNativeScrollback / vt.ScrollbackLen. Mode flips
+// (alt-screen / mouse / bracketed-paste) are detected on the whole chunk;
+// only the final state matters since these flags are read later by
+// SetSize / HandleMouse / translateKey, not mid-write.
+func (p *PaneView) applyBytesLocked(data []byte) {
 	if hasSeq(data, altScreenEnableSeqs) {
 		p.altScreenActive = true
 		p.viewportOffset = 0
@@ -1283,16 +1217,23 @@ func (p *PaneView) applyOutput(data []byte) {
 	if hasSeq(data, bracketedPasteDisableSeqs) {
 		p.bracketedPasteActive.Store(false)
 	}
-	// Capture scrollback: snapshot row 0 before vt.Write, push it
-	// after if it scrolled off. Without this, the local scrollback
-	// ring stays empty and wheel scroll silently no-ops because
-	// scrollUpLocked clamps to scrollback.Len() == 0.
-	p.lastTopRow = terminal.CaptureTopRow(p.vt, p.altScreenActive)
 	p.vt.Write(data)
-	terminal.PushScrolledLine(p.vt, p.altScreenActive, p.lastTopRow, p.scrollback)
-	p.lastTopRow = nil
 	p.dirty = true
 	p.cachedView = ""
+}
+
+// applyOutput feeds live bytes into the local emulator and updates the
+// scroll/alt-screen detectors. Mirrors the relevant subset of
+// terminal.Pane.handleOutput — selection / clipboard pieces are not
+// duplicated because they're driven by client-side input, not by
+// inbound bytes.
+func (p *PaneView) applyOutput(data []byte) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.vt == nil {
+		return
+	}
+	p.applyBytesLocked(data)
 }
 
 var (
@@ -1433,8 +1374,8 @@ func (p *PaneView) HandleKey(msg tea.KeyMsg) tea.Msg {
 		p.mu.Unlock()
 		return nil
 	case "shift+home":
-		if p.scrollback != nil {
-			p.viewportOffset = p.scrollback.Len()
+		if p.vt != nil {
+			p.viewportOffset = p.vt.ScrollbackLen()
 			p.dirty = true
 		}
 		p.mu.Unlock()
@@ -1639,10 +1580,10 @@ func (p *PaneView) viewportToLogicalLocked(x, y int) terminal.Position {
 // scrollUpLocked / scrollDownLocked move the viewport. Must be called
 // with p.mu held.
 func (p *PaneView) scrollUpLocked(lines int) {
-	if p.scrollback == nil {
+	if p.vt == nil {
 		return
 	}
-	max := p.scrollback.Len()
+	max := p.vt.ScrollbackLen()
 	p.viewportOffset += lines
 	if p.viewportOffset > max {
 		p.viewportOffset = max
@@ -1732,7 +1673,7 @@ func (p *PaneView) View() string {
 		return p.cachedView
 	}
 	cursorVisible := !p.cursorHidden.Load()
-	p.cachedView = terminal.RenderVT(p.vt, p.scrollback, p.viewportOffset, cursorVisible, p.selection)
+	p.cachedView = terminal.RenderVTNativeScrollback(p.vt, p.viewportOffset, cursorVisible, p.selection)
 	p.dirty = false
 	return p.cachedView
 }
