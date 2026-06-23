@@ -1595,11 +1595,55 @@ func (m *Model) handleSidebarNav(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "o":
 		m.sidebarOpenOnly = !m.sidebarOpenOnly
+	case "g":
+		if m.sidebarIndex > 0 && m.sidebarIndex <= len(projects) {
+			m.cycleProjectAgent(projects[m.sidebarIndex-1])
+		}
+		return m, nil
 	case "esc":
 		m.sidebarFocused = false
 	}
 
 	return m, nil
+}
+
+// cycleProjectAgent advances a project's pinned agent to the next configured
+// agent (by config key) and persists it to the registry. The per-project pin is
+// the ONLY place agent identity is chosen, and it governs every spawn in the
+// project (an unpinned project refuses to spawn — see resolveSpawnAgent). The
+// status-bar toast names the agent's Label so the binding is visible.
+func (m *Model) cycleProjectAgent(proj *project.Project) {
+	if proj == nil {
+		return
+	}
+	names := m.getAgentNames()
+	if len(names) == 0 {
+		return
+	}
+	next := names[0]
+	for i, n := range names {
+		if n == proj.Settings.DefaultAgent {
+			next = names[(i+1)%len(names)]
+			break
+		}
+	}
+	proj.Settings.DefaultAgent = next
+	if err := m.projectRegistry.Update(proj); err != nil {
+		m.notify("Failed to save project agent: " + err.Error())
+		return
+	}
+	m.notify("Project agent: " + m.agentLabel(next))
+}
+
+// agentLabel returns the human-facing label for an agent key, falling back to
+// the key itself when the config has no Label.
+func (m *Model) agentLabel(name string) string {
+	if m.config != nil {
+		if cfg, ok := m.config.Agents[name]; ok && cfg.Label != "" {
+			return cfg.Label
+		}
+	}
+	return name
 }
 
 // sidebarTicketCount counts tickets for the sidebar. projectID=="" counts
@@ -2489,7 +2533,6 @@ func (m *Model) handleWorktreeToggle(msg tea.KeyMsg) tea.Cmd {
 	}
 	return nil
 }
-
 
 func (m *Model) handleProjectListNav(msg tea.KeyMsg) tea.Cmd {
 	projects := m.globalStore.Projects()
@@ -4714,7 +4757,7 @@ type spawnReqInputs struct {
 	rows           int
 	agentType      string
 	agentEnv       map[string]string // per-agent Env (config.AgentConfig.Env), injected at spawn with leading "~/" expanded
-	cleanArgs      []string // agentCfg.Args with empty entries stripped
+	cleanArgs      []string          // agentCfg.Args with empty entries stripped
 	isNewSession   bool
 	promptTemplate string
 	ctxData        agent.ContextData
@@ -6024,7 +6067,6 @@ func (m *Model) getAgentNames() []string {
 	sort.Strings(names)
 	return names
 }
-
 
 func (m *Model) getBranchPrefix(proj *project.Project) string {
 	if proj != nil && proj.Settings.BranchPrefix != "" {

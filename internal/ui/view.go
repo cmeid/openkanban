@@ -831,6 +831,7 @@ func (m *Model) contextualHints(hintStyle lipgloss.Style, sep string, maxWidth i
 				{key: "o", label: "open only", prio: 1},
 				{key: "a", label: "add", prio: 2},
 				{key: "d", label: "delete", prio: 3},
+				{key: "g", label: "pin agent", prio: 4},
 				{key: "l/Esc", label: "back", prio: 6, pinned: true},
 			}, hintStyle, sep, maxWidth)
 		}
@@ -1071,7 +1072,8 @@ func (m *Model) renderHelp() string {
 		"  " + keyStyle.Render("j/k") + descStyle.Render("   Navigate projects       ") + keyStyle.Render("Ctrl+]") + descStyle.Render("  Next session (in view)") + "\n" +
 		"  " + keyStyle.Render("a") + descStyle.Render("     Add project             ") + keyStyle.Render("Ctrl+\\") + descStyle.Render("  Prev session (in view)") + "\n" +
 		"  " + keyStyle.Render("d") + descStyle.Render("     Delete project          ") + keyStyle.Render("Ctrl+Space") + descStyle.Render(" Promote + bg agent") + "\n" +
-		"  " + keyStyle.Render("o") + descStyle.Render("     Toggle open only        ") + keyStyle.Render("r") + descStyle.Render("       Recover/destroy stuck session") + "\n\n" +
+		"  " + keyStyle.Render("o") + descStyle.Render("     Toggle open only        ") + keyStyle.Render("r") + descStyle.Render("       Recover/destroy stuck session") + "\n" +
+		"  " + keyStyle.Render("g") + descStyle.Render("     Pin project agent") + "\n\n" +
 		sep + "\n" +
 		sectionStyle.Render("  👁 View") + "                       " + sectionStyle.Render("⚙ System") + "\n" +
 		sep + "\n" +
@@ -1711,7 +1713,6 @@ func (m *Model) renderWorktreeSelector() string {
 
 	return worktreeOption + "  " + mainOption + hint
 }
-
 
 func (m *Model) renderBlockerSelector() string {
 	if len(m.blockerCandidates) == 0 {
@@ -2427,6 +2428,18 @@ func (m *Model) renderSidebar() string {
 		} else {
 			lines = append(lines, uncheckStyle.Render(label))
 		}
+
+		// Pinned agent (which Claude profile launches here). Visible so the
+		// guard is legible; "unpinned" warns that spawning will refuse.
+		pinStyle := lipgloss.NewStyle().Foreground(m.colors.muted).Italic(true)
+		var pin string
+		if p.Settings.DefaultAgent == "" {
+			pinStyle = lipgloss.NewStyle().Foreground(m.colors.warning)
+			pin = "↳ unpinned · g"
+		} else {
+			pin = "↳ " + m.agentLabel(p.Settings.DefaultAgent)
+		}
+		lines = append(lines, "  "+pinStyle.Render(truncateMiddle(pin, m.sidebarWidth-2)))
 	}
 
 	lines = append(lines, "")
@@ -2444,7 +2457,7 @@ func (m *Model) renderSidebar() string {
 
 	hintStyle := lipgloss.NewStyle().Foreground(m.colors.muted).Italic(true)
 	if m.sidebarFocused {
-		lines = append(lines, hintStyle.Render("  j/k ⏎toggle a/d o:open"))
+		lines = append(lines, hintStyle.Render("  ⏎tog a/d g:agt o:open"))
 	} else {
 		lines = append(lines, hintStyle.Render("  h→focus  [hide"))
 	}
