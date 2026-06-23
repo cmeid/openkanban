@@ -194,10 +194,11 @@ func (d *StatusDetector) DetectStatusWithActivity(agentType, fileSessionName, ap
 	// "waiting" refinement below. The hook status file can stay pinned at
 	// "working" while the session is actually blocked on the user: Claude's
 	// Notification hook does not reliably fire for every input-needed state
-	// (notably an AskUserQuestion prompt — observed pinning a session at
-	// "working" for hours), so the file is never demoted to "waiting". When
-	// the live grid shows a recognized approval/question prompt
-	// ("do you want to" / "esc to cancel") and NO active-turn marker, the
+	// (notably an AskUserQuestion or plan-approval prompt — observed pinning
+	// a session at "working" for hours), so the file is never demoted to
+	// "waiting". When the live grid shows a recognized approval/question
+	// prompt ("do you want to" / "esc to cancel" / "would you like to
+	// proceed") and NO active-turn marker, the
 	// session is needs-you, not working. The activeTurnVisible check is
 	// ordered as a guard so a genuinely busy session whose streamed output
 	// coincidentally contains a prompt substring is never demoted. An empty
@@ -254,13 +255,19 @@ func (d *StatusDetector) DetectStatusWithActivity(agentType, fileSessionName, ap
 // interactive approval prompt — Claude Code's tool-permission box ("Do
 // you want to proceed?" and its edit/create variants) and its
 // keyboard-hint footer ("Esc to cancel", distinct from the running
-// state's "esc to interrupt"). They are deliberately narrower than the
-// keyword list in detectCodingAgentStatus: a running tool's streamed
+// state's "esc to interrupt"), plus the plan-approval prompt that closes
+// plan mode ("…ready to execute. Would you like to proceed?"). The plan
+// box carries neither "do you want to" nor an "esc to cancel" footer, and
+// its Notification hook does not reliably fire (same family as
+// AskUserQuestion), so without its own signature a plan-blocked session
+// stays pinned at a stale "working". They are deliberately narrower than
+// the keyword list in detectCodingAgentStatus: a running tool's streamed
 // output won't contain them, so matching one is strong evidence the
 // session is genuinely blocked on the user rather than actively working.
 var permissionPromptSignatures = []string{
 	"do you want to",
 	"esc to cancel",
+	"would you like to proceed",
 }
 
 // backgroundAgentSignatures are substrings that appear only on Claude
