@@ -1,9 +1,3 @@
-<h1 align="center">
-  <br>
-  <img src="https://github.com/user-attachments/assets/14cde506-2091-4745-9349-2604d8ec5b32" alt="OpenKanban" width="600">
-  <br>
-</h1>
-
 <h4 align="center">A TUI kanban board for orchestrating AI coding agents.</h4>
 
 <p align="center">
@@ -17,11 +11,6 @@
     <img src="https://img.shields.io/badge/fork%20of-TechDufus%2Fopenkanban-blue?style=flat-square" alt="Fork">
   </a>
 </p>
-
-<p align="center">
-  <img src="./docs/assets/demo.gif" alt="OpenKanban Demo" width="800">
-</p>
-
 ---
 
 > **This is a fork.** OpenKanban was created by [@TechDufus](https://github.com/TechDufus). This fork (`cmeid/openkanban`) extends the original with per-ticket Markdown storage, hot reload, a non-interactive CLI, a long-running daemon for multi-window state, session linking for Claude Code, and a swap of the underlying terminal emulator. It also fixes a handful of correctness bugs in the upstream pane and input layers. See [Changes vs upstream](#changes-vs-upstream) for the full diff at the conceptual level.
