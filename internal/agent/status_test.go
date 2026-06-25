@@ -682,6 +682,26 @@ func TestDetectStatusWithActivity_StaleWorkingDemotedOnPrompt(t *testing.T) {
 		"   3. No, keep planning",
 	}, "\n")
 
+	// Additional hook-silent "Would you like to …?" confirmation boxes that
+	// carry neither "do you want to" nor an "esc to cancel" footer — each
+	// needs its own body signature, same as planApprovalGrid above. Wordings
+	// captured verbatim from the bundled binary (claude-code 2.1.179).
+	pluginInstallGrid := strings.Join([]string{
+		" Would you like to install this LSP plugin?",
+		" ❯ 1. Yes",
+		"   2. No",
+	}, "\n")
+	manifestGrid := strings.Join([]string{
+		" Would you like to create a manifest?",
+		" ❯ 1. Yes",
+		"   2. No",
+	}, "\n")
+	stashGrid := strings.Join([]string{
+		" Would you like to stash these changes and continue with teleport?",
+		" ❯ 1. Yes",
+		"   2. No",
+	}, "\n")
+
 	tests := []struct {
 		name            string
 		terminalContent string
@@ -692,6 +712,9 @@ func TestDetectStatusWithActivity_StaleWorkingDemotedOnPrompt(t *testing.T) {
 		{"AskUserQuestion prompt demotes stale working", askUserQuestionGrid, board.AgentWaiting},
 		{"permission box demotes stale working", permissionBox, board.AgentWaiting},
 		{"plan-approval prompt demotes stale working", planApprovalGrid, board.AgentWaiting},
+		{"plugin install prompt demotes stale working", pluginInstallGrid, board.AgentWaiting},
+		{"manifest prompt demotes stale working", manifestGrid, board.AgentWaiting},
+		{"stash prompt demotes stale working", stashGrid, board.AgentWaiting},
 		// Guards against over-demotion — these must STAY "working":
 		{"active turn alone preserves working", "⠹ Running bash command… (esc to interrupt)", board.AgentWorking},
 		{"no prompt + no marker preserves working (file authoritative)", "some streamed tool output\nrunning tests", board.AgentWorking},
@@ -710,6 +733,48 @@ func TestDetectStatusWithActivity_StaleWorkingDemotedOnPrompt(t *testing.T) {
 			got := d.DetectStatusWithActivity("claude", "sess", "sess", "", 0, true, tt.terminalContent, time.Now())
 			if got != tt.want {
 				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestPermissionPromptVisible_SignatureCoverageLedger is the authoritative
+// ledger of the real Claude Code prompt strings permissionPromptVisible must
+// recognize as a blocked-on-user state. Each row is a wording captured
+// verbatim from the bundled binary (claude-code 2.1.179); a row flipping to
+// false means EITHER a signature was dropped from permissionPromptSignatures
+// OR Claude's wording drifted — both are real regressions, NOT expectations to
+// "fix" by editing want. When refreshing for a new Claude version, update the
+// fixture string AND the matching signature in lockstep (verify against the
+// binary per memory reference_verify_claude_scraper_signatures_via_binary).
+//
+// The AskUserQuestion row is the load-bearing drift guard: that prompt has no
+// distinctive "?"-body of its own and is recognized ONLY via its "Esc to
+// cancel" footer, so if a future Claude build changes that footer this row is
+// what catches the silent regression to stale-"working".
+func TestPermissionPromptVisible_SignatureCoverageLedger(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{"AskUserQuestion footer (drift guard)", " Enter to select · Tab/Arrow keys to navigate · Esc to cancel", true},
+		{"plan-approval body", " Claude has written up a plan and is ready to execute. Would you like to proceed?", true},
+		{"tool permission body", " Do you want to proceed?", true},
+		{"plugin install prompt", " Would you like to install this LSP plugin?", true},
+		{"manifest creation prompt", " Would you like to create a manifest?", true},
+		{"teleport stash prompt", " Would you like to stash these changes and continue with teleport?", true},
+		{"plain streamed output (no prompt)", "running tests\nediting status.go\nall checks passed", false},
+		// Negative control: a "Would you like to …?" prompt whose tail matches
+		// NONE of the discriminating signatures must NOT match. Guards against a
+		// future edit truncating e.g. "would you like to install" back toward a
+		// bare "would you like to" (which would then catch agent narration).
+		{"would-you-like near-miss (no discriminating tail)", " Would you like to review the changes?", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := permissionPromptVisible(tt.content); got != tt.want {
+				t.Errorf("permissionPromptVisible(%q) = %v, want %v", tt.content, got, tt.want)
 			}
 		})
 	}

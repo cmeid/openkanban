@@ -255,19 +255,28 @@ func (d *StatusDetector) DetectStatusWithActivity(agentType, fileSessionName, ap
 // interactive approval prompt — Claude Code's tool-permission box ("Do
 // you want to proceed?" and its edit/create variants) and its
 // keyboard-hint footer ("Esc to cancel", distinct from the running
-// state's "esc to interrupt"), plus the plan-approval prompt that closes
-// plan mode ("…ready to execute. Would you like to proceed?"). The plan
-// box carries neither "do you want to" nor an "esc to cancel" footer, and
-// its Notification hook does not reliably fire (same family as
-// AskUserQuestion), so without its own signature a plan-blocked session
-// stays pinned at a stale "working". They are deliberately narrower than
-// the keyword list in detectCodingAgentStatus: a running tool's streamed
-// output won't contain them, so matching one is strong evidence the
-// session is genuinely blocked on the user rather than actively working.
+// state's "esc to interrupt"), plus the family of "Would you like to …?"
+// confirmation boxes that carry neither "do you want to" nor an "esc to
+// cancel" footer: the plan-approval prompt that closes plan mode ("…ready
+// to execute. Would you like to proceed?"), and the install / manifest /
+// stash boxes below. Their Notification hook does not reliably fire (same
+// family as AskUserQuestion), so without its own body signature each such
+// prompt would leave the session pinned at a stale "working". They are
+// deliberately narrower than the keyword list in detectCodingAgentStatus:
+// each is a full multi-word prompt phrase a running tool's streamed output
+// won't contain, so matching one (in the 15-line tail, and — for the
+// working→waiting demotion — only when no active-turn marker is present)
+// is strong evidence the session is genuinely blocked on the user rather
+// than actively working. Wordings are verified against the bundled binary
+// (see memory reference_verify_claude_scraper_signatures_via_binary); the
+// canonical detection ledger is TestPermissionPromptVisible_SignatureCoverageLedger.
 var permissionPromptSignatures = []string{
 	"do you want to",
 	"esc to cancel",
 	"would you like to proceed",
+	"would you like to install",             // plugin / dependency install prompt
+	"would you like to create a manifest",   // plugin-authoring prompt
+	"would you like to stash these changes", // checkpoint-rewind ("teleport") stash prompt
 }
 
 // backgroundAgentSignatures are substrings that appear only on Claude

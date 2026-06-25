@@ -89,9 +89,12 @@ cannot tell an active turn apart from a re-rendering prompt. Precedence when the
 file says "waiting":
 
 1. `permissionPromptVisible` — a recognized approval prompt on screen
-   (`"do you want to"` / `"esc to cancel"` / `"would you like to proceed"`,
-   the last being the plan-approval / ExitPlanMode prompt) → **waiting**
-   (wins outright).
+   (`"do you want to"` / `"esc to cancel"` / the hook-silent
+   `"would you like to …"` family: `proceed` (plan-approval / ExitPlanMode),
+   `install`, `create a manifest`, `stash these changes`) → **waiting**
+   (wins outright). The full signature list lives in
+   `permissionPromptSignatures`; its detection ledger is
+   `TestPermissionPromptVisible_SignatureCoverageLedger`.
 2. `activeTurnVisible` — positive evidence of an active turn
    (`"esc to interrupt"` / braille spinner) → **working**.
 3. otherwise → **waiting** (durable default).
