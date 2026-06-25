@@ -424,20 +424,43 @@ func (p *Pane) ScrollbackLen() int {
 	return p.scrollback.Len()
 }
 
-// SnapshotScrollback returns a copy of the scrollback ring's contents,
-// oldest line first. Returns nil if scrollback is nil or empty. Used by
-// the daemon to ship scrollback history to attaching clients.
+// SnapshotScrollback returns the emulator's native scrollback history,
+// oldest line first, as materialized Glyph rows. Returns nil when there
+// is no emulator or no history. Used by the daemon to ship scrollback to
+// attaching clients.
+//
+// We read the emulator's OWN scrollback (vt.ScrollbackLen /
+// ScrollbackCellAt) rather than the CaptureTopRow/PushScrolledLine ring:
+// that ring snapshots only one row per write, so a single write that
+// scrolls many rows off the grid (a burst of agent output, or a re-attach
+// drain after a detached period) lost all but one scrolled-off row. The
+// emulator wraps lines and tracks every scrolled-off row, so it is the
+// authoritative history — the same reason the client renders from native
+// scrollback (see daemonclient.PaneView / RenderVTNativeScrollback). The
+// ring remains only for the legacy daemon-side Pane.View render path.
 func (p *Pane) SnapshotScrollback() [][]Glyph {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.scrollback == nil {
+	if p.vt == nil {
 		return nil
 	}
-	n := p.scrollback.Len()
+	n := p.vt.ScrollbackLen()
 	if n == 0 {
 		return nil
 	}
-	return p.scrollback.GetRange(0, n)
+	cols := p.vt.Width()
+	if cols <= 0 {
+		return nil
+	}
+	out := make([][]Glyph, n)
+	for idx := 0; idx < n; idx++ {
+		row := make([]Glyph, cols)
+		for col := 0; col < cols; col++ {
+			row[col] = CellToGlyph(p.vt.ScrollbackCellAt(col, idx))
+		}
+		out[idx] = row
+	}
+	return out
 }
 
 // ViewportOffset returns how many lines the viewport is scrolled back.
