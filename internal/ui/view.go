@@ -2514,17 +2514,14 @@ func (m *Model) renderSidebar() string {
 			lines = append(lines, uncheckStyle.Render(label))
 		}
 
-		// Pinned agent (which Claude profile launches here). Visible so the
-		// guard is legible; "unpinned" warns that spawning will refuse.
-		pinStyle := lipgloss.NewStyle().Foreground(m.colors.muted).Italic(true)
-		var pin string
+		// Surface the agent line ONLY when configuration is missing: an unpinned
+		// project refuses to spawn, so the hint warns the user to press g. A pinned
+		// project stays quiet (the agent is set; it's visible in the e editor / g toast).
 		if p.Settings.DefaultAgent == "" {
-			pinStyle = lipgloss.NewStyle().Foreground(m.colors.warning)
-			pin = "↳ unpinned · g"
-		} else {
-			pin = "↳ " + m.agentLabel(p.Settings.DefaultAgent)
+			pinStyle := lipgloss.NewStyle().Foreground(m.colors.warning)
+			pin := "↳ unpinned · g"
+			lines = append(lines, "  "+pinStyle.Render(truncateMiddle(pin, m.sidebarWidth-2)))
 		}
-		lines = append(lines, "  "+pinStyle.Render(truncateMiddle(pin, m.sidebarWidth-2)))
 	}
 
 	lines = append(lines, "")

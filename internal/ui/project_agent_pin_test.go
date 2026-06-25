@@ -2,6 +2,7 @@ package ui
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -136,5 +137,56 @@ func TestPromoteAndSpawnUnattached_UnpinnedRefuses(t *testing.T) {
 	}
 	if _, ok := m.panes[ticket.ID]; ok {
 		t.Errorf("unpinned project created a pane; spawn should have been refused")
+	}
+}
+
+// TestSidebarPinLineOnlyWhenUnpinned pins the sidebar's render contract: a pinned
+// project shows just its name row (the agent line is noise once configured — it's
+// still reachable via the e editor and the g toast), while an unpinned project
+// keeps the amber "↳ unpinned · g" hint (its spawn would refuse, so the warning
+// earns its row). Reverting the change re-renders the pinned label and fails the
+// "must NOT contain" assertion.
+func TestSidebarPinLineOnlyWhenUnpinned(t *testing.T) {
+	t.Setenv("OPENKANBAN_CONFIG_DIR", t.TempDir())
+
+	store := project.NewGlobalTicketStore(nil)
+	store.AddProject(&project.Project{
+		ID: "pinned", Name: "Pinned", RepoPath: t.TempDir(),
+		Settings: project.ProjectSettings{DefaultAgent: "claude"},
+	})
+	store.AddProject(&project.Project{
+		ID: "loose", Name: "Loose", RepoPath: t.TempDir(),
+	})
+
+	m := &Model{
+		globalStore:    store,
+		sidebarVisible: true,
+		sidebarFocused: true,
+		sidebarWidth:   30,
+		width:          120,
+		height:         40,
+		colors:         newUIColors(config.DefaultConfig().GetTheme()),
+		config: &config.Config{
+			Agents: map[string]config.AgentConfig{
+				"claude": {Command: "claude", Label: "Claude (Default)"},
+			},
+		},
+	}
+
+	out := m.renderSidebar()
+
+	// Both project rows render.
+	for _, want := range []string{"Pinned", "Loose"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("sidebar missing project row %q\n---\n%s", want, out)
+		}
+	}
+	// The unpinned project keeps its hint.
+	if !strings.Contains(out, "unpinned · g") {
+		t.Errorf("sidebar dropped the unpinned hint\n---\n%s", out)
+	}
+	// The pinned project's agent label is NOT echoed under it.
+	if strings.Contains(out, "Claude (Default)") {
+		t.Errorf("sidebar still renders the pinned agent label\n---\n%s", out)
 	}
 }
