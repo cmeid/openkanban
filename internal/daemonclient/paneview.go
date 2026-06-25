@@ -334,6 +334,28 @@ func (p *PaneView) SetPaneStateForTest(s PaneViewState) {
 	p.state = s
 }
 
+// NewPaneViewForTest builds a PaneView wired with a closable client and an
+// empty teaMsgs buffer, for cross-package tests (internal/ui) that need to
+// exercise the tea.Cmd channel readers (readNextMsg and the model's
+// listenPaneMessages bridge) without a live daemon connection. readNextMsg
+// reads p.client.closeCh at arm time, so the client must be non-nil. See the
+// "ForTest" note on SetPaneStateForTest.
+func NewPaneViewForTest(ticketID string) *PaneView {
+	return &PaneView{
+		client:    &Client{closeCh: make(chan struct{})},
+		id:        ticketID,
+		sessionID: ticketID,
+		state:     PaneViewUnattached,
+		teaMsgs:   make(chan tea.Msg, 64),
+		detachCh:  make(chan struct{}),
+	}
+}
+
+// EmitForTest pushes one message into the pane's teaMsgs buffer — a test-only
+// wrapper around emitTeaMsg so cross-package tests can pre-load the channel.
+// See SetPaneStateForTest for the rationale.
+func (p *PaneView) EmitForTest(msg tea.Msg) { p.emitTeaMsg(msg) }
+
 // SetWorkdir caches a workdir locally. Informational — Spawn carries
 // the real workdir to the daemon. The model still calls this after a
 // successful spawn so GetWorkdir returns the expected value.
