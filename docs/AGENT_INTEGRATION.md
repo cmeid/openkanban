@@ -606,6 +606,20 @@ The embedded `agent_prompt.tmpl` is deliberately **generic about cross-cutting w
 
 The one deliberate exception is the **`finishing-an-openkanban-ticket`** skill, which the template names for the close-out. That skill is openkanban-owned (vendored at [`internal/finishskill/SKILL.md`](../internal/finishskill/SKILL.md) and written into `~/.claude/skills/` on launch — see "Standardized close-out" below), so it is guaranteed present in any openkanban-spawned session. The template's wrap-up section delegates the entire end-of-ticket flow to it: verify → self-evaluate readiness → one enumerated permission prompt → land via commit → PR → merge → reflective wind-down. The template itself stays generic and prose-affirmative (it describes *what* the close-out does, not a list of `NEVER` rules) so it doesn't restate the user's global push-gate.
 
+### Token / context optimization (the `claude-lean` preset)
+
+A default spawned session loads ~55k tokens of context before doing any work —
+mostly the *environment* (enabled plugins, auto-memory, global `CLAUDE.md`, MCP
+listings), not OpenKanban's own ~1.2k-token prompt. The **`claude-lean`** preset
+(`defaultAgents()` in `internal/config/config.go`) spawns a worker under a
+slimmed `CLAUDE_CONFIG_DIR`, disables auto-memory, forbids MCP, and uses a
+trimmed InitPrompt (`agent_prompt_lean.tmpl`, no `/prime` mandate) — cutting a
+worker to roughly half a default session. It rides the same basename-keyed spawn
+path as `claude`/`claude-custom` (no `model.go` change) and is opt-in per project
+(pin via sidebar `g`/`e`). Full measured breakdown, the one-time `~/.claude-lean`
+setup recipe, and why a literal "30%" is bounded by Claude Code's fixed system
+prompt + tools: see [`TOKEN_OPTIMIZATION.md`](TOKEN_OPTIMIZATION.md).
+
 ### Standardized close-out
 
 The shipped skill standardizes the two prompts a user otherwise re-types at the end of every ticket ("land the work" and "anything else / lessons learned"). Its safety model: the single permission prompt enumerates every outward action (push remote+branch, PR repo, merge target+strategy) and is only offered for a destination verified owned per the user's push-gate; the grant is scoped to the named actions; verification failures and blocking review findings stop the land (fail closed). The skill is shipped via `//go:embed` (mirroring how this template is embedded) and `finishskill.EnsureInstalled` rewrites the global copy from the embed on launch, so `openkanban update` propagates skill changes on the next start.

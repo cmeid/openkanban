@@ -111,6 +111,52 @@ func TestDefaultConfig(t *testing.T) {
 	}
 }
 
+// TestClaudeLeanPreset pins the token-optimized claude-lean preset shape.
+// The authoritative spawn-wiring assertion lives in
+// internal/ui/respawn_daemon_test.go (TestBuildSpawnReq_LeanPresetReachesSpawn);
+// this only guards the preset definition + its lean InitPrompt invariants.
+// See docs/TOKEN_OPTIMIZATION.md.
+func TestClaudeLeanPreset(t *testing.T) {
+	cfg := DefaultConfig()
+	lean, ok := cfg.Agents["claude-lean"]
+	if !ok {
+		t.Fatal("claude-lean preset missing from default agents")
+	}
+	// Command must be "claude" so it inherits Claude-class spawn behavior
+	// (plan mode, prompt-suggestion disable) via buildSpawnReq's basename switch.
+	if lean.Command != "claude" {
+		t.Errorf("claude-lean.Command = %q; want %q", lean.Command, "claude")
+	}
+	if lean.Env["CLAUDE_CONFIG_DIR"] == "" {
+		t.Error("claude-lean.Env missing CLAUDE_CONFIG_DIR (the slimmed profile)")
+	}
+	if lean.Env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] != "1" {
+		t.Errorf("claude-lean.Env[CLAUDE_CODE_DISABLE_AUTO_MEMORY] = %q; want \"1\"",
+			lean.Env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"])
+	}
+	hasStrictMCP := false
+	for _, a := range lean.Args {
+		if a == "--strict-mcp-config" {
+			hasStrictMCP = true
+		}
+	}
+	if !hasStrictMCP {
+		t.Errorf("claude-lean.Args = %v; want to contain --strict-mcp-config", lean.Args)
+	}
+	if lean.InitPrompt != defaultLeanAgentPrompt {
+		t.Error("claude-lean.InitPrompt should be the lean template (defaultLeanAgentPrompt)")
+	}
+	// Lean InitPrompt invariants: it must NOT mandate /prime (the whole point —
+	// a lean session has no global CLAUDE.md/memory for /prime to load), but it
+	// MUST preserve the close-out directive.
+	if strings.Contains(defaultLeanAgentPrompt, "/prime") {
+		t.Error("lean InitPrompt should not reference /prime")
+	}
+	if !strings.Contains(defaultLeanAgentPrompt, "finishing-an-openkanban-ticket") {
+		t.Error("lean InitPrompt must keep the finishing-an-openkanban-ticket close-out directive")
+	}
+}
+
 func TestConfigDir(t *testing.T) {
 	t.Setenv("OPENKANBAN_CONFIG_DIR", "")
 	t.Setenv("XDG_CONFIG_HOME", "")

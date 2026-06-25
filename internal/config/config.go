@@ -40,6 +40,15 @@ func DefaultAgentPrompt() string {
 	return defaultAgentPrompt
 }
 
+// defaultLeanAgentPrompt is the token-optimized priming template for the
+// `claude-lean` preset. It drops the mandatory `/prime` (a lean session has
+// no global CLAUDE.md / auto-memory to load) while preserving the brief-read,
+// scope/status, and `finishing-an-openkanban-ticket` close-out directives.
+// See docs/TOKEN_OPTIMIZATION.md.
+//
+//go:embed agent_prompt_lean.tmpl
+var defaultLeanAgentPrompt string
+
 const defaultAiderPrompt = `OpenKanban Ticket: {{.Title}}
 
 Description:
@@ -179,6 +188,28 @@ func defaultAgents() map[string]AgentConfig {
 			Env:        map[string]string{"CLAUDE_CONFIG_DIR": "~/.claude-personal"},
 			StatusFile: ".claude/status.json",
 			InitPrompt: defaultAgentPrompt,
+		},
+		// claude-lean spawns a token-optimized Claude worker (~50% of a
+		// default session's context — roughly half; see
+		// docs/TOKEN_OPTIMIZATION.md). It
+		// points at a slimmed CLAUDE_CONFIG_DIR (no plugins, no global
+		// CLAUDE.md, no auto-memory — the user sets ~/.claude-lean up once,
+		// same one-time pattern as claude-custom's ~/.claude-personal),
+		// disables auto-memory, and forbids MCP servers via --strict-mcp-config.
+		// Command:"claude" so it inherits all Claude-class spawn behavior
+		// (plan mode, prompt-suggestion disable) through buildSpawnReq's
+		// basename switch — no model.go change. Opt in by pinning a project
+		// to "claude-lean".
+		"claude-lean": {
+			Label:   "Claude (Lean)",
+			Command: "claude",
+			Args:    []string{"--dangerously-skip-permissions", "--strict-mcp-config"},
+			Env: map[string]string{
+				"CLAUDE_CONFIG_DIR":               "~/.claude-lean",
+				"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+			},
+			StatusFile: ".claude/status.json",
+			InitPrompt: defaultLeanAgentPrompt,
 		},
 		"opencode": {
 			Label:      "OpenCode",
