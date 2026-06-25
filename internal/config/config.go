@@ -191,11 +191,16 @@ func defaultAgents() map[string]AgentConfig {
 		},
 		// claude-lean spawns a token-optimized Claude worker (~50% of a
 		// default session's context — roughly half; see
-		// docs/TOKEN_OPTIMIZATION.md). It
-		// points at a slimmed CLAUDE_CONFIG_DIR (no plugins, no global
-		// CLAUDE.md, no auto-memory — the user sets ~/.claude-lean up once,
-		// same one-time pattern as claude-custom's ~/.claude-personal),
-		// disables auto-memory, and forbids MCP servers via --strict-mcp-config.
+		// docs/TOKEN_OPTIMIZATION.md). It points at a slimmed
+		// CLAUDE_CONFIG_DIR (no plugins, no global CLAUDE.md, no auto-memory
+		// — the user sets ~/.claude-lean up once, same one-time pattern as
+		// claude-custom's ~/.claude-personal), disables auto-memory, forbids
+		// MCP servers (--strict-mcp-config), and relocates per-machine system-
+		// prompt sections into the first user message for cross-session
+		// prompt-cache reuse (--exclude-dynamic-system-prompt-sections).
+		// It stays capability-complete (all built-in tools, incl. WebSearch);
+		// the further ~30% cut via --tools is a documented opt-in (it trades
+		// worker capability) — see docs/TOKEN_OPTIMIZATION.md, not baked here.
 		// Command:"claude" so it inherits all Claude-class spawn behavior
 		// (plan mode, prompt-suggestion disable) through buildSpawnReq's
 		// basename switch — no model.go change. Opt in by pinning a project
@@ -203,7 +208,11 @@ func defaultAgents() map[string]AgentConfig {
 		"claude-lean": {
 			Label:   "Claude (Lean)",
 			Command: "claude",
-			Args:    []string{"--dangerously-skip-permissions", "--strict-mcp-config"},
+			Args: []string{
+				"--dangerously-skip-permissions",
+				"--strict-mcp-config",
+				"--exclude-dynamic-system-prompt-sections",
+			},
 			Env: map[string]string{
 				"CLAUDE_CONFIG_DIR":               "~/.claude-lean",
 				"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",

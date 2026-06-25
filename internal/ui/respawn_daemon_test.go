@@ -322,6 +322,9 @@ func TestBuildSpawnReq_LeanPresetReachesSpawn(t *testing.T) {
 	if !argsContain(req.Args, "--strict-mcp-config") {
 		t.Errorf("lean args missing --strict-mcp-config, got %v", req.Args)
 	}
+	if !argsContain(req.Args, "--exclude-dynamic-system-prompt-sections") {
+		t.Errorf("lean args missing --exclude-dynamic-system-prompt-sections, got %v", req.Args)
+	}
 }
 
 // TestBuildSpawnReq_ForceFresh_AgentSpawnedAtNilAtConstruction asserts
