@@ -80,6 +80,61 @@ func TestAgentStatusResultMsgAppliesToDaemonOwnedTickets(t *testing.T) {
 		}
 	})
 
+	t.Run("subagents is not flapped to waiting/working by the grid-blind poll", func(t *testing.T) {
+		// The flap: a session waiting on background sub-agents is set to
+		// AgentSubagents by the daemon (which has the live grid). The UI
+		// file-poll is grid-blind for an unattached session, so it falls
+		// through to the stale "waiting"/"working" status file and would
+		// overwrite the daemon's verdict every ~2s. The poll must NOT move a
+		// ticket off AgentSubagents into those live-turn states; only the
+		// daemon-push (applyDaemonStatus) owns that transition.
+		//
+		// RED-BEFORE-GREEN: revert the AgentSubagents guard in the
+		// agentStatusResultMsg handler and both assertions fail (the ticket
+		// becomes the poll value).
+		for _, incoming := range []board.AgentStatus{board.AgentWaiting, board.AgentWorking} {
+			m, ticket := newModel(board.AgentSubagents, true)
+			_, _ = m.Update(agentStatusResultMsg{tid: incoming})
+			if ticket.AgentStatus != board.AgentSubagents {
+				t.Errorf("AgentStatus = %v after poll(%v), want %v (poll must not flap subagents)",
+					ticket.AgentStatus, incoming, board.AgentSubagents)
+			}
+		}
+	})
+
+	t.Run("subagents still transitions to quiescent/terminal poll values", func(t *testing.T) {
+		// Boundary assertion (NOT revert-provable): the guard blocks only the
+		// live-turn states the grid-blind poll fabricates. The fresh
+		// hook-written quiescent/terminal signals the poll legitimately owns
+		// (idle/completed/error) MUST still land — otherwise a session that
+		// finishes its sub-agents and goes idle would be stranded at
+		// "subagents" (the activity-gated daemon goes silent on idle, so the
+		// poll is the only writer of that transition).
+		for _, incoming := range []board.AgentStatus{board.AgentIdle, board.AgentCompleted, board.AgentError} {
+			m, ticket := newModel(board.AgentSubagents, true)
+			_, _ = m.Update(agentStatusResultMsg{tid: incoming})
+			if ticket.AgentStatus != incoming {
+				t.Errorf("AgentStatus = %v after poll(%v), want %v (quiescent/terminal must apply)",
+					ticket.AgentStatus, incoming, incoming)
+			}
+		}
+	})
+
+	t.Run("daemon-push still owns the subagents exit transition", func(t *testing.T) {
+		// Non-regression assertion (NOT revert-provable): the poll-side guard
+		// must not touch applyDaemonStatus — the daemon, which has the live
+		// grid, is authoritative for moving a ticket off AgentSubagents back
+		// to working/waiting when the bg-wait actually ends.
+		m, ticket := newModel(board.AgentSubagents, true)
+		if !m.applyDaemonStatus(ticket, string(board.AgentWorking)) {
+			t.Fatalf("applyDaemonStatus returned false moving subagents → working")
+		}
+		if ticket.AgentStatus != board.AgentWorking {
+			t.Errorf("AgentStatus = %v, want %v (daemon-push owns the exit)",
+				ticket.AgentStatus, board.AgentWorking)
+		}
+	})
+
 	t.Run("AgentNone from poll does not clobber set state", func(t *testing.T) {
 		// The poll returns AgentNone when it can't determine status
 		// (no file, no terminal hits). That isn't a transition — don't

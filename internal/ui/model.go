@@ -1277,6 +1277,23 @@ func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 				status != board.AgentError {
 				continue
 			}
+			// AgentSubagents is a grid-only verdict: it can only be derived
+			// from the live PTY grid (the daemon's), never from the hook
+			// status file. This poll's local grid is empty for an unattached
+			// session, so backgroundWaitVisible is false and the detector
+			// falls through to the stale file value ("waiting" from the
+			// delegating turn's approved prompt, or "working") — which would
+			// fight the daemon's authoritative AgentSubagents push every ~2s
+			// (the flap). While the ticket is AgentSubagents, the poll may
+			// apply only the FRESH hook-written quiescent/terminal signals it
+			// legitimately owns (idle/completed/error, which the
+			// activity-gated daemon goes silent on); the daemon-push
+			// (applyDaemonStatus), which has the grid, owns the live
+			// working/waiting/subagents transitions.
+			if ticket.AgentStatus == board.AgentSubagents &&
+				(status == board.AgentWorking || status == board.AgentWaiting) {
+				continue
+			}
 			// In-memory only — this poll loop refreshes AgentStatus for
 			// visibility and intentionally does not persist (see comment
 			// block above). SetAgentStatus is used so StatusChangedAt is
