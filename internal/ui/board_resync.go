@@ -222,7 +222,19 @@ func (m *Model) handleBoardResyncMsg(msg boardResyncMsg) (tea.Model, tea.Cmd) {
 	m.boardResyncSnap = msg.snap
 
 	if changed {
+		// Re-anchor focus on the selected ticket by ID after the
+		// re-sort, so a background resync can't make the highlight jump
+		// to whatever card now lands at its old index. Follows the
+		// ticket across columns (ensureColumnVisible) if its status
+		// changed externally; degrades via selectTicketByID's clamp
+		// fallback if it was deleted. Filter state is intentionally NOT
+		// relaxed — an external change must not yank the user's filter.
+		sel := m.selectedTicket()
 		m.refreshColumnTickets()
+		if sel != nil {
+			m.selectTicketByID(sel.ID)
+			m.ensureColumnVisible()
+		}
 	}
 
 	return m, m.scheduleBoardResync()

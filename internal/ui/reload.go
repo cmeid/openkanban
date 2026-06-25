@@ -115,7 +115,16 @@ func (m *Model) handleFsChanged(msg FsChangedMsg) {
 			log.Printf("openkanban: reload ticket %s: %v", msg.Path, err)
 			return
 		}
+		// Keep the cursor on the selected ticket by ID across the
+		// re-sort an external reload triggers (mirrors the board-resync
+		// path). Follows it across columns if its status changed;
+		// clamp-degrades if it was deleted. No filter relaxation.
+		sel := m.selectedTicket()
 		m.refreshColumnTickets()
+		if sel != nil {
+			m.selectTicketByID(sel.ID)
+			m.ensureColumnVisible()
+		}
 	}
 }
 
