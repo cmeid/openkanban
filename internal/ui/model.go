@@ -6350,16 +6350,30 @@ func (m *Model) pollAgentStatusesAsync() tea.Cmd {
 
 func (m *Model) handleTerminalMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
+	pid, addressed := paneIDOf(msg)
+	rearmed := false
 	for _, pane := range m.panes {
 		if cmd := pane.Update(msg); cmd != nil {
 			cmds = append(cmds, cmd)
+			// PaneView.Update returns a follow-up readNextMsg Cmd for
+			// exactly the messages where it consumed pane output
+			// (PaneOutputMsg/PaneAttachedMsg). That Cmd already reads the
+			// pane's single-reader teaMsgs channel, so the bridge below
+			// must not arm a second reader for this pane. (Which messages
+			// re-arm here vs. via the bridge is a partition over the
+			// pane-scoped types — keep it in sync with PaneView.Update.)
+			if addressed && pane.ID() == pid {
+				rearmed = true
+			}
 		}
 	}
-	// Always re-arm the listener on the pane the message was addressed
-	// to, even if Pane.Update returned nil. PaneView.Update only emits
-	// a follow-up readNextMsg Cmd from a small set of messages today;
-	// safe to bridge here regardless.
-	if pid, ok := paneIDOf(msg); ok {
+	// Re-arm the listener on the addressed pane ONLY when PaneView.Update
+	// did not already do so (e.g. PaneRenderTickMsg/PaneDetachedMsg return
+	// nil and would otherwise leave the pane with no reader). Double-arming
+	// a single-reader channel leaks a permanently-parked reader — and its
+	// parent execBatchMsg WaitGroup waiter — per event; see
+	// TestHandleTerminalMsg_PaneOutputArmsSingleReader.
+	if addressed && !rearmed {
 		if pv, exists := m.panes[board.TicketID(pid)]; exists {
 			cmds = append(cmds, m.listenPaneMessages(pv))
 		}

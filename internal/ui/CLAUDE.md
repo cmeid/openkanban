@@ -217,6 +217,15 @@ PaneView is the client-side handle; the PTY itself lives in openkanbankd. Lifecy
 
 **`readNextMsg`'s poll MUST watch `detachCh`, and MUST NOT arm while detached.** The per-attach poll `select`s on `teaMsgs` (output), this attach's `detachCh`, and the daemon-wide `client.closeCh`. The `detachCh` case is load-bearing: a detach closes neither `teaMsgs` (only `Close()` does) nor `closeCh` (only a full daemon disconnect does), so without it the poll parked at detach-time — and its bubbletea `execBatchMsg` parent — leak forever, one pair per agent-view enter/exit. Over a long session that reached 1600+ goroutines and surfaced as a multi-second, uptime-dependent TUI "freeze" the stall watchdog never caught (the Update loop stays healthy; the cost is GC/scheduler tax on the leaked stacks). `readNextMsg` snapshots `detachCh` under `p.mu` and early-returns nil unless `state == PaneViewAttached` (the state gate closes the race where a final buffered output msg re-arms the poll just after detach). Pinned by `TestPaneView_readNextMsg_ReturnsOnDetach` (PR #143).
 
+### `teaMsgs` has exactly ONE reader — don't double-arm
+
+A **second**, independent way to leak parked `teaMsgs` readers (distinct from the `readNextMsg`/`detachCh` leak above, which it compounds — both showed up in the same SIGUSR2 dump). `teaMsgs` is a single-reader channel: each event must re-arm exactly one reader, or output stops flowing. Two surfaces re-arm it and must form a **partition** over the pane-scoped message types (`paneIDOf`):
+
+- `PaneView.Update` returns `readNextMsg()` for the messages where it consumed output (`PaneOutputMsg`, `PaneAttachedMsg`). `readNextMsg` selects on `teaMsgs`, `detachCh`, and `closeCh`.
+- `handleTerminalMsg` bridges `m.listenPaneMessages(pv)` **only when `Update` did not** (`PaneRenderTickMsg`, `PaneDetachedMsg`, which return nil) — gated by the `rearmed` flag keyed on the addressed pane. `listenPaneMessages` has **no** escape channel, so a loser of a two-reader race parks forever.
+
+Arming **both** for one message leaks a permanently-parked `listenPaneMessages` reader — and its parent `execBatchMsg` WaitGroup waiter — per output event; a long-lived session accumulates thousands (the SIGUSR2 stall dump that surfaced this showed 181 parked `listenPaneMessages` readers + 1008 `execBatchMsg` waiters). If you add a fifth pane-scoped message, decide which surface re-arms it and keep the two comments in sync. Pinned by `TestHandleTerminalMsg_PaneOutputArmsSingleReader` / `…_RenderTickStillRearms`.
+
 ### Two title surfaces — keep their fallbacks straight
 
 The session header (`renderAgentView`) and the host terminal title (`computeWindowTitle`) resolve the title differently — don't unify them:
