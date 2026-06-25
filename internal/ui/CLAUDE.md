@@ -85,6 +85,15 @@ left-edge accent (`BorderLeftForeground`) is a separate signal driven by
 `ticket.AgentStatus` (working=warning, waiting, idle, …). Precedence is pinned by
 `TestTicketBorderColor`.
 
+The **selected** color in that chain is `columnColor(status)`, which also colors
+the column header text and the active-column border. Its palette is a deliberate
+"color = meaning" scheme: backlog=overlay (quiet/neutral), next=info, in_progress=**success
+(green)**, in_review=secondary, done=muted (grey). in_progress is green and NOT
+`warning`/amber **on purpose** — amber is reserved for the viewed-elsewhere border
+(and the working left-edge accent), so a selected in_progress card and a
+viewed-elsewhere card never share a border color. Don't revert in_progress to
+`warning`: that reintroduces the collision `TestColumnColorScheme` guards against.
+
 The board header **activity chip** (`renderHeader`) shows `<icon> N sessions · <breakdown>` —
 the total `N` is the number of **open sessions** and the breakdown lists every non-zero status
 bucket (working/waiting/idle/starting/stuck/error/done), so the counts always sum to `N`.

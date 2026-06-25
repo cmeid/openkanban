@@ -2667,15 +2667,20 @@ func (m *Model) dimStyle() lipgloss.Style {
 func (m *Model) columnColor(status board.TicketStatus) lipgloss.Color {
 	switch status {
 	case board.StatusBacklog:
-		return m.colors.primary
+		// Quiet/neutral "black" — backlog is the lowest-attention column.
+		return m.colors.overlay
 	case board.StatusNext:
 		return m.colors.info
 	case board.StatusInProgress:
-		return m.colors.warning
+		// Green = active work. Deliberately NOT warning/amber: amber is
+		// reserved for the "viewed in another TUI" border (ticketBorderColor)
+		// so the two are visually distinct. See ticket the-in-progress-border-color.
+		return m.colors.success
 	case board.StatusInReview:
 		return m.colors.secondary
 	case board.StatusDone:
-		return m.colors.success
+		// Grey = terminal/settled.
+		return m.colors.muted
 	default:
 		return m.colors.muted
 	}

@@ -19,12 +19,12 @@ type ThemeColors struct {
 	Muted   string `json:"muted"`   // Disabled/placeholder text
 
 	// Semantic accent colors
-	Primary   string `json:"primary"`   // Main accent (focus, selection, headers, backlog)
-	Secondary string `json:"secondary"` // Secondary accent (links, highlights)
-	Success   string `json:"success"`   // Positive states (done, confirmations)
-	Warning   string `json:"warning"`   // Caution states (in-progress, warnings)
-	Error     string `json:"error"`     // Errors, destructive actions
-	Info      string `json:"info"`      // Informational elements
+	Primary   string `json:"primary"`   // Main accent (focus, selection)
+	Secondary string `json:"secondary"` // Secondary accent (in-review column, links, highlights)
+	Success   string `json:"success"`   // Positive/active states (in-progress column, done agent, confirmations)
+	Warning   string `json:"warning"`   // Caution states (warnings, viewed-elsewhere border, working accent)
+	Error     string `json:"error"`     // Errors, destructive actions, stuck agents
+	Info      string `json:"info"`      // Informational elements (next column, viewing badge)
 }
 
 // BuiltinThemes contains all pre-defined themes
