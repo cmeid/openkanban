@@ -1875,6 +1875,19 @@ func (p *PaneView) readNextMsg() tea.Cmd {
 	if p.teaClosed.Load() {
 		return nil
 	}
+	// Snapshot detachCh under p.mu — detach()/handleAttachExit close and swap
+	// it under the same lock, and we read it lock-free in the closure below.
+	// Only arm a poll while actually attached: a poll on a detached pane would
+	// park forever (teaMsgs isn't closed on detach, and the daemon-wide
+	// closeCh only fires on full disconnect), leaking the goroutine and its
+	// bubbletea execBatchMsg parent. Re-attach re-arms via PaneAttachedMsg.
+	p.mu.Lock()
+	if p.state != PaneViewAttached {
+		p.mu.Unlock()
+		return nil
+	}
+	detachCh := p.detachCh
+	p.mu.Unlock()
 	id := p.id
 	ch := p.teaMsgs
 	closeCh := p.client.closeCh
@@ -1885,6 +1898,11 @@ func (p *PaneView) readNextMsg() tea.Cmd {
 				return PaneExitMsg{PaneID: id, Err: io.EOF}
 			}
 			return msg
+		case <-detachCh:
+			// Pane detached out from under this poll — wake and stop the
+			// chain (no re-arm) instead of parking until Close(). The detach
+			// path emits its own PaneDetachedMsg, so return a benign nil.
+			return nil
 		case <-closeCh:
 			return DaemonDisconnectedMsg{Err: ErrDaemonUnavailable}
 		}
