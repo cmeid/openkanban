@@ -2,10 +2,9 @@
 
 OpenKanban spawns a `claude` agent per ticket. Each spawn pays for whatever
 context the `claude` process loads at startup. This doc measures where those
-tokens go, ships a `claude-lean` preset that cuts a worker session to roughly
-**half** a default session, and explains why the literal "30% of tokens" goal
-is only partially reachable (the floor is Claude Code's own fixed system
-prompt + tool definitions, which no config can remove).
+tokens go, ships a capability-complete `claude-lean` preset (~53% of a default
+session), and documents the opt-in `--tools` lever that reaches the ~30% target
+at a deliberate capability cost.
 
 ## TL;DR
 
@@ -13,16 +12,20 @@ prompt + tool definitions, which no config can remove).
   does any work.
 - The token mass is **the environment**, not OpenKanban's own prompt: enabled
   plugins (skills + agents + SessionStart hook injections), auto-memory
-  (`MEMORY.md`), the global `~/.claude/CLAUDE.md`, and MCP server listings.
-  OpenKanban's argv prompt is only ~1.2k tokens.
-- The **`claude-lean`** agent preset points a worker at a slimmed
-  `CLAUDE_CONFIG_DIR`, disables auto-memory, and forbids MCP servers. Pin a
-  project to it (sidebar `g`/`e`). Measured equivalent: **~29k tokens ≈ 53% of
-  baseline**; with the global `CLAUDE.md` also gone it projects to ~45%.
-- **Reaching literal ~30% (≈16.5k) is not achievable by config alone** — the
-  irreducible floor (Claude Code system prompt + built-in tool schemas, ~10–13k)
-  plus the repo's root `CLAUDE.md` and OpenKanban's own prompt put the practical
-  worker floor around 40–50% of a fully-loaded interactive session.
+  (`MEMORY.md`), the global `~/.claude/CLAUDE.md`, MCP listings, and — the
+  single biggest chunk — **built-in tool schemas (~19.6k)**. OpenKanban's argv
+  prompt is only ~1.2k tokens.
+- The **`claude-lean`** preset points a worker at a slimmed `CLAUDE_CONFIG_DIR`,
+  disables auto-memory, forbids MCP, and improves prompt-cache reuse — while
+  staying **capability-complete (all built-in tools)**. Measured ~29k ≈ **53% of
+  baseline**, capability-neutral. Pin a project to it (sidebar `g`/`e`).
+- **The ~30% target *is* reachable** — but only by also trimming the built-in
+  toolset with **`--tools`** (the ~19.6k lever). Measured **~28% with a minimal
+  tool set**. That trades worker capability (a tool outside the set is
+  unavailable), so it is an **opt-in**, not the default — see "Going further"
+  below.
+- The true floor is **~18%** (`--tools ""`, no tools — unusable): Claude Code's
+  own system prompt + env is the only genuinely fixed part.
 
 ## How this was measured
 
@@ -57,8 +60,24 @@ Single-variable toggles, each removing **one** thing from the baseline:
 | − auto-memory (`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`) | 45,719 | 83% | **memory ≈ 9.5k** |
 | − skills/slash-commands (`--disable-slash-commands`) | 43,407 | 79% | **skills ≈ 11.8k** |
 | − MCP (`--strict-mcp-config`) | 53,179 | 96% | **MCP ≈ 2k** (deferred — names only) |
-| **`claude-lean` equivalent** (plugins off + memory off + MCP off, **skills kept**) | **29,432** | **53%** | combined |
+| − **all built-in tools** (`--tools ""`) | 9,843 | 18% | **built-in tools ≈ 19.6k** (the biggest single chunk) |
+| **`claude-lean`** (plugins off + memory off + MCP off, **all tools kept**) | **29,432** | **53%** | combined, capability-neutral |
 | plugins off + slash off + memory off + MCP off | 25,787 | 47% | *breaks the close-out skill — not shippable* |
+
+The full combination matrix (relevant to the design choice below):
+
+| Profile | Total tokens | % | Setup | Capability cost |
+|---|---:|---:|---|---|
+| `claude-lean` (config-dir; all tools) | 29,441 | **53%** | one-time `/login` | none |
+| Zero-setup pure-flags + `--tools` (minimal set) | 21,822 | 40% | none | loses WebSearch/NotebookEdit/… |
+| `claude-lean` + `--tools` (minimal set) | 15,523 | **28%** | one-time `/login` | + tools |
+| Floor: `--tools ""` (no tools) | 9,843 | 18% | — | unusable |
+
+`--exclude-dynamic-system-prompt-sections` (in the preset) measured **no change**
+to the token total — it relocates per-machine sections (cwd/env/git-status) into
+the first user message for cross-session prompt-**cache** reuse, a cost win, not a
+token-count win. Its benefit is marginal for OpenKanban (each worker is a unique
+cwd/ticket, so little prefix is shared), but it is free.
 
 Notes:
 - **Plugins are the biggest rock.** Disabling the 9 enabled plugins removes their
@@ -97,9 +116,13 @@ mechanism):
 
 ```go
 "claude-lean": {
-    Label:      "Claude (Lean)",
-    Command:    "claude",                       // inherits Claude-class spawn behavior via basename
-    Args:       []string{"--dangerously-skip-permissions", "--strict-mcp-config"},
+    Label:   "Claude (Lean)",
+    Command: "claude",                       // inherits Claude-class spawn behavior via basename
+    Args: []string{
+        "--dangerously-skip-permissions",
+        "--strict-mcp-config",
+        "--exclude-dynamic-system-prompt-sections",
+    },
     Env: map[string]string{
         "CLAUDE_CONFIG_DIR":               "~/.claude-lean",
         "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
@@ -117,6 +140,12 @@ Why this shape:
   stale). Same one-time-setup pattern as `claude-custom`'s `~/.claude-personal`.
 - **`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`** drops the ~9.5k-token `MEMORY.md`.
 - **`--strict-mcp-config`** forbids MCP servers (incl. project `.mcp.json`).
+- **`--exclude-dynamic-system-prompt-sections`** relocates per-machine prompt
+  sections into the first user message for cross-session cache reuse (a cost
+  win, not a token-count win — marginal here, but free).
+- **All built-in tools are kept** (no `--tools`): the preset is
+  **capability-complete**, so research, web search, notebooks, background bash,
+  and skill invocation all work. The `--tools` cut to ~30% is opt-in (below).
 - **`Command:"claude"`** means it rides `buildSpawnReq`'s basename-keyed switch
   and gets full Claude treatment (plan mode, prompt-suggestion disable) with
   **no `model.go` change**.
@@ -133,7 +162,8 @@ next load — no migration. Opt in by pinning a project to `claude-lean`
 
 Like `claude-custom`'s `~/.claude-personal`, the lean config dir must exist and
 be authenticated, or a spawn fails with `Not logged in` (the OAuth token lives
-under the config dir, not the macOS keychain). One-time:
+under the config dir, not the macOS keychain). The forthcoming `openkanban
+lean-init` helper (see Scope split) will automate this; until then, one-time:
 
 ```bash
 mkdir -p ~/.claude-lean
@@ -146,36 +176,40 @@ Keep `~/.claude-lean` deliberately minimal: no plugins, no `MEMORY.md`, a
 slim-or-absent global `CLAUDE.md`. The repo's own `CLAUDE.md` and the ticket
 brief still give the worker everything it needs to do scoped work.
 
-### Zero-setup alternative (no second config dir)
+## Going further: reaching ~30% with `--tools` (opt-in)
 
-If you don't want a second authenticated config dir, you can get most of the way
-with per-session flags on a `claude-lean`-style preset that keep the default
-config dir (auth intact). This was the measured 53% path. Trade-off: disabling
-plugins this way needs an explicit `--settings '{"enabledPlugins":{...all false...}}'`
-listing *your* plugin keys (brittle, user-specific, goes stale as you add
-plugins), and it does **not** drop the global `CLAUDE.md`. The `CLAUDE_CONFIG_DIR`
-approach above is preferred for being generic and slightly leaner.
+The single biggest remaining chunk is **built-in tool schemas (~19.6k)**. The
+`--tools` flag restricts which built-in tools load (allow-list); unlisted tools'
+schemas are dropped. Adding a minimal set to a `claude-lean` project takes a
+worker to **~28%** (measured `--tools "Bash,Edit,Read,Write,Grep,Glob,Task,TodoWrite"`
+= 15,523 tokens on the config-dir base). This is **opt-in, not the default**,
+because it trades capability:
 
-## Why not literally 30%
+- **A tool outside the set is unavailable** — the worker loses WebSearch (web
+  research), NotebookEdit (Jupyter), etc. Capability cuts fail *loudly* mid-task
+  (unlike context cuts), so only opt in for projects you know are pure
+  implementation.
+- **The allow-list is load-bearing and easy to get wrong.** A usable set must
+  include not just the obvious editors but the workflow-critical tools:
+  `Bash` + `BashOutput` + `KillShell` (background builds/tests), the skill-
+  invocation tool (or the `finishing-an-openkanban-ticket` close-out can't run),
+  and `WebFetch`/`WebSearch` if the project ever does research. **Test your set
+  on a throwaway ticket before relying on it.**
+- **Subagent inheritance is unverified** — whether `--tools` on the parent also
+  constrains `Task` subagents' toolsets is not confirmed; check if you fan out
+  research subagents from a lean parent.
 
-The 30% target (≈16.5k tokens) is below the practical floor. The component
-sizes below are **estimates** (the system prompt + tool definitions are not
-isolated by the `claude -p` probe — unlike the measured table above); the
-conclusion holds regardless of the exact split:
+Add it per project via the agent editor (sidebar `e`) on a `claude-lean`-pinned
+project, e.g. append `--tools "Bash,BashOutput,KillShell,Edit,Read,Write,Grep,Glob,Task,TodoWrite,WebFetch,WebSearch"`.
 
-| Floor component | ~tokens | Removable? |
-|---|---:|---|
-| Claude Code system prompt | ~4.2k | no (fixed by Claude Code) |
-| Built-in tool definitions | ~5–8k | no (fixed) |
-| Repo root `CLAUDE.md` | ~1.7k | only by deleting/slimming repo docs |
-| OpenKanban argv prompt (lean) | ~0.5–1k | already minimized |
+## The floor (~18%)
 
-Even with plugins, memory, MCP, and the global `CLAUDE.md` fully removed, a
-working session can't go below the Claude Code system prompt + built-in tools.
-The realistic worker floor is **~40–50% of a fully-loaded interactive session** —
-a roughly 2× efficiency win, which `claude-lean` delivers. Closing the rest of
-the gap to 30% would require Claude Code to slim its own baseline, which is
-outside OpenKanban's control.
+The only genuinely fixed part is Claude Code's own system prompt + environment
+(`--tools ""`, no tools = 9,843 tokens = 18% — but that session can't *do*
+anything). Repo root `CLAUDE.md` (~1.7k) and OpenKanban's lean argv prompt
+(~0.5–1k) are the other near-irreducibles. A usable worker therefore floors
+around **~28% with `--tools`** (config-dir tier) or **~40%** zero-setup, vs **53%**
+capability-complete.
 
 ## Scope split (what landed here vs. follow-up)
 
@@ -184,12 +218,22 @@ outside OpenKanban's control.
 - Lean InitPrompt (`internal/config/agent_prompt_lean.tmpl`).
 - This doc + the pointer in `AGENT_INTEGRATION.md`.
 
-**Follow-up / user-environment (recommended, not forced — outside the repo):**
-- Creating + authenticating `~/.claude-lean` with a minimal `settings.json`
-  (the recipe above). This is per-user environment, not shippable repo state.
-- Deciding which (if any) plugins/MCP a worker should keep (e.g. a project that
+**Follow-up (separate ticket):**
+- **`openkanban lean-init`** — a CLI helper to scaffold + authenticate
+  `~/.claude-lean` in one command, including a `--from <profile>` mode that
+  derives a lean config dir from an existing profile (copies settings structure,
+  strips plugins/MCP/memory/global CLAUDE.md; credentials are never copied — it
+  finishes with a one-time `claude /login`). Eliminates the manual recipe above.
+
+**Opt-in, documented (not default):**
+- The **`--tools`** cut to ~30% (see "Going further") — per-project, capability-
+  trading, added via the agent editor.
+- Deciding which (if any) plugins/MCP a worker should keep (a project that
   genuinely uses a plugin can pin the default `claude` instead).
 
 **Deliberately not done:** trimming the shared default `agent_prompt.tmpl` — it
 is load-bearing, saves ≲0.5k tokens, and would regress every default (non-lean)
-session. The lean variant is the right vehicle for the trim.
+session. The lean variant is the right vehicle for the trim. And `--tools` is
+**not** baked into the default `claude-lean`: it trades worker capability
+(WebSearch, notebooks, etc.) and needs a carefully-maintained allow-list, so the
+default stays capability-complete.
