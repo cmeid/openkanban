@@ -758,26 +758,39 @@ after the previous completion) re-arms the auto-stop transition.
 Worktree, branch, and session-JSONL teardown remain reserved for
 ticket deletion — `ticket done` does not touch them.
 
-### `openkanban ticket in-review`
+### `openkanban ticket move`
 
-Same motion as `ticket done`, but the ticket lands in
-`Status=in_review` instead of `Status=done`. Used when the agent has
-finished its implementation work and is handing the ticket off to a
-human reviewer — the reviewer picks it up from the board, not from
-inside the (now-dead) agent session. `AgentStatus=completed`, status
-file write, and daemon-side PTY termination all happen exactly as with
-`ticket done`; the daemon doesn't distinguish between the two.
+```
+openkanban ticket move --project <name|id> --id <ref> --status <status>
+```
 
-Idempotent on a ticket already `in_review` — no second `UpdatedAt`
-drift, but the status file and daemon RPC still fire.
+Moves any ticket to any of the six statuses: `backlog`, `next`,
+`in_progress`, `in_review`, `done`, `archived`. Selects the ticket by
+`--id` (exact UUID, unique UUID prefix, or unique title slug) within
+the project named by `--project`. This command replaces the former
+`ticket in-review` and `ticket in-progress` subcommands.
 
-### `openkanban ticket in-progress`
+**Daemon teardown:** any move out of `in_progress` sends `TicketDone`
+to the daemon (best-effort, no-op on miss) so the live PTY is
+terminated and the 1:1 ticket↔session invariant is preserved.
 
-Flips `Status=in_progress`. Unlike `ticket done` / `in-review`, this
-command does NOT signal the daemon — `AgentStatus` is left untouched
-and the live PTY keeps running. Use it when a session needs to flag
-itself as actively working (e.g. an agent resuming from a paused
-state and wanting the board to reflect that).
+**AgentStatus gating:** moves to `in_review` or `done` set
+`AgentStatus=completed`; a re-queue move (`in_progress → backlog` /
+`next`) resets `AgentStatus` to none so a re-spawned card doesn't
+falsely render as completed.
+
+**No session status-file write:** unlike `ticket done`, this command
+does not write the `$OPENKANBAN_SESSION`-keyed status file (it is
+designed for external/scripted callers that may not be inside the
+session being moved). The `.md` write and daemon RPC are the
+authoritative signals.
+
+In-session replacement for the former verbs:
+- Former `ticket in-progress`: `ticket move --id "$OPENKANBAN_TICKET_ID" --status in_progress`
+- Former `ticket in-review`: `ticket move --id "$OPENKANBAN_TICKET_ID" --status in_review`
+
+Idempotent on a ticket already at the target status — no timestamps
+are re-stamped and the daemon is not contacted.
 
 ## Claude approval persistence across tickets
 
@@ -793,7 +806,7 @@ A defensive `<repo>/.claude/.gitignore` (containing `settings.local.json`) is cr
 
 ### Promote on `→ in_review` / `→ done`
 
-`project.TicketStore.Move` is the single funnel for UI-driven status transitions (drag-drop, `space` quick-move, `backspace` quick-move-back). After delegating to `SetStatus`, it calls `agent.PromoteClaudeSettingsOnTransition(t.WorktreePath, s.repoPath, oldStatus, newStatus)`. The transition gate fires only when `newStatus ∈ {in_review, done}` and `oldStatus != newStatus` — moves into `in_progress` or `backlog` are explicit no-ops. The CLI path `wrapUpSessionTicketAt` (used by `openkanban ticket in-review` and `ticket done`) routes through `store.Move` rather than `ticket.SetStatus` directly so the same promotion fires for in-session self-completion.
+`project.TicketStore.Move` is the single funnel for UI-driven status transitions (drag-drop, `space` quick-move, `backspace` quick-move-back). After delegating to `SetStatus`, it calls `agent.PromoteClaudeSettingsOnTransition(t.WorktreePath, s.repoPath, oldStatus, newStatus)`. The transition gate fires only when `newStatus ∈ {in_review, done}` and `oldStatus != newStatus` — moves into `in_progress` or `backlog` are explicit no-ops. The CLI paths `cmd.wrapUpSessionTicketAt` (used by `openkanban ticket done`) and `ticketMoveCmd.RunE` (used by `ticket move`) both route through `store.Move` rather than `ticket.SetStatus` directly so the same promotion fires for CLI-driven completion and generic moves.
 
 The newly-promoted entries surface as a UI status-bar toast — `Moved to in_review · promoted 2 approvals to repo defaults` — so silent trust escalation isn't possible. The CLI prints the equivalent line to stderr (`openkanban: promoted N claude approval(s) to repo defaults`).
 

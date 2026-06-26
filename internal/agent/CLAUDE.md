@@ -177,7 +177,8 @@ Lifecycle management for opencode:
 Callers — keep them in sync if you add a new transition path:
 
 - `project.TicketStore.Move` (single funnel for UI drag/drop, quickMove, quickMoveBackward via `GlobalTicketStore.Move`).
-- `cmd.wrapUpSessionTicketAt` (CLI `ticket in-review` / `ticket done` — routes through `store.Move` rather than `ticket.SetStatus` directly so promotion fires).
+- `cmd.wrapUpSessionTicketAt` (CLI `ticket done` — routes through `store.Move` so promotion fires).
+- `cmd.ticketMoveCmd` (CLI `ticket move` — also routes through `store.Move`; the promote gate fires on `→in_review` and `→done` targets).
 
 Pure JSON-level merges — the helpers only touch `permissions.{allow,ask,deny}` and leave every other top-level key untouched. They do NOT claim to validate Claude Code's full settings schema; new top-level keys Claude adds in the future round-trip safely as long as they aren't named `permissions`.
 
