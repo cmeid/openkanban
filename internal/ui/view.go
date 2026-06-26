@@ -751,7 +751,7 @@ func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, w
 // ticketBorderColor resolves a card's full-border color by precedence,
 // highest first:
 //   - stuck wedge  → error (red), so it stands out on the board
-//   - selected     → column color, preserving navigation feedback
+//   - selected     → static bright white (ANSI 15), independent of column/status
 //   - viewedElsewhere (another TUI instance has this session open) → warning
 //     (amber), the same signal as the ◉ badge
 //   - hovered      → overlay
@@ -764,7 +764,7 @@ func (m *Model) ticketBorderColor(status board.AgentStatus, isSelected, isHovere
 	case status == board.AgentStuck:
 		return m.colors.err
 	case isSelected:
-		return columnColor
+		return lipgloss.Color("15") // static bright white, independent of column color
 	case viewedElsewhere:
 		return m.colors.warning
 	case isHovered:

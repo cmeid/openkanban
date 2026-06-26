@@ -29,8 +29,8 @@ func TestTicketBorderColor(t *testing.T) {
 		{"hovered only", board.AgentIdle, false, true, false, m.colors.overlay},
 		{"viewed elsewhere", board.AgentIdle, false, false, true, m.colors.warning},
 		{"viewed beats hover", board.AgentIdle, false, true, true, m.colors.warning},
-		{"selected beats viewed", board.AgentIdle, true, false, true, col},
-		{"selected only", board.AgentIdle, true, false, false, col},
+		{"selected beats viewed", board.AgentIdle, true, false, true, lipgloss.Color("15")},
+		{"selected only", board.AgentIdle, true, false, false, lipgloss.Color("15")},
 		{"stuck beats selected+viewed", board.AgentStuck, true, true, true, m.colors.err},
 		{"stuck only", board.AgentStuck, false, false, false, m.colors.err},
 	}
