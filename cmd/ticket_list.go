@@ -94,12 +94,11 @@ same keys (Labels is always an array, timestamps are RFC3339).`,
 			if s == "" {
 				continue
 			}
-			switch board.TicketStatus(s) {
-			case board.StatusBacklog, board.StatusNext, board.StatusInProgress, board.StatusInReview, board.StatusDone, board.StatusArchived:
-				statusFilter[board.TicketStatus(s)] = true
-			default:
-				return fmt.Errorf("--status %q is not one of: backlog, next, in_progress, in_review, done, archived", s)
+			ts, err := board.ParseStatus(s)
+			if err != nil {
+				return fmt.Errorf("--status %s", err)
 			}
+			statusFilter[ts] = true
 		}
 
 		registry, err := project.LoadRegistry()

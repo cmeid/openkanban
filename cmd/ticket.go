@@ -98,10 +98,8 @@ Description sources (mutually exclusive, in priority order):
 			return fmt.Errorf("--priority must be 0-5 (0 = use default)")
 		}
 		if ticketNewStatus != "" {
-			switch board.TicketStatus(ticketNewStatus) {
-			case board.StatusBacklog, board.StatusNext, board.StatusInProgress, board.StatusInReview, board.StatusDone, board.StatusArchived:
-			default:
-				return fmt.Errorf("--status %q is not one of: backlog, next, in_progress, in_review, done, archived", ticketNewStatus)
+			if _, err := board.ParseStatus(ticketNewStatus); err != nil {
+				return fmt.Errorf("--status %s", err)
 			}
 		}
 		if ticketNewWorktree && ticketNewNoWorktree {
