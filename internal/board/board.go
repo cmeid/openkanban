@@ -1,6 +1,7 @@
 package board
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 	"time"
@@ -56,6 +57,18 @@ const (
 	StatusDone       TicketStatus = "done"
 	StatusArchived   TicketStatus = "archived"
 )
+
+// ParseStatus converts a raw string to a TicketStatus, returning a
+// descriptive error for unrecognised values. Used to validate the
+// --status flag across the ticket new, list, and move commands.
+func ParseStatus(s string) (TicketStatus, error) {
+	switch TicketStatus(s) {
+	case StatusBacklog, StatusNext, StatusInProgress, StatusInReview, StatusDone, StatusArchived:
+		return TicketStatus(s), nil
+	default:
+		return "", fmt.Errorf("%q is not one of: backlog, next, in_progress, in_review, done, archived", s)
+	}
+}
 
 type AgentStatus string
 

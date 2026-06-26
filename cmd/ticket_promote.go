@@ -4,16 +4,14 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/spf13/cobra"
-
 	"github.com/techdufus/openkanban/internal/board"
 	"github.com/techdufus/openkanban/internal/project"
 )
 
 // loadSessionTicket resolves the ticket bound to the current openkanban
-// session via $OPENKANBAN_TICKET_ID. Shared by ticket-done /
-// ticket-in-progress / ticket-in-review, which are all "promote my
-// session's ticket to a new status" motions.
+// session via $OPENKANBAN_TICKET_ID. Used by ticket-done, which is
+// the "promote my session's ticket to a new status" motion that also
+// signals the daemon to wrap up the live PTY.
 //
 // Errors when the env var is unset (this command isn't running inside
 // a spawned session) or when the referenced ticket can't be found in
@@ -34,102 +32,4 @@ func loadSessionTicket() (*board.Ticket, *project.TicketStore, error) {
 		return nil, nil, fmt.Errorf("ticket %s not found in any project; was its .md file deleted?", ticketID)
 	}
 	return ticket, store, nil
-}
-
-// promoteSessionTicketTo applies a status transition to the env-bound
-// ticket. Idempotent: skips SetStatus (and the resulting Touch /
-// StartedAt restamp) when the ticket is already at the target. Returns
-// nil on either a fresh transition or a no-op — callers can layer
-// status-specific side effects (e.g. agent_status writes, daemon
-// notifications) on top.
-//
-// Used by `ticket in-progress`. `ticket done` and `ticket in-review`
-// have additional invariants (AgentStatus=completed, status-file write,
-// daemon-side PTY shutdown) and so go through wrapUpSessionTicketAt
-// rather than this helper.
-func promoteSessionTicketTo(target board.TicketStatus) error {
-	ticket, store, err := loadSessionTicket()
-	if err != nil {
-		return err
-	}
-	if ticket.Status == target {
-		return nil
-	}
-	// Route through TicketStore.Move so the existing side effects fire:
-	// promote-claude-approvals on -> in_review/done and prune-allowlist
-	// on every transition. The pre-fix path called ticket.SetStatus
-	// directly + store.SaveTicket, bypassing both. See PR #67 wiring
-	// and the original promote/prune feature
-	// ([[plan-ancient-sparking-dusk]] / "Why fire on every
-	// transition"). Move mutates in memory and returns
-	// (promoted, pruned, err); persistence is still the caller's job
-	// — mirrors the wrapUpSessionTicketAt template.
-	promoted, pruned, err := store.Move(ticket.ID, target)
-	if err != nil {
-		return fmt.Errorf("move ticket %s: %w", ticket.ID, err)
-	}
-	if err := store.SaveTicket(ticket); err != nil {
-		return fmt.Errorf("save ticket %s: %w", ticket.ID, err)
-	}
-	if n := len(promoted); n > 0 {
-		fmt.Fprintf(os.Stderr, "openkanban: promoted %d claude approval(s) to repo defaults\n", n)
-	}
-	if n := len(pruned); n > 0 {
-		fmt.Fprintf(os.Stderr, "openkanban: pruned %d stale allowlist entr(y/ies) (see .claude/.pruned-log)\n", n)
-	}
-	return nil
-}
-
-var ticketInProgressCmd = &cobra.Command{
-	Use:   "in-progress",
-	Short: "Move this session's ticket to in-progress",
-	Long: `Flip the ticket bound to the current openkanban session to
-Status=in_progress. Reads $OPENKANBAN_TICKET_ID (set by openkanban
-when spawning the session); exits non-zero if unset.
-
-Use this when a session needs to flag itself as actively working on
-the ticket — e.g. an agent that just resumed from a paused state and
-wants the board to reflect that. AgentStatus is left untouched; only
-the column position changes.
-
-Idempotent on a ticket already in_progress (no second StartedAt
-restamp). Unlike 'ticket done', this command does NOT signal the
-daemon — the live PTY keeps running.`,
-	Args:          cobra.NoArgs,
-	SilenceUsage:  true,
-	SilenceErrors: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return promoteSessionTicketTo(board.StatusInProgress)
-	},
-}
-
-var ticketInReviewCmd = &cobra.Command{
-	Use:   "in-review",
-	Short: "Mark this session's ticket as in-review and signal openkanban to wrap up",
-	Long: `Flip the ticket bound to the current openkanban session to
-Status=in_review + AgentStatus=completed. Reads $OPENKANBAN_TICKET_ID
-(set by openkanban when spawning the session); exits non-zero if unset.
-
-Use this when a session has finished its work and is handing the
-ticket off for human review. Mirrors 'ticket done': writes the
-session's status file (if $OPENKANBAN_SESSION is set) and signals the
-daemon to terminate the live PTY — the agent-side "/quit equivalent."
-The ticket lands in the In Review column with the completed badge so
-the reviewer picks it up from the board, not from inside the dying
-agent session.
-
-Idempotent on a ticket already in_review — no second UpdatedAt
-restamp, but the status file is re-written and the daemon is
-re-notified so a re-armed TUI can still react.`,
-	Args:          cobra.NoArgs,
-	SilenceUsage:  true,
-	SilenceErrors: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return wrapUpSessionTicketAt(board.StatusInReview)
-	},
-}
-
-func init() {
-	ticketCmd.AddCommand(ticketInProgressCmd)
-	ticketCmd.AddCommand(ticketInReviewCmd)
 }
