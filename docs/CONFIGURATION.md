@@ -132,9 +132,15 @@ A project with **no pin refuses to spawn** (`Pin a Claude for this project first
 
 `defaults.default_agent` is no longer used to choose the spawn agent; it is auto-detected from `PATH` and only influences whether the OpenCode server is pre-started.
 
+### Per-project model override (claude only)
+
+When a project has a **Model** set, openkanban passes `--model <value>` to the `claude` CLI on every spawn (new session and resume). Blank means no flag — claude uses its own configured default.
+
+Set it in the project editor (`e`), **Model** field: use `←`/`→` to cycle the presets (`opus` / `opusplan` / `sonnet`) or type any full model ID. The setting only applies to claude-class agents; other agents (opencode, gemini, codex) ignore it.
+
 ### Editing agents in the TUI (`e`)
 
-Focus a project in the sidebar and press **`e`** for a unified editor that edits **both** the project (name + pinned agent → `projects.json`) **and** the shared agent registry (→ `config.json`) in one screen. Per agent you can edit the **label, command, args, and env** (e.g. point `claude-custom`'s `CLAUDE_CONFIG_DIR` at a different directory) and set its **enabled** state. `Tab`/`↑`/`↓` move between fields, `←`/`→` toggle selectors (the pin and each agent's enabled state), `Ctrl+S` saves, `Esc` cancels. (`g` remains a quick one-press cycle of just the pin.)
+Focus a project in the sidebar and press **`e`** for a unified editor that edits **both** the project (name + pinned agent + model → `projects.json`) **and** the shared agent registry (→ `config.json`) in one screen. Per agent you can edit the **label, command, args, and env** (e.g. point `claude-custom`'s `CLAUDE_CONFIG_DIR` at a different directory) and set its **enabled** state. `Tab`/`↑`/`↓` move between fields, `←`/`→` toggle selectors (the pin and each agent's enabled state), `Ctrl+S` saves, `Esc` cancels. (`g` remains a quick one-press cycle of just the pin.)
 
 ### Enabling / disabling agents
 

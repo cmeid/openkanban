@@ -181,6 +181,8 @@ If you run more than one Claude Code install — e.g. a work account and a perso
 
 Selection is **per project and nowhere else** — there is no per-ticket or global agent picker. Focus a project in the sidebar and press `g` to cycle its pinned agent; the pin shows under the project name and governs every spawn (including `Ctrl+Space` background spawns). A project with no pin **refuses to spawn** with an actionable message — so you can't accidentally launch the wrong Claude as long as you stay in your projects. See [Configuration → Agents](./docs/CONFIGURATION.md#agents).
 
+You can also set a **per-project model** (claude only): open the project editor with `e`, tab to the **Model** field, and press `←`/`→` to cycle the presets (`opus`/`opusplan`/`sonnet`) or type any full model ID. OpenKanban passes `--model <value>` to the `claude` CLI on every spawn for that project. Leave it blank to let claude use its own configured default. See [Configuration → Per-project model override](./docs/CONFIGURATION.md#per-project-model-override-claude-only).
+
 ## Bugs fixed in upstream
 
 Seven correctness bugs that exist on `TechDufus/main` today are fixed in this fork. Each is verified against the upstream tree.

@@ -751,3 +751,49 @@ func TestBuildSpawnReq_UserConfigContinue_NotOverridden(t *testing.T) {
 		}
 	})
 }
+
+// TestBuildSpawnReq_Model pins that the per-project model override is threaded
+// into the claude argv as --model <value> in both new and resume arms, and is
+// absent when empty or when the agent is not claude.
+func TestBuildSpawnReq_Model(t *testing.T) {
+	t.Run("new_session_model_present", func(t *testing.T) {
+		in := baseClaudeInputs(t, "TICK-MODEL-NEW", "task/model-new")
+		in.isNewSession = true
+		in.model = "opus"
+		req := buildSpawnReq(in)
+		if !argsHavePair(req.Args, "--model", "opus") {
+			t.Errorf("new session: expected --model opus in argv, got %v", req.Args)
+		}
+	})
+
+	t.Run("resume_model_present", func(t *testing.T) {
+		in := baseClaudeInputs(t, "TICK-MODEL-RESUME", "task/model-resume")
+		in.isNewSession = false
+		in.model = "opus"
+		req := buildSpawnReq(in)
+		if !argsHavePair(req.Args, "--model", "opus") {
+			t.Errorf("resume: expected --model opus in argv, got %v", req.Args)
+		}
+	})
+
+	t.Run("new_session_model_absent_when_empty", func(t *testing.T) {
+		in := baseClaudeInputs(t, "TICK-MODEL-EMPTY", "task/model-empty")
+		in.isNewSession = true
+		in.model = ""
+		req := buildSpawnReq(in)
+		if argsContain(req.Args, "--model") {
+			t.Errorf("new session: --model must be absent when model is empty, got %v", req.Args)
+		}
+	})
+
+	t.Run("opencode_model_ignored", func(t *testing.T) {
+		in := baseClaudeInputs(t, "TICK-MODEL-OC", "task/model-oc")
+		in.agentType = "opencode"
+		in.command = "opencode"
+		in.model = "opus"
+		req := buildSpawnReq(in)
+		if argsContain(req.Args, "--model") {
+			t.Errorf("opencode: --model must be absent for non-claude agents, got %v", req.Args)
+		}
+	})
+}
