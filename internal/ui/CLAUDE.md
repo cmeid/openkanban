@@ -76,23 +76,24 @@ All styling via lipgloss with theme-based `uiColors` struct.
 Never use raw ANSI codes in UI rendering.
 
 **Ticket card border color** (`renderTicket` → `ticketBorderColor`) is resolved
-by precedence, highest first: **stuck** (red) > **selected** (column color) >
-**viewed in another TUI** (amber, `m.daemonViewing[id] > 0` — same signal as the
-`◉` badge) > **hovered** (overlay) > default (surface). It is NOT gated on
-`pane.Running()` — that stale-on-the-board flag drove a removed green
+by precedence, highest first: **stuck** (red) > **selected** (static bright white,
+`lipgloss.Color("15")`) > **viewed in another TUI** (amber, `m.daemonViewing[id] > 0` —
+same signal as the `◉` badge) > **hovered** (overlay) > default (surface). It is
+NOT gated on `pane.Running()` — that stale-on-the-board flag drove a removed green
 "running" border (see git log `drop green running-session card border`). The
 left-edge accent (`BorderLeftForeground`) is a separate signal driven by
 `ticket.AgentStatus` (working=warning, waiting, idle, …). Precedence is pinned by
 `TestTicketBorderColor`.
 
-The **selected** color in that chain is `columnColor(status)`, which also colors
-the column header text and the active-column border. Its palette is a deliberate
-"color = meaning" scheme: backlog=overlay (quiet/neutral), next=info, in_progress=**success
-(green)**, in_review=secondary, done=muted (grey). in_progress is green and NOT
-`warning`/amber **on purpose** — amber is reserved for the viewed-elsewhere border
-(and the working left-edge accent), so a selected in_progress card and a
-viewed-elsewhere card never share a border color. Don't revert in_progress to
-`warning`: that reintroduces the collision `TestColumnColorScheme` guards against.
+The **selected** border is intentionally **decoupled from `columnColor`** — it is a
+static white regardless of which column the card is in or which project it belongs to.
+`columnColor(status)` still drives the column header text and the active-column border
+and follows the deliberate "color = meaning" scheme: backlog=overlay (quiet/neutral),
+next=info, in_progress=**success (green)**, in_review=secondary, done=muted (grey).
+in_progress is green and NOT `warning`/amber **on purpose** — amber is reserved for
+the viewed-elsewhere border (and the working left-edge accent). Don't revert
+in_progress to `warning`: that reintroduces the collision `TestColumnColorScheme`
+guards against (for column headers / active-column border).
 
 The board header **activity chip** (`renderHeader`) shows `<icon> N sessions · <breakdown>` —
 the total `N` is the number of **open sessions** and the breakdown lists every non-zero status
