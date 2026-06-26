@@ -183,7 +183,7 @@ func DialOrStart(ctx context.Context) (net.Conn, error) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	return nil, fmt.Errorf("%w: forked daemon did not bind %s within %s", ErrDaemonUnavailable, sock, startWait)
+	return nil, fmt.Errorf("%w: daemon did not bind %s within %s — if using the launchd service, run: openkanban daemon install-service", ErrDaemonUnavailable, sock, startWait)
 }
 
 // EnsureStarted brings up a detached daemon if none is already listening
@@ -239,7 +239,7 @@ func EnsureStarted(ctx context.Context) (started bool, err error) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	return false, fmt.Errorf("%w: started daemon did not bind %s within %s", ErrDaemonUnavailable, sock, startWait)
+	return false, fmt.Errorf("%w: daemon did not bind %s within %s — if using the launchd service, run: openkanban daemon install-service", ErrDaemonUnavailable, sock, startWait)
 }
 
 // startDaemon brings up a daemon when none is listening. When the user
