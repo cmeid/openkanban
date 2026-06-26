@@ -158,6 +158,23 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   if [[ -x "$BUNDLE_SCRIPT" ]]; then
     if "$BUNDLE_SCRIPT" "$INSTALLED_BIN" "$HOME/Applications"; then
       say "  OpenKanban.app installed to $HOME/Applications/OpenKanban.app"
+      # Re-bootstrap the launchd service when it was previously installed.
+      # build-bundle.sh runs `codesign --force --deep`, which invalidates
+      # launchd's loaded job registration. Without this step, launchd fails
+      # to spawn the updated binary with EX_CONFIG (78) on the next launch
+      # and enters a ThrottleInterval loop — making `daemon start` /
+      # `daemon restart` hang with "context deadline exceeded" until the user
+      # manually runs `openkanban daemon install-service`. Re-bootstrapping
+      # here prevents that wedge. Guarded so it only fires when a plist was
+      # previously installed (i.e. the user already opted into launchd).
+      LAUNCHD_PLIST="$HOME/Library/LaunchAgents/dev.openkanban.daemon.plist"
+      if [[ -f "$LAUNCHD_PLIST" ]]; then
+        if "$INSTALLED_BIN" daemon install-service >/dev/null 2>&1; then
+          say "  launchd service re-bootstrapped with updated bundle binary"
+        else
+          warn "Could not re-bootstrap launchd service. Run: openkanban daemon install-service"
+        fi
+      fi
     else
       warn "build-bundle.sh failed. Desktop notifications will lack the OpenKanban identity until you re-run install.sh."
     fi
