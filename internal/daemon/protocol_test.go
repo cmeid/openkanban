@@ -171,6 +171,7 @@ func TestEnvelope_RoundTrip(t *testing.T) {
 		PID:            4242,
 		Cols:           80,
 		Rows:           24,
+		Scrollback:     1000,
 		Running:        true,
 		AttachedClient: 1,
 		StartedAt:      startedAt,

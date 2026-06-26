@@ -445,6 +445,7 @@ type SessionInfo struct {
 	PID            int       `json:"pid"`
 	Cols           int       `json:"cols"`
 	Rows           int       `json:"rows"`
+	Scrollback     int       `json:"scrollback"`
 	Running        bool      `json:"running"`
 	AttachedClient uint16    `json:"attached_client"`
 	ViewerCount    int       `json:"viewer_count"`

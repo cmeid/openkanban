@@ -179,10 +179,7 @@ type Pane struct {
 	mouseEnabled bool // tracks if child process has enabled mouse tracking
 
 	// Scrollback and viewport state (Issue #95)
-	scrollback      *ScrollbackBuffer
 	altScreenActive bool            // tracks if child process is in alternate screen mode
-	viewportOffset  int             // lines scrolled back (0 = live view)
-	lastTopRow      []Glyph         // snapshot of row 0 before write for scroll detection
 	scrollbackSize  int             // configured scrollback buffer size
 	selection       *SelectionState // mouse text selection state
 
@@ -392,9 +389,6 @@ func (p *Pane) SetSize(width, height int) {
 		p.selection.Clear()
 	}
 
-	// Reset viewport to live view on resize
-	p.viewportOffset = 0
-
 	if p.vt != nil {
 		p.vt.Resize(width, height)
 	}
@@ -414,14 +408,10 @@ func (p *Pane) Size() (width, height int) {
 	return unpackDims(p.dims.Load())
 }
 
-// ScrollbackLen returns the number of lines in the scrollback buffer.
-func (p *Pane) ScrollbackLen() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.scrollback == nil {
-		return 0
-	}
-	return p.scrollback.Len()
+// ScrollbackSize returns the configured native scrollback line count.
+// The field is set once in New and never mutated — safe to read without p.mu.
+func (p *Pane) ScrollbackSize() int {
+	return p.scrollbackSize
 }
 
 // SnapshotScrollback returns the emulator's native scrollback history,
@@ -461,13 +451,6 @@ func (p *Pane) SnapshotScrollback() [][]Glyph {
 		out[idx] = row
 	}
 	return out
-}
-
-// ViewportOffset returns how many lines the viewport is scrolled back.
-func (p *Pane) ViewportOffset() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.viewportOffset
 }
 
 // IsAltScreenActive returns whether the terminal is in alternate screen mode.
@@ -611,8 +594,8 @@ func (p *Pane) Start(command string, args ...string) tea.Cmd {
 		p.cursorAppMode.Store(false)
 		p.registerTitleHandlersUnlocked()
 		p.startDrainUnlocked()
+		p.vt.SetScrollbackSize(p.scrollbackSize)
 
-		p.scrollback = NewScrollbackBuffer(p.scrollbackSize)
 		p.selection = NewSelectionState()
 
 		// Build the read Cmd while we still hold p.mu (so the nil-
@@ -701,8 +684,8 @@ func (p *Pane) StartHeadless(command string, args []string, extraEnv []string) e
 	p.cursorAppMode.Store(false)
 	p.registerTitleHandlersUnlocked()
 	p.startDrainUnlocked()
+	p.vt.SetScrollbackSize(p.scrollbackSize)
 
-	p.scrollback = NewScrollbackBuffer(p.scrollbackSize)
 	p.selection = NewSelectionState()
 
 	p.mu.Unlock()
@@ -1511,14 +1494,7 @@ func (p *Pane) handleOutput(data []byte) {
 	p.detectMouseModeChanges(data)
 	p.detectAltScreenChanges(data)
 
-	// Capture scrollback: snapshot row 0 before vt.Write, push it to
-	// the ring after if it scrolled off. Shared with PaneView via
-	// scrollback_capture.go so the daemon-side pane and the client-side
-	// mirror produce identical scrollback content.
-	p.lastTopRow = CaptureTopRow(p.vt, p.altScreenActive)
 	p.vt.Write(data)
-	PushScrolledLine(p.vt, p.altScreenActive, p.lastTopRow, p.scrollback)
-	p.lastTopRow = nil
 
 	// Stamp activity for the daemon's status broadcaster. Lock-free
 	// write — readers (the broadcaster goroutine) use atomic.Load.
@@ -1620,7 +1596,6 @@ func (p *Pane) detectAltScreenChanges(data []byte) {
 		if bytes.Contains(data, seq) {
 			if !p.altScreenActive {
 				p.altScreenActive = true
-				p.viewportOffset = 0 // Reset viewport when entering alt screen
 				p.publishModeEventLocked()
 			}
 			return
@@ -1715,15 +1690,7 @@ func (p *Pane) HandleMouse(msg tea.MouseMsg) {
 		}
 	}
 
-	// When the child has not enabled mouse tracking, also handle wheel
-	// scrolling locally against our own scrollback buffer.
 	if !p.mouseEnabled {
-		switch msg.Button {
-		case tea.MouseButtonWheelUp:
-			p.scrollUp(3)
-		case tea.MouseButtonWheelDown:
-			p.scrollDown(3)
-		}
 		return
 	}
 
@@ -1765,15 +1732,7 @@ func (p *Pane) HandleMouse(msg tea.MouseMsg) {
 // Logical position: negative row = scrollback, 0+ = live screen
 // Called with mutex held.
 func (p *Pane) viewportToLogical(x, y int) Position {
-	// When scrolled back, top of viewport shows scrollback
-	// viewportOffset = how many scrollback lines are visible at top
-	// Calculate logical row
-	// If viewportOffset > 0, the top rows are from scrollback
-	// Row 0 in viewport corresponds to scrollback line (scrollbackLen - viewportOffset)
-
-	logicalRow := y - p.viewportOffset
-
-	return Position{Row: logicalRow, Col: x}
+	return Position{Row: y, Col: x}
 }
 
 // HandleKey processes a key event and sends to PTY
@@ -1799,50 +1758,6 @@ func (p *Pane) HandleKey(msg tea.KeyMsg) tea.Msg {
 		}
 	}
 
-	// Handle scroll navigation keys (work regardless of mouse mode)
-	switch key {
-	case "shift+pgup":
-		rows := p.vt.Height()
-		p.scrollUp(rows / 2)
-		return nil
-	case "shift+pgdown":
-		rows := p.vt.Height()
-		p.scrollDown(rows / 2)
-		return nil
-	case "shift+home":
-		// Scroll to top of scrollback
-		if p.scrollback != nil {
-			p.viewportOffset = p.scrollback.Len()
-			p.dirty = true
-		}
-		return nil
-	case "shift+end":
-		// Scroll to bottom (live view)
-		p.viewportOffset = 0
-		p.dirty = true
-		return nil
-	case "esc", "escape":
-		// Esc returns to live view if scrolled
-		if p.viewportOffset > 0 {
-			p.viewportOffset = 0
-			p.dirty = true
-			return nil
-		}
-		// Also clear selection on Esc
-		if p.selection != nil && p.selection.IsActive() {
-			p.selection.Clear()
-			p.dirty = true
-			return nil
-		}
-		// Otherwise forward escape to PTY
-	}
-
-	// Snap to live view on any other keyboard input
-	if p.viewportOffset > 0 {
-		p.viewportOffset = 0
-		p.dirty = true
-	}
-
 	// Clear selection on any keyboard input (except copy)
 	if p.selection != nil && p.selection.IsActive() {
 		p.selection.Clear()
@@ -1864,14 +1779,6 @@ func (p *Pane) copySelectionUnlocked() {
 		return
 	}
 
-	// Get scrollback lines for text extraction
-	var scrollbackLines [][]Glyph
-	scrollbackLen := 0
-	if p.scrollback != nil {
-		scrollbackLen = p.scrollback.Len()
-		scrollbackLines = p.scrollback.GetRange(0, scrollbackLen)
-	}
-
 	// Get live screen accessor. SafeEmulator handles its own locking
 	// for CellAt, so the closure is safe to use directly.
 	liveRows := p.vt.Height()
@@ -1879,7 +1786,7 @@ func (p *Pane) copySelectionUnlocked() {
 		return cellToGlyph(p.vt.CellAt(col, row))
 	}
 
-	text := p.selection.ExtractText(scrollbackLines, liveScreen, liveRows, scrollbackLen)
+	text := p.selection.ExtractText(nil, liveScreen, liveRows, 0)
 
 	if text != "" {
 		clipboard.WriteAll(text)
@@ -1890,29 +1797,6 @@ func (p *Pane) copySelectionUnlocked() {
 	p.dirty = true
 }
 
-// scrollUp scrolls the viewport up (into scrollback history)
-// Called with mutex held.
-func (p *Pane) scrollUp(lines int) {
-	if p.scrollback == nil {
-		return
-	}
-	maxOffset := p.scrollback.Len()
-	p.viewportOffset += lines
-	if p.viewportOffset > maxOffset {
-		p.viewportOffset = maxOffset
-	}
-	p.dirty = true
-}
-
-// scrollDown scrolls the viewport down (toward live view)
-// Called with mutex held.
-func (p *Pane) scrollDown(lines int) {
-	p.viewportOffset -= lines
-	if p.viewportOffset < 0 {
-		p.viewportOffset = 0
-	}
-	p.dirty = true
-}
 
 // translateKey converts Bubbletea KeyMsg to PTY byte sequences.
 //
@@ -2049,25 +1933,6 @@ func (p *Pane) contentLocked() string {
 
 // --- Rendering (Issue #14) ---
 
-// View returns the rendered terminal content
-// View returns the cached rendered view of the pane, regenerating
-// only when dirty. The actual rendering lives in render.go — kept as
-// loose functions taking emulator + scrollback + selection params so
-// PR7's client/server split can lift them into the daemon-client
-// without dragging Pane along.
-func (p *Pane) View() string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if !p.dirty && p.cachedView != "" {
-		return p.cachedView
-	}
-
-	p.cachedView = renderVT(p.vt, p.scrollback, p.viewportOffset, !p.cursorHidden.Load(), p.selection)
-	p.lastRender = time.Now()
-	p.dirty = false
-	return p.cachedView
-}
 
 func buildCleanEnv(sessionName, ticketID string) []string {
 	var env []string

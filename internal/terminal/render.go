@@ -6,43 +6,6 @@ import (
 	xvt "github.com/charmbracelet/x/vt"
 )
 
-// renderVT is the unexported alias retained so existing intra-package
-// call sites (Pane.View) read unchanged after RenderVT was exported in
-// PR7.
-var renderVT = RenderVT
-
-// RenderVT is the top-level render dispatch. It returns the cached
-// view for a pane's current state without touching any pane mutable
-// state: callers must hold whatever lock guards the inputs while this
-// runs (the Pane.View call site holds p.mu).
-//
-// Returns "Terminal not initialized" if vt is nil, "" if the emulator
-// has a zero-sized viewport. When viewportOffset > 0 and scrollback
-// is non-nil, renders a mixed scrollback + live view; otherwise just
-// the live screen.
-//
-// Exported (PR7) so daemonclient.PaneView can render its locally-
-// maintained emulator the same way Pane.View does. The lowercase
-// renderVT alias below keeps the existing intra-package call sites
-// readable.
-func RenderVT(vt *xvt.SafeEmulator, scrollback *ScrollbackBuffer, viewportOffset int, cursorVisible bool, selection *SelectionState) string {
-	if vt == nil {
-		return "Terminal not initialized"
-	}
-
-	cols := vt.Width()
-	rows := vt.Height()
-	if cols <= 0 || rows <= 0 {
-		return ""
-	}
-
-	if viewportOffset > 0 && scrollback != nil {
-		return renderScrolledView(vt, scrollback, viewportOffset, cursorVisible, selection, cols, rows)
-	}
-
-	return renderLiveScreen(vt, cursorVisible, selection, cols, rows)
-}
-
 // RenderVTNativeScrollback renders like RenderVT but uses the emulator's
 // OWN scrollback buffer (vt.ScrollbackLen / vt.ScrollbackCellAt) as the
 // history source instead of a separate ScrollbackBuffer.
@@ -123,50 +86,6 @@ func renderNativeScrollbackLine(vt *xvt.SafeEmulator, idx, cols, logicalRow int,
 		line[col] = CellToGlyph(vt.ScrollbackCellAt(col, idx))
 	}
 	return renderGlyphLine(line, cols, logicalRow, selection)
-}
-
-// renderScrolledView renders a viewport that includes scrollback history
-// at the top and live content below. viewportOffset is the number of
-// lines we've scrolled back from the live view.
-func renderScrolledView(vt *xvt.SafeEmulator, scrollback *ScrollbackBuffer, viewportOffset int, cursorVisible bool, selection *SelectionState, cols, rows int) string {
-	scrollbackLen := scrollback.Len()
-	offset := viewportOffset
-	if offset > scrollbackLen {
-		offset = scrollbackLen
-	}
-
-	var result strings.Builder
-	result.Grow(rows * cols * 2)
-
-	// Number of scrollback lines visible at top of viewport
-	scrollbackRowsVisible := offset
-	if scrollbackRowsVisible > rows {
-		scrollbackRowsVisible = rows
-	}
-
-	// Starting scrollback index (from the end of scrollback)
-	scrollbackStart := scrollbackLen - offset
-
-	for viewRow := 0; viewRow < rows; viewRow++ {
-		if viewRow > 0 {
-			result.WriteByte('\n')
-		}
-
-		if viewRow < scrollbackRowsVisible {
-			// Render from scrollback. Logical row is negative, counting
-			// up from -scrollbackLen at the oldest line to -1 at the
-			// newest. This is what selection uses for hit-testing.
-			scrollbackIdx := scrollbackStart + viewRow
-			line := scrollback.Get(scrollbackIdx)
-			logicalRow := scrollbackIdx - scrollbackLen
-			result.WriteString(renderGlyphLine(line, cols, logicalRow, selection))
-		} else {
-			liveRow := viewRow - scrollbackRowsVisible
-			result.WriteString(renderLiveRow(vt, cursorVisible, selection, cols, liveRow, liveRow))
-		}
-	}
-
-	return result.String()
 }
 
 // renderGlyphLine renders one line of scrollback Glyphs with ANSI
