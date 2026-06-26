@@ -96,17 +96,19 @@ file says "waiting":
    `permissionPromptSignatures`; its detection ledger is
    `TestPermissionPromptVisible_SignatureCoverageLedger`.
 2. `activeTurnVisible` — positive evidence of an active turn
-   (`"esc to interrupt"` / braille spinner) → **working**.
+   (`"esc to interrupt"` ≤2.1.179 / `"· x to stop"` ≥2.1.181 /
+   braille spinner) → **working**. Both footers are matched additively.
 3. otherwise → **waiting** (durable default).
 
 There is no byte-recency fallback: the old `lastActivity < WaitingActivityTTL →
 working` catch-all was removed (it mislabeled re-rendering prompts and
 empty-grid unattached sessions as "working"). Detection now **fails safe to
 "waiting"** — an unknown prompt type or a session with no grid is never shown as
-"working". The load-bearing assumption is that Claude renders `"esc to interrupt"`
-for the full duration of a tool run; if that footer string drifts, a busy session
-degrades to "waiting" (annoying, not dangerous), never the reverse. `lastActivity`
-is retained in the signature but no longer triggers promotion.
+"working". Known Claude Code footers: `"esc to interrupt"` (≤2.1.179) and `"· x to stop"`
+(≥2.1.181, React source `" \xB7 x to stop"`); both are matched additively in
+`activeTurnMarkers`. If any future footer drifts, detection fails safe to
+"waiting" (annoying, not dangerous), never the reverse. `lastActivity` is
+retained in the signature but no longer triggers promotion.
 
 For a session **no TUI is attached to**, the client has no grid, so the daemon
 supplies the verdict from its own live grid — see `internal/daemon`

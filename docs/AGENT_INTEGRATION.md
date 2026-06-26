@@ -740,14 +740,15 @@ defeats that: during a Bash tool Claude shows the command's output
 region, not its own ~10 Hz spinner, so a quiet `go test` emits nothing
 and the activity timestamp goes stale — leaving the card at `waiting`
 with nothing for the user to do. `activeTurnVisible(terminalContent)`
-closes it: when the live screen shows an active-turn marker
-(`esc to interrupt`, or a braille spinner glyph) and the prompt guard
-did not fire, the session is busy, not blocked on the user → `working`.
-Ordering is load-bearing — `activeTurnVisible` runs strictly *after*
+closes it: when the live screen shows an active-turn marker and the
+prompt guard did not fire, the session is busy, not blocked on the
+user → `working`. Known footers: `esc to interrupt` (≤2.1.179) and
+`· x to stop` (≥2.1.181) — both are matched additively. Ordering is
+load-bearing — `activeTurnVisible` runs strictly *after*
 `permissionPromptVisible`, so an on-screen prompt always wins; the
 marker set is mutually exclusive with a prompt in Claude's real UI, and
-if the footer string drifts in a future version the check fails *safe*
-(reverts to showing `waiting` while busy, never hides a needs-you).
+if any future footer drifts the check fails *safe* (reverts to showing
+`waiting` while busy, never hides a needs-you).
 
 The cost is bounded by the activity broadcaster's "only emit when
 advanced" check: an idle session generates zero traffic. Spinner-
