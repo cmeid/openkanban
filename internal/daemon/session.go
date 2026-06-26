@@ -329,6 +329,7 @@ func (s *Session) Info() SessionInfo {
 		PID:            s.pane.PID(),
 		Cols:           cols,
 		Rows:           rows,
+		Scrollback:     s.pane.ScrollbackSize(),
 		Running:        s.pane.Running(),
 		AttachedClient: attached,
 		ViewerCount:    s.ViewerCount(),

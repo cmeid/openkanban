@@ -806,14 +806,11 @@ func TestAttach_SnapshotIncludesScrollback(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	// Confirm the pane's scrollback ring really has lines in it. If
-	// not, the rest of the test is meaningless. NOTE: ScrollbackLen
-	// reads the legacy CaptureTopRow/PushScrolledLine ring, which is a
-	// DIFFERENT source from what the snapshot now ships — buildSnapshot
-	// reads the emulator's native scrollback (Pane.SnapshotScrollback).
-	// This precondition stays valid because the ring is still populated
-	// by handleOutput; it just no longer feeds the snapshot.
-	if got := sess.pane.ScrollbackLen(); got == 0 {
+	// Confirm the pane's native scrollback really has lines in it. If
+	// not, the rest of the test is meaningless. NOTE: SnapshotScrollback
+	// reads the emulator's native scrollback — the same source buildSnapshot
+	// ships to attaching clients.
+	if got := len(sess.pane.SnapshotScrollback()); got == 0 {
 		t.Fatalf("pane scrollback empty before re-attach; expected >0 lines after 60-line shell output")
 	}
 

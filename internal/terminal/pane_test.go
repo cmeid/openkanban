@@ -2,7 +2,6 @@ package terminal
 
 import (
 	"bytes"
-	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -270,39 +269,6 @@ func TestPaneLastActivity_EmptyDataDoesNotStamp(t *testing.T) {
 	}
 }
 
-func TestViewportScrolling(t *testing.T) {
-	pane := New("test", 80, 24, 100)
-	pane.scrollback = NewScrollbackBuffer(100)
-
-	// Add some lines to scrollback
-	for i := 0; i < 50; i++ {
-		pane.scrollback.Push(makeTestLine(fmt.Sprintf("line%d", i)))
-	}
-
-	// Test scrollUp
-	pane.scrollUp(10)
-	if pane.viewportOffset != 10 {
-		t.Errorf("after scrollUp(10), expected offset=10, got %d", pane.viewportOffset)
-	}
-
-	// Test scrollUp beyond max
-	pane.scrollUp(100)
-	if pane.viewportOffset != 50 {
-		t.Errorf("scrollUp beyond max should cap at scrollback length, got %d", pane.viewportOffset)
-	}
-
-	// Test scrollDown
-	pane.scrollDown(20)
-	if pane.viewportOffset != 30 {
-		t.Errorf("after scrollDown(20), expected offset=30, got %d", pane.viewportOffset)
-	}
-
-	// Test scrollDown to 0
-	pane.scrollDown(100)
-	if pane.viewportOffset != 0 {
-		t.Errorf("scrollDown beyond 0 should cap at 0, got %d", pane.viewportOffset)
-	}
-}
 
 func TestTranslateKey(t *testing.T) {
 	tests := []struct {

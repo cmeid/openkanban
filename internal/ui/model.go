@@ -4820,6 +4820,9 @@ type spawnReqInputs struct {
 	// terminal.Pane gates its OSC 9 → desktop-notification handler on
 	// this per session, rather than relying on a process-wide global.
 	forwardNotifications bool
+	// scrollback is config.UI.ScrollbackLines at spawn time — sizes the native
+	// vt emulator on the daemon side (and propagated client-side via SessionInfo).
+	scrollback int
 }
 
 // noProjectAgentMsg is shown when a spawn is attempted in a project with no
@@ -5036,7 +5039,7 @@ func buildSpawnReq(in spawnReqInputs) daemon.SpawnReq {
 		Env:                  env,
 		Cols:                 in.cols,
 		Rows:                 in.rows,
-		Scrollback:           0,
+		Scrollback:           in.scrollback,
 		AgentSessionUUID:     in.ticket.AgentSessionID,
 		AgentType:            in.agentType,
 		ForwardNotifications: in.forwardNotifications,
@@ -5388,6 +5391,7 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 			codexSessionID:       codexSessionID,
 			forwardNotifications: cfg.Behavior.ForwardAgentNotifications,
 			model:                projModel,
+			scrollback:           cfg.UI.ScrollbackLines,
 		})
 		spawnCtx, spawnCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		var (

@@ -139,8 +139,9 @@ type PaneView struct {
 
 	// Local rendering state. Mirrors the corresponding fields on
 	// terminal.Pane so View/GetContent can reuse the same render code.
-	width, height int
-	vt            *xvt.SafeEmulator
+	width, height  int
+	scrollbackSize int
+	vt             *xvt.SafeEmulator
 	// scrollback history is the emulator's OWN native scrollback
 	// (vt.ScrollbackLen / vt.ScrollbackCellAt), read directly by the
 	// render/scroll paths — see RenderVTNativeScrollback. We do not keep a
@@ -264,6 +265,7 @@ func NewPaneView(client *Client, ticketID, sessionID string, info *daemon.Sessio
 		pv.cachedTitle.Store(info.Title)
 		pv.width = info.Cols
 		pv.height = info.Rows
+		pv.scrollbackSize = info.Scrollback
 		pv.workdir = info.Workdir
 		pv.sessionName = info.SessionName
 		if info.Running {
@@ -554,6 +556,9 @@ func (p *PaneView) initEmulatorLocked() {
 	}
 	p.width, p.height = w, h
 	p.vt = xvt.NewSafeEmulator(w, h)
+	if p.scrollbackSize > 0 {
+		p.vt.SetScrollbackSize(p.scrollbackSize)
+	}
 	p.vt.SetCallbacks(xvt.Callbacks{
 		CursorVisibility: func(visible bool) {
 			p.cursorHidden.Store(!visible)

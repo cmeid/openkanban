@@ -1,13 +1,12 @@
 # Terminal Package
 
-**This package is now the daemon-side library.** PR7 cut the TUI over to `internal/daemonclient.PaneView`, which mirrors the surface (Title/Start/Stop/StopGraceful/SetSize/HandleKey/HandleMouse/Running/SetWorkdir/GetWorkdir/SetSessionName/GetContent/Update) but uses its own local emulator fed by the daemon's binary stream. The `*terminal.Pane` type defined here is instantiated inside `openkanbankd` (see `internal/daemon/session.go`) to own the actual PTY, scrollback ring, vt drain goroutine, and mode flags. UI code should not import this package — go through `daemonclient` instead.
+**This package is now the daemon-side library.** PR7 cut the TUI over to `internal/daemonclient.PaneView`, which mirrors the surface (Title/Start/Stop/StopGraceful/SetSize/HandleKey/HandleMouse/Running/SetWorkdir/GetWorkdir/SetSessionName/GetContent/Update) but uses its own local emulator fed by the daemon's binary stream. The `*terminal.Pane` type defined here is instantiated inside `openkanbankd` (see `internal/daemon/session.go`) to own the actual PTY, vt drain goroutine, and mode flags. UI code should not import this package — go through `daemonclient` instead.
 
 PTY management and terminal emulation for agent processes.
 
 ## Core Components
 
 - **Pane** - manages single PTY + virtual terminal
-- **ScrollbackBuffer** - ring buffer for history (default 10k lines)
 - **SelectionState** - text selection state machine
 - **Glyph** - internal cell representation; emulator-agnostic
 
@@ -27,7 +26,7 @@ Uses `github.com/charmbracelet/x/vt` (`SafeEmulator`) for escape sequence parsin
 - Cursor management
 - Cell-based rendering
 - Color/attribute handling
-- Scroll regions, alt-screen, scrollback — **native scrollback is authoritative on both sides.** The **client** `daemonclient.PaneView` renders from charm's native scrollback directly (`vt.ScrollbackLen`/`ScrollbackCellAt` via `RenderVTNativeScrollback`), and the **daemon's attach snapshot** reads native scrollback too (`Pane.SnapshotScrollback` → `vt.ScrollbackLen`/`ScrollbackCellAt`). The daemon's `ScrollbackBuffer` ring (populated by `CaptureTopRow`/`PushScrolledLine`) is **legacy** — its row-0-snapshot producer pushed at most one row per write, so a single write that scrolled many rows off the grid (a burst of output, or a re-attach drain after a detached period) lost all but one scrolled-off row; that under-captured ring was being shipped in the snapshot, which is what made detached output un-scrollable on re-attach. The emulator wraps lines and tracks every scrolled-off row, so it is trusted. The ring now feeds only the legacy daemon-side `Pane.View` render path (no production callers). Don't route the snapshot or the client back onto the ring; if you remove `Pane.View`, the ring and `CaptureTopRow`/`PushScrolledLine` can go with it.
+- Scroll regions, alt-screen, scrollback — **native scrollback is authoritative on both sides.** The **client** `daemonclient.PaneView` renders from charm's native scrollback directly (`vt.ScrollbackLen`/`ScrollbackCellAt` via `RenderVTNativeScrollback`), and the **daemon's attach snapshot** reads native scrollback too (`Pane.SnapshotScrollback` → `vt.ScrollbackLen`/`ScrollbackCellAt`). The `scrollbackSize` field (set in `New`, clamped to 10000 minimum) is applied to the emulator via `p.vt.SetScrollbackSize(p.scrollbackSize)` immediately after each emulator creation site; `ScrollbackSize()` exposes it read-only so `SessionInfo.Scrollback` can propagate the value to `daemonclient.PaneView`, which calls `SetScrollbackSize` on its own local emulator in `initEmulatorLocked`. This means `config.UI.ScrollbackLines` is a real end-to-end knob: config → `SpawnReq.Scrollback` → daemon emulator → `SessionInfo.Scrollback` → client emulator.
 
 charm/x/vt emits *responses* (DA queries, cursor reports, etc.) through `Emulator.Read()`. We MUST spawn a goroutine that loops `Read()` → writes to the PTY, or the emulator deadlocks on the first query. See `Pane.startDrainUnlocked` and `stopDrainUnlocked`.
 

@@ -306,11 +306,10 @@ func TestSerializeScrollback_Empty(t *testing.T) {
 	}
 }
 
-// TestSerializeScrollback_RoundTrip: serialize a known set of rows,
-// feed the bytes through a fresh emulator + scrollback driver that
-// mirrors the live-mode producer (CaptureTopRow → vt.Write →
-// PushScrolledLine), and assert the destination scrollback ring
-// contains the same rows in the same order.
+// TestSerializeScrollback_RoundTrip: serialize a known set of rows and
+// verify a native emulator sees them in its scrollback after ingesting
+// the serialized bytes. Decodes via ScrollbackLen/ScrollbackCellAt —
+// the same API SnapshotScrollback and SnapshotApply use.
 func TestSerializeScrollback_RoundTrip(t *testing.T) {
 	const cols, rows = 20, 4
 	src := make([][]terminal.Glyph, 10)
@@ -318,52 +317,29 @@ func TestSerializeScrollback_RoundTrip(t *testing.T) {
 		src[i] = makeGlyphLine(fmt.Sprintf("line %d", i), cols)
 	}
 
-	bytes := SerializeScrollback(src)
-	if len(bytes) == 0 {
+	serialized := SerializeScrollback(src)
+	if len(serialized) == 0 {
 		t.Fatalf("SerializeScrollback returned empty for non-empty rows")
 	}
 
 	em := xvt.NewSafeEmulator(cols, rows)
-	sb := terminal.NewScrollbackBuffer(100)
-	// Apply byte-by-byte chunks so the scrollback capture loop runs
-	// after each emulator write — same as applyOutput on the client.
-	// Feeding everything in one Write is also valid because each row
-	// in the byte stream ends in \r\n, which the emulator interprets
-	// as a scroll on the bottom row.
-	lastTop := terminal.CaptureTopRow(em, false)
-	if _, err := em.Write(bytes); err != nil {
+	if _, err := em.Write(serialized); err != nil {
 		t.Fatalf("emulator write: %v", err)
 	}
-	terminal.PushScrolledLine(em, false, lastTop, sb)
 
-	// The above single-write path only captures ONE scroll. The
-	// real client loop calls CaptureTopRow + PushScrolledLine around
-	// each write. Reset and redo: split bytes into per-row chunks via
-	// "\r\n" so the producer sees each scroll.
-	em = xvt.NewSafeEmulator(cols, rows)
-	sb = terminal.NewScrollbackBuffer(100)
-	for _, chunk := range splitAfter(bytes, []byte("\r\n")) {
-		top := terminal.CaptureTopRow(em, false)
-		if _, err := em.Write(chunk); err != nil {
-			t.Fatalf("emulator chunk write: %v", err)
-		}
-		terminal.PushScrolledLine(em, false, top, sb)
+	n := em.ScrollbackLen()
+	// 10 rows pushed onto a 4-row grid: expect at least 10-4=6 scrolled off.
+	if n < 6 {
+		t.Fatalf("ScrollbackLen = %d, want >= 6 (10 rows onto %d-row grid)", n, rows)
 	}
 
-	// We pushed 10 rows of content onto a 4-row screen, so we expect
-	// at least 10 - 4 = 6 lines in scrollback (the first 6 lines must
-	// have scrolled off; the last 4 sit on the live grid).
-	if got := sb.Len(); got < 6 {
-		t.Fatalf("scrollback.Len() = %d, want >= 6 (rows=10, grid=%d)", got, rows)
+	// Materialize first scrollback row and compare textually.
+	got := make([]terminal.Glyph, cols)
+	for c := 0; c < cols; c++ {
+		got[c] = terminal.CellToGlyph(em.ScrollbackCellAt(c, 0))
 	}
-
-	// Verify the first scrollback row matches src[0] textually.
-	first := sb.Get(0)
-	if first == nil {
-		t.Fatalf("sb.Get(0) returned nil")
-	}
-	if got, want := glyphRowToString(first), glyphRowToString(src[0]); got != want {
-		t.Errorf("first scrollback row: got %q, want %q", got, want)
+	if gotStr, wantStr := glyphRowToString(got), glyphRowToString(src[0]); gotStr != wantStr {
+		t.Errorf("first scrollback row: got %q, want %q", gotStr, wantStr)
 	}
 }
 
@@ -371,6 +347,9 @@ func TestSerializeScrollback_RoundTrip(t *testing.T) {
 // (Width=2) followed by its continuation cell (Width=0). The
 // continuation must be skipped during serialization; the destination
 // emulator re-allocates the wide cell from the leading rune.
+// Regression guard: if the Width=0 skip in writeGlyphRow is reverted,
+// a space is emitted for the continuation, shifting 'X' from col 2 to
+// col 3 — caught by the column-position assertions below.
 func TestSerializeScrollback_WideCharRoundTrip(t *testing.T) {
 	const cols, rows = 20, 4
 	// Build a single row: "中" is wide; the row layout is
@@ -389,60 +368,38 @@ func TestSerializeScrollback_WideCharRoundTrip(t *testing.T) {
 		src = append(src, makeGlyphLine(fmt.Sprintf("pad %d", i), cols))
 	}
 
-	bytes := SerializeScrollback(src)
-	if len(bytes) == 0 {
+	serialized := SerializeScrollback(src)
+	if len(serialized) == 0 {
 		t.Fatalf("SerializeScrollback returned empty")
 	}
 
+	// Decode via native emulator. Column-position assertions below
+	// catch the Width=0-skip regression (a space instead of skip
+	// shifts 'X' one column right, making col-2 != 'X').
 	em := xvt.NewSafeEmulator(cols, rows)
-	sb := terminal.NewScrollbackBuffer(100)
-	for _, chunk := range splitAfter(bytes, []byte("\r\n")) {
-		top := terminal.CaptureTopRow(em, false)
-		if _, err := em.Write(chunk); err != nil {
-			t.Fatalf("emulator chunk write: %v", err)
-		}
-		terminal.PushScrolledLine(em, false, top, sb)
+	if _, err := em.Write(serialized); err != nil {
+		t.Fatalf("emulator write: %v", err)
 	}
 
-	// First scrollback row should be the wide-char row. Verify cells.
-	first := sb.Get(0)
-	if first == nil {
-		t.Fatalf("first scrollback row nil")
+	if em.ScrollbackLen() < 1 {
+		t.Fatalf("no scrollback rows after write")
 	}
-	if len(first) != cols {
-		t.Fatalf("first row len = %d, want %d", len(first), cols)
-	}
-	if first[0].Char != '中' || first[0].Width != 2 {
+	c0 := terminal.CellToGlyph(em.ScrollbackCellAt(0, 0))
+	c1 := terminal.CellToGlyph(em.ScrollbackCellAt(1, 0))
+	c2 := terminal.CellToGlyph(em.ScrollbackCellAt(2, 0))
+	if c0.Char != '中' || c0.Width != 2 {
 		t.Errorf("col 0: got char=%q width=%d, want char=%q width=2",
-			first[0].Char, first[0].Width, '中')
+			c0.Char, c0.Width, '中')
 	}
-	if first[1].Width != 0 {
-		t.Errorf("col 1 (continuation): got width=%d, want 0", first[1].Width)
+	if c1.Width != 0 {
+		t.Errorf("col 1 (continuation): got width=%d, want 0", c1.Width)
 	}
-	if first[2].Char != 'X' || first[2].Width != 1 {
+	if c2.Char != 'X' || c2.Width != 1 {
 		t.Errorf("col 2: got char=%q width=%d, want char=%q width=1",
-			first[2].Char, first[2].Width, 'X')
+			c2.Char, c2.Width, 'X')
 	}
 }
 
-// splitAfter splits data so each segment ends with sep (last segment
-// may not). Used by the round-trip tests to chunk byte streams
-// row-by-row so the scrollback capture loop runs per row.
-func splitAfter(data, sep []byte) [][]byte {
-	var out [][]byte
-	for {
-		idx := bytes.Index(data, sep)
-		if idx < 0 {
-			if len(data) > 0 {
-				out = append(out, data)
-			}
-			return out
-		}
-		end := idx + len(sep)
-		out = append(out, data[:end])
-		data = data[end:]
-	}
-}
 
 // glyphRowToString turns a row of glyphs into a trimmed string for
 // diagnostics. Width=0 cells contribute nothing.
