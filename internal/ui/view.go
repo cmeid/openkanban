@@ -206,7 +206,7 @@ func (m *Model) renderHeader() string {
 		case workingCount > 0:
 			bgColor, icon = m.colors.warning, m.spinner.View()
 		case subagentsCount > 0:
-			bgColor, icon = m.colors.muted, "⊟"
+			bgColor, icon = m.colors.primary, m.spinner.View()
 		case idleCount > 0:
 			bgColor, icon = m.colors.primary, "◆"
 		default: // starting / done only
@@ -531,7 +531,7 @@ func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, w
 		}
 	case board.AgentSubagents:
 		sessionBadge = lipgloss.NewStyle().
-			Foreground(m.colors.muted).
+			Foreground(m.colors.primary).
 			Render("⊟")
 	case board.AgentCompleted:
 		sessionBadge = lipgloss.NewStyle().
@@ -656,9 +656,9 @@ func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, w
 			statusText = "idle"
 			statusColor = m.colors.primary
 		case board.AgentSubagents:
-			statusIcon = "⊟"
+			statusIcon = m.spinner.View()
 			statusText = "sub-agents"
-			statusColor = m.colors.muted
+			statusColor = m.colors.primary
 		case board.AgentWorking:
 			statusIcon = m.spinner.View()
 			statusText = "working"
@@ -721,7 +721,7 @@ func (m *Model) renderTicket(ticket *board.Ticket, isSelected, isHovered bool, w
 			accentColor = m.colors.primary
 		}
 	case board.AgentSubagents:
-		accentColor = m.colors.muted
+		accentColor = m.colors.primary
 	case board.AgentCompleted:
 		accentColor = m.colors.success
 	case board.AgentError:
@@ -2200,7 +2200,7 @@ func agentStatusGlyph(s board.AgentStatus) (icon, label string) {
 // renderAgentStatusPill returns a styled "<icon> <label>" pill for the
 // embedded-session title bar, or "" for AgentNone. Color tracks status
 // severity (working=success, waiting=warning, completed=success-dim,
-// error=err, idle=muted, subagents=muted).
+// error=err, idle=muted, subagents=primary).
 func (m *Model) renderAgentStatusPill(s board.AgentStatus) string {
 	icon, label := agentStatusGlyph(s)
 	if icon == "" {
@@ -2215,7 +2215,7 @@ func (m *Model) renderAgentStatusPill(s board.AgentStatus) string {
 	case board.AgentIdle:
 		color = m.colors.muted
 	case board.AgentSubagents:
-		color = m.colors.muted
+		color = m.colors.primary
 	case board.AgentCompleted:
 		color = m.colors.success
 	case board.AgentError:
