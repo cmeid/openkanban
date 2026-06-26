@@ -427,6 +427,36 @@ func TestTicketStatus_Constants(t *testing.T) {
 	}
 }
 
+func TestParseStatus(t *testing.T) {
+	valid := []struct {
+		in   string
+		want TicketStatus
+	}{
+		{"backlog", StatusBacklog},
+		{"next", StatusNext},
+		{"in_progress", StatusInProgress},
+		{"in_review", StatusInReview},
+		{"done", StatusDone},
+		{"archived", StatusArchived},
+	}
+	for _, tt := range valid {
+		got, err := ParseStatus(tt.in)
+		if err != nil {
+			t.Errorf("ParseStatus(%q) unexpected error: %v", tt.in, err)
+		}
+		if got != tt.want {
+			t.Errorf("ParseStatus(%q) = %q; want %q", tt.in, got, tt.want)
+		}
+	}
+
+	invalid := []string{"", "BACKLOG", "in-progress", "pending", "unknown"}
+	for _, s := range invalid {
+		if _, err := ParseStatus(s); err == nil {
+			t.Errorf("ParseStatus(%q) expected error; got nil", s)
+		}
+	}
+}
+
 func TestAgentStatus_Constants(t *testing.T) {
 	if AgentNone != "none" {
 		t.Errorf("AgentNone = %q; want %q", AgentNone, "none")
