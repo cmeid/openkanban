@@ -327,6 +327,14 @@ Do NOT reintroduce a ticket-form agent picker or a global Default-Agent setting
 reads `Defaults.DefaultAgent` again. The struct field still exists and is read
 by `internal/app` only for the OpenCode-server autostart decision.
 
+**Per-project model override (`project.Settings.Model`):** when set, `buildSpawnReq`
+emits `--model <value>` as the first flag in the `case "claude":` arm (covering
+both new-session and resume paths). Empty = no flag (claude's own default). The
+model is read from project settings at every spawn — NOT stored on the ticket —
+so changing a project's model and re-spawning takes effect without any ticket-level
+migration. Do NOT add a global `config.Defaults.Model` or a per-ticket model field;
+project-scoped only, claude-class agents only.
+
 ## Anti-Patterns
 
 - Don't block in Update() - use Cmd for async
