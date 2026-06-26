@@ -337,19 +337,33 @@ func permissionPromptVisible(content string) bool {
 // activeTurnMarkers are substrings that appear on screen only while a
 // Claude turn or tool is actively running and interruptible — never on a
 // permission prompt (which shows "esc to cancel") or an idle input box.
-// Observed in Claude Code as of 2026-06; if the footer string drifts in a
-// future version, activeTurnVisible simply stops matching and detection
-// falls through to the activity fallback and then the "waiting" default —
-// i.e. drift fails SAFE (a busy session shows "waiting", the original
-// annoyance) and never the dangerous direction (hiding a needs-you).
+//
+// Known footers by version:
+//   ≤2.1.179: "esc to interrupt" (in the interrupt footer)
+//   ≥2.1.181: "· x to stop" (React source: " \xB7 x to stop", so the
+//              rendered cell bytes are space+·+space+"x to stop"; the
+//              leading-space form " x to stop" is used as the anchor to
+//              avoid bare-"x to stop" false positives in agent narration)
+//
+// Both are retained (additive). A session can only show one at a time, so
+// keeping the old marker costs nothing and preserves historical fixtures.
+// If any future footer drifts off, activeTurnVisible stops matching and
+// detection falls to "waiting" — SAFE direction, never hides a needs-you.
 var activeTurnMarkers = []string{
 	"esc to interrupt",
+	" x to stop", // 2.1.181+: "· x to stop"; leading space avoids "max/fix to stop" false positives
 }
 
-// activeTurnSpinnerGlyphs are the braille frames Claude animates while
-// thinking; detectCodingAgentStatus already treats them as "working".
-// Listed here too because that path is skipped when the status file is
-// authoritative (file=waiting short-circuits DetectStatusWithPortAPI).
+// activeTurnSpinnerGlyphs are spinner frames that may appear while Claude
+// is thinking. The braille frames below are from ≤2.1.179; the 2.1.181
+// spinner glyph is unknown (binary grep returned 0 hits — compressed
+// segment or changed) and is deferred to live-capture confirmation.
+// Left as harmless dead code: these serve opencode/gemini/codex via
+// detectCodingAgentStatus and are listed here so file=waiting sessions see
+// them too (that path skips detectCodingAgent). activeTurnVisible is fully
+// restored by the " x to stop" text marker alone; the spinner is secondary
+// and only added when confirmed distinct and non-colliding with
+// backgroundAgentSignatures ("✻ Waiting for N background agent(s)…").
 var activeTurnSpinnerGlyphs = []string{
 	"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
 }
@@ -433,7 +447,12 @@ func (d *StatusDetector) detectCodingAgentStatus(recentLower, fullLower string) 
 		}
 	}
 
+	// workingPatterns are matched after backgroundAgentSignatures and
+	// waitingPatterns above, so a shared glyph cannot mis-fire the
+	// background-wait line. " x to stop" is the 2.1.181+ Claude Code
+	// interrupt footer; the leading space avoids "max/fix to stop" hits.
 	workingPatterns := []string{
+		" x to stop", // 2.1.181+: "· x to stop" turn-active footer
 		"thinking",
 		"processing",
 		"running",

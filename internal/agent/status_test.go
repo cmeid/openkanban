@@ -603,6 +603,17 @@ func TestDetectStatusWithActivity_BusyTurnNotWaiting(t *testing.T) {
 		"   2. No",
 		" ⠹ Esc to cancel",
 	}, "\n")
+	// 2.1.181+ footer: " · x to stop". No esc/braille/permission text so
+	// this row exercises ONLY the " x to stop" marker (non-vacuous proof).
+	// Red-before-green: remove only " x to stop" from activeTurnMarkers
+	// (keep "esc to interrupt") and this row must go RED while all
+	// esc-to-interrupt rows stay GREEN.
+	xToStopFooter := strings.Join([]string{
+		"⎿ Running…",
+		"  $ go test ./...",
+		"",
+		" · x to stop",
+	}, "\n")
 
 	tests := []struct {
 		name            string
@@ -614,6 +625,9 @@ func TestDetectStatusWithActivity_BusyTurnNotWaiting(t *testing.T) {
 		// from the new active-turn marker, not the activity fallback.
 		{"running footer with esc-to-interrupt is working", runningFooter, stale, board.AgentWorking},
 		{"braille spinner footer is working", spinnerFooter, stale, board.AgentWorking},
+		// 2.1.181 marker — RED when only " x to stop" is removed from
+		// activeTurnMarkers (per-marker revert, not combined).
+		{"x-to-stop footer is working (2.1.181)", xToStopFooter, stale, board.AgentWorking},
 		// Ordering guards: recent activity, so WITHOUT the prompt guard
 		// these would return working — proving prompt-first wins over both
 		// the turn marker and the activity fallback (not vacuous).
@@ -685,7 +699,8 @@ func TestDetectStatusWithActivity_StaleWorkingDemotedOnPrompt(t *testing.T) {
 	// Additional hook-silent "Would you like to …?" confirmation boxes that
 	// carry neither "do you want to" nor an "esc to cancel" footer — each
 	// needs its own body signature, same as planApprovalGrid above. Wordings
-	// captured verbatim from the bundled binary (claude-code 2.1.179).
+	// captured verbatim from the bundled binary (claude-code 2.1.179);
+	// re-verified present in 2.1.181 binary grep.
 	pluginInstallGrid := strings.Join([]string{
 		" Would you like to install this LSP plugin?",
 		" ❯ 1. Yes",
@@ -717,6 +732,7 @@ func TestDetectStatusWithActivity_StaleWorkingDemotedOnPrompt(t *testing.T) {
 		{"stash prompt demotes stale working", stashGrid, board.AgentWaiting},
 		// Guards against over-demotion — these must STAY "working":
 		{"active turn alone preserves working", "⠹ Running bash command… (esc to interrupt)", board.AgentWorking},
+		{"x-to-stop alone preserves working (2.1.181)", " · x to stop", board.AgentWorking},
 		{"no prompt + no marker preserves working (file authoritative)", "some streamed tool output\nrunning tests", board.AgentWorking},
 		{"empty grid preserves working (fails safe)", "", board.AgentWorking},
 		// Asymmetry vs the waiting-branch: in the working-branch the
@@ -725,6 +741,7 @@ func TestDetectStatusWithActivity_StaleWorkingDemotedOnPrompt(t *testing.T) {
 		// conservative choice for a file already saying "working" is to not
 		// demote when any active-turn evidence is present.
 		{"prompt plus interrupt marker stays working (guard)", askUserQuestionGrid + "\n (esc to interrupt)", board.AgentWorking},
+		{"prompt plus x-to-stop stays working (guard, 2.1.181)", askUserQuestionGrid + "\n · x to stop", board.AgentWorking},
 	}
 
 	for _, tt := range tests {
@@ -741,12 +758,14 @@ func TestDetectStatusWithActivity_StaleWorkingDemotedOnPrompt(t *testing.T) {
 // TestPermissionPromptVisible_SignatureCoverageLedger is the authoritative
 // ledger of the real Claude Code prompt strings permissionPromptVisible must
 // recognize as a blocked-on-user state. Each row is a wording captured
-// verbatim from the bundled binary (claude-code 2.1.179); a row flipping to
-// false means EITHER a signature was dropped from permissionPromptSignatures
-// OR Claude's wording drifted — both are real regressions, NOT expectations to
-// "fix" by editing want. When refreshing for a new Claude version, update the
-// fixture string AND the matching signature in lockstep (verify against the
-// binary per memory reference_verify_claude_scraper_signatures_via_binary).
+// verbatim from the bundled binary (claude-code 2.1.179); re-verified
+// present in 2.1.181 binary grep (Do you want to proceed?, Would you like
+// to …, Esc to cancel families all confirmed). A row flipping to false means
+// EITHER a signature was dropped from permissionPromptSignatures OR Claude's
+// wording drifted — both are real regressions, NOT expectations to "fix" by
+// editing want. When refreshing for a new Claude version, update the fixture
+// string AND the matching signature in lockstep (verify against the binary
+// per memory reference_verify_claude_scraper_signatures_via_binary).
 //
 // The AskUserQuestion row is the load-bearing drift guard: that prompt has no
 // distinctive "?"-body of its own and is recognized ONLY via its "Esc to
@@ -798,7 +817,7 @@ func TestDetectStatusWithActivity_BackgroundAgentWait(t *testing.T) {
 	bgWaitGrid := strings.Join([]string{
 		"  Spawning helpers…",
 		"",
-		" ✻ Waiting for 1 background agent to finish (esc to interrupt)",
+		" ✻ Waiting for 1 background agent to finish",
 	}, "\n")
 	bgWaitPlural := " ✻ Waiting for 3 background agents to finish"
 
