@@ -212,8 +212,8 @@ func TestAgentStatusGlyph(t *testing.T) {
 }
 
 // TestRenderHeaderSubagentsChip pins the header activity chip for the
-// sub-agents status: a session awaiting background sub-agents shows the calm
-// "⊟ N sub-agents" chip (NOT the orange "waiting"), and a genuine needs-you
+// sub-agents status: a session awaiting background sub-agents shows an
+// animated chip (NOT the orange "waiting"), and a genuine needs-you
 // "waiting" session still wins the single chip when both are present.
 func TestRenderHeaderSubagentsChip(t *testing.T) {
 	proj := &project.Project{ID: "test", RepoPath: t.TempDir()}
@@ -242,13 +242,10 @@ func TestRenderHeaderSubagentsChip(t *testing.T) {
 		}
 	}
 
-	// Only a sub-agents session → calm "⊟" leading icon + a "sub-agents"
+	// Only a sub-agents session → animated leading icon + a "sub-agents"
 	// breakdown bucket, and crucially NOT classified as "waiting".
 	add("sub-1", board.AgentSubagents)
 	out := ansi.Strip(newM().renderHeader())
-	if !strings.Contains(out, "⊟") {
-		t.Errorf("header missing sub-agents ⊟ icon; got:\n%s", out)
-	}
 	if !strings.Contains(out, "1 sub-agents") {
 		t.Errorf("header missing sub-agents breakdown bucket; got:\n%s", out)
 	}
