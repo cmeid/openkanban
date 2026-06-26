@@ -14,7 +14,9 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/techdufus/openkanban/internal/daemon"
 	"github.com/techdufus/openkanban/internal/finishskill"
+	"github.com/techdufus/openkanban/internal/service"
 )
 
 // UpdateStatus is the result of a CheckForUpdates call.
@@ -228,41 +230,86 @@ func ApplyUpdate(ctx context.Context, status UpdateStatus, out io.Writer) error 
 	if resolveGoBin() == "" {
 		installedBin = ""
 	}
-	assembleBundle(ctx, out, runtime.GOOS, SourcePath, installedBin,
+	restarted := assembleBundle(ctx, out, runtime.GOOS, SourcePath, installedBin,
 		func(ctx context.Context, name string, args ...string) error {
 			cmd := exec.CommandContext(ctx, name, args...)
 			cmd.Stdout = out
 			cmd.Stderr = out
 			return cmd.Run()
 		})
-	fmt.Fprintln(out, daemonUpdatedMsg)
+	if restarted {
+		fmt.Fprintln(out, "launchd service updated and restarted automatically")
+	} else {
+		fmt.Fprintln(out, daemonUpdatedMsg)
+	}
 
 	return nil
 }
+
+// assembleBundlePlistInstalledFn and assembleBundleInstallFn are seams for
+// testing — they let assembleBundle tests verify the re-bootstrap path without
+// shelling out to launchctl. In production they delegate to the service package.
+var (
+	assembleBundlePlistInstalledFn = service.PlistInstalled
+	assembleBundleInstallFn        = func(binPath, logPath string) (string, error) {
+		return service.Install(binPath, logPath)
+	}
+)
 
 // assembleBundle refreshes the macOS .app bundle daemon binary after a
 // go install, mirroring scripts/install.sh. No-op off darwin. Non-fatal:
 // a missing/failing bundle script warns but does not fail the update
 // (the CLI is already updated; the bundle is the daemon's binary source
 // that the user can otherwise repair with ./scripts/install.sh).
-func assembleBundle(ctx context.Context, out io.Writer, goos, sourcePath, installedBin string, run func(ctx context.Context, name string, args ...string) error) {
+//
+// Returns true when the launchd service was successfully re-bootstrapped
+// (daemon restarted automatically via launchd); false otherwise. The caller
+// uses this to decide whether to print a "run daemon restart" hint.
+func assembleBundle(ctx context.Context, out io.Writer, goos, sourcePath, installedBin string, run func(ctx context.Context, name string, args ...string) error) bool {
 	if goos != "darwin" {
-		return
+		return false
 	}
 	if installedBin == "" {
 		fmt.Fprintln(out, "note: could not resolve installed binary path; daemon bundle not refreshed — run ./scripts/install.sh")
-		return
+		return false
 	}
 	script := filepath.Join(sourcePath, "dist", "macos", "build-bundle.sh")
 	if st, err := os.Stat(script); err != nil || st.IsDir() {
 		fmt.Fprintf(out, "note: bundle script %s not found; daemon binary not refreshed — run ./scripts/install.sh to update the daemon\n", script)
-		return
+		return false
 	}
 	dest := filepath.Join(os.Getenv("HOME"), "Applications")
 	fmt.Fprintf(out, "refreshing OpenKanban.app daemon bundle (%s)\n", dest)
 	if err := run(ctx, script, installedBin, dest); err != nil {
 		fmt.Fprintf(out, "warning: bundle refresh failed (%v); daemon binary not updated — run ./scripts/install.sh\n", err)
+		return false
 	}
+
+	// Re-bootstrap the launchd service when it was previously installed.
+	//
+	// build-bundle.sh runs `codesign --force --deep`, which invalidates
+	// launchd's loaded job registration. Without this step, launchd fails to
+	// spawn the updated binary with EX_CONFIG (78) on the next launch and
+	// enters a ThrottleInterval loop — making `daemon start` / `daemon restart`
+	// hang with "context deadline exceeded" until the user manually runs
+	// `openkanban daemon install-service`. Re-bootstrapping here fixes that.
+	//
+	// Guarded by PlistInstalled so we never silently opt a user into launchd
+	// supervision: the re-bootstrap only fires when they already have a plist.
+	if ok, _ := assembleBundlePlistInstalledFn(); ok {
+		bundleBin := filepath.Join(dest, "OpenKanban.app", "Contents", "MacOS", "openkanbankd")
+		lp, lpErr := daemon.LogPath()
+		if lpErr != nil {
+			fmt.Fprintf(out, "warning: could not resolve daemon log path (%v); run: openkanban daemon install-service\n", lpErr)
+			return false
+		}
+		if _, serr := assembleBundleInstallFn(bundleBin, lp); serr != nil {
+			fmt.Fprintf(out, "warning: could not re-bootstrap launchd service (%v); run: openkanban daemon install-service\n", serr)
+			return false
+		}
+		return true // daemon restarted automatically via launchd
+	}
+	return false
 }
 
 // buildInstallCmd constructs the `go install` command that rebuilds and

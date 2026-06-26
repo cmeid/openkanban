@@ -798,6 +798,105 @@ func TestAssembleBundle_RunnerError_WarnsNoPanic(t *testing.T) {
 	}
 }
 
+// --- assembleBundle re-bootstrap tests ---
+
+// overrideAssembleBundleSeams installs fake plistInstalled / installService
+// seams for the duration of the test and restores the originals on cleanup.
+// Returns a pointer to the recorded installService calls so callers can assert.
+func overrideAssembleBundleSeams(t *testing.T, plistInstalled bool, installErr error) *[][]string {
+	t.Helper()
+	prevPlist := assembleBundlePlistInstalledFn
+	prevInstall := assembleBundleInstallFn
+	t.Cleanup(func() {
+		assembleBundlePlistInstalledFn = prevPlist
+		assembleBundleInstallFn = prevInstall
+	})
+
+	assembleBundlePlistInstalledFn = func() (bool, error) { return plistInstalled, nil }
+
+	var calls [][]string
+	assembleBundleInstallFn = func(binPath, logPath string) (string, error) {
+		calls = append(calls, []string{binPath, logPath})
+		return "", installErr
+	}
+	return &calls
+}
+
+func TestAssembleBundle_RebootstrapsWhenPlistInstalled(t *testing.T) {
+	calls := overrideAssembleBundleSeams(t, true, nil)
+
+	var out strings.Builder
+	tempSource := t.TempDir()
+	makeBundleScript(t, tempSource)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	// Point the daemon log somewhere writable so LogPath resolves.
+	t.Setenv("OPENKANBAN_DAEMON_LOG", home+"/daemon.log")
+
+	restarted := assembleBundle(context.Background(), &out, "darwin", tempSource, "/go/bin/openkanban", recordingRunner(&[][]string{}, nil))
+
+	if !restarted {
+		t.Errorf("expected assembleBundle to return true (re-bootstrapped), got false; output: %q", out.String())
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("expected installService called once, got %d calls: %v", len(*calls), *calls)
+	}
+	wantBin := home + "/Applications/OpenKanban.app/Contents/MacOS/openkanbankd"
+	if (*calls)[0][0] != wantBin {
+		t.Errorf("installService binPath: got %q, want %q", (*calls)[0][0], wantBin)
+	}
+	if strings.Contains(out.String(), "warning") {
+		t.Errorf("unexpected warning in output when re-bootstrap succeeds: %q", out.String())
+	}
+}
+
+func TestAssembleBundle_NoRebootstrapWhenNoPlist(t *testing.T) {
+	calls := overrideAssembleBundleSeams(t, false, nil)
+
+	var out strings.Builder
+	tempSource := t.TempDir()
+	makeBundleScript(t, tempSource)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	restarted := assembleBundle(context.Background(), &out, "darwin", tempSource, "/go/bin/openkanban", recordingRunner(&[][]string{}, nil))
+
+	if restarted {
+		t.Errorf("expected assembleBundle to return false (no plist), got true")
+	}
+	if len(*calls) != 0 {
+		t.Errorf("expected installService not called when plist absent, got %d calls", len(*calls))
+	}
+}
+
+func TestAssembleBundle_RebootstrapFailureWarns(t *testing.T) {
+	installErr := errors.New("launchctl bootout: permission denied")
+	calls := overrideAssembleBundleSeams(t, true, installErr)
+
+	var out strings.Builder
+	tempSource := t.TempDir()
+	makeBundleScript(t, tempSource)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENKANBAN_DAEMON_LOG", home+"/daemon.log")
+
+	restarted := assembleBundle(context.Background(), &out, "darwin", tempSource, "/go/bin/openkanban", recordingRunner(&[][]string{}, nil))
+
+	if restarted {
+		t.Errorf("expected assembleBundle to return false on install error, got true")
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("expected installService called once, got %d", len(*calls))
+	}
+	if !strings.Contains(out.String(), "warning") {
+		t.Errorf("expected warning in output when re-bootstrap fails; got: %q", out.String())
+	}
+	if !strings.Contains(out.String(), "install-service") {
+		t.Errorf("expected 'install-service' hint in output; got: %q", out.String())
+	}
+}
+
 func TestCurrentBranch_OnNamed(t *testing.T) {
 	_, local := setupRepos(t)
 
