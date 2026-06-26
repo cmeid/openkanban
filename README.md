@@ -21,6 +21,8 @@ AI coding agents are powerful, but managing several of them across projects gets
 
 OpenKanban gives you one TUI with kanban columns. Each ticket is a git worktree with an embedded terminal. Spawn an agent into a ticket, watch it work, jump between tasks. Tickets are flat Markdown files on disk so any editor or script can read, edit, and create them.
 
+**New here?** Start with the [Getting Started guide](docs/GETTING_STARTED.md).
+
 ## Changes vs upstream
 
 This fork sits **56 commits ahead** of `TechDufus/main`. The changes fall into six themes.
@@ -376,7 +378,7 @@ Restore writes to a small, explicit allowlist of roots (`~/.config/openkanban/` 
 
 OpenKanban is heavily configurable. Agents, keybindings, branch naming, cleanup behavior — all customizable in `~/.config/openkanban/config.json`.
 
-See [Configuration Guide](./docs/CONFIGURATION.md) for the full reference, [Data Model](./docs/DATA_MODEL.md) for the on-disk layout, and [Architecture](./ARCHITECTURE.md) for the system overview.
+See [Getting Started](./docs/GETTING_STARTED.md) for a task-oriented walkthrough, [Configuration Guide](./docs/CONFIGURATION.md) for the full reference, [Data Model](./docs/DATA_MODEL.md) for the on-disk layout, and [Architecture](./ARCHITECTURE.md) for the system overview.
 
 ## Architecture notes
 
