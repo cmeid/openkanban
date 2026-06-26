@@ -83,6 +83,22 @@ func TestResolveStatusVerdict(t *testing.T) {
 			want:         "working",
 		},
 		{
+			// 2.1.181+ footer: "· x to stop" (" \xB7 x to stop" in React
+			// source). Content has NO esc/braille/permission text, so this
+			// row is non-vacuous — only the " x to stop" marker can satisfy
+			// it. Proves the daemon/unattached path (which drives Auto-mode
+			// routing) recognises the 2.1.181 active-turn footer.
+			// Red-before-green: remove only " x to stop" from activeTurnMarkers;
+			// this row must go RED while the esc-to-interrupt rows stay GREEN.
+			name:         "claude with 2.1.181 x-to-stop marker resolves working",
+			detector:     d,
+			agentType:    "claude",
+			sessionName:  name,
+			content:      " · x to stop",
+			lastActivity: recent,
+			want:         "working",
+		},
+		{
 			// A bg-spawned session awaiting its own sub-agents resolves to
 			// the distinct "subagents" verdict (idle-but-occupied), NOT the
 			// "waiting" the file is pinned at — exactly the unattached case
