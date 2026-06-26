@@ -56,7 +56,7 @@ func TestProjectEditForm_SavesAgentsAndPin(t *testing.T) {
 	if idx < 0 {
 		t.Fatal("claude-custom not present in editor rows")
 	}
-	base := 2 + idx*peFieldsPerAgent
+	base := peAgentBaseField + idx*peFieldsPerAgent
 
 	// Edit the custom agent's env (text field, via the real sync cycle).
 	editTextField(m, base+peSubEnv, "CLAUDE_CONFIG_DIR=~/.claude-work")
@@ -101,6 +101,76 @@ func TestProjectEditForm_SavesAgentsAndPin(t *testing.T) {
 	}
 	if got.Settings.DefaultAgent != "claude-custom" {
 		t.Errorf("project pin not persisted: got %q", got.Settings.DefaultAgent)
+	}
+}
+
+// TestProjectEditForm_SavesModel verifies that saveProjectEditForm persists
+// proj.Settings.Model to disk and mirrors it onto the live store pointer.
+// Also asserts that leading/trailing whitespace is trimmed.
+func TestProjectEditForm_SavesModel(t *testing.T) {
+	t.Setenv("OPENKANBAN_CONFIG_DIR", t.TempDir())
+
+	cfg := config.DefaultConfig()
+	proj := project.NewProject("ModelProj", t.TempDir())
+	reg := &project.ProjectRegistry{Projects: map[string]*project.Project{proj.ID: proj}}
+	gs := project.NewGlobalTicketStore(nil)
+	gs.AddProject(proj)
+
+	cols := board.DefaultColumns()
+	m := &Model{
+		config:          cfg,
+		projectRegistry: reg,
+		globalStore:     gs,
+		columns:         cols,
+		columnTickets:   make([][]*board.Ticket, len(cols)),
+		columnOffsets:   make([]int, len(cols)),
+		width:           120,
+		height:          40,
+	}
+
+	m.editProject(proj)
+
+	// Case 1: plain model value.
+	m.peModel = "opus"
+	if _, cmd := m.saveProjectEditForm(); cmd != nil {
+		_ = cmd
+	}
+
+	reloaded, err := project.LoadRegistry()
+	if err != nil {
+		t.Fatalf("LoadRegistry: %v", err)
+	}
+	got := reloaded.Projects[proj.ID]
+	if got == nil {
+		t.Fatal("project missing after reload")
+	}
+	if got.Settings.Model != "opus" {
+		t.Errorf("model not persisted: got %q, want %q", got.Settings.Model, "opus")
+	}
+	// Also verify the live store pointer was updated.
+	if live := gs.GetProject(proj.ID); live != nil {
+		if live.Settings.Model != "opus" {
+			t.Errorf("live store model not updated: got %q, want %q", live.Settings.Model, "opus")
+		}
+	}
+
+	// Case 2: whitespace is trimmed.
+	m.editProject(proj)
+	m.peModel = "  sonnet  "
+	if _, cmd := m.saveProjectEditForm(); cmd != nil {
+		_ = cmd
+	}
+
+	reloaded2, err := project.LoadRegistry()
+	if err != nil {
+		t.Fatalf("LoadRegistry (case 2): %v", err)
+	}
+	got2 := reloaded2.Projects[proj.ID]
+	if got2 == nil {
+		t.Fatal("project missing after reload (case 2)")
+	}
+	if got2.Settings.Model != "sonnet" {
+		t.Errorf("model whitespace not trimmed: got %q, want %q", got2.Settings.Model, "sonnet")
 	}
 }
 

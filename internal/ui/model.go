@@ -283,6 +283,7 @@ type Model struct {
 	editingProjectID string
 	peName           string
 	peProjectAgent   string
+	peModel          string
 	peAgents         []peAgentRow
 	peField          int
 	peScrollOffset   int
@@ -4804,6 +4805,7 @@ type spawnReqInputs struct {
 	agentType      string
 	agentEnv       map[string]string // per-agent Env (config.AgentConfig.Env), injected at spawn with leading "~/" expanded
 	cleanArgs      []string          // agentCfg.Args with empty entries stripped
+	model          string            // resolved from proj.Settings.Model (trimmed); empty = no --model flag
 	isNewSession   bool
 	promptTemplate string
 	ctxData        agent.ContextData
@@ -4877,6 +4879,9 @@ func buildSpawnReq(in spawnReqInputs) daemon.SpawnReq {
 
 	switch in.agentType {
 	case "claude":
+		if in.model != "" {
+			args = append(args, "--model", in.model)
+		}
 		if in.isNewSession {
 			// New claude sessions always start in plan mode so the user
 			// reviews the proposed approach before any tree mutation.
@@ -5359,6 +5364,10 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 		// its own process; we then build a PaneView and attach
 		// immediately so the snapshot frames flow into the local
 		// emulator before the model sees the spawnReadyMsg.
+		var projModel string
+		if proj != nil {
+			projModel = strings.TrimSpace(proj.Settings.Model)
+		}
 		req := buildSpawnReq(spawnReqInputs{
 			ticket:               ticket,
 			plan:                 plan,
@@ -5378,6 +5387,7 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 			geminiSessionID:      geminiSessionID,
 			codexSessionID:       codexSessionID,
 			forwardNotifications: cfg.Behavior.ForwardAgentNotifications,
+			model:                projModel,
 		})
 		spawnCtx, spawnCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		var (

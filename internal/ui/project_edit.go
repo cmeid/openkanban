@@ -35,11 +35,16 @@ type peAgentRow struct {
 
 // Flat field layout for the editor cursor (m.peField):
 //
-//	0                                  = project name (text)
-//	1                                  = project default agent (selector)
-//	2 + i*peFieldsPerAgent + sub       = agent i's fields
+//	0                                        = project name (text)
+//	1                                        = project default agent (selector)
+//	2                                        = project model override (text)
+//	peAgentBaseField + i*peFieldsPerAgent + sub = agent i's fields
 //	    sub: 0 enabled(sel) 1 label 2 command 3 args 4 env
 const peFieldsPerAgent = 5
+
+// peAgentBaseField is the flat field index where agent rows begin.
+// Inserting a new project-level field above bumps this; update in one place.
+const peAgentBaseField = 3
 
 const (
 	peSubEnabled = 0
@@ -49,14 +54,14 @@ const (
 	peSubEnv     = 4
 )
 
-func (m *Model) peFieldCount() int { return 2 + len(m.peAgents)*peFieldsPerAgent }
+func (m *Model) peFieldCount() int { return peAgentBaseField + len(m.peAgents)*peFieldsPerAgent }
 
 // peLocate maps a flat field index to (isAgent, agentIdx, sub).
 func (m *Model) peLocate(field int) (isAgent bool, idx, sub int) {
-	if field < 2 {
+	if field < peAgentBaseField {
 		return false, 0, field
 	}
-	rel := field - 2
+	rel := field - peAgentBaseField
 	return true, rel / peFieldsPerAgent, rel % peFieldsPerAgent
 }
 
@@ -67,6 +72,9 @@ func (m *Model) peFieldIsText(field int) bool {
 	}
 	if field == 1 {
 		return false // default-agent selector
+	}
+	if field == 2 {
+		return true // model override (text)
 	}
 	_, _, sub := m.peLocate(field)
 	return sub != peSubEnabled
@@ -82,6 +90,7 @@ func (m *Model) editProject(proj *project.Project) (tea.Model, tea.Cmd) {
 	m.editingProjectID = proj.ID
 	m.peName = proj.Name
 	m.peProjectAgent = proj.Settings.DefaultAgent
+	m.peModel = proj.Settings.Model
 	m.peAgents = m.buildPeAgents()
 	m.peField = 0
 	m.peScrollOffset = 0
@@ -155,6 +164,10 @@ func (m *Model) peSyncToField() {
 		m.peName = val
 		return
 	}
+	if m.peField == 2 {
+		m.peModel = val
+		return
+	}
 	_, idx, sub := m.peLocate(m.peField)
 	if idx < 0 || idx >= len(m.peAgents) {
 		return
@@ -175,6 +188,9 @@ func (m *Model) peSyncToField() {
 func (m *Model) peTextValue(field int) string {
 	if field == 0 {
 		return m.peName
+	}
+	if field == 2 {
+		return m.peModel
 	}
 	_, idx, sub := m.peLocate(field)
 	if idx < 0 || idx >= len(m.peAgents) {
@@ -217,6 +233,18 @@ func (m *Model) handleProjectEditForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Model field (2): left/right cycle presets before forwarding to text input.
+	if m.peField == 2 {
+		switch msg.String() {
+		case "left":
+			m.peCycleModel(-1)
+			return m, nil
+		case "right":
+			m.peCycleModel(1)
+			return m, nil
+		}
+	}
+
 	// Selector fields consume left/right to cycle their value.
 	if !m.peFieldIsText(m.peField) {
 		switch msg.String() {
@@ -232,6 +260,20 @@ func (m *Model) handleProjectEditForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.peInput, cmd = m.peInput.Update(msg)
 	return m, cmd
+}
+
+// peCycleModel cycles m.peModel through the preset model list by dir (+1/-1).
+func (m *Model) peCycleModel(dir int) {
+	presets := []string{"", "opus", "opusplan", "sonnet"}
+	cur := 0
+	for i, p := range presets {
+		if p == m.peModel {
+			cur = i
+			break
+		}
+	}
+	m.peModel = presets[((cur+dir)%len(presets)+len(presets))%len(presets)]
+	m.peInput.SetValue(m.peModel)
 }
 
 // peCycleSelector advances the current selector field by dir (+1/-1).
@@ -303,6 +345,7 @@ func (m *Model) saveProjectEditForm() (tea.Model, tea.Cmd) {
 	if proj, err := m.projectRegistry.Get(m.editingProjectID); err == nil && proj != nil {
 		proj.Name = name
 		proj.Settings.DefaultAgent = m.peProjectAgent
+		proj.Settings.Model = strings.TrimSpace(m.peModel)
 		if err := m.projectRegistry.Update(proj); err != nil {
 			m.notify("Failed to save project: " + err.Error())
 			return m, nil
@@ -311,6 +354,7 @@ func (m *Model) saveProjectEditForm() (tea.Model, tea.Cmd) {
 		if live := m.globalStore.GetProject(m.editingProjectID); live != nil {
 			live.Name = name
 			live.Settings.DefaultAgent = m.peProjectAgent
+			live.Settings.Model = strings.TrimSpace(m.peModel)
 		}
 	}
 
@@ -427,12 +471,13 @@ func (m *Model) renderProjectEditForm() string {
 		agentDisp = valStyle.Render(m.agentLabel(m.peProjectAgent))
 	}
 	b = append(b, cursor(1)+lbl(1, "Agent:   ")+agentDisp+dimStyle.Render("  ◀ ▶"))
+	b = append(b, cursor(2)+lbl(2, "Model:   ")+textOrValue(2)+dimStyle.Render("  ←/→ presets · blank = claude default"))
 	b = append(b, "")
 	b = append(b, sectionStyle.Render("Agents (shared across all projects)"))
 	b = append(b, dimStyle.Render("  enabled: auto = show when on PATH"))
 
 	for i, r := range m.peAgents {
-		base := 2 + i*peFieldsPerAgent
+		base := peAgentBaseField + i*peFieldsPerAgent
 		// header line: enabled selector + key + label
 		en := r.enabled
 		enStyle := dimStyle
@@ -487,15 +532,17 @@ func (m *Model) renderProjectEditForm() string {
 // peFocusedLine returns the rendered line index of the current field (header
 // rows above the agents add a fixed offset).
 func (m *Model) peFocusedLine() int {
-	// Header lines before the first field: title, blank, "Project", name(0)...
-	// Layout: 0 title,1 blank,2 "Project",3 name,4 agent,5 blank,6 "Agents",
-	// 7 hint, then per agent 5 lines.
+	// Layout: 0=title, 1=blank, 2="Project", 3=name(0), 4=agent(1), 5=model(2),
+	// 6=blank, 7="Agents", 8=hint, then agents start at 9 (5 lines each).
 	if m.peField == 0 {
 		return 3
 	}
 	if m.peField == 1 {
 		return 4
 	}
+	if m.peField == 2 {
+		return 5
+	}
 	_, idx, sub := m.peLocate(m.peField)
-	return 8 + idx*peFieldsPerAgent + sub
+	return 9 + idx*peFieldsPerAgent + sub
 }
