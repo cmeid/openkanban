@@ -1080,10 +1080,11 @@ func (p *PaneView) detach(sendFrame bool) error {
 	//
 	// attachLoopWG is reused across attach/detach cycles. If a
 	// re-Attach happens between conn.Close() and the old loop's Done,
-	// the inner Wait will block until BOTH loops drain — the watchdog's
-	// PaneDetachedMsg then arrives late w.r.t. the OLD attach, but
-	// handleAttachExit has already emitted its own when the old loop
-	// exited, and the model handler is idempotent. Acceptable.
+	// the inner Wait will block until BOTH loops drain. The old loop's
+	// handleAttachExit sees p.attachConn != ownConn and exits silently
+	// (no state clobber, no PaneDetachedMsg). The watchdog's
+	// PaneDetachedMsg arrives after both loops drain — by then
+	// focusedPane is clear, so the model handler no-ops it.
 	paneID := p.id
 	sessID := p.sessionID
 	go func() {
@@ -1130,11 +1131,11 @@ func (p *PaneView) attachLoop(conn net.Conn, r *bufio.Reader) {
 		if err != nil {
 			if err == io.EOF || errors.Is(err, net.ErrClosed) {
 				log.Printf("openkanban paneview: attachLoop EOF session=%s frames=%d outputBytes=%d", p.sessionID, frameCount, outputBytes)
-				p.handleAttachExit(nil, true)
+				p.handleAttachExit(conn, nil, true)
 				return
 			}
 			log.Printf("openkanban paneview: attachLoop err session=%s frames=%d outputBytes=%d: %v", p.sessionID, frameCount, outputBytes, err)
-			p.handleAttachExit(err, false)
+			p.handleAttachExit(conn, err, false)
 			return
 		}
 		frameCount++
@@ -1151,7 +1152,7 @@ func (p *PaneView) attachLoop(conn net.Conn, r *bufio.Reader) {
 			// still be running. We transition to Unattached and let
 			// the UI poll List to learn the truth.
 			log.Printf("openkanban paneview: attachLoop got TypeDetach session=%s frames=%d outputBytes=%d", p.sessionID, frameCount, outputBytes)
-			p.handleAttachExit(nil, true)
+			p.handleAttachExit(conn, nil, true)
 			return
 		case daemon.TypeResize:
 			// Daemon-pushed resize (from another client). Apply.
@@ -1173,12 +1174,25 @@ func (p *PaneView) attachLoop(conn net.Conn, r *bufio.Reader) {
 	}
 }
 
-// handleAttachExit drives the post-loop cleanup. cleanExit=true means
-// the daemon closed the connection cleanly (EOF or TypeDetach frame);
-// false means an unexpected I/O error and we treat the daemon as gone.
-func (p *PaneView) handleAttachExit(err error, cleanExit bool) {
+// handleAttachExit drives the post-loop cleanup. ownConn is the conn
+// that this attachLoop instance was given — used to detect whether a
+// concurrent re-Attach has already replaced p.attachConn. If it has,
+// we leave the new attach's state intact and exit silently.
+// cleanExit=true means the daemon closed the connection cleanly (EOF
+// or TypeDetach frame); false means an unexpected I/O error.
+func (p *PaneView) handleAttachExit(ownConn net.Conn, err error, cleanExit bool) {
 	p.mu.Lock()
-	conn := p.attachConn
+	if p.attachConn != ownConn {
+		// A concurrent attach() replaced our conn before our loop
+		// exited. The new loop now owns p.attachConn; touching
+		// p.attachConn, p.state, or p.detachCh here would clobber it.
+		// Close only our own (already-closed-by-Detach) conn and exit.
+		p.mu.Unlock()
+		if ownConn != nil {
+			_ = ownConn.Close()
+		}
+		return
+	}
 	p.attachConn = nil
 	p.attachR = nil
 	p.state = PaneViewUnattached
@@ -1187,8 +1201,8 @@ func (p *PaneView) handleAttachExit(err error, cleanExit bool) {
 	p.detachCh = make(chan struct{})
 	p.mu.Unlock()
 
-	if conn != nil {
-		_ = conn.Close()
+	if ownConn != nil {
+		_ = ownConn.Close()
 	}
 
 	if !cleanExit {
