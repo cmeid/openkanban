@@ -147,7 +147,6 @@ type PaneView struct {
 	// render/scroll paths — see RenderVTNativeScrollback. We do not keep a
 	// parallel ScrollbackBuffer here: its row-snapshot producer could not
 	// capture wrapped rows, which left gaps when scrolling back.
-	selection      *terminal.SelectionState
 	viewportOffset int
 	cachedView     string
 	dirty          bool
@@ -474,9 +473,6 @@ func (p *PaneView) SetSize(width, height int) {
 	p.height = height
 	p.dirty = true
 	p.cachedView = ""
-	if p.selection != nil && p.selection.IsActive() {
-		p.selection.Clear()
-	}
 	p.viewportOffset = 0
 	if p.vt != nil {
 		p.vt.Resize(width, height)
@@ -584,7 +580,6 @@ func (p *PaneView) initEmulatorLocked() {
 	// subsequent output silently. Resetting at emulator (re)init severs
 	// that cross-lifecycle coupling.
 	p.renderSignalPending.Store(false)
-	p.selection = terminal.NewSelectionState()
 	titleHandler := func(data []byte) bool {
 		// IMPORTANT: this callback runs SYNCHRONOUSLY inside vt.Write,
 		// which is itself called from applyOutput while applyOutput
@@ -663,7 +658,6 @@ func (p *PaneView) teardownEmulatorLocked() {
 	wg := &p.drainWG
 	go wg.Wait()
 	p.vt = nil
-	p.selection = nil
 	p.cachedView = ""
 }
 
@@ -1391,14 +1385,6 @@ func (p *PaneView) HandleKey(msg tea.KeyMsg) tea.Msg {
 	// only forward translated bytes to the daemon.
 	key := msg.String()
 
-	if p.selection != nil && p.selection.IsActive() {
-		if key == "ctrl+c" || key == "cmd+c" {
-			p.copySelectionLocked()
-			p.mu.Unlock()
-			return nil
-		}
-	}
-
 	switch key {
 	case "shift+pgup":
 		if p.vt != nil {
@@ -1433,21 +1419,11 @@ func (p *PaneView) HandleKey(msg tea.KeyMsg) tea.Msg {
 			p.mu.Unlock()
 			return nil
 		}
-		if p.selection != nil && p.selection.IsActive() {
-			p.selection.Clear()
-			p.dirty = true
-			p.mu.Unlock()
-			return nil
-		}
 		// Otherwise fall through and forward escape.
 	}
 
 	if p.viewportOffset > 0 {
 		p.viewportOffset = 0
-		p.dirty = true
-	}
-	if p.selection != nil && p.selection.IsActive() {
-		p.selection.Clear()
 		p.dirty = true
 	}
 	conn := p.attachConn
@@ -1532,40 +1508,6 @@ func (p *PaneView) HandleMouse(msg tea.MouseMsg) {
 		p.mu.Unlock()
 		return
 	}
-	if p.selection != nil {
-		switch msg.Button {
-		case tea.MouseButtonLeft:
-			pos := p.viewportToLogicalLocked(msg.X, msg.Y)
-			switch msg.Action {
-			case tea.MouseActionPress:
-				p.selection.Start(pos)
-				p.dirty = true
-			case tea.MouseActionMotion:
-				p.selection.Update(pos)
-				p.dirty = true
-			case tea.MouseActionRelease:
-				p.selection.Finish()
-				p.dirty = true
-			}
-		case tea.MouseButtonNone:
-			if p.selection.Mode == terminal.SelectionSelecting {
-				pos := p.viewportToLogicalLocked(msg.X, msg.Y)
-				p.selection.Update(pos)
-				p.dirty = true
-			}
-		case tea.MouseButtonRight, tea.MouseButtonMiddle:
-			if p.selection.IsActive() {
-				p.selection.Clear()
-				p.dirty = true
-			}
-		case tea.MouseButtonWheelUp, tea.MouseButtonWheelDown:
-			if p.selection.IsActive() {
-				p.selection.Clear()
-				p.dirty = true
-			}
-		}
-	}
-
 	if !p.mouseEnabled {
 		switch msg.Button {
 		case tea.MouseButtonWheelUp:
@@ -1640,37 +1582,17 @@ func (p *PaneView) scrollDownLocked(lines int) {
 	p.dirty = true
 }
 
-// copySelectionLocked extracts selected text and writes it to the
-// system clipboard. Must be called with p.mu held. Mirrors
-// terminal.Pane.copySelectionUnlocked but reads cells directly from
-// our local emulator.
-func (p *PaneView) copySelectionLocked() {
-	// PaneView does not currently maintain scrollback cell extraction
-	// — the daemon's snapshot only captures the live grid, so older
-	// scrollback content lives only on the daemon side. For PR7 we
-	// support selection on the visible portion only.
-	if p.selection == nil || p.vt == nil {
-		return
+// ScrollLines moves the viewport by 1 line. Positive dir scrolls into
+// history (up); negative scrolls toward live output (down). Safe to
+// call from outside the pane's lock.
+func (p *PaneView) ScrollLines(dir int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if dir > 0 {
+		p.scrollUpLocked(1)
+	} else if dir < 0 {
+		p.scrollDownLocked(1)
 	}
-	rows := p.vt.Height()
-	cols := p.vt.Width()
-	liveScreen := func(col, row int) terminal.Glyph {
-		return terminal.CellToGlyph(p.vt.CellAt(col, row))
-	}
-	_ = cols // silence unused if extraction stub changes
-	_ = liveScreen
-	// Use SelectionState.ExtractText with no scrollback lines.
-	text := p.selection.ExtractText(nil, liveScreen, rows, 0)
-	if text != "" {
-		// clipboard interaction is best-effort; we deliberately don't
-		// import atotto/clipboard at this layer to keep the daemonclient
-		// free of UI deps. The model can copy via its own clipboard
-		// shim after pulling text via GetContent if it wants explicit
-		// behavior. (PR7 accepts this limitation; PR8 may wire a
-		// callback through.)
-	}
-	p.selection.Clear()
-	p.dirty = true
 }
 
 // --- View / GetContent ---
@@ -1714,7 +1636,7 @@ func (p *PaneView) View() string {
 		return p.cachedView
 	}
 	cursorVisible := !p.cursorHidden.Load()
-	p.cachedView = terminal.RenderVTNativeScrollback(p.vt, p.viewportOffset, cursorVisible, p.selection)
+	p.cachedView = terminal.RenderVTNativeScrollback(p.vt, p.viewportOffset, cursorVisible, nil)
 	p.dirty = false
 	return p.cachedView
 }
