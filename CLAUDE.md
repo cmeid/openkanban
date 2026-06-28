@@ -45,6 +45,8 @@ go test ./...         # Test
 go run .              # Run (carries no install-time ldflags — fine for ad-hoc iteration)
 
 ./scripts/install.sh  # INSTALL — always use this; never bare `go install .`
+                      # Run from main clone → updates $GOBIN/openkanban (global).
+                      # Run from a worktree → builds ./openkanban locally; global install untouched.
 openkanban update     # Update an existing install (pull + rebuild via the same path)
 ```
 
