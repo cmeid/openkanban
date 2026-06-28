@@ -30,6 +30,17 @@ if [ ! -f go.mod ] || [ ! -d cmd ]; then
   exit 1
 fi
 
+# -- linked worktree detection ------------------------------------------
+# A linked worktree's --git-dir points into .git/worktrees/<name>; the
+# main clone's --git-dir is just ".git". Detecting this lets us build a
+# local test binary instead of clobbering the global $GOBIN install.
+GIT_DIR_VAL="$(git -C "$REPO_ROOT" rev-parse --git-dir 2>/dev/null || true)"
+GIT_COMMON_DIR_VAL="$(git -C "$REPO_ROOT" rev-parse --git-common-dir 2>/dev/null || true)"
+IS_WORKTREE=0
+if [ -n "$GIT_DIR_VAL" ] && [ -n "$GIT_COMMON_DIR_VAL" ] && [ "$GIT_DIR_VAL" != "$GIT_COMMON_DIR_VAL" ]; then
+  IS_WORKTREE=1
+fi
+
 # -- pretty printing ------------------------------------------------------
 have_tty=0
 if [ -t 1 ]; then have_tty=1; fi
@@ -87,32 +98,32 @@ say "  git:  $(git --version | awk '{print $3}')"
 say "  go:   $GO_VERSION (>= $REQUIRED_GO required)"
 
 # -- GOBIN on PATH check --------------------------------------------------
-step "Checking install destination"
-
+# Always resolve GOBIN_DIR — needed in the closing banner for both modes.
 GOBIN_DIR="${GOBIN:-}"
 if [ -z "$GOBIN_DIR" ]; then
   GOPATH_DIR="${GOPATH:-$(go env GOPATH)}"
   GOBIN_DIR="$GOPATH_DIR/bin"
 fi
 
-case ":$PATH:" in
-  *":$GOBIN_DIR:"*)
-    say "  install dir: $GOBIN_DIR (on \$PATH)"
-    ;;
-  *)
-    warn "install dir $GOBIN_DIR is NOT on \$PATH"
-    say  ""
-    say  "  Add this to your shell rc (~/.zshrc or ~/.bashrc) and reopen your shell:"
-    say  ""
-    say  "      export PATH=\"$GOBIN_DIR:\$PATH\""
-    say  ""
-    fail "PATH setup required. Re-run install.sh after adding the line above."
-    ;;
-esac
+if [ "$IS_WORKTREE" = "0" ]; then
+  step "Checking install destination"
+  case ":$PATH:" in
+    *":$GOBIN_DIR:"*)
+      say "  install dir: $GOBIN_DIR (on \$PATH)"
+      ;;
+    *)
+      warn "install dir $GOBIN_DIR is NOT on \$PATH"
+      say  ""
+      say  "  Add this to your shell rc (~/.zshrc or ~/.bashrc) and reopen your shell:"
+      say  ""
+      say  "      export PATH=\"$GOBIN_DIR:\$PATH\""
+      say  ""
+      fail "PATH setup required. Re-run install.sh after adding the line above."
+      ;;
+  esac
+fi
 
 # -- build + install ------------------------------------------------------
-step "Building and installing openkanban"
-
 LDFLAGS="-X github.com/techdufus/openkanban/cmd.SourcePath=$REPO_ROOT"
 # Mark this binary as built via the canonical install path. The root
 # command's PersistentPreRunE refuses to run anything except `version`
@@ -125,16 +136,23 @@ if git -C "$REPO_ROOT" rev-parse --short HEAD >/dev/null 2>&1; then
   LDFLAGS="$LDFLAGS -X github.com/techdufus/openkanban/cmd.Commit=$COMMIT"
 fi
 
-# Use `go install` so the binary lands in $GOBIN_DIR. The cache makes
-# repeat installs ~instant.
-GO_INSTALL_TARGET="."
-if ! go install -ldflags "$LDFLAGS" "$GO_INSTALL_TARGET"; then
-  fail "go install failed. See output above."
+if [ "$IS_WORKTREE" = "1" ]; then
+  step "Building test binary (worktree — local only)"
+  if ! go build -ldflags "$LDFLAGS" -o "$REPO_ROOT/openkanban" .; then
+    fail "go build failed. See output above."
+  fi
+  INSTALLED_BIN="$REPO_ROOT/openkanban"
+else
+  step "Building and installing openkanban"
+  GO_INSTALL_TARGET="."
+  if ! go install -ldflags "$LDFLAGS" "$GO_INSTALL_TARGET"; then
+    fail "go install failed. See output above."
+  fi
+  INSTALLED_BIN="$GOBIN_DIR/openkanban"
 fi
 
-INSTALLED_BIN="$GOBIN_DIR/openkanban"
 if [ ! -x "$INSTALLED_BIN" ]; then
-  fail "go install reported success but $INSTALLED_BIN does not exist or is not executable"
+  fail "build reported success but $INSTALLED_BIN does not exist or is not executable"
 fi
 
 INSTALLED_SHA="$("$INSTALLED_BIN" version 2>/dev/null | awk '/^  source:/ {print $2}' | head -n1 || true)"
@@ -152,77 +170,80 @@ say "  source:    $REPO_ROOT"
 #
 # build-bundle.sh is idempotent (removes any existing OpenKanban.app at the
 # target) and calls lsregister so Launch Services notices immediately.
-if [[ "$(uname -s)" == "Darwin" ]]; then
-  step "Installing OpenKanban.app bundle (macOS notifications identity)"
-  BUNDLE_SCRIPT="$REPO_ROOT/dist/macos/build-bundle.sh"
-  if [[ -x "$BUNDLE_SCRIPT" ]]; then
-    if "$BUNDLE_SCRIPT" "$INSTALLED_BIN" "$HOME/Applications"; then
-      say "  OpenKanban.app installed to $HOME/Applications/OpenKanban.app"
-      # Re-bootstrap the launchd service when it was previously installed.
-      # build-bundle.sh runs `codesign --force --deep`, which invalidates
-      # launchd's loaded job registration. Without this step, launchd fails
-      # to spawn the updated binary with EX_CONFIG (78) on the next launch
-      # and enters a ThrottleInterval loop — making `daemon start` /
-      # `daemon restart` hang with "context deadline exceeded" until the user
-      # manually runs `openkanban daemon install-service`. Re-bootstrapping
-      # here prevents that wedge. Guarded so it only fires when a plist was
-      # previously installed (i.e. the user already opted into launchd).
-      LAUNCHD_PLIST="$HOME/Library/LaunchAgents/dev.openkanban.daemon.plist"
-      if [[ -f "$LAUNCHD_PLIST" ]]; then
-        if "$INSTALLED_BIN" daemon install-service >/dev/null 2>&1; then
-          say "  launchd service re-bootstrapped with updated bundle binary"
-        else
-          warn "Could not re-bootstrap launchd service. Run: openkanban daemon install-service"
+if [ "$IS_WORKTREE" = "0" ]; then
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    step "Installing OpenKanban.app bundle (macOS notifications identity)"
+    BUNDLE_SCRIPT="$REPO_ROOT/dist/macos/build-bundle.sh"
+    if [[ -x "$BUNDLE_SCRIPT" ]]; then
+      if "$BUNDLE_SCRIPT" "$INSTALLED_BIN" "$HOME/Applications"; then
+        say "  OpenKanban.app installed to $HOME/Applications/OpenKanban.app"
+        # Re-bootstrap the launchd service when it was previously installed.
+        # build-bundle.sh runs `codesign --force --deep`, which invalidates
+        # launchd's loaded job registration. Without this step, launchd fails
+        # to spawn the updated binary with EX_CONFIG (78) on the next launch
+        # and enters a ThrottleInterval loop — making `daemon start` /
+        # `daemon restart` hang with "context deadline exceeded" until the user
+        # manually runs `openkanban daemon install-service`. Re-bootstrapping
+        # here prevents that wedge. Guarded so it only fires when a plist was
+        # previously installed (i.e. the user already opted into launchd).
+        LAUNCHD_PLIST="$HOME/Library/LaunchAgents/dev.openkanban.daemon.plist"
+        if [[ -f "$LAUNCHD_PLIST" ]]; then
+          if "$INSTALLED_BIN" daemon install-service >/dev/null 2>&1; then
+            say "  launchd service re-bootstrapped with updated bundle binary"
+          else
+            warn "Could not re-bootstrap launchd service. Run: openkanban daemon install-service"
+          fi
         fi
       fi
     else
-      warn "build-bundle.sh failed. Desktop notifications will lack the OpenKanban identity until you re-run install.sh."
+      warn "dist/macos/build-bundle.sh not found or not executable; skipping bundle install."
+      say  "  Notifications from the daemon will be attributed to the parent terminal app."
     fi
-  else
-    warn "dist/macos/build-bundle.sh not found or not executable; skipping bundle install."
-    say  "  Notifications from the daemon will be attributed to the parent terminal app."
   fi
 fi
 
 # -- optional: Claude Code hooks ------------------------------------------
-step "Claude Code integration"
+if [ "$IS_WORKTREE" = "0" ]; then
+  step "Claude Code integration"
 
-CLAUDE_DIR="$HOME/.claude"
-if [ -d "$CLAUDE_DIR" ] && command -v claude >/dev/null 2>&1; then
-  if [ "$have_tty" = "1" ] && [ -t 0 ]; then
-    say "  Claude Code detected at $CLAUDE_DIR."
-    say "  openkanban can install four hooks into ~/.claude/settings.json so it"
-    say "  sees your session status live (working / idle / waiting). Hooks are"
-    say "  idempotent and only touch sessions where openkanban set"
-    say "  \$OPENKANBAN_SESSION — they no-op everywhere else."
-    say  ""
-    printf '  Install Claude Code hooks now? [Y/n] '
-    # Read a full line so the user can confirm with Enter.
-    read -r reply
-    case "${reply:-y}" in
-      y|Y|yes|YES)
-        if "$INSTALLED_BIN" hooks install; then
-          say "  hooks installed."
-        else
-          warn "openkanban hooks install failed. You can re-run it later with:"
+  CLAUDE_DIR="$HOME/.claude"
+  if [ -d "$CLAUDE_DIR" ] && command -v claude >/dev/null 2>&1; then
+    if [ "$have_tty" = "1" ] && [ -t 0 ]; then
+      say "  Claude Code detected at $CLAUDE_DIR."
+      say "  openkanban can install four hooks into ~/.claude/settings.json so it"
+      say "  sees your session status live (working / idle / waiting). Hooks are"
+      say "  idempotent and only touch sessions where openkanban set"
+      say "  \$OPENKANBAN_SESSION — they no-op everywhere else."
+      say  ""
+      printf '  Install Claude Code hooks now? [Y/n] '
+      # Read a full line so the user can confirm with Enter.
+      read -r reply
+      case "${reply:-y}" in
+        y|Y|yes|YES)
+          if "$INSTALLED_BIN" hooks install; then
+            say "  hooks installed."
+          else
+            warn "openkanban hooks install failed. You can re-run it later with:"
+            say  "      openkanban hooks install"
+          fi
+          ;;
+        *)
+          say "  skipped. You can install hooks later with:"
           say  "      openkanban hooks install"
-        fi
-        ;;
-      *)
-        say "  skipped. You can install hooks later with:"
-        say  "      openkanban hooks install"
-        ;;
-    esac
+          ;;
+      esac
+    else
+      say "  Claude Code detected but stdin is not a TTY — skipping hooks prompt."
+      say "  Run \`openkanban hooks install\` interactively to enable live status hooks."
+    fi
   else
-    say "  Claude Code detected but stdin is not a TTY — skipping hooks prompt."
-    say "  Run \`openkanban hooks install\` interactively to enable live status hooks."
+    say "  Claude Code not detected — skipping hooks step."
+    say "  (Run \`openkanban hooks install\` later if you set up Claude Code.)"
   fi
-else
-  say "  Claude Code not detected — skipping hooks step."
-  say "  (Run \`openkanban hooks install\` later if you set up Claude Code.)"
 fi
 
 # -- optional: launchd background service (macOS) -------------------------
+if [ "$IS_WORKTREE" = "0" ]; then
 step "Background service (launchd)"
 
 # Linux / other Unixes: no systemd backend yet, so we silently skip.
@@ -299,8 +320,22 @@ else
   say "  launchd-based service install is macOS-only. On Linux, run \`openkanban daemon --persistent\`"
   say "  under your own process supervisor (systemd user unit, tmux, etc.)."
 fi
+fi # IS_WORKTREE=0
 
 # -- closing banner -------------------------------------------------------
+if [ "$IS_WORKTREE" = "1" ]; then
+  step "Done (worktree build)"
+  say ""
+  say "  Built a test binary inside this worktree:"
+  say "    $INSTALLED_BIN"
+  say ""
+  say "  Run it with:  ./openkanban"
+  say "  Your global install ($GOBIN_DIR/openkanban) was NOT modified."
+  say "  To update the global install, run install.sh from the main clone on main."
+  say ""
+  exit 0
+fi
+
 step "Done"
 
 cat <<EOF
