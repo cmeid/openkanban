@@ -272,26 +272,16 @@ func (m *Model) applyDaemonSessionEvent(ev daemon.SessionEvent) {
 				} else {
 					stateChanged = ticket.SetAgentStatus(board.AgentNone)
 				}
-				// On an EXPECTED exit, clear the on-disk session
-				// linkage so a later resume doesn't pick up the dead
-				// UUID. The clean wrap-up signal (handleTicketDone) is
-				// our certainty that the session is truly gone — the
-				// JSONL has been finalised by the agent's /quit motion.
-				//
-				// On UNEXPECTED exits we deliberately preserve the
-				// linkage. A daemon crash or transient PTY tear-down
-				// can fire an "exited" event while the JSONL is still
-				// on disk and resumable; clearing here would lose the
-				// user's link to a session that's coming right back.
-				// See commit c718699 — the UUID persistence is what
-				// makes --resume work.
-				if ev.Expected {
-					if ticket.AgentSessionID != "" || ticket.AgentSpawnedAt != nil {
-						ticket.AgentSessionID = ""
-						ticket.AgentSpawnedAt = nil
-						stateChanged = true
-					}
-				}
+				// The JSONL transcript outlives the PTY — only the
+				// process dies, not the conversation. Preserve
+				// AgentSessionID and AgentSpawnedAt on BOTH expected
+				// and unexpected exits so pulling a ticket back from
+				// done (or after a crash) resumes the same session via
+				// --resume. AgentStatus is the meaningful difference:
+				// Expected → AgentCompleted, Unexpected → AgentNone.
+				// See commit c718699 (UUID persistence) for the
+				// original unexpected-exit rationale; expected exits
+				// are now symmetric for the same reason.
 				if stateChanged {
 					m.saveTicket(ticket)
 				}
