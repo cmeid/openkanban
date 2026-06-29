@@ -211,6 +211,19 @@ func (d *StatusDetector) DetectStatusWithActivity(agentType, fileSessionName, ap
 		}
 		return status
 	}
+	// A stale idle file (e.g. Stop→idle fired, then the turn continued via
+	// auto-mode with no new UserPromptSubmit hook) can be promoted to working
+	// when positive active-turn evidence is on screen. Prompt guard first:
+	// an approval box on an otherwise-idle session holds idle rather than
+	// falsely promoting to working. activeTurnVisible then lifts to working
+	// only when a real spinner/footer is present — empty grid fails safe to
+	// idle (no promotion).
+	if status == board.AgentIdle {
+		if !permissionPromptVisible(terminalContent) && activeTurnVisible(terminalContent) {
+			return board.AgentWorking
+		}
+		return status
+	}
 	if status != board.AgentWaiting {
 		return status
 	}
@@ -338,20 +351,26 @@ func permissionPromptVisible(content string) bool {
 // Claude turn or tool is actively running and interruptible — never on a
 // permission prompt (which shows "esc to cancel") or an idle input box.
 //
-// Known footers by version:
+// Known footers/indicators by version:
 //   ≤2.1.179: "esc to interrupt" (in the interrupt footer)
 //   ≥2.1.181: "· x to stop" (React source: " \xB7 x to stop", so the
 //              rendered cell bytes are space+·+space+"x to stop"; the
 //              leading-space form " x to stop" is used as the anchor to
 //              avoid bare-"x to stop" false positives in agent narration)
+//   ≥2.1.181: "· ↓ " — the activity-counter separator in the streaming
+//              spinner "· ↓ N tokens [· still thinking]". More drift-resistant
+//              than glyph/gerund: confirmed from two live captures —
+//              "· Considering… (2m 17s · ↓ 6.4k tokens · still thinking)"
+//              and "✢ Razzle-dazzling… (9m 5s · ↓ 16.4k tokens)".
 //
-// Both are retained (additive). A session can only show one at a time, so
-// keeping the old marker costs nothing and preserves historical fixtures.
+// All are retained (additive). A session shows only one indicator at a time,
+// so keeping older markers costs nothing and preserves historical fixtures.
 // If any future footer drifts off, activeTurnVisible stops matching and
 // detection falls to "waiting" — SAFE direction, never hides a needs-you.
 var activeTurnMarkers = []string{
 	"esc to interrupt",
 	" x to stop", // 2.1.181+: "· x to stop"; leading space avoids "max/fix to stop" false positives
+	"· ↓ ",       // 2.1.181+: activity-counter separator "· ↓ N tokens"; drift-resistant spinner anchor
 }
 
 // activeTurnSpinnerGlyphs are spinner frames that may appear while Claude

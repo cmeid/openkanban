@@ -635,6 +635,17 @@ func TestDetectStatusWithActivity_BusyTurnNotWaiting(t *testing.T) {
 		{"prompt plus braille glyph stays waiting", promptPlusSpinner, recent, board.AgentWaiting},
 		// Precision guard: idle screen, no marker — must not over-match.
 		{"idle input box stays waiting", idleBox, stale, board.AgentWaiting},
+		// 2.1.181+ activity-counter spinner — live captures from two running sessions
+		// (Opus plan-mode and Sonnet auto-mode, 2026-06-29). The "· ↓ N tokens"
+		// separator is the drift-resistant anchor added in this fix. RED when only
+		// "· ↓ " is removed from activeTurnMarkers (per-marker revert, same discipline
+		// as xToStopFooter above).
+		{"plan-mode spinner promotes waiting to working (Opus, 2.1.181+)",
+			"· Considering… (2m 17s · ↓ 6.4k tokens · still thinking)",
+			stale, board.AgentWorking},
+		{"auto-mode spinner promotes waiting to working (Sonnet, 2.1.181+)",
+			"✢ Razzle-dazzling… (9m 5s · ↓ 16.4k tokens)",
+			stale, board.AgentWorking},
 	}
 
 	for _, tt := range tests {
@@ -863,11 +874,12 @@ func TestDetectStatusWithActivity_BackgroundAgentWait(t *testing.T) {
 }
 
 // TestDetectStatusWithActivity_NoDowngrade ensures the override never
-// downgrades a non-waiting status WHEN NO on-screen prompt is present.
-// Even when activity is present, a file saying "working" / "idle" /
-// "completed" passes through. (The one intentional exception — a stale
-// "working" with a visible prompt → "waiting" — is pinned in
-// TestDetectStatusWithActivity_StaleWorkingDemotedOnPrompt.)
+// changes a non-waiting status when the terminal content is empty (no
+// on-screen evidence of either a prompt or an active turn). Files saying
+// "working" / "idle" / "completed" / "error" all pass through unchanged.
+// Intentional exceptions tested elsewhere:
+//   - stale "working" + visible prompt → "waiting" (StaleWorkingDemotedOnPrompt)
+//   - stale "idle" + visible spinner → "working" (IdlePromotedOnSpinner)
 func TestDetectStatusWithActivity_NoDowngrade(t *testing.T) {
 	tmpDir := t.TempDir()
 	d := NewStatusDetector()
@@ -952,5 +964,64 @@ func TestDetectStatusWithActivity_FileKeyVsAPIKey(t *testing.T) {
 	got := d.DetectStatusWithActivity("claude", branchKey, apiSessionID, "", 0, true, terminalContent, time.Now())
 	if got != board.AgentIdle {
 		t.Errorf("got %q, want AgentIdle (file lookup must use the branch-keyed name, not the API UUID)", got)
+	}
+}
+
+// TestDetectStatusWithActivity_IdlePromotedOnSpinner pins the fix for the
+// second observed failure: a session in auto-mode whose Stop hook wrote
+// "idle", then continued generating without a new UserPromptSubmit (no hook
+// fires during pure generation). The status file stays pinned at "idle"
+// while the spinner shows an active turn. An idle→working promotion arm —
+// symmetric to the waiting→working arm — lifts the status when positive
+// active-turn evidence is on screen.
+//
+// Fail-safes (both must hold):
+//   - empty grid → stays idle (no active evidence)
+//   - approval prompt on screen → stays idle (prompt guard runs first)
+//
+// Fixtures are the two real-world live captures that triggered this fix.
+func TestDetectStatusWithActivity_IdlePromotedOnSpinner(t *testing.T) {
+	stale := time.Now().Add(-(WaitingActivityTTL + time.Second))
+
+	sonnetSpinner := "✢ Razzle-dazzling… (9m 5s · ↓ 16.4k tokens)"
+	opusSpinner := "· Considering… (2m 17s · ↓ 6.4k tokens · still thinking)"
+	planApprovalPrompt := strings.Join([]string{
+		" Claude has written up a plan and is ready to execute. Would you like to proceed?",
+		" ❯ 1. Yes, and auto-accept edits",
+		"   2. No, keep planning",
+	}, "\n")
+
+	tests := []struct {
+		name            string
+		terminalContent string
+		lastActivity    time.Time
+		want            board.AgentStatus
+	}{
+		// The fix: spinner promotes idle→working.
+		// RED before adding the idle arm in DetectStatusWithActivity (the
+		// "status != AgentWaiting" guard returns idle before any refinement).
+		{"Sonnet auto-mode spinner promotes idle to working", sonnetSpinner, stale, board.AgentWorking},
+		{"Opus plan-mode spinner promotes idle to working", opusSpinner, stale, board.AgentWorking},
+		// Fail-safe: empty grid → no promotion.
+		{"empty grid keeps idle", "", stale, board.AgentIdle},
+		// Fail-safe: approval prompt present → stays idle (prompt guard first).
+		{"plan-approval prompt keeps idle", planApprovalPrompt, stale, board.AgentIdle},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			d := NewStatusDetector()
+			d.statusDirs = []string{tmpDir}
+			statusFile := filepath.Join(tmpDir, "sess.status")
+			if err := os.WriteFile(statusFile, []byte("idle"), 0644); err != nil {
+				t.Fatalf("write status: %v", err)
+			}
+			d.InvalidateCache("sess")
+			got := d.DetectStatusWithActivity("claude", "sess", "sess", "", 0, true, tt.terminalContent, tt.lastActivity)
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
