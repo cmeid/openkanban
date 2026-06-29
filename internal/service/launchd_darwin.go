@@ -257,6 +257,12 @@ func Status() (running bool, pid int, err error) {
 // to manage one the user never opted into.
 var ErrNotInstalled = errors.New("service: launchd plist not installed")
 
+// errExConfig is a sentinel returned by kickstart when launchctl exits
+// with EX_CONFIG (78), indicating the job registration was invalidated
+// (e.g. by a codesign --force during openkanban update). Start catches
+// this sentinel and performs a bootout + bootstrap + kickstart recovery.
+var errExConfig = errors.New("service: launchctl EX_CONFIG (78) — registration invalidated")
+
 // Start asks launchd to run the already-installed service now. It's the
 // autostart counterpart to Install: where Install (re)writes and
 // bootstraps the plist, Start assumes the plist already exists and just
@@ -283,16 +289,6 @@ func Start() error {
 		return err
 	}
 
-	// Fast path: if the service is already loaded, kickstart forces a
-	// running instance now (idempotent when it's already running).
-	if ok, kerr := kickstart(target); kerr != nil {
-		return kerr
-	} else if ok {
-		return nil
-	}
-
-	// Not loaded → bootstrap the plist (RunAtLoad=true starts it), then
-	// kickstart to remove the ThrottleInterval / socket-bind race.
 	plistPath, err := PlistPath()
 	if err != nil {
 		return err
@@ -301,9 +297,32 @@ func Start() error {
 	if err != nil {
 		return err
 	}
+
+	// Fast path: if the service is already loaded, kickstart forces a
+	// running instance now (idempotent when it's already running).
+	if ok, kerr := kickstart(target); kerr != nil {
+		if !errors.Is(kerr, errExConfig) {
+			return kerr
+		}
+		// EX_CONFIG: registration was invalidated (e.g. codesign during
+		// update). Recover by dropping the stale registration and
+		// re-bootstrapping. Start is only called when no daemon is bound,
+		// so bootout here never kills live sessions.
+		return recoverExConfig(target, domain, plistPath)
+	} else if ok {
+		return nil
+	}
+
+	// Not loaded → bootstrap the plist (RunAtLoad=true starts it), then
+	// kickstart to remove the ThrottleInterval / socket-bind race.
 	if _, stderr, code, runErr := runLaunchctl("bootstrap", domain, plistPath); runErr != nil {
 		return fmt.Errorf("service: launchctl bootstrap exec: %w", runErr)
 	} else if code != 0 {
+		if errIndicatesExConfig(code) {
+			// EX_CONFIG on bootstrap: stale registration in the domain.
+			// Recover the same way as the kickstart path.
+			return recoverExConfig(target, domain, plistPath)
+		}
 		return fmt.Errorf("service: launchctl bootstrap failed (exit %d): %s", code, strings.TrimSpace(stderr.String()))
 	}
 	if ok, kerr := kickstart(target); kerr != nil {
@@ -314,10 +333,32 @@ func Start() error {
 	return nil
 }
 
+// recoverExConfig handles EX_CONFIG (78) from launchctl by doing a
+// best-effort bootout of the stale registration, re-bootstrapping from
+// the plist already on disk, and kickstarting. Returns nil on success or
+// the original EX_CONFIG sentinel on second failure (no retry loop).
+func recoverExConfig(target, domain, plistPath string) error {
+	// Best-effort: ignore errors — the job may already be unloaded.
+	runLaunchctl("bootout", target) //nolint:errcheck
+	if _, stderr, code, runErr := runLaunchctl("bootstrap", domain, plistPath); runErr != nil {
+		return fmt.Errorf("service: EX_CONFIG recovery bootstrap exec: %w", runErr)
+	} else if code != 0 {
+		return fmt.Errorf("service: EX_CONFIG recovery bootstrap failed (exit %d): %s", code, strings.TrimSpace(stderr.String()))
+	}
+	if ok, kerr := kickstart(target); kerr != nil {
+		return kerr
+	} else if !ok {
+		return fmt.Errorf("service: EX_CONFIG recovery: bootstrapped %s but kickstart could not find it", target)
+	}
+	return nil
+}
+
 // kickstart runs `launchctl kickstart <target>` (no -k: never restart a
 // running instance). Returns (true, nil) on success, (false, nil) when
-// the service isn't loaded (caller should bootstrap first), and
-// (false, err) on a real failure.
+// the service isn't loaded (caller should bootstrap first),
+// (false, errExConfig) when launchd signals EX_CONFIG (78) meaning the
+// registration was invalidated (e.g. codesign after bootstrap), and
+// (false, err) on any other real failure.
 func kickstart(target string) (bool, error) {
 	_, stderr, code, runErr := runLaunchctl("kickstart", target)
 	if runErr != nil {
@@ -333,6 +374,11 @@ func kickstart(target string) (bool, error) {
 	// but the user still gets a daemon.
 	if errIndicatesNotLoaded(stderr.String(), code) {
 		return false, nil
+	}
+	// EX_CONFIG (78): codesign-invalidated registration. Return a sentinel
+	// so Start can perform a bootout + bootstrap + kickstart recovery.
+	if errIndicatesExConfig(code) {
+		return false, errExConfig
 	}
 	return false, fmt.Errorf("service: launchctl kickstart failed (exit %d): %s", code, strings.TrimSpace(stderr.String()))
 }
@@ -431,6 +477,16 @@ func errIndicatesNotLoaded(stderr string, code int) bool {
 		}
 	}
 	return false
+}
+
+// errIndicatesExConfig returns true when launchctl's exit code signals
+// EX_CONFIG (78) — the error launchd emits when a codesign-invalidated
+// job registration is kicked. The most common cause: `codesign --force`
+// on the app bundle after bootstrap (e.g. during `openkanban update`).
+// We key primarily off the exit code; the stderr message varies across
+// macOS versions ("Invalid property list", "could not find service", etc.).
+func errIndicatesExConfig(code int) bool {
+	return code == 78
 }
 
 // sanityCheckBinPath rejects binPath values that point at transient

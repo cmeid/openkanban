@@ -1,7 +1,9 @@
 package cmd
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -249,10 +251,47 @@ func ApplyUpdate(ctx context.Context, status UpdateStatus, out io.Writer) error 
 // assembleBundlePlistInstalledFn and assembleBundleInstallFn are seams for
 // testing — they let assembleBundle tests verify the re-bootstrap path without
 // shelling out to launchctl. In production they delegate to the service package.
+//
+// assembleBundleLiveSessionsFn counts running daemon sessions. Used to skip
+// the launchd bootout when the daemon has live sessions — bootout SIGTERMs
+// the daemon, which kills every owned agent session. On any probe error (no
+// daemon, timeout) it returns 0 so we fall through to the normal path.
 var (
 	assembleBundlePlistInstalledFn = service.PlistInstalled
 	assembleBundleInstallFn        = func(binPath, logPath string) (string, error) {
 		return service.Install(binPath, logPath)
+	}
+	assembleBundleLiveSessionsFn = func() int {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		conn, err := dialDaemon(ctx)
+		if err != nil {
+			return 0 // daemon not running — safe to proceed
+		}
+		defer conn.Close()
+		r := bufio.NewReader(conn)
+		if _, err := exchange(ctx, conn, r, daemon.MsgHelloReq, daemon.HelloReq{
+			ProtocolVersion: daemon.ProtocolVersion,
+			BinaryVersion:   Version,
+			ClientName:      daemon.ClientNameCLI,
+		}); err != nil {
+			return 0
+		}
+		raw, err := exchange(ctx, conn, r, daemon.MsgListReq, daemon.ListReq{})
+		if err != nil {
+			return 0
+		}
+		var list daemon.ListResp
+		if err := json.Unmarshal(raw, &list); err != nil {
+			return 0
+		}
+		count := 0
+		for _, s := range list.Sessions {
+			if s.Running {
+				count++
+			}
+		}
+		return count
 	}
 )
 
@@ -297,6 +336,14 @@ func assembleBundle(ctx context.Context, out io.Writer, goos, sourcePath, instal
 	// Guarded by PlistInstalled so we never silently opt a user into launchd
 	// supervision: the re-bootstrap only fires when they already have a plist.
 	if ok, _ := assembleBundlePlistInstalledFn(); ok {
+		// Guard: skip bootout when the daemon has live sessions. service.Install
+		// starts with launchctl bootout, which SIGTERMs the running daemon and
+		// kills every owned agent session. The daemon's stalenessStep already
+		// handles binary swaps safely once sessions drain — let it do that.
+		if n := assembleBundleLiveSessionsFn(); n > 0 {
+			fmt.Fprintf(out, "skipping launchd re-registration: daemon has %d live session(s); it will pick up the new binary once they finish. Re-run 'openkanban update' after sessions drain, or run 'openkanban daemon install-service' once they've finished.\n", n)
+			return false
+		}
 		bundleBin := filepath.Join(dest, "OpenKanban.app", "Contents", "MacOS", "openkanbankd")
 		lp, lpErr := daemon.LogPath()
 		if lpErr != nil {

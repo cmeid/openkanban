@@ -802,17 +802,26 @@ func TestAssembleBundle_RunnerError_WarnsNoPanic(t *testing.T) {
 
 // overrideAssembleBundleSeams installs fake plistInstalled / installService
 // seams for the duration of the test and restores the originals on cleanup.
-// Returns a pointer to the recorded installService calls so callers can assert.
+// liveSessions controls what assembleBundleLiveSessionsFn returns (0 = no
+// live sessions, proceed with bootout as normal). Returns a pointer to the
+// recorded installService calls so callers can assert.
 func overrideAssembleBundleSeams(t *testing.T, plistInstalled bool, installErr error) *[][]string {
+	return overrideAssembleBundleSeamsWithSessions(t, plistInstalled, installErr, 0)
+}
+
+func overrideAssembleBundleSeamsWithSessions(t *testing.T, plistInstalled bool, installErr error, liveSessions int) *[][]string {
 	t.Helper()
 	prevPlist := assembleBundlePlistInstalledFn
 	prevInstall := assembleBundleInstallFn
+	prevLive := assembleBundleLiveSessionsFn
 	t.Cleanup(func() {
 		assembleBundlePlistInstalledFn = prevPlist
 		assembleBundleInstallFn = prevInstall
+		assembleBundleLiveSessionsFn = prevLive
 	})
 
 	assembleBundlePlistInstalledFn = func() (bool, error) { return plistInstalled, nil }
+	assembleBundleLiveSessionsFn = func() int { return liveSessions }
 
 	var calls [][]string
 	assembleBundleInstallFn = func(binPath, logPath string) (string, error) {
@@ -820,6 +829,39 @@ func overrideAssembleBundleSeams(t *testing.T, plistInstalled bool, installErr e
 		return "", installErr
 	}
 	return &calls
+}
+
+// TestAssembleBundle_SkipsBootoutWhenLiveSessions verifies that when the daemon
+// has live sessions, assembleBundle skips launchd re-registration (to avoid
+// SIGTERMing the daemon and killing agent sessions) and returns false.
+func TestAssembleBundle_SkipsBootoutWhenLiveSessions(t *testing.T) {
+	calls := overrideAssembleBundleSeamsWithSessions(t, true, nil, 2)
+
+	var out strings.Builder
+	tempSource := t.TempDir()
+	makeBundleScript(t, tempSource)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENKANBAN_DAEMON_LOG", home+"/daemon.log")
+
+	restarted := assembleBundle(context.Background(), &out, "darwin", tempSource, "/go/bin/openkanban", recordingRunner(&[][]string{}, nil))
+
+	if restarted {
+		t.Errorf("expected assembleBundle to return false (skipped bootout), got true")
+	}
+	if len(*calls) != 0 {
+		t.Errorf("expected installService NOT called when live sessions exist, got %d calls: %v", len(*calls), *calls)
+	}
+	outStr := out.String()
+	if !strings.Contains(outStr, "skipping launchd re-registration") {
+		t.Errorf("expected skip message in output; got: %q", outStr)
+	}
+	if !strings.Contains(outStr, "2 live session") {
+		t.Errorf("expected session count in output; got: %q", outStr)
+	}
+	if !strings.Contains(outStr, "openkanban update") {
+		t.Errorf("expected re-run hint in output; got: %q", outStr)
+	}
 }
 
 func TestAssembleBundle_RebootstrapsWhenPlistInstalled(t *testing.T) {
