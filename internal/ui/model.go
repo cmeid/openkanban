@@ -473,18 +473,6 @@ type Model struct {
 	// See computeWindowTitle / maybeSetWindowTitle.
 	lastWindowTitle string
 
-	// arrowPending / arrowSeq implement the rate classifier that
-	// distinguishes trackpad scroll (high-rate up/down flood from alt-scroll
-	// mode) from real arrow keypresses in ModeAgentView. A single up/down is
-	// held for arrowLeadWindow before being forwarded; a second within that
-	// window confirms a scroll gesture.
-	arrowPending     bool
-	arrowPendingKey  tea.KeyMsg
-	arrowPendingAt   time.Time
-	arrowScrollUntil time.Time
-	arrowSeq         int
-	// clock is a time source seam for testing. nil → time.Now.
-	clock func() time.Time
 }
 
 func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projectRegistry *project.ProjectRegistry, agentMgr *agent.Manager, opencodeServer *agent.OpencodeServer, filterProjectID string, ownedByDaemon map[board.TicketID]daemon.SessionInfo, daemonClient *daemonclient.Client, autostartDaemon bool) *Model {
@@ -840,8 +828,6 @@ func (m *Model) reconcileMouseMode(prevMode Mode) tea.Cmd {
 	if wasAgent == isAgent {
 		return nil
 	}
-	// Drop any pending arrow classification across mode transitions.
-	m.arrowPending = false
 	if isAgent {
 		return tea.Batch(tea.DisableMouse, altScrollCmd(true))
 	}
@@ -861,31 +847,6 @@ func altScrollCmd(on bool) tea.Cmd {
 		_, _ = io.WriteString(os.Stdout, seq)
 		return nil
 	}
-}
-
-// now returns the current time. Uses m.clock when set (for tests), otherwise time.Now.
-func (m *Model) now() time.Time {
-	if m.clock != nil {
-		return m.clock()
-	}
-	return time.Now()
-}
-
-// handleArrowReleaseMsg fires from a tea.Tick after arrowLeadWindow. If the
-// buffered arrow is still pending (seq still matches), it was isolated — not
-// the start of a scroll flood — so forward it as a real keypress to Claude.
-func (m *Model) handleArrowReleaseMsg(msg arrowReleaseMsg) (tea.Model, tea.Cmd) {
-	if !m.arrowPending || msg.seq != m.arrowSeq {
-		return m, nil
-	}
-	m.arrowPending = false
-	pane, ok := m.panes[m.focusedPane]
-	if !ok || pane == nil {
-		return m, m.maybeSetWindowTitle()
-	}
-	// Forward the buffered key bypassing the rate classifier.
-	pane.HandleKey(m.arrowPendingKey)
-	return m, m.maybeSetWindowTitle()
 }
 
 func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -1132,9 +1093,6 @@ func (m *Model) dispatchUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// A cycle Peek finished; processing this message is enough to
 		// re-render the backdrop. Nothing else to do.
 		return m, nil
-
-	case arrowReleaseMsg:
-		return m.handleArrowReleaseMsg(msg)
 
 	case QuitRequestedMsg:
 		return m.handleQuitRequested()
@@ -2165,17 +2123,6 @@ func (m *Model) exitToBoard() {
 	m.cycleAttachPrompt = false
 }
 
-const (
-	// arrowLeadWindow is the leading-edge buffer for the trackpad-scroll rate
-	// classifier. A second up/down within this window confirms a scroll gesture;
-	// after this window the arrow is forwarded as a real keypress.
-	// Threshold ≈ 33/s — above key auto-repeat (~30/s), below scroll flood (~100/s).
-	arrowLeadWindow = 30 * time.Millisecond
-	// arrowScrollDebounce is the tail-side debounce: once a scroll gesture is
-	// detected, arrows within this window keep scrolling (handles gaps in the flood).
-	arrowScrollDebounce = 150 * time.Millisecond
-)
-
 func (m *Model) handleAgentViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// The takeover warning modal swallows all keys until the user
 	// resolves it (Enter/y take over, anything else cancels). Checked
@@ -2196,13 +2143,6 @@ func (m *Model) handleAgentViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if !ok {
 		m.exitToBoard()
 		return m, m.maybeSetWindowTitle()
-	}
-
-	// If a non-arrow key arrives while an arrow is buffered in the rate
-	// classifier, flush the buffered arrow first to preserve input order.
-	if m.arrowPending && msg.String() != "up" && msg.String() != "down" {
-		m.arrowPending = false
-		pane.HandleKey(m.arrowPendingKey)
 	}
 
 	// Session-cycle bindings are intercepted before the pane forwards
@@ -2229,39 +2169,12 @@ func (m *Model) handleAgentViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(cmd, m.maybeSetWindowTitle())
 		}
 	case "up", "down":
-		now := m.now()
 		dir := 1
 		if msg.String() == "down" {
 			dir = -1
 		}
-		// Already in a scroll gesture — apply and extend debounce tail.
-		if now.Before(m.arrowScrollUntil) {
-			pane.ScrollLines(dir)
-			m.arrowScrollUntil = now.Add(arrowScrollDebounce)
-			return m, nil
-		}
-		// Second fast event within the lead window — start of a scroll flood.
-		if m.arrowPending && now.Sub(m.arrowPendingAt) < arrowLeadWindow {
-			// Apply both the buffered event and this one as scrolls.
-			pendingDir := 1
-			if m.arrowPendingKey.String() == "down" {
-				pendingDir = -1
-			}
-			pane.ScrollLines(pendingDir)
-			pane.ScrollLines(dir)
-			m.arrowPending = false
-			m.arrowScrollUntil = now.Add(arrowScrollDebounce)
-			return m, nil
-		}
-		// First or isolated event — buffer and wait for the lead window.
-		m.arrowPending = true
-		m.arrowPendingKey = msg
-		m.arrowPendingAt = now
-		m.arrowSeq++
-		seq := m.arrowSeq
-		return m, tea.Tick(arrowLeadWindow, func(time.Time) tea.Msg {
-			return arrowReleaseMsg{seq: seq}
-		})
+		pane.ScrollLines(dir)
+		return m, nil
 	}
 
 	if result := pane.HandleKey(msg); result != nil {
@@ -6638,10 +6551,6 @@ type attachConflictMsg struct {
 // purely to trigger a View() re-render so the freshly-peeked backdrop
 // shows. It carries no pane ID so it doesn't arm a pane-message listener.
 type cyclePeekedMsg struct{}
-
-// arrowReleaseMsg fires from a tea.Tick when a buffered up/down key has
-// been isolated long enough to be classified as a real arrow (not scroll).
-type arrowReleaseMsg struct{ seq int }
 
 func tickAgentStatus(d time.Duration) tea.Cmd {
 	return tea.Tick(d, func(t time.Time) tea.Msg {
