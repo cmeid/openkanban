@@ -341,3 +341,65 @@ func TestBranchForWorktree(t *testing.T) {
 		t.Errorf("expected error for unknown path, got nil")
 	}
 }
+
+// TestCreateWorktree_BranchCheckedOutElsewhere covers the two collision cases
+// where the deterministically-derived branch is already registered to a
+// DIFFERENT worktree path than the one CreateWorktree wants to use.
+func TestCreateWorktree_BranchCheckedOutElsewhere(t *testing.T) {
+	t.Run("live conflict returns actionable error", func(t *testing.T) {
+		repoPath := initTestRepo(t)
+		baseDir := filepath.Join(t.TempDir(), "worktrees")
+		mgr := NewWorktreeManagerFromPaths(repoPath, baseDir)
+
+		// Register a worktree holding branch "collide-x" at a path that is NOT
+		// the one CreateWorktree will derive (it derives baseDir/collide-x).
+		otherPath := filepath.Join(t.TempDir(), "manual", "live-elsewhere")
+		runGitIn(t, repoPath, "worktree", "add", "-b", "collide-x", otherPath, "main")
+
+		// The derived path is free, but the branch is checked out at otherPath
+		// (on disk) → LIVE conflict.
+		_, err := mgr.CreateWorktree("collide-x", "main")
+		if err == nil {
+			t.Fatal("expected error for live branch-collision, got nil")
+		}
+		// Assert on wording the FIX introduces, not on the path — the pre-fix
+		// generic error already echoes git's prose (which contains the path),
+		// so a path assertion would pass without the fix (tautology). Reverting
+		// the fix makes this fail: the generic "failed to create worktree"
+		// error carries no "git worktree remove" / "to unblock" guidance.
+		got := err.Error()
+		if !strings.Contains(got, "git worktree remove") || !strings.Contains(got, "to unblock") {
+			t.Errorf("error lacks actionable recovery wording: %q", got)
+		}
+	})
+
+	t.Run("stale registration is pruned and branch reused", func(t *testing.T) {
+		repoPath := initTestRepo(t)
+		baseDir := filepath.Join(t.TempDir(), "worktrees")
+		mgr := NewWorktreeManagerFromPaths(repoPath, baseDir)
+
+		// Register a worktree on branch "stale-x" at a non-derived path, then
+		// delete its directory WITHOUT `git worktree remove` — leaving a stale
+		// registration that still pins the branch.
+		stalePath := filepath.Join(t.TempDir(), "manual", "stale-elsewhere")
+		runGitIn(t, repoPath, "worktree", "add", "-b", "stale-x", stalePath, "main")
+		if err := os.RemoveAll(stalePath); err != nil {
+			t.Fatalf("RemoveAll stale dir: %v", err)
+		}
+
+		// CreateWorktree derives baseDir/stale-x (a different, free path). Without
+		// the fix this fails opaquely ("failed to create worktree: ... is already
+		// used by worktree at ..."); with the fix the stale registration is
+		// pruned and the branch reused at the derived path.
+		wtPath, err := mgr.CreateWorktree("stale-x", "main")
+		if err != nil {
+			t.Fatalf("CreateWorktree should recover from stale registration: %v", err)
+		}
+		if wtPath == "" {
+			t.Fatal("expected a non-empty worktree path after stale recovery")
+		}
+		if _, err := os.Stat(filepath.Join(wtPath, ".git")); err != nil {
+			t.Errorf("expected worktree .git at %s: %v", wtPath, err)
+		}
+	})
+}

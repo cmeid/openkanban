@@ -55,18 +55,86 @@ func (m *WorktreeManager) CreateWorktree(branchName, baseBranch string) (string,
 	cmd.Dir = m.repoPath
 
 	if output, err := cmd.CombinedOutput(); err != nil {
-		if strings.Contains(string(output), "already exists") {
+		out := string(output)
+		if strings.Contains(out, "already exists") {
+			// The branch already exists; retry without -b to reuse it.
 			cmd = exec.Command("git", "worktree", "add", worktreePath, branchName)
 			cmd.Dir = m.repoPath
 			if output2, err2 := cmd.CombinedOutput(); err2 != nil {
-				return "", fmt.Errorf("failed to create worktree: %s: %w", string(output2), err2)
+				out2 := string(output2)
+				// STALE/LIVE case surfaces here: the no-`-b` retry reports the
+				// branch is already used by another worktree. (LIVE surfaces on
+				// the primary add below.)
+				if strings.Contains(out2, "is already used by worktree at") {
+					return m.resolveBranchCheckedOutElsewhere(branchName, worktreePath, err2)
+				}
+				return "", fmt.Errorf("failed to create worktree: %s: %w", out2, err2)
 			}
 			return worktreePath, nil
 		}
-		return "", fmt.Errorf("failed to create worktree: %s: %w", string(output), err)
+		// LIVE case: the conflicting worktree dir is on disk with the branch
+		// checked out there, so the primary `add -b` fails directly.
+		if strings.Contains(out, "is already used by worktree at") {
+			return m.resolveBranchCheckedOutElsewhere(branchName, worktreePath, err)
+		}
+		return "", fmt.Errorf("failed to create worktree: %s: %w", out, err)
 	}
 
 	return worktreePath, nil
+}
+
+// resolveBranchCheckedOutElsewhere handles the "is already used by worktree
+// at" failure from `git worktree add`. branchName is the branch we tried to
+// create; worktreePath is the (free) path we wanted to add it at; cause is the
+// originating git error.
+//
+// It distinguishes two cases by whether the conflicting worktree is still on
+// disk:
+//   - STALE (dir gone, registration lingers): prune the dead registration and
+//     re-add the worktree at worktreePath, reusing the branch.
+//   - LIVE (dir present, branch checked out there): return an actionable error
+//     telling the operator how to unblock.
+func (m *WorktreeManager) resolveBranchCheckedOutElsewhere(branchName, worktreePath string, cause error) (string, error) {
+	conflictPath := m.conflictingWorktreePath(branchName)
+
+	// No structured match (and no prose to scrape) — fall back to the generic
+	// failure so we never silently swallow the error.
+	if conflictPath == "" {
+		return "", fmt.Errorf("failed to create worktree: branch %q is already used by another worktree: %w", branchName, cause)
+	}
+
+	if _, statErr := os.Stat(canonicalPath(conflictPath)); statErr == nil {
+		// LIVE: the conflicting worktree exists on disk.
+		return "", fmt.Errorf("branch %q is already checked out at %s; to unblock, run: git worktree remove %s\n  (or rename the ticket to derive a different branch): %w", branchName, conflictPath, conflictPath, cause)
+	}
+
+	// STALE: the directory is gone but the registration lingers. Prune it and
+	// reuse the branch at the path we wanted.
+	pruneCmd := exec.Command("git", "worktree", "prune")
+	pruneCmd.Dir = m.repoPath
+	pruneCmd.CombinedOutput()
+
+	addCmd := exec.Command("git", "worktree", "add", worktreePath, branchName)
+	addCmd.Dir = m.repoPath
+	if output, err := addCmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("failed to create worktree after pruning stale registration: %s: %w", string(output), err)
+	}
+	return worktreePath, nil
+}
+
+// conflictingWorktreePath finds the path of the worktree currently holding
+// branchName. It prefers ListWorktrees (structured + already canonicalized for
+// macOS /var vs /private/var), falling back to nothing if no match is found.
+func (m *WorktreeManager) conflictingWorktreePath(branchName string) string {
+	expected := strings.TrimPrefix(branchName, "refs/heads/")
+	if worktrees, err := m.ListWorktrees(); err == nil {
+		for _, wt := range worktrees {
+			if strings.TrimPrefix(wt.Branch, "refs/heads/") == expected {
+				return wt.Path
+			}
+		}
+	}
+	return ""
 }
 
 func (m *WorktreeManager) isValidWorktree(path string) bool {
