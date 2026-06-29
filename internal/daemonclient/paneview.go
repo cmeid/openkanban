@@ -1076,9 +1076,11 @@ func (p *PaneView) detach(sendFrame bool) error {
 	// re-Attach happens between conn.Close() and the old loop's Done,
 	// the inner Wait will block until BOTH loops drain. The old loop's
 	// handleAttachExit sees p.attachConn != ownConn and exits silently
-	// (no state clobber, no PaneDetachedMsg). The watchdog's
-	// PaneDetachedMsg arrives after both loops drain — by then
-	// focusedPane is clear, so the model handler no-ops it.
+	// (no state clobber, no PaneDetachedMsg). The PaneDetachedMsg below
+	// arrives after both loops drain. It is safe only because doAttach
+	// (model.go) skips PaneDetachedMsg in its post-attach drain — without
+	// that skip, a re-Attach would consume this message and bounce back
+	// to the board immediately (the double-Enter regression, PR #160).
 	paneID := p.id
 	sessID := p.sessionID
 	go func() {
