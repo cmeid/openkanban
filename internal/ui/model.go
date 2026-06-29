@@ -3791,17 +3791,27 @@ func (m *Model) doAttach(ticketID board.TicketID, pv *daemonclient.PaneView, tak
 			return spawnErrorMsg{ticketID: id, err: "attach failed: " + err.Error()}
 		}
 		// Drain one message from the pane's tea channel so the update
-		// loop keeps spinning.
-		select {
-		case msg, ok := <-pv.TeaMessages():
-			if !ok {
-				return daemonclient.PaneExitMsg{PaneID: pv.ID(), Err: io.EOF}
+		// loop keeps spinning. Skip stale PaneDetachedMsg: detach()'s
+		// WG goroutine emits one after the old attachLoop drains; if
+		// it's still buffered when the next attach starts, returning it
+		// triggers exitToBoard() and immediately undoes this attach.
+		timeout := time.NewTimer(50 * time.Millisecond)
+		defer timeout.Stop()
+		for {
+			select {
+			case msg, ok := <-pv.TeaMessages():
+				if !ok {
+					return daemonclient.PaneExitMsg{PaneID: pv.ID(), Err: io.EOF}
+				}
+				if _, isDetach := msg.(daemonclient.PaneDetachedMsg); isDetach {
+					continue
+				}
+				return msg
+			case <-timeout.C:
+				// No event yet — return a synthetic attached message so
+				// the model arms the reader.
+				return daemonclient.PaneAttachedMsg{PaneID: pv.ID()}
 			}
-			return msg
-		case <-time.After(50 * time.Millisecond):
-			// No event yet — return a synthetic attached message so the
-			// model arms the reader.
-			return daemonclient.PaneAttachedMsg{PaneID: pv.ID()}
 		}
 	}
 }

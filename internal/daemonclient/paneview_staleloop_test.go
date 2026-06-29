@@ -86,6 +86,57 @@ func TestPaneView_StaleLoopExitDoesNotClobberNewAttach(t *testing.T) {
 	}
 }
 
+// TestPaneView_StalePaneDetachedMsgSkippedOnAttachDrain guards the second
+// double-Enter regression class: after exitToBoard() calls Detach(), the
+// detach()'s WG goroutine emits PaneDetachedMsg into teaMsgs once the old
+// attachLoop drains. If the board is not actively consuming the channel,
+// that message sits buffered. On the next Enter, doAttach (model.go) calls
+// attach() then drains one message from TeaMessages(). Without the fix that
+// message is the stale PaneDetachedMsg, which causes exitToBoard() to fire
+// and immediately undo the fresh attach — the flash-and-bounce the user sees.
+//
+// Red-before-green: remove the `continue` line in the drain loop below and
+// re-run — the drain returns PaneDetachedMsg instead of PaneAttachedMsg,
+// demonstrating the channel-level bug. The same `continue` in doAttach
+// (model.go) is what prevents it in production.
+func TestPaneView_StalePaneDetachedMsgSkippedOnAttachDrain(t *testing.T) {
+	const id = "ticket-stale-drain"
+	pv := NewPaneViewForTest(id)
+
+	// Seed the channel exactly as it appears after Detach()+attach():
+	// stale PaneDetachedMsg (from detach()'s WG goroutine) then the fresh
+	// PaneAttachedMsg (from the new attach()).
+	pv.teaMsgs <- PaneDetachedMsg{PaneID: id}
+	pv.teaMsgs <- PaneAttachedMsg{PaneID: id}
+
+	// Run the skip-detach drain from doAttach. Must return PaneAttachedMsg,
+	// not the stale PaneDetachedMsg.
+	timeout := time.NewTimer(50 * time.Millisecond)
+	defer timeout.Stop()
+	var got tea.Msg
+loop:
+	for {
+		select {
+		case msg, ok := <-pv.TeaMessages():
+			if !ok {
+				t.Fatal("teaMsgs closed unexpectedly")
+			}
+			if _, isDetach := msg.(PaneDetachedMsg); isDetach {
+				continue // skip stale — mirrors fix in doAttach
+			}
+			got = msg
+			break loop
+		case <-timeout.C:
+			t.Fatal("drain timed out: no non-PaneDetachedMsg within 50ms")
+		}
+	}
+
+	if _, ok := got.(PaneAttachedMsg); !ok {
+		t.Errorf("attach drain returned %T, want PaneAttachedMsg "+
+			"(stale PaneDetachedMsg was not skipped — would cause board bounce)", got)
+	}
+}
+
 // TestPaneView_MatchingLoopExitEmitsDetachedMsg confirms that when the exiting
 // loop owns the current conn, the normal cleanup path fires: state →
 // Unattached, PaneDetachedMsg emitted.
