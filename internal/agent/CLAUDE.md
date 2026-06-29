@@ -97,7 +97,8 @@ file says "waiting":
    `TestPermissionPromptVisible_SignatureCoverageLedger`.
 2. `activeTurnVisible` — positive evidence of an active turn
    (`"esc to interrupt"` ≤2.1.179 / `"· x to stop"` ≥2.1.181 /
-   braille spinner) → **working**. Both footers are matched additively.
+   `"· ↓ "` activity-counter separator ≥2.1.181 / braille spinner)
+   → **working**. All markers are matched additively.
 3. otherwise → **waiting** (durable default).
 
 There is no byte-recency fallback: the old `lastActivity < WaitingActivityTTL →
