@@ -269,10 +269,15 @@ The --project flag follows the same matching rules as 'ticket new': an
 exact name, an exact UUID, or a unique UUID prefix of at least 4
 characters.
 
-If the daemon is down or doesn't own the ticket's AgentSessionID, the
-delete is a pure file-system operation — the lsof / SIGTERM dance from
+If the daemon is down or doesn't own the ticket's AgentSessionID, no
+foreign Claude process is killed — the lsof / SIGTERM dance from
 'ticket new --migrate --force' is NOT replicated here, since deleting a
 ticket should not, on its own, kill a foreign Claude process.
+
+If the ticket has a worktree, it is torn down per config.Cleanup
+(delete_worktree removes the worktree; delete_branch deletes the branch
+only when it is fully merged). Teardown is best-effort: failures are
+warned to stderr and never block the delete.
 
 This command does NOT autostart the daemon: a scripted invocation must
 remain quiet when the daemon happens to be down.`,
@@ -346,6 +351,34 @@ remain quiet when the daemon happens to be down.`,
 			// authoritative "ticket is gone" signal; a transient daemon
 			// failure must not block deletion.
 			fmt.Fprintf(os.Stderr, "openkanbankd: ticket_done for %s: %v\n", t.ID, derr)
+		}
+
+		// Worktree + branch teardown BEFORE the file-system delete, so a
+		// deleted ticket doesn't leave an orphaned worktree/branch behind —
+		// the orphan is what later collides with a new ticket's spawn (the
+		// branch name is derived deterministically from the title). All of
+		// this is best-effort: warnings go to stderr, but teardown failure
+		// never aborts the delete. Honors config.Cleanup gates, matching the
+		// TUI's performTicketCleanup (model.go:3824).
+		cfg, cerr := config.Load("")
+		if cerr != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "warning: could not load config for worktree cleanup: %v\n", cerr)
+		} else {
+			mgr := git.NewWorktreeManager(proj)
+			if t.WorktreePath != "" && cfg.Cleanup.DeleteWorktree {
+				if rerr := mgr.RemoveWorktree(t.WorktreePath); rerr != nil {
+					fmt.Fprintf(cmd.ErrOrStderr(), "warning: could not remove worktree %s: %v\n", t.WorktreePath, rerr)
+				}
+			}
+			if cfg.Cleanup.DeleteBranch && t.BranchName != "" {
+				// Mirror model.go's safe-delete: DeleteMergedBranch refuses an
+				// unmerged branch rather than force-deleting it.
+				if deleted, derr := mgr.DeleteMergedBranch(t.BranchName); derr != nil {
+					fmt.Fprintf(cmd.ErrOrStderr(), "warning: could not delete branch %s: %v\n", t.BranchName, derr)
+				} else if !deleted {
+					fmt.Fprintf(cmd.ErrOrStderr(), "note: branch %q has unmerged work; not deleted\n", t.BranchName)
+				}
+			}
 		}
 
 		if err := store.Delete(t.ID); err != nil {
