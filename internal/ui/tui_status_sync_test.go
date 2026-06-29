@@ -512,12 +512,13 @@ func TestActivityEvent_DoesNotDowngradeCompleted(t *testing.T) {
 	}
 }
 
-// TestExitedEvent_ClearsAgentSessionResidueOnExpected pins the
-// post-fix contract for B21: an Expected=true "exited" event (the
-// clean wrap-up signal, fired by the daemon's handleTicketDone) must
-// clear the on-disk session linkage so a later resume doesn't pick
-// up the dead UUID.
-func TestExitedEvent_ClearsAgentSessionResidueOnExpected(t *testing.T) {
+// TestExitedEvent_PreservesResidueOnExpected pins that an Expected=true
+// "exited" event (the clean wrap-up signal from handleTicketDone) must
+// NOT clear AgentSessionID or AgentSpawnedAt. The JSONL transcript
+// outlives the PTY; pulling the ticket back from done must resume the
+// same session, not spawn fresh. AgentStatus still transitions to
+// AgentCompleted (the only meaningful difference vs unexpected exit).
+func TestExitedEvent_PreservesResidueOnExpected(t *testing.T) {
 	t.Setenv("OPENKANBAN_CONFIG_DIR", t.TempDir())
 
 	const tid board.TicketID = "exit-expected-1"
@@ -526,13 +527,14 @@ func TestExitedEvent_ClearsAgentSessionResidueOnExpected(t *testing.T) {
 	globalStore.AddProject(proj)
 
 	now := time.Now()
+	const wantUUID = "uuid-to-preserve"
 	ticket := &board.Ticket{
 		ID:             tid,
 		Title:          "expected exit",
 		ProjectID:      "test",
 		Status:         board.StatusInProgress,
 		AgentStatus:    board.AgentWorking,
-		AgentSessionID: "uuid-to-clear",
+		AgentSessionID: wantUUID,
 		AgentSpawnedAt: &now,
 	}
 	if err := globalStore.Add(ticket); err != nil {
@@ -555,11 +557,12 @@ func TestExitedEvent_ClearsAgentSessionResidueOnExpected(t *testing.T) {
 		},
 	})
 
-	if ticket.AgentSessionID != "" {
-		t.Errorf("AgentSessionID = %q, want \"\" (cleared on expected exit)", ticket.AgentSessionID)
+	if ticket.AgentSessionID != wantUUID {
+		t.Errorf("AgentSessionID = %q, want %q (must NOT clear on expected exit)",
+			ticket.AgentSessionID, wantUUID)
 	}
-	if ticket.AgentSpawnedAt != nil {
-		t.Errorf("AgentSpawnedAt = %v, want nil (cleared on expected exit)", ticket.AgentSpawnedAt)
+	if ticket.AgentSpawnedAt == nil {
+		t.Errorf("AgentSpawnedAt = nil, want non-nil (must NOT clear on expected exit)")
 	}
 	if ticket.AgentStatus != board.AgentCompleted {
 		t.Errorf("AgentStatus = %v, want %v (Expected=true preserves Completed)", ticket.AgentStatus, board.AgentCompleted)

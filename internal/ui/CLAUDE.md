@@ -271,7 +271,7 @@ This closes the historical asymmetry where the CLI tore down sessions on transit
 Two seams worth knowing about:
 
 - **`daemonGuardAPI` interface** (`exit_guard.go`) — extended with `TicketDone(ctx, ticketID)` so UI tests can substitute a fake without spinning up a real daemon. New daemon RPCs needed from UI code should be added here for the same reason. **The Model field is `m.daemon` (type `daemonAPI`, which embeds `daemonGuardAPI`)** — `m.guardAPI` is a vestige of the pre-PR-#39 name and won't compile. If you copy a call site from a stale branch or older PR diff, sanity-check the receiver before merging.
-- **`handleDaemonSessionEvent("exited")` conditional clear** (`daemon_subscribe.go`) — clears `ticket.AgentSessionID` / `AgentSpawnedAt` only when `ev.Expected == true`. Unexpected exits (daemon crash, transient PTY tear-down) deliberately preserve the residue so `--resume` can still pick up a JSONL that's still on disk. The persistence work in commit `c718699` (`feat(session): persist UUID, prefer --resume`) is what makes this matter — clearing on every exit would un-do it.
+- **`handleDaemonSessionEvent("exited")` link preservation** (`daemon_subscribe.go`) — `AgentSessionID` and `AgentSpawnedAt` are preserved on **both** expected and unexpected exits. Only the PTY dies; the JSONL transcript outlives the session process, so pulling a ticket back from `done` resumes the same conversation via `--resume`. `AgentStatus` is the meaningful difference: `Expected=true` → `AgentCompleted`, `Expected=false` → `AgentNone`. See commit `c718699` (original unexpected-exit rationale) and PR #158 (extended the same invariant to expected exits).
 
 ## tea.Cmd goroutines must not touch shared Model state
 

@@ -331,10 +331,12 @@ remain quiet when the daemon happens to be down.`,
 		//  2. TicketID-keyed TicketDone (unconditional): catches the
 		//     freshly-spawned-but-not-yet-backfilled case, where the
 		//     daemon DOES have a live session for the ticket but the
-		//     ticket .md still has AgentSessionID="". TicketDone is a
-		//     no-op on miss, so it's safe to layer on top of (1) — if
-		//     (1) already killed the session, (2) just reports
-		//     Killed=false.
+		//     ticket .md still has AgentSessionID="". Also a safe
+		//     no-op when (1) already killed the session. Note:
+		//     AgentSessionID may be set even after a ticket is done
+		//     (the expected-exit handler preserves it for resume); (1)
+		//     will probe the daemon, find the session already gone,
+		//     and skip — (2) catches the remaining case.
 		if t.AgentSessionID != "" {
 			ownsResp, daemonUp, daemonOwns, perr := probeDaemonOwnership(t.AgentSessionID)
 			if perr != nil {
@@ -739,7 +741,10 @@ func probeDaemonOwnership(uuid string) (daemon.OwnsResp, bool, bool, error) {
 // delete` as the second layer of daemon-side cleanup: it catches the
 // freshly-spawned-but-not-yet-backfilled case where the daemon owns a
 // live session for this ticket but the ticket .md still has
-// AgentSessionID="" (so the UUID-keyed Owns/Kill path can't fire).
+// AgentSessionID="" (so the UUID-keyed Owns/Kill path above can't fire).
+// Also acts as a no-op safety net when AgentSessionID IS set (preserved
+// from a prior expected exit for resume) but the daemon already cleaned
+// up — the RPC simply reports Killed=false and returns.
 //
 // Same conservative dial contract as probeDaemonOwnership: a scripted
 // `ticket delete` must NOT autostart a background daemon. A daemon-down
