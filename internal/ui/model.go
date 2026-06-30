@@ -472,7 +472,6 @@ type Model struct {
 	// tea.SetWindowTitle, used to dedupe redundant title updates.
 	// See computeWindowTitle / maybeSetWindowTitle.
 	lastWindowTitle string
-
 }
 
 func NewModel(cfg *config.Config, globalStore *project.GlobalTicketStore, projectRegistry *project.ProjectRegistry, agentMgr *agent.Manager, opencodeServer *agent.OpencodeServer, filterProjectID string, ownedByDaemon map[board.TicketID]daemon.SessionInfo, daemonClient *daemonclient.Client, autostartDaemon bool) *Model {
@@ -714,7 +713,7 @@ func (m *Model) computeWindowTitle() string {
 	if ok {
 		sub = pane.Title()
 	}
-	if sub == "" && m.globalStore != nil {
+	if sub == "" {
 		if ticket, _ := m.globalStore.Get(m.focusedPane); ticket != nil {
 			sub = ticket.Title
 		}
@@ -749,18 +748,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	m.monitor.enterUpdate(reflect.TypeOf(msg).String(), string(m.mode), len(m.panes), len(m.daemonOwned))
 	defer m.monitor.exitUpdate()
 	maybeDebugStall()
-	prevMode := m.mode
 	next, cmd := m.dispatchUpdate(msg)
 	nm, ok := next.(*Model)
 	if !ok {
 		return next, cmd
 	}
-	viewingCmd := nm.reconcileViewing()
-	mouseCmd := nm.reconcileMouseMode(prevMode)
-	if viewingCmd == nil && mouseCmd == nil {
-		return nm, cmd
+	if viewingCmd := nm.reconcileViewing(); viewingCmd != nil {
+		return nm, tea.Batch(cmd, viewingCmd)
 	}
-	return nm, tea.Batch(cmd, viewingCmd, mouseCmd)
+	return nm, cmd
 }
 
 // reconcileViewing computes the session this TUI is currently focused
@@ -813,38 +809,6 @@ func (m *Model) setViewingCmd(sessionID string, viewing bool) tea.Cmd {
 		if _, err := client.SetViewing(ctx, sessionID, viewing); err != nil {
 			log.Printf("openkanban: SetViewing(%s, %v) failed: %v", sessionID, viewing, err)
 		}
-		return nil
-	}
-}
-
-// reconcileMouseMode compares the mode before and after a dispatch. On any
-// ModeAgentView↔other transition it emits the Cmd that toggles mouse
-// reporting and alternate-scroll (DEC 1007) so the terminal lets through
-// native drag-select in the attached view and converts trackpad scroll to
-// cursor-key sequences.
-func (m *Model) reconcileMouseMode(prevMode Mode) tea.Cmd {
-	wasAgent := prevMode == ModeAgentView
-	isAgent := m.mode == ModeAgentView
-	if wasAgent == isAgent {
-		return nil
-	}
-	if isAgent {
-		return tea.Batch(tea.DisableMouse, altScrollCmd(true))
-	}
-	return tea.Batch(tea.EnableMouseAllMotion, altScrollCmd(false))
-}
-
-// altScrollCmd emits a tea.Cmd that writes the DEC 1007 alternate-scroll
-// enable/disable sequence directly to stdout. With alt-scroll ON and mouse
-// reporting OFF, terminals convert trackpad scroll to ESC[A/B cursor-key
-// sequences that the rate classifier in handleAgentViewMode intercepts.
-func altScrollCmd(on bool) tea.Cmd {
-	seq := "\x1b[?1007l"
-	if on {
-		seq = "\x1b[?1007h"
-	}
-	return func() tea.Msg {
-		_, _ = io.WriteString(os.Stdout, seq)
 		return nil
 	}
 }
@@ -2168,13 +2132,6 @@ func (m *Model) handleAgentViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			cmd := m.attachExisting(m.focusedPane, pane)
 			return m, tea.Batch(cmd, m.maybeSetWindowTitle())
 		}
-	case "up", "down":
-		dir := 1
-		if msg.String() == "down" {
-			dir = -1
-		}
-		pane.ScrollLines(dir)
-		return m, nil
 	}
 
 	if result := pane.HandleKey(msg); result != nil {
