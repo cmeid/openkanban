@@ -138,6 +138,25 @@ When a project has a **Model** set, openkanban passes `--model <value>` to the `
 
 Set it in the project editor (`e`), **Model** field: use `←`/`→` to cycle the presets (`opus` / `opusplan` / `sonnet`) or type any full model ID. The setting only applies to claude-class agents; other agents (opencode, gemini, codex) ignore it.
 
+### Per-project ticket-brief ignore
+
+When a project has **Briefs** set to `ignore`, openkanban appends `tickets/` to the worktree's `.git/info/exclude` at agent spawn so the generated ticket brief (`tickets/<slug>.md`) is never picked up by `git add -A` and never committed into that repo. The brief file is still written to disk — the agent can read it for full context — it is simply git-excluded locally.
+
+Set it in the project editor (`e`), **Briefs** field: press `←`/`→` to toggle between `land` (default — briefs can be committed, current behaviour) and `ignore` (briefs are excluded from git).
+
+**How it works:** uses `.git/info/exclude`, not a committed `.gitignore`. That file is never tracked, works on any git clone without polluting the repo for other contributors, and is automatically scoped to the correct common git directory in linked-worktree setups.
+
+**Turning it off again:** `.git/info/exclude` entries are append-only; flipping back to `land` does not remove the existing `tickets/` line. The line is harmless if you later want to commit briefs — remove it manually from `.git/info/exclude` with any text editor.
+
+**Backup:** `openkanban backup` archives the repo's `tickets/` directory directly from the filesystem (not via git), so backup snapshots still capture briefs regardless of this setting. That is intentional: a local backup is not a repo commit, so the "don't land ticket files in this repo" goal is fully satisfied by the git-exclude alone.
+
+```json
+{
+  "ignore_ticket_briefs": true
+}
+```
+*(JSON field in `projects.json` under the project's `settings` key. Managed by the TUI editor; hand-editing is safe.)*
+
 ### Editing agents in the TUI (`e`)
 
 Focus a project in the sidebar and press **`e`** for a unified editor that edits **both** the project (name + pinned agent + model → `projects.json`) **and** the shared agent registry (→ `config.json`) in one screen. Per agent you can edit the **label, command, args, and env** (e.g. point `claude-custom`'s `CLAUDE_CONFIG_DIR` at a different directory) and set its **enabled** state. `Tab`/`↑`/`↓` move between fields, `←`/`→` toggle selectors (the pin and each agent's enabled state), `Ctrl+S` saves, `Esc` cancels. (`g` remains a quick one-press cycle of just the pin.)

@@ -67,6 +67,16 @@ Use `NewContextData(ticket, briefRelPath, hasBrief, isExternalResume) ContextDat
 - `MergeTicketBrief` rewrites **only** the managed-block fences (`upsertManagedBlock`). Content outside the block is agent-authored, preserved verbatim, and **worktree-only** — the store has no copy, so it is lost if the worktree is removed.
 - The brief write is **atomic (temp+rename, mirroring `TicketStore.SaveTicket`)** so concurrent readers (the spawned agent, a second TUI) always see a complete brief, never a torn one. Keep `PreviewBriefMerge` strictly read-only; only `MergeTicketBrief` writes.
 
+### Git-exclude gate (`EnsureTicketsGitExcluded`)
+
+`brief_exclude.go` exports `EnsureTicketsGitExcluded(worktreePath string) error`. It is called by `prepareSpawnWith` (`internal/ui/model.go`, just after `resolveBrief`) when `proj.Settings.IgnoreTicketBriefs` is true. It appends `tickets/` to `.git/info/exclude` (resolved via `git rev-parse --git-path info/exclude` so linked worktrees write into the common git dir, not a per-worktree path). This keeps the brief file on disk — the agent reads it — but prevents `git add -A` from staging it.
+
+Guardrails:
+- **Never** suppress the brief write itself here; the agent needs the file. The gate is exclude-only.
+- The helper writes `.git/info/exclude`, never a committed file (no `.gitignore` creation).
+- Errors are non-fatal: callers log to stderr and degrade gracefully, matching the `SeedClaudeSettings` precedent.
+- The sole non-test writer of briefs is `MergeTicketBrief` via `resolveBrief` — this is the only call site that needs gating.
+
 Template in config: `"init_prompt": "Work on: {{.Title}}"`
 
 ## Status Detection
