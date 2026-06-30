@@ -27,6 +27,10 @@ func scaffoldTicketDoneEnv(t *testing.T) (proj *project.Project, ticket *board.T
 	t.Setenv("HOME", home)
 	t.Setenv("OPENKANBAN_CONFIG_DIR", filepath.Join(home, ".config", "openkanban"))
 	t.Setenv("XDG_CONFIG_HOME", "")
+	// Clear agent session env vars so tests start in "human context". Tests
+	// that simulate agent context re-set these explicitly after scaffolding.
+	t.Setenv("OPENKANBAN_SESSION", "")
+	t.Setenv("OPENKANBAN_TICKET_ID", "")
 
 	registry, err := project.LoadRegistry()
 	if err != nil {
@@ -67,6 +71,9 @@ func TestTicketDone_HappyPath(t *testing.T) {
 
 	t.Setenv("OPENKANBAN_TICKET_ID", string(tk.ID))
 	t.Setenv("OPENKANBAN_SESSION", "test-session")
+
+	ticketDoneForce = true
+	t.Cleanup(func() { ticketDoneForce = false })
 
 	if err := ticketDoneCmd.RunE(ticketDoneCmd, nil); err != nil {
 		t.Fatalf("ticketDoneCmd.RunE: %v", err)
@@ -226,6 +233,9 @@ func TestTicketDone_DaemonUp_OwnsTicket_SendsTicketDoneReq(t *testing.T) {
 	// Pre-stage a daemon-owned session for the ticket.
 	daemonSessionID := spawnDaemonSessionForTicket(t, string(tk.ID))
 
+	ticketDoneForce = true
+	t.Cleanup(func() { ticketDoneForce = false })
+
 	stderr := captureStderr(t, func() {
 		if err := ticketDoneCmd.RunE(ticketDoneCmd, nil); err != nil {
 			t.Fatalf("ticketDoneCmd.RunE: %v", err)
@@ -290,6 +300,9 @@ func TestTicketDone_DaemonUp_DoesNotOwn_StderrWarningExit0(t *testing.T) {
 	t.Setenv("OPENKANBAN_TICKET_ID", string(tk.ID))
 	t.Setenv("OPENKANBAN_SESSION", "test-session")
 
+	ticketDoneForce = true
+	t.Cleanup(func() { ticketDoneForce = false })
+
 	var runErr error
 	stderr := captureStderr(t, func() {
 		runErr = ticketDoneCmd.RunE(ticketDoneCmd, nil)
@@ -321,6 +334,9 @@ func TestTicketDone_DaemonDown_StderrWarningExit0(t *testing.T) {
 	t.Setenv("OPENKANBAN_TICKET_ID", string(tk.ID))
 	t.Setenv("OPENKANBAN_SESSION", "test-session")
 
+	ticketDoneForce = true
+	t.Cleanup(func() { ticketDoneForce = false })
+
 	var runErr error
 	stderr := captureStderr(t, func() {
 		runErr = ticketDoneCmd.RunE(ticketDoneCmd, nil)
@@ -343,6 +359,9 @@ func TestTicketDone_NoStatusFileWhenSessionUnset(t *testing.T) {
 	t.Setenv("OPENKANBAN_TICKET_ID", string(tk.ID))
 	t.Setenv("OPENKANBAN_SESSION", "")
 
+	ticketDoneForce = true
+	t.Cleanup(func() { ticketDoneForce = false })
+
 	if err := ticketDoneCmd.RunE(ticketDoneCmd, nil); err != nil {
 		t.Fatalf("ticketDoneCmd.RunE: %v", err)
 	}
@@ -357,5 +376,51 @@ func TestTicketDone_NoStatusFileWhenSessionUnset(t *testing.T) {
 	entries, _ := os.ReadDir(filepath.Join(home, ".cache", "openkanban-status"))
 	if len(entries) != 0 {
 		t.Errorf("expected no status files; got %d entries", len(entries))
+	}
+}
+
+// TestTicketDone_RefusedFromAgentSession verifies the hard gate: when
+// run from inside an agent session (env vars set) without --force, the
+// command returns an error and the ticket status is unchanged on disk.
+// Red-before-green: commenting out the guardAgentStatusChange call in
+// wrapUpSessionTicketAt must make this test fail.
+func TestTicketDone_RefusedFromAgentSession(t *testing.T) {
+	proj, tk, _ := scaffoldTicketDoneEnv(t) // seeds ticket as in_progress
+
+	t.Setenv("OPENKANBAN_TICKET_ID", string(tk.ID))
+	t.Setenv("OPENKANBAN_SESSION", "agent-session")
+	// ticketDoneForce deliberately left false (the default).
+
+	err := ticketDoneCmd.RunE(ticketDoneCmd, nil)
+	if err == nil {
+		t.Fatal("expected error from agent context without --force; got nil")
+	}
+
+	// Ticket must remain in_progress on disk — the gate must not have
+	// allowed the status mutation through.
+	got := loadTicket(t, proj, tk.ID)
+	if got.Status != board.StatusInProgress {
+		t.Errorf("Status = %q after refused gate; want in_progress (ticket must be unchanged)", got.Status)
+	}
+}
+
+// TestTicketDone_AllowedWithForce verifies that --force lets the
+// command through from an agent session.
+func TestTicketDone_AllowedWithForce(t *testing.T) {
+	proj, tk, _ := scaffoldTicketDoneEnv(t)
+
+	t.Setenv("OPENKANBAN_TICKET_ID", string(tk.ID))
+	t.Setenv("OPENKANBAN_SESSION", "agent-session")
+
+	ticketDoneForce = true
+	t.Cleanup(func() { ticketDoneForce = false })
+
+	if err := ticketDoneCmd.RunE(ticketDoneCmd, nil); err != nil {
+		t.Fatalf("ticketDoneCmd.RunE with --force: %v", err)
+	}
+
+	got := loadTicket(t, proj, tk.ID)
+	if got.Status != board.StatusDone {
+		t.Errorf("Status = %q; want done", got.Status)
 	}
 }
