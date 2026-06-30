@@ -13,6 +13,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/mattn/go-isatty"
 	"github.com/techdufus/openkanban/internal/agent"
 	"github.com/techdufus/openkanban/internal/board"
 	"github.com/techdufus/openkanban/internal/config"
@@ -147,6 +148,7 @@ func Run(cfg *config.Config, filterPath string, autostartDaemon bool) error {
 	model.StartStallMonitor()
 
 	defer func() {
+		restoreHostTerminalModes(os.Stdout)
 		model.Cleanup()
 		if daemonClient != nil {
 			_ = daemonClient.Close()
@@ -156,6 +158,13 @@ func Run(cfg *config.Config, filterPath string, autostartDaemon bool) error {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
+	// WithMouseAllMotion enables mouse tracking on the host terminal; bubbletea
+	// emits ?1002l/?1003l/?1006l on exit but never resets ?1007 (alt-scroll).
+	// restoreHostTerminalModes (in the defer above) is the safety net for any
+	// raw host DEC-mode write: every sequence added here — or reintroduced in
+	// future, e.g. ?1007h for trackpad scroll (see #155 arrow-key leak) — MUST
+	// also be reset there. restoreHostTerminalModes writes to os.Stdout; if
+	// tea.WithOutput(...) is ever added here, update it to match the same fd.
 	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseAllMotion())
 
 	// Give the stall watchdog teeth: on a sustained "starved" stall it now
@@ -440,4 +449,33 @@ func redirectTUILog() io.Closer {
 	log.SetOutput(f)
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	return f
+}
+
+// writeHostTerminalModeReset emits the DEC private-mode resets that
+// openkanban issues on exit to normalize the host terminal. Separated from
+// restoreHostTerminalModes so it is unit-testable against any io.Writer
+// (the isatty guard would otherwise require a real PTY).
+//
+//   - ?1007l: alt-scroll OFF — the actual leak vector. PR #155 set ?1007h on
+//     the host so trackpad scroll became arrow keys; bubbletea never resets
+//     1007, so a stuck ?1007h corrupted arrow-key handling in unrelated
+//     programs (e.g. arrow selection in a later `claude` askuserquestion).
+//     #155 is reverted; this is the safety net so any re-introduction cannot
+//     leak again.
+//   - ?1000l/?1002l/?1003l/?1006l: mouse-tracking OFF — belt-and-suspenders
+//     (bubbletea already disables 1000/1003/1006 on its own exit).
+func writeHostTerminalModeReset(w io.Writer) (int, error) {
+	return io.WriteString(w, "\x1b[?1007l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l")
+}
+
+// restoreHostTerminalModes defensively resets host-terminal DEC modes that
+// bubbletea's teardown does not cover. Safe to call after program.Run()
+// returns: bubbletea has relinquished the terminal by then, and every
+// sequence is a no-op when its mode is already off. No-op when stdout is not
+// a terminal (emitting escapes into a pipe would corrupt redirected output).
+func restoreHostTerminalModes(f *os.File) {
+	if f == nil || !isatty.IsTerminal(f.Fd()) {
+		return
+	}
+	_, _ = writeHostTerminalModeReset(f)
 }
