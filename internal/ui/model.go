@@ -284,6 +284,7 @@ type Model struct {
 	peName           string
 	peProjectAgent   string
 	peModel          string
+	peBriefs         string
 	peAgents         []peAgentRow
 	peField          int
 	peScrollOffset   int
@@ -5319,6 +5320,11 @@ func (m *Model) prepareSpawnWith(ticket *board.Ticket, proj *project.Project, ag
 		briefRelPath, hasBrief, briefErr := resolveBrief(ticket, worktreePath, plan)
 		if briefErr != nil {
 			fmt.Fprintf(os.Stderr, "openkanban: merge brief failed: %v\n", briefErr)
+		}
+		if proj != nil && proj.Settings.IgnoreTicketBriefs && worktreePath != "" {
+			if err := agent.EnsureTicketsGitExcluded(worktreePath); err != nil {
+				fmt.Fprintf(os.Stderr, "openkanban: brief-exclude: %v\n", err)
+			}
 		}
 
 		// readyNotice is surfaced via m.notify() in the spawnReadyMsg
