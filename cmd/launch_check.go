@@ -48,6 +48,22 @@ func MaybePromptForUpdate(cfg *config.Config, isTTY bool, disableFlag bool) (han
 		// silent — startup should not spam the user with internal noise.
 		return false, nil
 	}
+	// Stale-fetch self-heal: "diverged" is frequently a false positive when
+	// the source clone hasn't fetched since origin/main advanced. Offer to
+	// fetch once before dead-ending. fetchAndRecheck runs on its own
+	// context.Background() — never on the 1.5s launch ctx.
+	if !status.Available && status.Reason == "diverged" {
+		if choice, runErr := runStaleFetchPrompt(); runErr == nil {
+			switch choice {
+			case promptQuit:
+				return true, nil
+			case promptApply:
+				newStatus, _ := fetchAndRecheck(context.Background())
+				status = newStatus
+			}
+		}
+	}
+
 	if !status.Available {
 		// Surface every non-empty Reason. This deliberately includes the
 		// boring "up to date" case so the user can see why auto-update
@@ -332,6 +348,59 @@ func runBranchSwitchPrompt(branch string) (promptChoice, error) {
 		return promptDismiss, err
 	}
 	finalModel, ok := final.(branchSwitchPromptModel)
+	if !ok {
+		return promptDismiss, nil
+	}
+	return finalModel.choice, nil
+}
+
+// staleFetchPromptModel backs the one-line prompt offering to fetch
+// origin/main when the source clone looks stale (a "diverged"
+// classification from an unfetched remote commit). Sibling of
+// branchSwitchPromptModel.
+type staleFetchPromptModel struct {
+	choice promptChoice
+}
+
+func (m staleFetchPromptModel) Init() tea.Cmd { return nil }
+
+func (m staleFetchPromptModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	keyMsg, ok := msg.(tea.KeyMsg)
+	if !ok {
+		return m, nil
+	}
+	switch keyMsg.String() {
+	case "enter":
+		m.choice = promptApply
+		return m, tea.Quit
+	case "esc":
+		m.choice = promptDismiss
+		return m, tea.Quit
+	case "q", "Q", "ctrl+c":
+		m.choice = promptQuit
+		return m, tea.Quit
+	}
+	return m, nil
+}
+
+func (m staleFetchPromptModel) View() string {
+	prefix := lipgloss.NewStyle().Bold(true).Render("Source clone looks stale.")
+	return prefix + " [Enter] fetch & re-check · [Esc] skip · [Q] quit\n"
+}
+
+// runStaleFetchPrompt drives the stale-fetch tea program on stderr.
+// Mirrors runBranchSwitchPrompt.
+func runStaleFetchPrompt() (promptChoice, error) {
+	model := staleFetchPromptModel{choice: promptDismiss}
+	prog := tea.NewProgram(model,
+		tea.WithInput(os.Stdin),
+		tea.WithOutput(os.Stderr),
+	)
+	final, err := prog.Run()
+	if err != nil {
+		return promptDismiss, err
+	}
+	finalModel, ok := final.(staleFetchPromptModel)
 	if !ok {
 		return promptDismiss, nil
 	}

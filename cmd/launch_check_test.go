@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	tea "github.com/charmbracelet/bubbletea"
+
 	"github.com/techdufus/openkanban/internal/config"
 )
 
@@ -75,6 +77,34 @@ func TestShouldPromptForUpdate(t *testing.T) {
 			if got != tt.want {
 				t.Errorf("shouldPromptForUpdate(cfg, %q, %v, %v) = %v, want %v",
 					tt.sourcePath, tt.isTTY, tt.disableFlag, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestStaleFetchPromptModel_KeyDispatch verifies that the staleFetchPromptModel
+// maps the three terminal keys to the correct promptChoice values, matching the
+// contract of its sibling branchSwitchPromptModel.
+func TestStaleFetchPromptModel_KeyDispatch(t *testing.T) {
+	tests := []struct {
+		name       string
+		msg        tea.KeyMsg
+		wantChoice promptChoice
+	}{
+		{"enter", tea.KeyMsg{Type: tea.KeyEnter}, promptApply},
+		{"esc", tea.KeyMsg{Type: tea.KeyEsc}, promptDismiss},
+		{"q", tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")}, promptQuit},
+		{"Q", tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("Q")}, promptQuit},
+		{"ctrl+c", tea.KeyMsg{Type: tea.KeyCtrlC}, promptQuit},
+		{"x (unrecognised)", tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")}, promptDismiss},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := staleFetchPromptModel{choice: promptDismiss}
+			next, _ := m.Update(tt.msg)
+			got := next.(staleFetchPromptModel).choice
+			if got != tt.wantChoice {
+				t.Errorf("key %q: got choice %d, want %d", tt.name, got, tt.wantChoice)
 			}
 		})
 	}

@@ -597,10 +597,10 @@ func reasonForDisplay(reason, sourcePath string) string {
 		return reason
 	}
 	if sourcePath == "" {
-		return "diverged or unfetched — if your source clone is just stale, fetch origin main there, then retry"
+		return "diverged or unfetched — run: openkanban update (fetches & self-heals); or manually: fetch origin main in your source clone, then retry"
 	}
 	return fmt.Sprintf(
-		"diverged or unfetched — if your source clone is just stale, run: git -C %s fetch origin main, then retry",
+		"diverged or unfetched — run: openkanban update (fetches & self-heals); or: git -C %s fetch origin main, then retry",
 		sourcePath)
 }
 
