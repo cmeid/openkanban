@@ -120,6 +120,25 @@ var updateCmd = &cobra.Command{
 			return fmt.Errorf("check for updates: %w", err)
 		}
 
+		// Self-heal: "diverged" from CheckForUpdates may be a false
+		// positive when the remote commit is absent from the local object
+		// DB (no fetch since origin/main advanced). Fetch once and
+		// re-check before dead-ending. Only on a full update (not --check)
+		// since the probe is intentionally fetch-free.
+		if !status.Available && status.Reason == "diverged" && !updateCheckOnly {
+			newStatus, _ := fetchAndRecheck(cmd.Context())
+			if !newStatus.Available && newStatus.Reason == "diverged" {
+				// Still diverged after fetch — genuine non-fast-forward.
+				fmt.Fprintln(cmd.OutOrStdout(), "diverged: source clone has commits not on origin/main.")
+				fmt.Fprintf(cmd.OutOrStdout(), "  to recover: git -C %s reset --hard origin/main\n", SourcePath)
+				return nil
+			}
+			status = newStatus
+			// If newStatus.Available: falls through to update path below.
+			// If !newStatus.Available (other reason): falls through to the
+			// existing handler below, which prints the new reason.
+		}
+
 		if !status.Available {
 			fmt.Fprintln(cmd.OutOrStdout(), status.Reason)
 			if !status.OfferBranchSwitch || updateCheckOnly {
@@ -689,6 +708,21 @@ func branchSwitchAndRecheck(ctx context.Context, out io.Writer) (UpdateStatus, e
 	if err := applyBranchSwitch(switchCtx, SourcePath, out); err != nil {
 		return UpdateStatus{}, err
 	}
+	recheckCtx, cancelRe := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelRe()
+	return CheckForUpdates(recheckCtx)
+}
+
+// fetchAndRecheck fetches origin/main into the local object DB and
+// re-runs CheckForUpdates. Used to resolve the "diverged" false-positive
+// that occurs when the remote tip is simply absent from the local object
+// DB (no fetch since origin advanced). Fetch errors are swallowed — a
+// network failure here leaves the re-check to return "diverged" again,
+// which the caller surfaces as genuine divergence.
+func fetchAndRecheck(ctx context.Context) (UpdateStatus, error) {
+	fetchCtx, cancelFetch := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelFetch()
+	_ = exec.CommandContext(fetchCtx, "git", "-C", SourcePath, "fetch", "origin", "main").Run()
 	recheckCtx, cancelRe := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelRe()
 	return CheckForUpdates(recheckCtx)

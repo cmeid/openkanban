@@ -392,6 +392,57 @@ func TestUpdateCheckForUpdates_Diverged(t *testing.T) {
 	}
 }
 
+func TestFetchAndRecheck_SelfHealsUnfetchedRemote(t *testing.T) {
+	remote, local := setupRepos(t)
+	withSourcePath(t, local)
+
+	// Advance remote without fetching into local — remote commit is absent
+	// from local's object DB, so CheckForUpdates classifies as "diverged"
+	// (the false positive this test guards against).
+	makeCommit(t, remote, "new.txt", "new\n", "second commit on remote")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	pre, _ := CheckForUpdates(ctx)
+	if pre.Reason != "diverged" {
+		t.Fatalf("pre-fetch: expected Reason=%q, got %q", "diverged", pre.Reason)
+	}
+
+	// fetchAndRecheck must fetch, re-classify as behind, and return Available.
+	status, err := fetchAndRecheck(ctx)
+	if err != nil {
+		t.Fatalf("fetchAndRecheck: %v", err)
+	}
+	if !status.Available {
+		t.Fatalf("expected self-heal to Available=true, got %+v", status)
+	}
+}
+
+func TestFetchAndRecheck_GenuineDivergeStaysDiverged(t *testing.T) {
+	remote, local := setupRepos(t)
+	withSourcePath(t, local)
+
+	// Both sides get a unique commit — genuine divergence.
+	// Do NOT pre-fetch: fetchAndRecheck performs the fetch itself.
+	makeCommit(t, remote, "remote-only.txt", "remote\n", "remote-only commit")
+	makeCommit(t, local, "local-only.txt", "local\n", "local-only commit")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	status, err := fetchAndRecheck(ctx)
+	if err != nil {
+		t.Fatalf("fetchAndRecheck: %v", err)
+	}
+	if status.Available {
+		t.Fatalf("genuine diverge should stay unavailable, got %+v", status)
+	}
+	if status.Reason != "diverged" {
+		t.Fatalf("expected Reason=%q, got %q", "diverged", status.Reason)
+	}
+}
+
 func TestUpdateCheckForUpdates_NoOriginRemote(t *testing.T) {
 	// Plain git repo with one commit but no `origin` remote configured.
 	root := t.TempDir()
