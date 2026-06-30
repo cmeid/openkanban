@@ -8,6 +8,9 @@ openkanban
 *.swp
 *.swo
 
+# openkanban tool state (never committed to tracked repos)
+.openkanban/
+
 # OS
 .DS_Store
 Thumbs.db
