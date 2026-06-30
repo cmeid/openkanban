@@ -53,7 +53,7 @@ func MaybePromptForUpdate(cfg *config.Config, isTTY bool, disableFlag bool) (han
 		// boring "up to date" case so the user can see why auto-update
 		// is or isn't doing anything on each launch.
 		if status.Reason != "" {
-			fmt.Fprintln(os.Stderr, "openkanban: "+status.Reason)
+			fmt.Fprintln(os.Stderr, "openkanban: "+reasonForDisplay(status.Reason, SourcePath))
 		}
 		if !status.OfferBranchSwitch {
 			return false, nil
@@ -82,7 +82,7 @@ func MaybePromptForUpdate(cfg *config.Config, isTTY bool, disableFlag bool) (han
 			// Often the re-check returns "up to date" — surface that
 			// too so the user knows the switch worked.
 			if newStatus.Reason != "" {
-				fmt.Fprintln(os.Stderr, "openkanban: "+newStatus.Reason)
+				fmt.Fprintln(os.Stderr, "openkanban: "+reasonForDisplay(newStatus.Reason, SourcePath))
 			}
 			return false, nil
 		}
