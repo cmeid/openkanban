@@ -1142,3 +1142,30 @@ func TestDaemonUpdatedMsg_AutoRestartWording(t *testing.T) {
 		t.Errorf("daemonUpdatedMsg should still mention the manual restart path; got %q", daemonUpdatedMsg)
 	}
 }
+
+func TestReasonForDisplay(t *testing.T) {
+	tests := []struct {
+		reason     string
+		sourcePath string
+		wantSub    string // substring that must appear in output
+		wantNot    string // substring that must NOT appear (optional)
+	}{
+		// diverged with a known path: path-specific fetch command
+		{"diverged", "/home/user/src/openkanban", "git -C /home/user/src/openkanban fetch origin main", ""},
+		// diverged with empty path: generic hint, no -C flag
+		{"diverged", "", "fetch origin main", "git -C"},
+		// non-diverged reasons pass through unchanged
+		{"ahead", "/any/path", "ahead", ""},
+		{"up to date", "/any/path", "up to date", ""},
+		{"no source clone", "/any/path", "no source clone", ""},
+	}
+	for _, tt := range tests {
+		got := reasonForDisplay(tt.reason, tt.sourcePath)
+		if !strings.Contains(got, tt.wantSub) {
+			t.Errorf("reasonForDisplay(%q, %q) = %q; want it to contain %q", tt.reason, tt.sourcePath, got, tt.wantSub)
+		}
+		if tt.wantNot != "" && strings.Contains(got, tt.wantNot) {
+			t.Errorf("reasonForDisplay(%q, %q) = %q; should not contain %q", tt.reason, tt.sourcePath, got, tt.wantNot)
+		}
+	}
+}

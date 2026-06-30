@@ -141,7 +141,7 @@ var updateCmd = &cobra.Command{
 		}
 
 		if !status.Available {
-			fmt.Fprintln(cmd.OutOrStdout(), status.Reason)
+			fmt.Fprintln(cmd.OutOrStdout(), reasonForDisplay(status.Reason, SourcePath))
 			if !status.OfferBranchSwitch || updateCheckOnly {
 				return nil
 			}
@@ -159,7 +159,7 @@ var updateCmd = &cobra.Command{
 			}
 			status = newStatus
 			if !status.Available {
-				fmt.Fprintln(cmd.OutOrStdout(), status.Reason)
+				fmt.Fprintln(cmd.OutOrStdout(), reasonForDisplay(status.Reason, SourcePath))
 				return nil
 			}
 			// Fall through into the "update available" path below.
@@ -583,6 +583,25 @@ func CheckForUpdates(ctx context.Context) (UpdateStatus, error) {
 		// non-actionable for a fast-forward.
 		return UpdateStatus{Available: false, Reason: "diverged"}, nil
 	}
+}
+
+// reasonForDisplay maps UpdateStatus.Reason to the string shown to the user.
+// Only "diverged" is enriched — that Reason is frequently a false positive
+// because CheckForUpdates probes origin with ls-remote and never fetches, so
+// a source clone whose object DB predates origin's latest push classifies as
+// "diverged" (see the classify switch above). The internal Reason value stays
+// the bare "diverged" key — the update self-heal (L128-130) and tests match it
+// by string equality — so the user-facing hint lives here, at display time.
+func reasonForDisplay(reason, sourcePath string) string {
+	if reason != "diverged" {
+		return reason
+	}
+	if sourcePath == "" {
+		return "diverged or unfetched — if your source clone is just stale, fetch origin main there, then retry"
+	}
+	return fmt.Sprintf(
+		"diverged or unfetched — if your source clone is just stale, run: git -C %s fetch origin main, then retry",
+		sourcePath)
 }
 
 // remoteMainSHA returns the SHA at refs/heads/main on the "origin"
