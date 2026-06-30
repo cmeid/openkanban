@@ -296,6 +296,121 @@ func TestTicket_SetStatus(t *testing.T) {
 	})
 }
 
+// Entering an active column (backlog/next/in_progress) means a prior
+// terminal "done" no longer describes the ticket, so SetStatus must clear
+// the unambiguous done-flags (AgentCompleted -> AgentNone, CompletedAt ->
+// nil). It must NOT touch live AgentWorking, and must NOT clear when
+// landing on in_review (a completed-awaiting-review state the board still
+// badges).
+func TestTicket_SetStatus_ClearsStaleDoneFlagsOnReopen(t *testing.T) {
+	tests := []struct {
+		name          string
+		seedAgent     AgentStatus
+		seedStatus    TicketStatus
+		seedCompleted bool // seed a non-nil CompletedAt
+		move          TicketStatus
+		wantAgent     AgentStatus
+		wantCompleted bool // expect CompletedAt non-nil after move
+	}{
+		{
+			name:          "in_review->in_progress clears done flags",
+			seedAgent:     AgentCompleted,
+			seedStatus:    StatusInReview,
+			seedCompleted: true,
+			move:          StatusInProgress,
+			wantAgent:     AgentNone,
+			wantCompleted: false,
+		},
+		{
+			name:          "done->backlog clears done flags",
+			seedAgent:     AgentCompleted,
+			seedStatus:    StatusDone,
+			seedCompleted: true,
+			move:          StatusBacklog,
+			wantAgent:     AgentNone,
+			wantCompleted: false,
+		},
+		{
+			name:          "done->next clears done flags",
+			seedAgent:     AgentCompleted,
+			seedStatus:    StatusDone,
+			seedCompleted: true,
+			move:          StatusNext,
+			wantAgent:     AgentNone,
+			wantCompleted: false,
+		},
+		{
+			name:          "forward move to done still stamps CompletedAt",
+			seedAgent:     AgentNone,
+			seedStatus:    StatusInProgress,
+			seedCompleted: false,
+			move:          StatusDone,
+			wantAgent:     AgentNone, // SetStatus does not touch AgentStatus on done
+			wantCompleted: true,
+		},
+		{
+			name:          "in_review keeps done badge",
+			seedAgent:     AgentCompleted,
+			seedStatus:    StatusInProgress,
+			seedCompleted: true,
+			move:          StatusInReview,
+			wantAgent:     AgentCompleted,
+			wantCompleted: true,
+		},
+		{
+			name:          "no clobber of live work on in_progress",
+			seedAgent:     AgentWorking,
+			seedStatus:    StatusInProgress,
+			seedCompleted: false,
+			move:          StatusInProgress,
+			wantAgent:     AgentWorking,
+			wantCompleted: false,
+		},
+		{
+			name:          "next->in_progress clears done flags",
+			seedAgent:     AgentCompleted,
+			seedStatus:    StatusNext,
+			seedCompleted: true,
+			move:          StatusInProgress,
+			wantAgent:     AgentNone,
+			wantCompleted: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ticket := NewTicket("Test", "project-1")
+			ticket.AgentStatus = tt.seedAgent
+			ticket.Status = tt.seedStatus
+			if tt.seedCompleted {
+				someTime := time.Now().Add(-time.Hour)
+				ticket.CompletedAt = &someTime
+			}
+
+			// Fail-loud preconditions: the post-assertions are only
+			// meaningful if the seeded state is actually present.
+			if ticket.AgentStatus != tt.seedAgent {
+				t.Fatalf("precondition: want AgentStatus %q, got %q", tt.seedAgent, ticket.AgentStatus)
+			}
+			if tt.seedCompleted && ticket.CompletedAt == nil {
+				t.Fatal("precondition: want non-nil CompletedAt, got nil")
+			}
+
+			ticket.SetStatus(tt.move)
+
+			if ticket.AgentStatus != tt.wantAgent {
+				t.Errorf("AgentStatus = %q; want %q", ticket.AgentStatus, tt.wantAgent)
+			}
+			if tt.wantCompleted && ticket.CompletedAt == nil {
+				t.Error("CompletedAt = nil; want non-nil")
+			}
+			if !tt.wantCompleted && ticket.CompletedAt != nil {
+				t.Errorf("CompletedAt = %v; want nil", *ticket.CompletedAt)
+			}
+		})
+	}
+}
+
 func TestTicket_SetAgentStatus(t *testing.T) {
 	t.Run("no-op when status unchanged", func(t *testing.T) {
 		ticket := NewTicket("Test", "project-1")

@@ -180,6 +180,18 @@ func (t *Ticket) SetStatus(status TicketStatus) {
 	case StatusDone:
 		t.CompletedAt = &now
 	}
+
+	// Re-entering an active column means a prior terminal "done" no longer
+	// describes the ticket; clear the stale done-flags so the board stops
+	// badging it as complete. AgentWorking and other live states are left
+	// untouched; in_review deliberately keeps the badge.
+	switch status {
+	case StatusBacklog, StatusNext, StatusInProgress:
+		if t.AgentStatus == AgentCompleted {
+			t.AgentStatus = AgentNone
+		}
+		t.CompletedAt = nil
+	}
 }
 
 // SetAgentStatus updates AgentStatus and stamps the transition.
