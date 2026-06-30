@@ -48,7 +48,7 @@ func EnsureTicketsGitExcluded(worktreePath string) error {
 func ticketsDirIgnored(worktreePath string) bool {
 	// Probe a representative file path (not the bare dir) to match how
 	// git check-ignore resolves patterns.
-	cmd := exec.Command("git", "-C", worktreePath, "check-ignore", "-q", "--no-index", "tickets/probe.md")
+	cmd := exec.Command("git", "-C", worktreePath, "check-ignore", "-q", "tickets/probe.md")
 	return cmd.Run() == nil
 }
 
