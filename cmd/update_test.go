@@ -1154,6 +1154,9 @@ func TestReasonForDisplay(t *testing.T) {
 		{"diverged", "/home/user/src/openkanban", "git -C /home/user/src/openkanban fetch origin main", ""},
 		// diverged with empty path: generic hint, no -C flag
 		{"diverged", "", "fetch origin main", "git -C"},
+		// diverged cases also surface openkanban update as the primary fix
+		{"diverged", "/home/user/src/openkanban", "openkanban update", ""},
+		{"diverged", "", "openkanban update", ""},
 		// non-diverged reasons pass through unchanged
 		{"ahead", "/any/path", "ahead", ""},
 		{"up to date", "/any/path", "up to date", ""},
