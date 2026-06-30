@@ -174,6 +174,93 @@ func TestProjectEditForm_SavesModel(t *testing.T) {
 	}
 }
 
+// TestProjectEditForm_FocusedLine pins the peFocusedLine return values so a
+// future field insertion (peAgentBaseField bump) is caught immediately.
+func TestProjectEditForm_FocusedLine(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Agents = map[string]config.AgentConfig{
+		"claude": {Command: "claude", Label: "Claude"},
+	}
+	m := &Model{config: cfg}
+
+	cases := []struct {
+		field int
+		want  int
+	}{
+		{0, 3},  // project name
+		{1, 4},  // default agent
+		{2, 5},  // model
+		{3, 6},  // ignore-briefs (new field)
+		{4, 10}, // agent 0 sub 0 (peAgentBaseField=4, base line=10)
+		{5, 11}, // agent 0 sub 1
+	}
+	for _, tc := range cases {
+		m.peField = tc.field
+		got := m.peFocusedLine()
+		if got != tc.want {
+			t.Errorf("peFocusedLine(field=%d) = %d, want %d", tc.field, got, tc.want)
+		}
+	}
+}
+
+// TestProjectEditForm_SavesIgnoreBriefs verifies that saveProjectEditForm
+// persists IgnoreTicketBriefs to disk and mirrors it onto the live store.
+func TestProjectEditForm_SavesIgnoreBriefs(t *testing.T) {
+	t.Setenv("OPENKANBAN_CONFIG_DIR", t.TempDir())
+
+	cfg := config.DefaultConfig()
+	proj := project.NewProject("BriefsProj", t.TempDir())
+	reg := &project.ProjectRegistry{Projects: map[string]*project.Project{proj.ID: proj}}
+	gs := project.NewGlobalTicketStore(nil)
+	gs.AddProject(proj)
+
+	cols := board.DefaultColumns()
+	m := &Model{
+		config:          cfg,
+		projectRegistry: reg,
+		globalStore:     gs,
+		columns:         cols,
+		columnTickets:   make([][]*board.Ticket, len(cols)),
+		columnOffsets:   make([]int, len(cols)),
+		width:           120,
+		height:          40,
+	}
+
+	m.editProject(proj)
+	m.peBriefs = "ignore"
+	if _, cmd := m.saveProjectEditForm(); cmd != nil {
+		_ = cmd
+	}
+
+	reloaded, err := project.LoadRegistry()
+	if err != nil {
+		t.Fatalf("LoadRegistry: %v", err)
+	}
+	got := reloaded.Projects[proj.ID]
+	if got == nil {
+		t.Fatal("project missing after reload")
+	}
+	if !got.Settings.IgnoreTicketBriefs {
+		t.Error("IgnoreTicketBriefs not persisted: want true, got false")
+	}
+	if live := gs.GetProject(proj.ID); live != nil {
+		if !live.Settings.IgnoreTicketBriefs {
+			t.Error("live store IgnoreTicketBriefs not updated: want true, got false")
+		}
+	}
+
+	// Flip back to "land" and verify it clears the flag.
+	m.editProject(got)
+	m.peBriefs = "land"
+	if _, cmd := m.saveProjectEditForm(); cmd != nil {
+		_ = cmd
+	}
+	reloaded2, _ := project.LoadRegistry()
+	if got2 := reloaded2.Projects[proj.ID]; got2 != nil && got2.Settings.IgnoreTicketBriefs {
+		t.Error("IgnoreTicketBriefs should be false after setting to 'land'")
+	}
+}
+
 // TestEnabledAgentNames_FiltersByPath pins that the pin cycle only offers
 // enabled agents: an explicit Enabled=&false hides one even though its command
 // exists, and an Enabled=&true shows one whose command is absent.

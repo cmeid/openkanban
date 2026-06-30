@@ -38,13 +38,14 @@ type peAgentRow struct {
 //	0                                        = project name (text)
 //	1                                        = project default agent (selector)
 //	2                                        = project model override (text)
+//	3                                        = ignore ticket briefs (selector: land/ignore)
 //	peAgentBaseField + i*peFieldsPerAgent + sub = agent i's fields
 //	    sub: 0 enabled(sel) 1 label 2 command 3 args 4 env
 const peFieldsPerAgent = 5
 
 // peAgentBaseField is the flat field index where agent rows begin.
 // Inserting a new project-level field above bumps this; update in one place.
-const peAgentBaseField = 3
+const peAgentBaseField = 4
 
 const (
 	peSubEnabled = 0
@@ -76,6 +77,9 @@ func (m *Model) peFieldIsText(field int) bool {
 	if field == 2 {
 		return true // model override (text)
 	}
+	if field == 3 {
+		return false // ignore-briefs selector
+	}
 	_, _, sub := m.peLocate(field)
 	return sub != peSubEnabled
 }
@@ -91,6 +95,11 @@ func (m *Model) editProject(proj *project.Project) (tea.Model, tea.Cmd) {
 	m.peName = proj.Name
 	m.peProjectAgent = proj.Settings.DefaultAgent
 	m.peModel = proj.Settings.Model
+	if proj.Settings.IgnoreTicketBriefs {
+		m.peBriefs = "ignore"
+	} else {
+		m.peBriefs = "land"
+	}
 	m.peAgents = m.buildPeAgents()
 	m.peField = 0
 	m.peScrollOffset = 0
@@ -296,6 +305,14 @@ func (m *Model) peCycleSelector(dir int) {
 		m.peProjectAgent = keys[((cur+dir)%len(keys)+len(keys))%len(keys)]
 		return
 	}
+	if m.peField == 3 { // ignore-briefs toggle
+		if m.peBriefs == "land" {
+			m.peBriefs = "ignore"
+		} else {
+			m.peBriefs = "land"
+		}
+		return
+	}
 	_, idx, sub := m.peLocate(m.peField)
 	if sub == peSubEnabled && idx >= 0 && idx < len(m.peAgents) {
 		order := []string{"auto", "on", "off"}
@@ -346,6 +363,7 @@ func (m *Model) saveProjectEditForm() (tea.Model, tea.Cmd) {
 		proj.Name = name
 		proj.Settings.DefaultAgent = m.peProjectAgent
 		proj.Settings.Model = strings.TrimSpace(m.peModel)
+		proj.Settings.IgnoreTicketBriefs = (m.peBriefs == "ignore")
 		if err := m.projectRegistry.Update(proj); err != nil {
 			m.notify("Failed to save project: " + err.Error())
 			return m, nil
@@ -355,6 +373,7 @@ func (m *Model) saveProjectEditForm() (tea.Model, tea.Cmd) {
 			live.Name = name
 			live.Settings.DefaultAgent = m.peProjectAgent
 			live.Settings.Model = strings.TrimSpace(m.peModel)
+			live.Settings.IgnoreTicketBriefs = (m.peBriefs == "ignore")
 		}
 	}
 
@@ -472,6 +491,7 @@ func (m *Model) renderProjectEditForm() string {
 	}
 	b = append(b, cursor(1)+lbl(1, "Agent:   ")+agentDisp+dimStyle.Render("  ◀ ▶"))
 	b = append(b, cursor(2)+lbl(2, "Model:   ")+textOrValue(2)+dimStyle.Render("  ←/→ presets · blank = claude default"))
+	b = append(b, cursor(3)+lbl(3, "Briefs:  ")+valStyle.Render(m.peBriefs)+dimStyle.Render("  ◀ ▶ · ignore = keep tickets/ out of git"))
 	b = append(b, "")
 	b = append(b, sectionStyle.Render("Agents (shared across all projects)"))
 	b = append(b, dimStyle.Render("  enabled: auto = show when on PATH"))
@@ -533,7 +553,7 @@ func (m *Model) renderProjectEditForm() string {
 // rows above the agents add a fixed offset).
 func (m *Model) peFocusedLine() int {
 	// Layout: 0=title, 1=blank, 2="Project", 3=name(0), 4=agent(1), 5=model(2),
-	// 6=blank, 7="Agents", 8=hint, then agents start at 9 (5 lines each).
+	// 6=briefs(3), 7=blank, 8="Agents", 9=hint, then agents start at 10 (5 lines each).
 	if m.peField == 0 {
 		return 3
 	}
@@ -543,6 +563,9 @@ func (m *Model) peFocusedLine() int {
 	if m.peField == 2 {
 		return 5
 	}
+	if m.peField == 3 {
+		return 6
+	}
 	_, idx, sub := m.peLocate(m.peField)
-	return 9 + idx*peFieldsPerAgent + sub
+	return 10 + idx*peFieldsPerAgent + sub
 }

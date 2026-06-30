@@ -185,6 +185,10 @@ Selection is **per project and nowhere else** — there is no per-ticket or glob
 
 You can also set a **per-project model** (claude only): open the project editor with `e`, tab to the **Model** field, and press `←`/`→` to cycle the presets (`opus`/`opusplan`/`sonnet`) or type any full model ID. OpenKanban passes `--model <value>` to the `claude` CLI on every spawn for that project. Leave it blank to let claude use its own configured default. See [Configuration → Per-project model override](./docs/CONFIGURATION.md#per-project-model-override-claude-only).
 
+### 13. Per-project ticket-brief ignore
+
+Ticket briefs (`tickets/<slug>.md`, written at spawn so the agent has context) can now be kept out of git on a per-project basis. Enable it in the project editor (`e`), **Briefs** field (`←`/`→` to toggle `land` ↔ `ignore`). When `ignore`, openkanban appends `tickets/` to the worktree's `.git/info/exclude` at spawn — the brief is still written (the agent reads it) but `git add -A` never stages it. No committed artifact is added to the target repo; the exclude entry is local-only and works across linked worktrees. See [Configuration → Per-project ticket-brief ignore](./docs/CONFIGURATION.md#per-project-ticket-brief-ignore).
+
 ## Bugs fixed in upstream
 
 Seven correctness bugs that exist on `TechDufus/main` today are fixed in this fork. Each is verified against the upstream tree.
