@@ -322,3 +322,50 @@ func TestTicketMove_DaemonDown_ExitZero(t *testing.T) {
 		t.Errorf("Status = %q; want in_review", got.Status)
 	}
 }
+
+// TestTicketMove_RefusedFromAgentSession verifies the hard gate: when run from
+// inside an agent session (env vars set) without --force, the command returns
+// an error and the ticket status is unchanged on disk.
+// Red-before-green: commenting out the guardAgentStatusChange call in
+// ticket_move.go must make this test fail.
+func TestTicketMove_RefusedFromAgentSession(t *testing.T) {
+	proj, tk, _ := scaffoldTicketDoneEnv(t) // seeds ticket as in_progress
+
+	t.Setenv("OPENKANBAN_SESSION", "agent-session")
+	t.Setenv("OPENKANBAN_TICKET_ID", string(tk.ID))
+	// ticketMoveForce deliberately left false (the default).
+
+	err := runTicketMove(t, "test-proj", string(tk.ID), "in_review")
+	if err == nil {
+		t.Fatal("expected error from agent context without --force; got nil")
+	}
+
+	// Ticket must remain in_progress on disk — the gate must not have allowed
+	// the status mutation through.
+	got := loadTicket(t, proj, tk.ID)
+	if got.Status != board.StatusInProgress {
+		t.Errorf("Status = %q after refused gate; want in_progress", got.Status)
+	}
+}
+
+// TestTicketMove_AllowedWithForce verifies that --force lets the command
+// through from an agent session.
+func TestTicketMove_AllowedWithForce(t *testing.T) {
+	daemonTestEnv(t) // isolate socket; in_progress→in_review triggers best-effort teardown
+	proj, tk, _ := scaffoldTicketDoneEnv(t)
+
+	t.Setenv("OPENKANBAN_SESSION", "agent-session")
+	t.Setenv("OPENKANBAN_TICKET_ID", string(tk.ID))
+
+	ticketMoveForce = true
+	t.Cleanup(func() { ticketMoveForce = false })
+
+	if err := runTicketMove(t, "test-proj", string(tk.ID), "in_review"); err != nil {
+		t.Fatalf("runTicketMove with --force: %v", err)
+	}
+
+	got := loadTicket(t, proj, tk.ID)
+	if got.Status != board.StatusInReview {
+		t.Errorf("Status = %q; want in_review", got.Status)
+	}
+}

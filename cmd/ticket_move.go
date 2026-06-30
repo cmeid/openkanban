@@ -14,6 +14,7 @@ var (
 	ticketMoveID      string
 	ticketMoveProject string
 	ticketMoveStatus  string
+	ticketMoveForce   bool
 )
 
 var ticketMoveCmd = &cobra.Command{
@@ -31,7 +32,12 @@ invariant is preserved. Moving to in_review or done also marks the
 agent status as completed.
 
 This command does NOT autostart the daemon: a scripted invocation
-must remain quiet when the daemon happens to be down.`,
+must remain quiet when the daemon happens to be down.
+
+When run from inside a spawned agent session (OPENKANBAN_SESSION or
+OPENKANBAN_TICKET_ID is set), this command is refused unless --force is
+passed. Tickets are advanced by the user after reviewing agent work,
+not by the agent itself.`,
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -79,6 +85,10 @@ must remain quiet when the daemon happens to be down.`,
 		if ticket.Status == target {
 			fmt.Printf("ticket %s already %s\n", shortID(string(ticket.ID)), target)
 			return nil
+		}
+
+		if err := guardAgentStatusChange(target, ticketMoveForce); err != nil {
+			return err
 		}
 
 		current := ticket.Status
@@ -131,4 +141,6 @@ func init() {
 	ticketMoveCmd.Flags().StringVar(&ticketMoveProject, "project", "", "project name, ID, or unique prefix (required)")
 	ticketMoveCmd.Flags().StringVar(&ticketMoveID, "id", "", "ticket ID, unique prefix, or title slug (required)")
 	ticketMoveCmd.Flags().StringVar(&ticketMoveStatus, "status", "", "target status: backlog, next, in_progress, in_review, done, archived (required)")
+	ticketMoveCmd.Flags().BoolVar(&ticketMoveForce, "force", false,
+		"allow status change from inside an agent session (only use when the user explicitly asked)")
 }
