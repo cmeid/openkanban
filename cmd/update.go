@@ -129,8 +129,9 @@ var updateCmd = &cobra.Command{
 			newStatus, _ := fetchAndRecheck(cmd.Context())
 			if !newStatus.Available && newStatus.Reason == "diverged" {
 				// Still diverged after fetch — genuine non-fast-forward.
-				fmt.Fprintln(cmd.OutOrStdout(), "diverged: source clone has commits not on origin/main.")
-				fmt.Fprintf(cmd.OutOrStdout(), "  to recover: git -C %s reset --hard origin/main\n", SourcePath)
+				fmt.Fprintln(cmd.OutOrStdout(), "diverged: local main has commits not on origin/main.")
+				fmt.Fprintf(cmd.OutOrStdout(), "  inspect first:                        git -C %s log main..origin/main\n", SourcePath)
+				fmt.Fprintf(cmd.OutOrStdout(), "  to recover (discards local commits):  git -C %s reset --hard origin/main\n", SourcePath)
 				return nil
 			}
 			status = newStatus
