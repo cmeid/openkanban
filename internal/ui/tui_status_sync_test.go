@@ -343,6 +343,38 @@ func TestQuickMoveTicketBackward_DoneToInReview_NoWrapUp(t *testing.T) {
 	}
 }
 
+// TestQuickMoveTicketBackward_InReviewToInProgress_ClearsDoneBadge pins the
+// reported bug end-to-end through the TUI: a ticket pulled from in_review
+// back to in_progress carries a stale AgentCompleted badge ("✓ done") that
+// must clear once it re-enters the active column. The TUI backward path
+// routes through globalStore.Move → board.SetStatus, where the fix lives.
+func TestQuickMoveTicketBackward_InReviewToInProgress_ClearsDoneBadge(t *testing.T) {
+	m, ticket, _ := newWrapUpModel(t, board.StatusInReview)
+	// Seed the stale done badge a finished session leaves behind.
+	ticket.SetAgentStatus(board.AgentCompleted)
+	someTime := time.Now().Add(-time.Hour)
+	ticket.CompletedAt = &someTime
+
+	// Fail-loud precondition: the post-assertion is vacuous unless the
+	// stale badge is actually present before the move (AgentNone is the
+	// zero-value default).
+	if ticket.AgentStatus != board.AgentCompleted {
+		t.Fatalf("precondition: want AgentStatus %q, got %q", board.AgentCompleted, ticket.AgentStatus)
+	}
+
+	_, _ = m.quickMoveTicketBackward()
+
+	if ticket.Status != board.StatusInProgress {
+		t.Errorf("Status = %v, want %v", ticket.Status, board.StatusInProgress)
+	}
+	if ticket.AgentStatus != board.AgentNone {
+		t.Errorf("AgentStatus = %q, want %q (stale done badge must clear)", ticket.AgentStatus, board.AgentNone)
+	}
+	if ticket.CompletedAt != nil {
+		t.Errorf("CompletedAt = %v, want nil", *ticket.CompletedAt)
+	}
+}
+
 // TestDropTicket_InProgressToInReview_WrapsUp covers the drag-drop
 // path. dropTicket reads dragSourceColumn / dragTargetColumn so the
 // fixture points dragTarget at the in-review column before invoking.
