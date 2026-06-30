@@ -2134,7 +2134,7 @@ func (m *Model) renderAgentView() string {
 	// than `surface` because surface alone is too subtle — at a glance
 	// it's not obvious the session is encapsulated. Inner badges keep
 	// their own backgrounds; spacing cells inherit the bar's tint.
-	barStyle := lipgloss.NewStyle().Background(m.colors.overlay).Width(m.width)
+	barStyle := lipgloss.NewStyle().Background(m.colors.overlay).Width(m.width).MaxWidth(m.width)
 	bar := barStyle.Render(header + strings.Repeat(" ", spacing) + hints)
 	b.WriteString(bar)
 	b.WriteString("\n")
