@@ -22,6 +22,8 @@ func newTicketTestProject(t *testing.T, name string) *project.Project {
 	cfgDir := t.TempDir()
 	t.Setenv("OPENKANBAN_CONFIG_DIR", cfgDir)
 	t.Setenv("HOME", t.TempDir())
+	t.Setenv("OPENKANBAN_SESSION", "")
+	t.Setenv("OPENKANBAN_TICKET_ID", "")
 
 	repoDir := filepath.Join(t.TempDir(), "repo")
 	if err := os.MkdirAll(repoDir, 0o755); err != nil {
