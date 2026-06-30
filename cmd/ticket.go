@@ -136,7 +136,13 @@ Description sources (mutually exclusive, in priority order):
 		ticket := board.NewTicket(title, proj.ID)
 		ticket.Description = desc
 		if ticketNewStatus != "" {
-			ticket.Status = board.TicketStatus(ticketNewStatus)
+			target := board.TicketStatus(ticketNewStatus)
+			if target == board.StatusInProgress || target == board.StatusDone {
+				if err := guardAgentStatusChange(target, ticketNewForce); err != nil {
+					return err
+				}
+			}
+			ticket.Status = target
 		}
 		if ticketNewPriority > 0 {
 			ticket.Priority = ticketNewPriority

@@ -25,6 +25,8 @@ import (
 // missing, `ticket done` exits non-zero if $OPENKANBAN_TICKET_ID is
 // unset — the env var being present IS the signal that this is an
 // openkanban session.
+var ticketDoneForce bool
+
 var ticketDoneCmd = &cobra.Command{
 	Use:   "done",
 	Short: "Mark this session's ticket as done and signal openkanban to wrap up",
@@ -41,12 +43,17 @@ ticket file referenced by $OPENKANBAN_TICKET_ID has been deleted.
 
 Idempotent on a ticket that's already done — no second CompletedAt
 timestamp, but the status file is re-written so a re-armed TUI can
-still react.`,
+still react.
+
+When run from inside a spawned agent session (OPENKANBAN_SESSION or
+OPENKANBAN_TICKET_ID is set), this command is refused unless --force is
+passed. Tickets are advanced by the user after reviewing agent work,
+not by the agent itself.`,
 	Args:          cobra.NoArgs,
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return wrapUpSessionTicketAt(board.StatusDone)
+		return wrapUpSessionTicketAt(board.StatusDone, ticketDoneForce)
 	},
 }
 
@@ -69,7 +76,7 @@ still react.`,
 //     (skipped when $OPENKANBAN_SESSION is empty).
 //   - notifyDaemonTicketDone is best-effort and never fails the
 //     command — daemon outages downgrade to a stderr warning.
-func wrapUpSessionTicketAt(target board.TicketStatus) error {
+func wrapUpSessionTicketAt(target board.TicketStatus, force bool) error {
 	ticket, store, err := loadSessionTicket()
 	if err != nil {
 		return err
@@ -82,6 +89,9 @@ func wrapUpSessionTicketAt(target board.TicketStatus) error {
 	// auto-stop transition is re-armed for any pane that's somehow
 	// still alive.
 	if ticket.Status != target {
+		if err := guardAgentStatusChange(target, force); err != nil {
+			return err
+		}
 		// Route through Move so any claude-code approvals collected in
 		// this worktree get promoted to the repo's settings.local.json
 		// before the worktree (and the agent's permission scope with
@@ -180,4 +190,6 @@ func findTicketAcrossProjects(registry *project.ProjectRegistry, id board.Ticket
 
 func init() {
 	ticketCmd.AddCommand(ticketDoneCmd)
+	ticketDoneCmd.Flags().BoolVar(&ticketDoneForce, "force", false,
+		"allow status change from inside an agent session (only use when the user explicitly asked)")
 }
