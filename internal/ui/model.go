@@ -1939,11 +1939,9 @@ func (m *Model) dropTicket() (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// Wrap up any live session BEFORE Move (see quickMoveTicket). The
-	// returned Cmd performs the daemon-side Stop + TicketDone in a
-	// background goroutine — must not be dropped or the Update loop
-	// freezes for up to ~7s on the daemon RPCs.
-	wrapUpCmd := m.wrapUpSessionForTicket(ticket, targetStatus)
+	// Stamp the terminal badge BEFORE Move (see quickMoveTicket). Any
+	// live session is preserved across the drop — no teardown here.
+	m.stampTerminalAgentStatus(ticket, targetStatus)
 
 	promoted, pruned, _ := m.globalStore.Move(ticket.ID, targetStatus)
 	m.refreshColumnTickets()
@@ -1963,7 +1961,7 @@ func (m *Model) dropTicket() (tea.Model, tea.Cmd) {
 	m.dragging = false
 	m.dragTargetColumn = 0
 
-	return m, wrapUpCmd
+	return m, nil
 }
 
 func (m *Model) handleConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -3832,8 +3830,12 @@ func (m *Model) performTicketCleanup(ticket *board.Ticket) {
 	// exist but the daemon owns a session (sibling-TUI window — the
 	// 30s resync hasn't yet imported it), this is the rescue path that
 	// keeps daemon-owned sessions from being orphaned by TUI ticket
-	// deletion. Best-effort; failures logged but not surfaced — same
-	// contract as wrapUpSessionForTicket.
+	// deletion. Best-effort; failures logged but not surfaced.
+	//
+	// This is now the ONLY TUI path that sends TicketDone. Status moves
+	// deliberately don't (see stampTerminalAgentStatus) — deleting a
+	// ticket is destructive by request, so ending its session is the
+	// point; moving a card is not.
 	if m.daemon != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		if _, err := m.daemon.TicketDone(ctx, string(ticket.ID)); err != nil {
@@ -3926,11 +3928,11 @@ func (m *Model) quickMoveTicket() (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// Wrap up any live session BEFORE Move mutates ticket.Status —
-	// the helper's pre-move-status check is what gates the teardown.
-	// No-op when the ticket isn't leaving in_progress for a terminal.
-	// The returned Cmd runs the daemon RPCs off the Update loop.
-	wrapUpCmd := m.wrapUpSessionForTicket(ticket, nextStatus)
+	// Stamp the terminal badge BEFORE Move mutates ticket.Status — the
+	// helper's pre-move-status check is what gates it. No-op when the
+	// ticket isn't leaving in_progress for a terminal status. Any live
+	// session is preserved across the move.
+	m.stampTerminalAgentStatus(ticket, nextStatus)
 
 	promoted, pruned, _ := m.globalStore.Move(ticket.ID, nextStatus)
 	m.refreshColumnTickets()
@@ -3938,7 +3940,7 @@ func (m *Model) quickMoveTicket() (tea.Model, tea.Cmd) {
 	m.saveTicket(ticket)
 	m.notify(moveAndPromoteMsg(nextStatus, promoted, pruned))
 
-	return m, wrapUpCmd
+	return m, nil
 }
 
 // promoteAndSpawnUnattached implements ctrl+space (matched as "ctrl+@"): move
@@ -4395,7 +4397,7 @@ func (m *Model) quickMoveTicketBackward() (tea.Model, tea.Cmd) {
 	// helper's pre-condition keeps this a no-op. The call is harmless
 	// here but kept for parity with quickMoveTicket so a future change
 	// to status ordering doesn't silently introduce an asymmetry.
-	wrapUpCmd := m.wrapUpSessionForTicket(ticket, prevStatus)
+	m.stampTerminalAgentStatus(ticket, prevStatus)
 
 	promoted, pruned, _ := m.globalStore.Move(ticket.ID, prevStatus)
 	m.refreshColumnTickets()
@@ -4403,7 +4405,7 @@ func (m *Model) quickMoveTicketBackward() (tea.Model, tea.Cmd) {
 	m.saveTicket(ticket)
 	m.notify(moveAndPromoteMsg(prevStatus, promoted, pruned))
 
-	return m, wrapUpCmd
+	return m, nil
 }
 
 func (m *Model) setupWorktree(ticket *board.Ticket) error {
@@ -4724,6 +4726,14 @@ func (m *Model) spawnAgent() (tea.Model, tea.Cmd) {
 						Label: "Discard prior session, start fresh",
 						Fn: func() tea.Cmd {
 							ticketCopy.AgentSpawnedAt = nil
+							// Drop the conversation link too, so the poll
+							// loop can back-fill the NEW session's UUID
+							// (backfillAgentSession only fires on an empty
+							// field). Without this the next spawn would
+							// --resume the very session the user just
+							// discarded. ticketsvc is the single sanctioned
+							// funnel for this field — never assign it here.
+							ticketsvc.UnlinkSession(ticketCopy)
 							m.saveTicket(ticketCopy)
 							m.mode = ModeSpawning
 							m.spawningTicketID = ticketCopy.ID
@@ -4908,7 +4918,17 @@ func buildSpawnReq(in spawnReqInputs) daemon.SpawnReq {
 			if !hasClaudeNameFlag(args) && strings.TrimSpace(in.ticket.Title) != "" {
 				args = append(args, "-n", in.ticket.Title)
 			}
-			if in.ticket.AgentSessionID != "" && agent.SessionUUIDPattern.MatchString(in.ticket.AgentSessionID) {
+			// plan.ForceFresh (brief-chooser option 'd', "discard prior
+			// session") is the ONE place a lost conversation is what the
+			// user asked for, so it must actually skip --resume. Without
+			// this gate the option silently resumed anyway — the very
+			// bug that makes the preservation guarantee dishonest in the
+			// other direction. The 'd' closure also clears
+			// AgentSessionID (via ticketsvc.UnlinkSession) so the poll
+			// loop can link the NEW session's UUID; leaving the stale one
+			// would make 'd' work exactly once, then quietly revert.
+			if !in.plan.ForceFresh &&
+				in.ticket.AgentSessionID != "" && agent.SessionUUIDPattern.MatchString(in.ticket.AgentSessionID) {
 				// Always migrate-on-resume; the divergent-fork option was
 				// eliminated in task/enforce-one-to-one-session because
 				// silent divergence broke the 1:1 ticket↔session
@@ -5690,54 +5710,47 @@ func (m *Model) stopAgent() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// wrapUpSessionForTicket performs the TUI-side equivalent of the CLI's
-// wrapUpSessionTicketAt (cmd/ticket_done.go): when the ticket is leaving
-// in_progress for a terminal status (in_review or done) and has a live
-// daemon session, stop the local pane, ask the daemon to kill the
-// session via TicketDone, and stamp AgentStatus=Completed so the card
-// renders correctly even before the daemon's "exited" event lands.
+// stampTerminalAgentStatus flips AgentStatus→Completed when a ticket
+// leaves in_progress for a terminal column (in_review or done), so the
+// card renders as finished without waiting on a daemon event.
 //
-// Returns a tea.Cmd that performs the daemon-side teardown (Stop +
-// TicketDone) in a background goroutine. The Update loop must not block
-// on these RPCs — together they have a worst-case ~7s timeout (5s Kill
-// + 2s TicketDone), which is what the multi-second freeze on session
-// exit was actually about. Local state mutations (pane map delete,
-// focus clear, AgentStatus stamp) stay synchronous so the next render
-// reflects the wrap-up immediately.
+// It performs NO teardown. A ticket's session is durable: it survives
+// every status change, in both directions, however many times. Sessions
+// end only on ticket delete (performTicketCleanup), project delete,
+// explicit 'x' (stopAgent), the exit guard, or the agent's own exit.
+// Pressing Enter on a ticket in any column must land the user back in
+// the same live process with its scrollback intact — which is why this
+// function must never touch m.panes or send TicketDone.
 //
-// Safe to call when no daemon session exists for the ticket — returns
-// nil in that case. Must be called BEFORE m.globalStore.Move so the
-// ticket.Status check ("are we leaving in_progress?") runs against the
-// pre-move status; Move's SetStatus mutates ticket.Status in place.
+// (This replaced wrapUpSessionForTicket, which killed the PTY here to
+// mirror the CLI's teardown — see PR #33. The CLI no longer tears down
+// either; both sides now preserve. The conversation-level half of the
+// same guarantee lives in handleDaemonSessionEvent's "exited" arm.)
 //
-// The returned Cmd's closure captures the pane handle and daemon API
-// into locals BEFORE the goroutine runs, per the "tea.Cmd goroutines
-// must not touch shared Model state" discipline in internal/ui/CLAUDE.md.
-func (m *Model) wrapUpSessionForTicket(ticket *board.Ticket, newStatus board.TicketStatus) tea.Cmd {
+// Must be called BEFORE m.globalStore.Move so the ticket.Status check
+// ("are we leaving in_progress?") runs against the pre-move status;
+// Move's SetStatus mutates ticket.Status in place.
+func (m *Model) stampTerminalAgentStatus(ticket *board.Ticket, newStatus board.TicketStatus) {
 	if ticket == nil {
-		return nil
+		return
 	}
-	// Only wrap up when crossing OUT of in_progress to a terminal
-	// status. Backlog→in_progress and other transitions don't have a
-	// session to tear down (or shouldn't tear it down if they do).
+	// Only stamp when crossing OUT of in_progress to a terminal status.
 	if ticket.Status != board.StatusInProgress {
-		return nil
+		return
 	}
 	if newStatus != board.StatusInReview && newStatus != board.StatusDone {
-		return nil
+		return
 	}
 
-	// Capture the local pane handle and remove it from m.panes so
-	// subsequent Update ticks don't see a stale entry. The goroutine
-	// below stops the captured handle off-loop.
-	var capturedPane *daemonclient.PaneView
-	if pane, ok := m.panes[ticket.ID]; ok {
-		capturedPane = pane
-		delete(m.panes, ticket.ID)
-	}
-	if m.focusedPane == ticket.ID {
-		m.mode = ModeNormal
-		m.focusedPane = ""
+	// A preserved live session keeps reporting its own status, and
+	// AgentCompleted is terminal against BOTH status sources — the poll
+	// handler refuses to downgrade it (see the AgentCompleted guard in
+	// handleAgentStatusResult) and so does applyDaemonStatus. Stamping
+	// it over an agent that is still working would freeze the badge at
+	// "Completed" until the ticket returned to backlog/next/in_progress,
+	// where SetStatus demotes it. So only stamp when nothing is live.
+	if pane, ok := m.panes[ticket.ID]; ok && pane != nil && pane.Running() {
+		return
 	}
 
 	// AgentStatus discipline. SetAgentStatus stamps StatusChangedAt;
@@ -5745,36 +5758,6 @@ func (m *Model) wrapUpSessionForTicket(ticket *board.Ticket, newStatus board.Tic
 	// internal/board/board.go and the SetAgentStatus memory note).
 	// The caller's saveTicket call after Move will persist this.
 	ticket.SetAgentStatus(board.AgentCompleted)
-
-	// Capture daemon API + ticket ID into locals so the goroutine has
-	// no dependency on m.*.
-	api := m.daemon
-	ticketID := string(ticket.ID)
-	if capturedPane == nil && api == nil {
-		return nil
-	}
-
-	return func() tea.Msg {
-		t0 := time.Now()
-		if capturedPane != nil {
-			_ = capturedPane.Stop()
-			// Close after Stop so teaMsgs is drained and the PaneView
-			// goroutines (drainWG, detach watchdog) can wind down
-			// instead of lingering until GC. The model has already
-			// removed this pane from m.panes synchronously, so no
-			// in-flight handler will dispatch new messages to it.
-			_ = capturedPane.Close()
-		}
-		if api != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-			if _, err := api.TicketDone(ctx, ticketID); err != nil {
-				log.Printf("openkanban: TicketDone(%s) on board promotion: %v", ticketID, err)
-			}
-		}
-		log.Printf("openkanban: wrapUpSessionForTicket(%s) daemon teardown took %s", ticketID, time.Since(t0))
-		return nil
-	}
 }
 
 func (m *Model) selectedTicket() *board.Ticket {
@@ -6326,16 +6309,22 @@ func (m *Model) pollAgentStatusesAsync() tea.Cmd {
 	return func() tea.Msg {
 		results := make(agentStatusResultMsg)
 		for _, p := range panes {
-			if !p.running {
-				results[p.ticketID] = board.AgentNone
-				continue
-			}
-
 			// Back-fill the agent's persistent session UUID into the
 			// ticket if it isn't already pinned. This is unrelated to
 			// the file-lookup key (fileSessionName) — see the field
 			// comments above. Keeping it here so --resume picks up the
 			// UUID on the next spawn / external-resume detection.
+			//
+			// Runs BEFORE the !p.running early-continue on purpose.
+			// p.running is the pane's *cached* lastInfo.Running, which
+			// goes stale for an unattached or resynced pane (see
+			// internal/ui/CLAUDE.md "Count by m.panes membership, NOT
+			// pane.Running()"). Gating the back-fill on it meant a live
+			// session whose cached flag had gone false never got its
+			// UUID pinned — and AgentSessionID is the durable resume key
+			// that makes a session survive a status round-trip. There's
+			// no risk of resurrecting a dead UUID: FindClaudeSession /
+			// FindOpencodeSession only return live sessions.
 			apiSessionID := p.agentSessionID
 			if apiSessionID == "" {
 				home, _ := os.UserHomeDir()
@@ -6356,6 +6345,11 @@ func (m *Model) pollAgentStatusesAsync() tea.Cmd {
 				); id != "" {
 					apiSessionID = id
 				}
+			}
+
+			if !p.running {
+				results[p.ticketID] = board.AgentNone
+				continue
 			}
 
 			// fileSessionName is what the status hook wrote with. If

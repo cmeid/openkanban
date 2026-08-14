@@ -260,16 +260,27 @@ func (m *Model) applyDaemonSessionEvent(ev daemon.SessionEvent) {
 				delete(m.daemonViewing, ticketID)
 				delete(m.lastPTYActivity, ticketID)
 				// Expected=true means the daemon initiated the kill via
-				// handleTicketDone (i.e. the agent invoked `openkanban
-				// ticket done`, or the TUI's board-promotion wrap-up
-				// sent a TicketDone RPC). Preserve AgentCompleted so the
-				// card renders as done rather than getting reset to
-				// AgentNone. Expected=false is a natural exit / plain
-				// Kill — reset to AgentNone as before.
+				// handleTicketDone — now only the ticket-delete path,
+				// since status changes no longer send TicketDone (see
+				// stampTerminalAgentStatus in model.go). Preserve
+				// AgentCompleted so the card renders as done rather than
+				// getting reset to AgentNone.
+				//
+				// Expected=false is a natural exit / plain Kill, which
+				// normally resets to AgentNone — but NOT over an already-
+				// terminal AgentCompleted. Sessions now survive the move
+				// to in_review/done, so an agent that finishes, gets its
+				// Completed badge, and only then exits on its own arrives
+				// here with Expected=false; demoting would erase the
+				// badge on a genuinely finished ticket. Mirrors the same
+				// guard in stopAgent and resetSpawnState.
 				stateChanged := false
-				if ev.Expected {
+				switch {
+				case ev.Expected:
 					stateChanged = ticket.SetAgentStatus(board.AgentCompleted)
-				} else {
+				case ticket.AgentStatus == board.AgentCompleted:
+					// Preserve; nothing to save.
+				default:
 					stateChanged = ticket.SetAgentStatus(board.AgentNone)
 				}
 				// The JSONL transcript outlives the PTY — only the

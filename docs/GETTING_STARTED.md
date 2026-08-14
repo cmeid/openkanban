@@ -123,28 +123,30 @@ For scripts: add `--json` for a stable `{id, path, slug, status, project_id, wor
 
 ## 6. Closing a ticket from inside the session
 
-Don't just `exit`. Let openkanban know so it can clean up the PTY gracefully and update the board.
+Don't just `exit`. Let openkanban know so it can update the board.
 
 **Work needs human review first:**
 ```bash
-openkanban ticket in-review
+openkanban ticket move --id "$OPENKANBAN_TICKET_ID" --status in_review
 ```
-Moves the ticket to **In Review** and terminates the session. The card sits in the In Review column waiting for you.
+Moves the ticket to **In Review**. The card sits in the In Review column waiting for you.
 
 **Work is complete — no review needed:**
 ```bash
 openkanban ticket done
 ```
-Moves the ticket to **Done** and terminates the session.
+Moves the ticket to **Done** and writes the completed badge.
 
-Both commands send SIGTERM (3 s grace, then SIGKILL) to the live pane. The ticket card updates on the board automatically.
+**Neither command ends your session.** The agent keeps running, and pressing `Enter` on the card — in any column — drops you back into the same live session with its full scrollback. A session ends only when you delete the ticket, press `x` on it, kill it from the exit-guard modal, or the agent exits on its own.
 
 ### Pulling a ticket back to In Progress
 
 If a reviewed or done ticket needs more work:
 
 - On the board: **`-`** or **`Backspace`** steps the ticket left (Done → In Review → In Progress → Next → Backlog).
-- From a new session on that ticket: `openkanban ticket in-progress` moves it back to In Progress without stopping the current pane.
+- From the CLI: `openkanban ticket move --id "$OPENKANBAN_TICKET_ID" --status in_progress`.
+
+Either way the ticket keeps its session — that's the whole point of the round trip. `Enter` puts you back where you were.
 
 > Full reference for in-session commands, the hook-driven status cycle, and session linking: [`docs/AGENT_INTEGRATION.md` → Agent-callable commands](AGENT_INTEGRATION.md#agent-callable-commands-in-session).
 

@@ -211,3 +211,48 @@ func TestSpawnAgent_UnchangedBrief_NoChooser(t *testing.T) {
 		t.Errorf("showChoice = true, want false (no brief change → chooser should not fire). msg=%q", m.choiceMsg)
 	}
 }
+
+// TestBriefChooser_Discard_ClearsSessionLink pins the second half of the
+// ForceFresh contract. Suppressing --resume at argv-build time is not
+// enough: the ticket's AgentSessionID is the durable resume key, and the
+// poll loop's back-fill only claims a UUID for a ticket that has none
+// (backfillAgentSession is gated on an empty field). Leave the discarded
+// UUID in place and the NEW session never gets linked — so the next
+// spawn resumes the very conversation the user threw away, and option
+// 'd' silently works exactly once.
+//
+// The closure is invoked directly; the tea.Cmd it returns (which is what
+// performs the actual daemon Spawn) is deliberately not run.
+//
+// RED-BEFORE-GREEN: drop the ticketsvc.UnlinkSession call from the 'd'
+// closure and AgentSessionID survives the discard.
+func TestBriefChooser_Discard_ClearsSessionLink(t *testing.T) {
+	m, ticket, _ := oldSessionFixture(t, time.Hour)
+	ticket.Description = "brief diverged, open the chooser"
+	const uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	ticket.AgentSessionID = uuid
+
+	if _, _ = m.spawnAgent(); !m.showChoice {
+		t.Fatalf("precondition: chooser did not open, so the 'd' closure under test is unreachable")
+	}
+	var discard *choiceItem
+	for i := range m.choices {
+		if m.choices[i].Key == 'd' {
+			discard = &m.choices[i]
+			break
+		}
+	}
+	if discard == nil {
+		t.Fatalf("no 'd' (discard) choice among %d options", len(m.choices))
+	}
+
+	_ = discard.Fn()
+
+	if ticket.AgentSessionID != "" {
+		t.Errorf("AgentSessionID = %q, want empty — discarding a session must unlink it so the "+
+			"poll loop can back-fill the new session's UUID", ticket.AgentSessionID)
+	}
+	if ticket.AgentSpawnedAt != nil {
+		t.Errorf("AgentSpawnedAt = %v, want nil (the fresh-spawn branch is gated on it)", ticket.AgentSpawnedAt)
+	}
+}

@@ -197,6 +197,33 @@ func LinkSession(store TicketStore, requesting *board.Ticket, uuid string, opts 
 	return true, nil
 }
 
+// UnlinkSession clears a ticket's AgentSessionID, deliberately
+// abandoning the linked conversation. It is the counterpart to
+// LinkSession and exists so callers outside this package never assign
+// AgentSessionID directly (see the package doc comment).
+//
+// This is NOT part of ordinary status handling. A ticket's session is
+// durable across every status change; the only sanctioned caller is the
+// brief-chooser's "discard prior session and start fresh" option, where
+// losing the conversation is explicitly what the user asked for.
+// Clearing the field is what lets the post-spawn poll back-fill link the
+// NEW session's UUID — the back-fill only fires on an empty field, so
+// leaving the stale UUID would make "start fresh" revert on the spawn
+// after next.
+//
+// Like LinkSession, this only mutates in memory — **the caller persists
+// the ticket.** Returns true when a non-empty UUID was actually cleared,
+// false when the ticket is nil or already unlinked (so callers can skip
+// a pointless save).
+func UnlinkSession(ticket *board.Ticket) (cleared bool) {
+	if ticket == nil || ticket.AgentSessionID == "" {
+		return false
+	}
+	ticket.AgentSessionID = ""
+	ticket.Touch()
+	return true
+}
+
 // daemonProbeTimeout caps the daemon Owns RPC inside NewRealProbe. The
 // Owns query is a local socket round-trip; we'd rather degrade to "not
 // owned" than stall the spawn path on a wedged daemon.

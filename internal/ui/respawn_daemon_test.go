@@ -356,6 +356,54 @@ func TestBuildSpawnReq_ForceFresh_AgentSpawnedAtNilAtConstruction(t *testing.T) 
 	}
 }
 
+// TestBuildSpawnReq_ForceFresh_SkipsResume is the one place in the
+// codebase where losing a conversation is the point. Everywhere else a
+// session is durable across status changes; option 'd' of the
+// brief-chooser ("discard prior session, start fresh") is the explicit
+// opt-out, and it has to actually work or the guarantee is dishonest in
+// the other direction — the user asks for a clean slate and silently
+// gets the old conversation back.
+//
+// The new-session branch appends `--resume <uuid>` whenever the ticket
+// carries a valid UUID (that's what re-attaches a fresh spawn to the
+// existing conversation). ForceFresh must suppress it.
+//
+// Both rows are load-bearing: the negative case alone would pass
+// against a build that never emits --resume at all.
+func TestBuildSpawnReq_ForceFresh_SkipsResume(t *testing.T) {
+	const uuid = "abcdefab-cdef-4abc-8def-abcdefabcdef"
+	cases := []struct {
+		name       string
+		forceFresh bool
+		wantResume bool
+	}{
+		{"force_fresh_discards_the_uuid", true, false},
+		{"plain_new_session_resumes", false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := baseClaudeInputs(t, "TICK-FF-"+tc.name, "task/ff")
+			// ForceFresh's caller nils AgentSpawnedAt, so this is the
+			// new-session branch in both rows — the only difference is
+			// the plan flag.
+			in.ticket.AgentSpawnedAt = nil
+			in.isNewSession = true
+			in.ticket.AgentSessionID = uuid
+			in.plan = spawnPlan{ForceFresh: tc.forceFresh}
+
+			req := buildSpawnReq(in)
+
+			if got := argsHavePair(req.Args, "--resume", uuid); got != tc.wantResume {
+				verb := "must NOT"
+				if tc.wantResume {
+					verb = "must"
+				}
+				t.Errorf("argv %s carry --resume %s; got %v", verb, uuid, req.Args)
+			}
+		})
+	}
+}
+
 // argsHavePair reports whether args contains `flag` immediately
 // followed by `value` (space-separated CLI pair).
 func argsHavePair(args []string, flag, value string) bool {

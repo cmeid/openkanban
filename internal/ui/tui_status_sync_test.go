@@ -7,16 +7,18 @@ import (
 	"time"
 
 	"github.com/techdufus/openkanban/internal/board"
+	"github.com/techdufus/openkanban/internal/config"
 	"github.com/techdufus/openkanban/internal/daemon"
 	"github.com/techdufus/openkanban/internal/daemonclient"
 	"github.com/techdufus/openkanban/internal/project"
 )
 
-// ticketDoneStubAPI is a minimal daemonAPI focused on the
-// wrap-up-on-promotion path. It records every TicketDone invocation so
-// tests can assert the daemon notification fired (or didn't). The
-// wrap-up helper only calls TicketDone, so every other method falls
-// through to daemonAPINoop's zero-value returns.
+// ticketDoneStubAPI is a minimal daemonAPI focused on the status-move
+// path. It records every TicketDone invocation so tests can assert the
+// daemon notification did NOT fire (status moves must never end a
+// session) — and, in the control subtest, that it still fires for
+// ticket DELETE. Every other method falls through to daemonAPINoop's
+// zero-value returns.
 type ticketDoneStubAPI struct {
 	daemonAPINoop
 
@@ -36,15 +38,21 @@ func (s *ticketDoneStubAPI) TicketDone(_ context.Context, ticketID string) (daem
 	return daemon.TicketDoneResp{Killed: true}, nil
 }
 
-// newWrapUpModel builds a minimal Model wired with the column stack,
-// pane map, and global store needed to exercise the board-promotion
-// wrap-up path. The seeded ticket starts at StatusInProgress with a
-// daemon-owned PTY entry so the wrap-up has work to do; a stub
-// PaneView is placed in m.panes so the call site can verify the
-// teardown. The PaneView is constructed without a live daemon client
-// — its Stop() call short-circuits on sessionID="" so the test
-// doesn't need a real socket.
-func newWrapUpModel(t *testing.T, status board.TicketStatus) (*Model, *board.Ticket, *ticketDoneStubAPI) {
+// newStatusMoveModel builds a minimal Model wired with the column
+// stack, pane map, and global store needed to exercise a board-driven
+// status move. The seeded ticket starts at `status` with a daemon-owned
+// pane entry AND a linked session (AgentSessionID + AgentSpawnedAt), so
+// the preservation assertions have something they could actually lose —
+// a fixture with no session residue would pass even against the old
+// teardown code.
+//
+// live controls the pane's cached Running() flag, which is the gate
+// stampTerminalAgentStatus reads: a still-working agent must NOT be
+// stamped Completed (that badge is terminal against both status
+// sources and would freeze), while a ticket with no live session must
+// be. Either way the PaneView is built with no daemon client and
+// sessionID="" so Stop()/Close() short-circuit and no socket is needed.
+func newStatusMoveModel(t *testing.T, status board.TicketStatus, live bool) (*Model, *board.Ticket, *ticketDoneStubAPI) {
 	t.Helper()
 	t.Setenv("OPENKANBAN_CONFIG_DIR", t.TempDir())
 
@@ -68,10 +76,18 @@ func newWrapUpModel(t *testing.T, status board.TicketStatus) (*Model, *board.Tic
 
 	stub := &ticketDoneStubAPI{}
 
-	// PaneView with empty sessionID — Stop() short-circuits, so no
-	// real daemon is needed. The map entry is what wrapUpSessionForTicket
-	// removes; the Stop call is verified by the absence of a panic.
-	pv := daemonclient.NewPaneView(nil, string(ticket.ID), "", nil)
+	// PaneView with empty sessionID — Stop() short-circuits, so no real
+	// daemon is needed. A non-nil SessionInfo with Running=true puts the
+	// view in PaneViewUnattached, which is what makes Running() report
+	// true (see PaneView.Running's state table).
+	var info *daemon.SessionInfo
+	if live {
+		info = &daemon.SessionInfo{Running: true}
+	}
+	pv := daemonclient.NewPaneView(nil, string(ticket.ID), "", info)
+	if pv.Running() != live {
+		t.Fatalf("fixture: pane Running() = %v, want %v", pv.Running(), live)
+	}
 
 	m := &Model{
 		globalStore:     globalStore,
@@ -83,6 +99,7 @@ func newWrapUpModel(t *testing.T, status board.TicketStatus) (*Model, *board.Tic
 		columns:         board.DefaultColumns(),
 		focusedPane:     ticket.ID,
 		mode:            ModeAgentView,
+		config:          &config.Config{Agents: map[string]config.AgentConfig{}},
 	}
 	m.refreshColumnTickets()
 	// quickMoveTicket / dropTicket use selectedTicket() / dragSource*
@@ -100,246 +117,192 @@ func newWrapUpModel(t *testing.T, status board.TicketStatus) (*Model, *board.Tic
 	return m, ticket, stub
 }
 
-// TestWrapUpSessionForTicket_InProgressToInReview_StopsPaneAndNotifiesDaemon
-// pins the helper's contract on the canonical "in_progress → in_review"
-// transition: the pane is removed, the daemon is told, AgentStatus
-// flips to Completed (via SetAgentStatus, which stamps
-// StatusChangedAt), and the focused-pane mode unwinds.
-func TestWrapUpSessionForTicket_InProgressToInReview_StopsPaneAndNotifiesDaemon(t *testing.T) {
-	m, ticket, stub := newWrapUpModel(t, board.StatusInProgress)
+// TestStatusMove_PreservesSessionAndSkipsTicketDone is the core
+// preservation guarantee: a board-driven status move must never end the
+// ticket's session. It replaces a family of tests that pinned the
+// opposite — the removed wrapUpSessionForTicket stopped the pane and
+// sent TicketDone on every exit from in_progress.
+//
+// The table covers every destination, for both a live and a finished
+// session. In all cases the pane stays in m.panes, no TicketDone RPC is
+// sent, the durable resume residue (AgentSessionID / AgentSpawnedAt) is
+// untouched, and the user is not ejected from the session view.
+//
+// The final "control" subtest deletes a ticket on the SAME fixture and
+// asserts TicketDone fires exactly once. Without it every "want 0 calls"
+// assertion above would also pass if the stub were simply never wired to
+// m.daemon — a false green that survives reverting the fix.
+func TestStatusMove_PreservesSessionAndSkipsTicketDone(t *testing.T) {
+	targets := []board.TicketStatus{
+		board.StatusInReview,
+		board.StatusDone,
+		board.StatusBacklog,
+		board.StatusNext,
+		board.StatusArchived,
+	}
+	for _, live := range []bool{true, false} {
+		for _, target := range targets {
+			name := string(target) + "/finished"
+			if live {
+				name = string(target) + "/live"
+			}
+			t.Run(name, func(t *testing.T) {
+				m, ticket, stub := newStatusMoveModel(t, board.StatusInProgress, live)
+				wantSession := ticket.AgentSessionID
+				wantSpawned := ticket.AgentSpawnedAt
+				if wantSession == "" || wantSpawned == nil {
+					t.Fatal("fixture: ticket must carry session residue, or the preservation assertions are vacuous")
+				}
 
-	// wrapUpSessionForTicket now returns a tea.Cmd that performs the
-	// daemon-side teardown (pane.Stop + TicketDone) in a goroutine —
-	// keeping the Update loop unblocked on session-end. The tests drive
-	// it inline to assert on the daemon-fake call counts.
-	cmd := m.wrapUpSessionForTicket(ticket, board.StatusInReview)
-	if cmd != nil {
-		_ = cmd()
+				m.stampTerminalAgentStatus(ticket, target)
+
+				if _, ok := m.panes[ticket.ID]; !ok {
+					t.Errorf("panes[%s] removed by a status move; the session must survive", ticket.ID)
+				}
+				if got := stub.calls.Load(); got != 0 {
+					t.Errorf("TicketDone calls = %d, want 0 (a status move must not end the session)", got)
+				}
+				if ticket.AgentSessionID != wantSession {
+					t.Errorf("AgentSessionID = %q, want %q (the resume key must survive)", ticket.AgentSessionID, wantSession)
+				}
+				if ticket.AgentSpawnedAt != wantSpawned {
+					t.Errorf("AgentSpawnedAt = %v, want %v (unchanged)", ticket.AgentSpawnedAt, wantSpawned)
+				}
+				if m.focusedPane != ticket.ID || m.mode != ModeAgentView {
+					t.Errorf("focus unwound (focusedPane=%q mode=%v); a status move must not eject the user from the session",
+						m.focusedPane, m.mode)
+				}
+			})
+		}
 	}
 
-	if _, ok := m.panes[ticket.ID]; ok {
-		t.Errorf("panes[%s] still present after wrap-up", ticket.ID)
-	}
-	if stub.calls.Load() != 1 {
-		t.Errorf("TicketDone calls = %d, want 1", stub.calls.Load())
-	}
-	if got := stub.lastTicketID.Load(); got != string(ticket.ID) {
-		t.Errorf("TicketDone ticketID = %v, want %s", got, ticket.ID)
-	}
-	if ticket.AgentStatus != board.AgentCompleted {
-		t.Errorf("AgentStatus = %v, want %v", ticket.AgentStatus, board.AgentCompleted)
-	}
-	if m.focusedPane != "" {
-		t.Errorf("focusedPane = %q, want \"\" (unwound after pane removal)", m.focusedPane)
-	}
-	if m.mode != ModeNormal {
-		t.Errorf("mode = %v, want %v (unwound from ModeAgentView)", m.mode, ModeNormal)
-	}
+	// Control: proves the stub is actually reachable from this fixture.
+	t.Run("control/ticket delete still notifies daemon", func(t *testing.T) {
+		m, ticket, stub := newStatusMoveModel(t, board.StatusInProgress, true)
+
+		m.performTicketCleanup(ticket)
+
+		if got := stub.calls.Load(); got != 1 {
+			t.Fatalf("TicketDone calls on ticket DELETE = %d, want 1 — the stub isn't wired, so the want-0 assertions above prove nothing", got)
+		}
+	})
 }
 
-// TestWrapUpSessionForTicket_LocalSyncDaemonAsync pins the sync-vs-async
-// split that the multi-second-freeze fix introduced. Local state
-// mutations (panes map, AgentStatus, focusedPane, mode) MUST happen
-// synchronously in wrapUpSessionForTicket so the next render reflects
-// the wrap-up. The daemon-side RPCs (pane.Stop + TicketDone), which
-// previously blocked the BubbleTea Update loop for up to ~7s, MUST be
-// deferred to the returned tea.Cmd so the loop returns immediately.
-// This test asserts BOTH halves of that split.
-func TestWrapUpSessionForTicket_LocalSyncDaemonAsync(t *testing.T) {
-	m, ticket, stub := newWrapUpModel(t, board.StatusInProgress)
+// TestStampTerminalAgentStatus_BadgeGate pins the only bookkeeping the
+// helper still does, and its gate. Leaving in_progress for a terminal
+// column stamps AgentCompleted so the card renders as finished without
+// waiting on a daemon event — but ONLY when nothing is live.
+// AgentCompleted is terminal against both status sources (the poll
+// handler and applyDaemonStatus each refuse to downgrade it), so
+// stamping it over a still-working agent would freeze the badge until
+// the ticket returned to an active column.
+func TestStampTerminalAgentStatus_BadgeGate(t *testing.T) {
+	t.Run("live session is not stamped", func(t *testing.T) {
+		m, ticket, _ := newStatusMoveModel(t, board.StatusInProgress, true)
+		// Precondition: the seeded badge must differ from Completed, or
+		// "it still isn't Completed" is a tautology.
+		if ticket.AgentStatus != board.AgentWorking {
+			t.Fatalf("fixture: AgentStatus = %v, want %v", ticket.AgentStatus, board.AgentWorking)
+		}
 
-	cmd := m.wrapUpSessionForTicket(ticket, board.StatusInReview)
+		m.stampTerminalAgentStatus(ticket, board.StatusInReview)
 
-	// BEFORE running the Cmd: local state mutations must already be
-	// visible. If any of these asserts fail, the helper has regressed
-	// into doing local work inside the goroutine — that breaks the
-	// "card renders correctly immediately" contract.
-	if _, ok := m.panes[ticket.ID]; ok {
-		t.Errorf("panes[%s] still present BEFORE Cmd ran — should be removed synchronously", ticket.ID)
-	}
-	if ticket.AgentStatus != board.AgentCompleted {
-		t.Errorf("AgentStatus BEFORE Cmd ran = %v, want %v (must be set synchronously)", ticket.AgentStatus, board.AgentCompleted)
-	}
-	if m.focusedPane != "" {
-		t.Errorf("focusedPane BEFORE Cmd ran = %q, want \"\" (must unwind synchronously)", m.focusedPane)
-	}
-	if m.mode != ModeNormal {
-		t.Errorf("mode BEFORE Cmd ran = %v, want %v (must unwind synchronously)", m.mode, ModeNormal)
-	}
+		if ticket.AgentStatus == board.AgentCompleted {
+			t.Fatalf("AgentStatus = %v; a live agent must not be stamped Completed", ticket.AgentStatus)
+		}
+		// The load-bearing consequence: the daemon can still drive the
+		// badge. Assert on applyDaemonStatus's RETURN value — reading
+		// AgentStatus after the write would pass even if the terminal
+		// guard had swallowed the update. "waiting" (not "working") so
+		// the call is a real transition rather than a no-op.
+		if !m.applyDaemonStatus(ticket, string(board.AgentWaiting)) {
+			t.Error("applyDaemonStatus(waiting) = false; the live agent's badge is frozen")
+		}
+	})
 
-	// BEFORE running the Cmd: the daemon RPC must NOT have fired. If
-	// it has, wrapUpSessionForTicket has regressed into blocking the
-	// Update loop on the RPC, which is the original bug.
-	if calls := stub.calls.Load(); calls != 0 {
-		t.Errorf("TicketDone calls BEFORE Cmd ran = %d, want 0 (daemon RPC must be deferred to the Cmd)", calls)
-	}
+	t.Run("no live session is stamped", func(t *testing.T) {
+		m, ticket, _ := newStatusMoveModel(t, board.StatusInProgress, false)
 
-	// Now run the Cmd. The daemon RPC fires here, on whatever
-	// goroutine tea picks — for the test, the same goroutine.
-	if cmd == nil {
-		t.Fatal("wrapUpSessionForTicket returned nil Cmd despite a live pane + daemon")
-	}
-	_ = cmd()
+		m.stampTerminalAgentStatus(ticket, board.StatusDone)
 
-	if calls := stub.calls.Load(); calls != 1 {
-		t.Errorf("TicketDone calls AFTER Cmd ran = %d, want 1", calls)
-	}
+		if ticket.AgentStatus != board.AgentCompleted {
+			t.Errorf("AgentStatus = %v, want %v (a finished ticket should still get its badge)",
+				ticket.AgentStatus, board.AgentCompleted)
+		}
+	})
+
+	t.Run("not leaving in_progress is a no-op", func(t *testing.T) {
+		m, ticket, _ := newStatusMoveModel(t, board.StatusBacklog, false)
+
+		m.stampTerminalAgentStatus(ticket, board.StatusInProgress)
+
+		if ticket.AgentStatus != board.AgentWorking {
+			t.Errorf("AgentStatus = %v, want %v (unchanged)", ticket.AgentStatus, board.AgentWorking)
+		}
+	})
+
+	t.Run("non-terminal destination is a no-op", func(t *testing.T) {
+		m, ticket, _ := newStatusMoveModel(t, board.StatusInProgress, false)
+
+		m.stampTerminalAgentStatus(ticket, board.StatusBacklog)
+
+		if ticket.AgentStatus != board.AgentWorking {
+			t.Errorf("AgentStatus = %v, want %v (unchanged)", ticket.AgentStatus, board.AgentWorking)
+		}
+	})
 }
 
-// TestWrapUpSessionForTicket_InProgressToDone covers the second
-// "leaving in_progress for a terminal" transition. Behaviour matches
-// the in_review case exactly — both go through TicketDone with
-// Expected=true on the daemon side.
-func TestWrapUpSessionForTicket_InProgressToDone(t *testing.T) {
-	m, ticket, stub := newWrapUpModel(t, board.StatusInProgress)
-
-	cmd := m.wrapUpSessionForTicket(ticket, board.StatusDone)
-	if cmd != nil {
-		_ = cmd()
-	}
-
-	if _, ok := m.panes[ticket.ID]; ok {
-		t.Errorf("panes[%s] still present after wrap-up", ticket.ID)
-	}
-	if stub.calls.Load() != 1 {
-		t.Errorf("TicketDone calls = %d, want 1", stub.calls.Load())
-	}
-	if ticket.AgentStatus != board.AgentCompleted {
-		t.Errorf("AgentStatus = %v, want %v", ticket.AgentStatus, board.AgentCompleted)
-	}
-}
-
-// TestWrapUpSessionForTicket_BacklogToInProgress_NoOp asserts that the
-// helper does NOT tear anything down when the ticket isn't leaving
-// in_progress. This is the "moving the OTHER direction" sanity check —
-// promoting a backlog ticket to in_progress must not stop its
-// (just-spawned) pane.
-func TestWrapUpSessionForTicket_BacklogToInProgress_NoOp(t *testing.T) {
-	m, ticket, stub := newWrapUpModel(t, board.StatusBacklog)
-
-	m.wrapUpSessionForTicket(ticket, board.StatusInProgress)
-
-	if _, ok := m.panes[ticket.ID]; !ok {
-		t.Errorf("panes[%s] removed despite backlog→in_progress (should be no-op)", ticket.ID)
-	}
-	if stub.calls.Load() != 0 {
-		t.Errorf("TicketDone calls = %d, want 0 (no wrap-up on backlog→in_progress)", stub.calls.Load())
-	}
-	if ticket.AgentStatus != board.AgentWorking {
-		t.Errorf("AgentStatus = %v, want %v (unchanged)", ticket.AgentStatus, board.AgentWorking)
-	}
-}
-
-// TestWrapUpSessionForTicket_InReviewToDone_NoOp pins the
-// "in_progress only" gate. A wrap-up move from in_review → done must
-// not double-tear-down: by the time we reach in_review the session
-// has already been killed by the prior in_progress → in_review hop
-// (which IS the wrap-up moment). Calling TicketDone again would
-// at best be redundant and at worst race with the daemon's
-// post-kill cleanup.
-func TestWrapUpSessionForTicket_InReviewToDone_NoOp(t *testing.T) {
-	m, ticket, stub := newWrapUpModel(t, board.StatusInReview)
-
-	m.wrapUpSessionForTicket(ticket, board.StatusDone)
-
-	if stub.calls.Load() != 0 {
-		t.Errorf("TicketDone calls = %d, want 0 (no wrap-up on in_review→done)", stub.calls.Load())
-	}
-}
-
-// TestWrapUpSessionForTicket_NoLivePane_StillNotifiesDaemon covers the
-// "ticket has no PaneView but daemon may still own its session"
-// edge — e.g., a second TUI moved the ticket but this one never
-// attached. The daemon notification must still fire so the daemon's
-// orphaned PTY is reaped. Local map mutations are no-ops by definition.
-func TestWrapUpSessionForTicket_NoLivePane_StillNotifiesDaemon(t *testing.T) {
-	m, ticket, stub := newWrapUpModel(t, board.StatusInProgress)
-	// Drop the pane so we exercise the "no local pane" branch.
-	delete(m.panes, ticket.ID)
-	m.focusedPane = ""
-	m.mode = ModeNormal
-
-	cmd := m.wrapUpSessionForTicket(ticket, board.StatusInReview)
-	if cmd != nil {
-		_ = cmd()
-	}
-
-	if stub.calls.Load() != 1 {
-		t.Errorf("TicketDone calls = %d, want 1 (daemon must still be told)", stub.calls.Load())
-	}
-	if ticket.AgentStatus != board.AgentCompleted {
-		t.Errorf("AgentStatus = %v, want %v", ticket.AgentStatus, board.AgentCompleted)
-	}
-}
-
-// TestWrapUpSessionForTicket_NilDaemonAPI_DoesNotPanic exercises the
-// daemon-unreachable case: the TUI started before the daemon was up,
-// so m.daemon is nil. Local cleanup must still proceed; the daemon
-// notification is silently skipped.
-func TestWrapUpSessionForTicket_NilDaemonAPI_DoesNotPanic(t *testing.T) {
-	m, ticket, _ := newWrapUpModel(t, board.StatusInProgress)
-	m.daemon = nil
-
-	cmd := m.wrapUpSessionForTicket(ticket, board.StatusInReview)
-	if cmd != nil {
-		// Invoke the Cmd to also exercise pane.Stop()/Close() under
-		// a nil daemon API — the closure must skip the TicketDone
-		// branch but still drain the pane handle without panicking.
-		_ = cmd()
-	}
-
-	if _, ok := m.panes[ticket.ID]; ok {
-		t.Errorf("panes[%s] still present after wrap-up with nil m.daemon", ticket.ID)
-	}
-	if ticket.AgentStatus != board.AgentCompleted {
-		t.Errorf("AgentStatus = %v, want %v", ticket.AgentStatus, board.AgentCompleted)
-	}
-}
-
-// TestQuickMoveTicket_InProgressToInReview_WrapsUp verifies that the
-// quick-move (forward) keyboard path threads the wrap-up call BEFORE
-// the store's Move. The ticket's pre-Move status (in_progress) is
-// what gates the wrap-up; if the wire-up landed AFTER Move the gate
-// would never fire because Move mutates Status in place.
-func TestQuickMoveTicket_InProgressToInReview_WrapsUp(t *testing.T) {
-	m, ticket, stub := newWrapUpModel(t, board.StatusInProgress)
+// TestQuickMoveTicket_InProgressToInReview_PreservesSession pins the
+// forward quick-move wiring. The stamp still runs BEFORE
+// globalStore.Move — its gate reads the pre-move status, which Move
+// mutates in place — but the path no longer returns a teardown Cmd.
+func TestQuickMoveTicket_InProgressToInReview_PreservesSession(t *testing.T) {
+	m, ticket, stub := newStatusMoveModel(t, board.StatusInProgress, false)
 
 	_, cmd := m.quickMoveTicket()
-	if cmd != nil {
-		_ = cmd()
-	}
 
-	// Move went through.
+	if cmd != nil {
+		t.Error("quickMoveTicket returned a Cmd; the async teardown Cmd should be gone")
+	}
 	if ticket.Status != board.StatusInReview {
 		t.Errorf("Status = %v, want %v", ticket.Status, board.StatusInReview)
 	}
-	// Wrap-up fired BEFORE Move (gate saw in_progress).
-	if stub.calls.Load() != 1 {
-		t.Errorf("TicketDone calls = %d, want 1 (wrap-up must have fired)", stub.calls.Load())
+	if _, ok := m.panes[ticket.ID]; !ok {
+		t.Errorf("panes[%s] removed by quick-move; the session must survive", ticket.ID)
 	}
-	if _, ok := m.panes[ticket.ID]; ok {
-		t.Errorf("panes[%s] still present after quick-move", ticket.ID)
+	if got := stub.calls.Load(); got != 0 {
+		t.Errorf("TicketDone calls = %d, want 0", got)
 	}
+	if ticket.AgentSessionID == "" {
+		t.Error("AgentSessionID cleared by quick-move; the resume key must survive")
+	}
+	// Proves the stamp ran pre-Move: post-Move the gate would see
+	// in_review and skip.
 	if ticket.AgentStatus != board.AgentCompleted {
-		t.Errorf("AgentStatus = %v, want %v", ticket.AgentStatus, board.AgentCompleted)
+		t.Errorf("AgentStatus = %v, want %v (stamp must run before Move)", ticket.AgentStatus, board.AgentCompleted)
 	}
 }
 
-// TestQuickMoveTicketBackward_DoneToInReview_NoWrapUp asserts that the
-// backward path doesn't fire wrap-up on done → in_review. The session
-// is already gone (we wrapped up when entering in_review or done the
-// first time); the helper's pre-Move-status gate ensures we don't try
-// to re-kill it.
-func TestQuickMoveTicketBackward_DoneToInReview_NoWrapUp(t *testing.T) {
-	m, ticket, stub := newWrapUpModel(t, board.StatusDone)
+// TestQuickMoveTicketBackward_DoneToInReview_PreservesSession asserts the
+// backward path is inert with respect to the session too. The stamp's
+// pre-move-status gate makes it a no-op here (the ticket isn't leaving
+// in_progress), and nothing else touches the pane.
+func TestQuickMoveTicketBackward_DoneToInReview_PreservesSession(t *testing.T) {
+	m, ticket, stub := newStatusMoveModel(t, board.StatusDone, true)
 
-	_, _ = m.quickMoveTicketBackward()
+	_, cmd := m.quickMoveTicketBackward()
 
+	if cmd != nil {
+		t.Error("quickMoveTicketBackward returned a Cmd; the async teardown Cmd should be gone")
+	}
 	if ticket.Status != board.StatusInReview {
 		t.Errorf("Status = %v, want %v", ticket.Status, board.StatusInReview)
 	}
-	if stub.calls.Load() != 0 {
-		t.Errorf("TicketDone calls = %d, want 0 (no wrap-up on done→in_review)", stub.calls.Load())
+	if got := stub.calls.Load(); got != 0 {
+		t.Errorf("TicketDone calls = %d, want 0 (no teardown on done→in_review)", got)
+	}
+	if _, ok := m.panes[ticket.ID]; !ok {
+		t.Errorf("panes[%s] removed by backward move", ticket.ID)
 	}
 }
 
@@ -348,8 +311,12 @@ func TestQuickMoveTicketBackward_DoneToInReview_NoWrapUp(t *testing.T) {
 // back to in_progress carries a stale AgentCompleted badge ("✓ done") that
 // must clear once it re-enters the active column. The TUI backward path
 // routes through globalStore.Move → board.SetStatus, where the fix lives.
+//
+// This is also the self-healing half of the preserved-session design: the
+// badge a terminal move stamps is demoted on the way back, so a session
+// that keeps running doesn't stay frozen at "Completed".
 func TestQuickMoveTicketBackward_InReviewToInProgress_ClearsDoneBadge(t *testing.T) {
-	m, ticket, _ := newWrapUpModel(t, board.StatusInReview)
+	m, ticket, _ := newStatusMoveModel(t, board.StatusInReview, false)
 	// Seed the stale done badge a finished session leaves behind.
 	ticket.SetAgentStatus(board.AgentCompleted)
 	someTime := time.Now().Add(-time.Hour)
@@ -373,13 +340,20 @@ func TestQuickMoveTicketBackward_InReviewToInProgress_ClearsDoneBadge(t *testing
 	if ticket.CompletedAt != nil {
 		t.Errorf("CompletedAt = %v, want nil", *ticket.CompletedAt)
 	}
+	// Pulling a ticket back must not cost the session either.
+	if _, ok := m.panes[ticket.ID]; !ok {
+		t.Errorf("panes[%s] removed by in_review→in_progress", ticket.ID)
+	}
+	if ticket.AgentSessionID == "" {
+		t.Error("AgentSessionID cleared by in_review→in_progress; the resume key must survive")
+	}
 }
 
-// TestDropTicket_InProgressToInReview_WrapsUp covers the drag-drop
-// path. dropTicket reads dragSourceColumn / dragTargetColumn so the
-// fixture points dragTarget at the in-review column before invoking.
-func TestDropTicket_InProgressToInReview_WrapsUp(t *testing.T) {
-	m, ticket, stub := newWrapUpModel(t, board.StatusInProgress)
+// TestDropTicket_InProgressToInReview_PreservesSession covers the
+// drag-drop path. dropTicket reads dragSourceColumn / dragTargetColumn so
+// the fixture points dragTarget at the in-review column before invoking.
+func TestDropTicket_InProgressToInReview_PreservesSession(t *testing.T) {
+	m, ticket, stub := newStatusMoveModel(t, board.StatusInProgress, false)
 	// Find the in-review column index.
 	for colIdx, col := range m.columns {
 		if col.Status == board.StatusInReview {
@@ -390,18 +364,36 @@ func TestDropTicket_InProgressToInReview_WrapsUp(t *testing.T) {
 	m.dragging = true
 
 	_, cmd := m.dropTicket()
-	if cmd != nil {
-		_ = cmd()
-	}
 
+	if cmd != nil {
+		t.Error("dropTicket returned a Cmd; the async teardown Cmd should be gone")
+	}
 	if ticket.Status != board.StatusInReview {
 		t.Errorf("Status = %v, want %v", ticket.Status, board.StatusInReview)
 	}
-	if stub.calls.Load() != 1 {
-		t.Errorf("TicketDone calls = %d, want 1", stub.calls.Load())
+	if got := stub.calls.Load(); got != 0 {
+		t.Errorf("TicketDone calls = %d, want 0", got)
 	}
-	if _, ok := m.panes[ticket.ID]; ok {
-		t.Errorf("panes[%s] still present after drop", ticket.ID)
+	if _, ok := m.panes[ticket.ID]; !ok {
+		t.Errorf("panes[%s] removed by drop; the session must survive", ticket.ID)
+	}
+	if ticket.AgentStatus != board.AgentCompleted {
+		t.Errorf("AgentStatus = %v, want %v", ticket.AgentStatus, board.AgentCompleted)
+	}
+}
+
+// TestStatusMove_NilDaemonAPI_DoesNotPanic exercises the
+// daemon-unreachable case: the TUI started before the daemon was up, so
+// m.daemon is nil. The stamp is pure local bookkeeping, so it must still
+// land.
+func TestStatusMove_NilDaemonAPI_DoesNotPanic(t *testing.T) {
+	m, ticket, _ := newStatusMoveModel(t, board.StatusInProgress, false)
+	m.daemon = nil
+
+	m.stampTerminalAgentStatus(ticket, board.StatusInReview)
+
+	if _, ok := m.panes[ticket.ID]; !ok {
+		t.Errorf("panes[%s] removed with nil m.daemon", ticket.ID)
 	}
 	if ticket.AgentStatus != board.AgentCompleted {
 		t.Errorf("AgentStatus = %v, want %v", ticket.AgentStatus, board.AgentCompleted)
