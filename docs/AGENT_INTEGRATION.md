@@ -761,14 +761,16 @@ as `Status=done` + `AgentStatus=completed` (atomic .md write), then
 writes `completed` to the status file. Reads `$OPENKANBAN_TICKET_ID`;
 exits non-zero if unset or if the ticket .md is missing.
 
-When the TUI sees the resulting `AgentCompleted` transition on a ticket
-whose `Status == StatusDone`, it gracefully stops the pane
-(SIGTERM → 3s grace → SIGKILL) — the Claude process exits cleanly and
-the ticket lands in the Done column with the completed badge.
+**The session is not ended.** `ticket done` is a status change like any
+other — the agent process keeps running after the command returns, and
+the daemon is not contacted at all. The card lands in Done with the
+completed badge, and pressing `Enter` on it re-attaches to the same
+live session with its full transcript. That is the durable-session
+guarantee: exactly one session per ticket, ended only by ticket
+delete, `x`, the exit-guard modal, or the agent's own exit.
 
 Idempotent: a second invocation does not re-stamp `CompletedAt`, but
-the status file is re-written so a freshly-spawned pane (re-opened
-after the previous completion) re-arms the auto-stop transition.
+the status file is re-written.
 
 Worktree, branch, and session-JSONL teardown remain reserved for
 ticket deletion — `ticket done` does not touch them.
@@ -785,9 +787,12 @@ Moves any ticket to any of the six statuses: `backlog`, `next`,
 the project named by `--project`. This command replaces the former
 `ticket in-review` and `ticket in-progress` subcommands.
 
-**Daemon teardown:** any move out of `in_progress` sends `TicketDone`
-to the daemon (best-effort, no-op on miss) so the live PTY is
-terminated and the 1:1 ticket↔session invariant is preserved.
+**No daemon teardown:** the command never contacts the daemon. A
+ticket's session is durable and survives every status change, in both
+directions — move a card to `done` and back to `backlog` and its agent
+is still there. The 1:1 ticket↔session invariant this used to cite is
+enforced at the daemon by `handleSpawn`'s per-TicketID dedup, not by
+killing sessions.
 
 **AgentStatus gating:** moves to `in_review` or `done` set
 `AgentStatus=completed`; a re-queue move (`in_progress → backlog` /
@@ -797,15 +802,14 @@ falsely render as completed.
 **No session status-file write:** unlike `ticket done`, this command
 does not write the `$OPENKANBAN_SESSION`-keyed status file (it is
 designed for external/scripted callers that may not be inside the
-session being moved). The `.md` write and daemon RPC are the
-authoritative signals.
+session being moved). The `.md` write is the authoritative signal.
 
 In-session replacement for the former verbs:
 - Former `ticket in-progress`: `ticket move --id "$OPENKANBAN_TICKET_ID" --status in_progress`
 - Former `ticket in-review`: `ticket move --id "$OPENKANBAN_TICKET_ID" --status in_review`
 
 Idempotent on a ticket already at the target status — no timestamps
-are re-stamped and the daemon is not contacted.
+are re-stamped.
 
 ## Claude approval persistence across tickets
 

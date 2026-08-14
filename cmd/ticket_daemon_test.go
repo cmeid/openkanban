@@ -611,6 +611,31 @@ func daemonHasSessionForTicket(t *testing.T, ticketID string) bool {
 	return false
 }
 
+// requireSessionSurvives polls for `window` and fails the moment the
+// ticket's daemon session disappears. It's the inverse of the old
+// "poll until gone" pattern the status-change tests used, and it's
+// deliberately a *window* rather than a single check: a teardown could
+// be in flight when the CLI returns (the RPC is best-effort and the
+// daemon's kill is asynchronous), so an immediate one-shot assertion
+// would go green against a slow kill. Fails loudly if the session
+// wasn't there to begin with, since "never appeared" would otherwise
+// masquerade as "survived".
+func requireSessionSurvives(t *testing.T, ticketID string, window time.Duration) {
+	t.Helper()
+	if !daemonHasSessionForTicket(t, ticketID) {
+		t.Fatalf("no daemon session for ticket %s at the start of the survival window; "+
+			"the assertion would be vacuous", ticketID)
+	}
+	deadline := time.Now().Add(window)
+	for time.Now().Before(deadline) {
+		if !daemonHasSessionForTicket(t, ticketID) {
+			t.Fatalf("daemon session for ticket %s was killed by a status change; "+
+				"sessions must be durable across every status change", ticketID)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // TestTicketDelete_KillsDaemonSessionWithoutBackfilledUUID is the load-
 // bearing test for B2: a freshly-spawned daemon session whose owning
 // ticket has AgentSessionID="" (UUID not yet back-filled) must still

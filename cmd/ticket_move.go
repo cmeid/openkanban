@@ -3,7 +3,6 @@ package cmd
 import (
 	"fmt"
 	"os"
-	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/techdufus/openkanban/internal/board"
@@ -26,10 +25,10 @@ backlog, next, in_progress, in_review, done, or archived.
 Selects the ticket by --id (exact UUID, unique UUID prefix, or unique
 title slug) within the project named by --project.
 
-When moving a ticket out of in_progress, the live daemon session for
-the ticket is terminated (best-effort) so the 1:1 ticket↔session
-invariant is preserved. Moving to in_review or done also marks the
-agent status as completed.
+The ticket's live daemon session is NOT touched: sessions are durable
+across every status change, in both directions, so a card pulled back
+to in_progress re-attaches to the same running agent. Moving to
+in_review or done marks the agent status as completed.
 
 This command does NOT autostart the daemon: a scripted invocation
 must remain quiet when the daemon happens to be down.
@@ -122,14 +121,13 @@ not by the agent itself.`,
 			fmt.Fprintf(os.Stderr, "openkanban: pruned %d stale allowlist entr(y/ies) (see .claude/.pruned-log)\n", n)
 		}
 
-		// Daemon teardown: any exit from in_progress terminates the live
-		// PTY to preserve the 1:1 ticket↔session invariant. TicketDone is
-		// a no-op on miss and best-effort on failure.
-		if current == board.StatusInProgress && target != board.StatusInProgress {
-			if derr := notifyDaemonTicketDoneCLI(string(ticket.ID), 3*time.Second); derr != nil {
-				fmt.Fprintf(os.Stderr, "openkanbankd: ticket_done for %s: %v\n", ticket.ID, derr)
-			}
-		}
+		// No daemon teardown. A ticket's session is durable and survives
+		// every status change, in both directions — moving a card must
+		// never cost the user their agent's live process or scrollback.
+		// (The 1:1 ticket↔session invariant this used to cite is enforced
+		// at the daemon by handleSpawn's per-TicketID dedup, not by
+		// killing sessions.) Sessions end only on ticket/project delete,
+		// explicit 'x' in the TUI, the exit guard, or the agent's exit.
 
 		fmt.Printf("moved %s → %s\n", shortID(string(ticket.ID)), target)
 		return nil

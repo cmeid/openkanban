@@ -108,10 +108,11 @@ func TestTicketMove_IDPrefixResolution(t *testing.T) {
 
 // --- Daemon-integrated tests -----------------------------------------------
 //
-// Each test that asserts "daemon NOT fired" seeds a live session first and
-// verifies it survives the move — a phantom assertion (no session seeded)
-// would pass even if TicketDone were erroneously sent, because TicketDone
-// is a no-op on miss.
+// Every one of these seeds a live session first and verifies it survives
+// the move: `ticket move` must never end a session, in either direction,
+// for any destination. A phantom assertion (no session seeded) would pass
+// even if TicketDone were erroneously sent, because TicketDone is a no-op
+// on miss — hence requireSessionSurvives's fail-loud precondition.
 
 func TestTicketMove_BacklogToInProgress_DaemonSessionSurvives(t *testing.T) {
 	sock, _ := daemonTestEnv(t)
@@ -149,7 +150,7 @@ func TestTicketMove_BacklogToInProgress_DaemonSessionSurvives(t *testing.T) {
 	}
 }
 
-func TestTicketMove_InProgressToInReview_AgentCompleted_SessionGone(t *testing.T) {
+func TestTicketMove_InProgressToInReview_AgentCompleted_SessionSurvives(t *testing.T) {
 	sock, _ := daemonTestEnv(t)
 	startDaemonServer(t, sock)
 	proj, tk, _ := scaffoldTicketDoneEnv(t)
@@ -172,17 +173,15 @@ func TestTicketMove_InProgressToInReview_AgentCompleted_SessionGone(t *testing.T
 		t.Errorf("CompletedAt = %v; want nil for in_review", got.CompletedAt)
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if !daemonHasSessionForTicket(t, string(tk.ID)) {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Error("daemon session still alive after in_progress→in_review")
+	// The card is badged completed, but the SESSION lives on: the whole
+	// point of the preservation guarantee is that pressing Enter on the
+	// in_review card lands back in the same agent. This asserted the
+	// opposite before (the CLI used to send TicketDone on any exit from
+	// in_progress).
+	requireSessionSurvives(t, string(tk.ID), 500*time.Millisecond)
 }
 
-func TestTicketMove_InProgressToDone_CompletedAt_SessionGone(t *testing.T) {
+func TestTicketMove_InProgressToDone_CompletedAt_SessionSurvives(t *testing.T) {
 	sock, _ := daemonTestEnv(t)
 	startDaemonServer(t, sock)
 	proj, tk, _ := scaffoldTicketDoneEnv(t)
@@ -204,14 +203,10 @@ func TestTicketMove_InProgressToDone_CompletedAt_SessionGone(t *testing.T) {
 		t.Error("CompletedAt should be stamped after →done")
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if !daemonHasSessionForTicket(t, string(tk.ID)) {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Error("daemon session still alive after in_progress→done")
+	// done is the furthest-right column and still not a session-ender:
+	// the user can pull the card back to in_progress and re-enter the
+	// same live agent. See the in_review case above.
+	requireSessionSurvives(t, string(tk.ID), 500*time.Millisecond)
 }
 
 func TestTicketMove_InProgressToBacklog_Requeue_ResetsAgentStatus(t *testing.T) {
@@ -255,15 +250,11 @@ func TestTicketMove_InProgressToBacklog_Requeue_ResetsAgentStatus(t *testing.T) 
 		t.Error("AgentStatus must NOT be completed on re-queue (sticky-terminal bug)")
 	}
 
-	// TicketDone fires on any exit from in_progress — session gone.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if !daemonHasSessionForTicket(t, string(tk.ID)) {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Error("daemon session still alive after in_progress→backlog")
+	// Re-queueing resets the badge but keeps the session — this is the
+	// exact round-trip the ticket describes ("pull it back to backlog and
+	// promote to in progress again ... the session should still be
+	// there").
+	requireSessionSurvives(t, string(tk.ID), 500*time.Millisecond)
 }
 
 func TestTicketMove_SameStatus_NoOp_TimestampsUnchanged_SessionSurvives(t *testing.T) {

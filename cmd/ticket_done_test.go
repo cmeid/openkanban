@@ -217,12 +217,18 @@ func spawnDaemonSessionForTicket(t *testing.T, ticketID string) string {
 	return resp.SessionID
 }
 
-// TestTicketDone_DaemonUp_OwnsTicket_SendsTicketDoneReq verifies that
-// when the daemon is up and owns a session for the ticket, the CLI
-// successfully delivers a TicketDoneReq and the daemon responds by
-// killing the session. The List RPC after the run shows no remaining
-// sessions for the ticket.
-func TestTicketDone_DaemonUp_OwnsTicket_SendsTicketDoneReq(t *testing.T) {
+// TestTicketDone_DaemonUp_LeavesSessionAlive is the CLI half of the
+// preservation guarantee. `openkanban ticket done` is the agent saying
+// "I'm handing this back" — a status change like any other, NOT the
+// agent's own exit (the process keeps running after the command
+// returns). So the daemon-owned session must still be there afterwards,
+// ready for the user to press Enter on the done card and read the
+// transcript.
+//
+// This inverts the old contract: the command used to send a TicketDone
+// RPC that killed the PTY, and this test used to poll until the session
+// disappeared.
+func TestTicketDone_DaemonUp_LeavesSessionAlive(t *testing.T) {
 	sock, _ := daemonTestEnv(t)
 	startDaemonServer(t, sock)
 
@@ -230,8 +236,9 @@ func TestTicketDone_DaemonUp_OwnsTicket_SendsTicketDoneReq(t *testing.T) {
 	t.Setenv("OPENKANBAN_TICKET_ID", string(tk.ID))
 	t.Setenv("OPENKANBAN_SESSION", "test-session")
 
-	// Pre-stage a daemon-owned session for the ticket.
-	daemonSessionID := spawnDaemonSessionForTicket(t, string(tk.ID))
+	// Pre-stage a daemon-owned session for the ticket. Seeding it is what
+	// makes the survival assertion non-vacuous.
+	spawnDaemonSessionForTicket(t, string(tk.ID))
 
 	ticketDoneForce = true
 	t.Cleanup(func() { ticketDoneForce = false })
@@ -242,58 +249,34 @@ func TestTicketDone_DaemonUp_OwnsTicket_SendsTicketDoneReq(t *testing.T) {
 		}
 	})
 
-	// On success there's no warning line (Killed=true).
+	// The daemon isn't contacted at all any more, so nothing should be
+	// reported about it either way.
 	if strings.Contains(stderr, "openkanbankd:") {
-		t.Errorf("unexpected openkanbankd warning on happy path: %q", stderr)
+		t.Errorf("stderr mentions openkanbankd; the daemon must not be contacted: %q", stderr)
 	}
 
-	// Ticket .md write should have happened (existing behavior).
+	// Ticket .md write is still authoritative.
 	got := loadTicket(t, proj, tk.ID)
 	if got.Status != board.StatusDone {
 		t.Errorf("Status = %q; want %q", got.Status, board.StatusDone)
 	}
-
-	// And the daemon should no longer hold that session. Use a fresh
-	// short-lived client to ask.
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	c, err := daemonclient.New(ctx)
-	if err != nil {
-		t.Fatalf("daemonclient.New (post-check): %v", err)
+	if got.AgentStatus != board.AgentCompleted {
+		t.Errorf("AgentStatus = %q; want %q", got.AgentStatus, board.AgentCompleted)
 	}
-	defer c.Close()
 
-	// Give the kill goroutine a moment to do its work.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		list, err := c.List(ctx)
-		if err != nil {
-			t.Fatalf("List: %v", err)
-		}
-		stillThere := false
-		for _, s := range list.Sessions {
-			if s.SessionID == daemonSessionID {
-				stillThere = true
-				break
-			}
-		}
-		if !stillThere {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Errorf("daemon still holds session %s after ticket-done", daemonSessionID)
+	requireSessionSurvives(t, string(tk.ID), 500*time.Millisecond)
 }
 
-// TestTicketDone_DaemonUp_DoesNotOwn_StderrWarningExit0 verifies the
-// soft-no-op path: when the daemon is up but doesn't have a session
-// for the ticket, the CLI prints a stderr warning and exits 0. The
-// on-disk .md write still happens.
-func TestTicketDone_DaemonUp_DoesNotOwn_StderrWarningExit0(t *testing.T) {
+// TestTicketDone_DaemonUp_NoSession_DoesNotContactDaemon covers the case
+// where the daemon is up but holds no session for this ticket. There is
+// nothing to warn about now that the RPC is gone, so stderr must be
+// clean — the old "no live session for ticket …" line was a symptom of
+// the teardown call this change removed.
+func TestTicketDone_DaemonUp_NoSession_DoesNotContactDaemon(t *testing.T) {
 	sock, _ := daemonTestEnv(t)
 	startDaemonServer(t, sock)
-	// Hold the daemon open so it doesn't shut down between our
-	// scaffolding and the CLI's probe.
+	// Hold the daemon open so "no warning" can't be confused with "the
+	// daemon went away".
 	holdDaemonOpen(t)
 
 	proj, tk, _ := scaffoldTicketDoneEnv(t)
@@ -310,11 +293,8 @@ func TestTicketDone_DaemonUp_DoesNotOwn_StderrWarningExit0(t *testing.T) {
 	if runErr != nil {
 		t.Fatalf("ticketDoneCmd.RunE: %v", runErr)
 	}
-	if !strings.Contains(stderr, "openkanbankd:") {
-		t.Errorf("expected stderr to mention openkanbankd; got %q", stderr)
-	}
-	if !strings.Contains(stderr, "no live session") {
-		t.Errorf("expected stderr to say 'no live session'; got %q", stderr)
+	if strings.Contains(stderr, "openkanbankd:") {
+		t.Errorf("stderr mentions openkanbankd; the daemon must not be contacted: %q", stderr)
 	}
 	got := loadTicket(t, proj, tk.ID)
 	if got.Status != board.StatusDone {
@@ -322,11 +302,12 @@ func TestTicketDone_DaemonUp_DoesNotOwn_StderrWarningExit0(t *testing.T) {
 	}
 }
 
-// TestTicketDone_DaemonDown_StderrWarningExit0 verifies that with no
-// daemon running, the CLI completes successfully (.md write done) but
-// emits a stderr warning line. We intentionally do NOT call
-// startDaemonServer.
-func TestTicketDone_DaemonDown_StderrWarningExit0(t *testing.T) {
+// TestTicketDone_DaemonDown_Exit0Quietly verifies that with no daemon
+// running the CLI still completes (.md write done) and stays silent. A
+// scripted invocation must never autostart a daemon, and it no longer
+// needs one at all — so the old "openkanbankd: <dial error>" warning
+// line must be gone too. We intentionally do NOT call startDaemonServer.
+func TestTicketDone_DaemonDown_Exit0Quietly(t *testing.T) {
 	daemonTestEnv(t)
 	// NOT starting the daemon.
 
@@ -344,8 +325,8 @@ func TestTicketDone_DaemonDown_StderrWarningExit0(t *testing.T) {
 	if runErr != nil {
 		t.Fatalf("ticketDoneCmd.RunE: %v", runErr)
 	}
-	if !strings.Contains(stderr, "openkanbankd:") {
-		t.Errorf("expected stderr to mention openkanbankd; got %q", stderr)
+	if strings.Contains(stderr, "openkanbankd:") {
+		t.Errorf("stderr mentions openkanbankd with no daemon running; want silence: %q", stderr)
 	}
 	got := loadTicket(t, proj, tk.ID)
 	if got.Status != board.StatusDone {

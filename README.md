@@ -57,7 +57,7 @@ Upstream's CLI was effectively project-management only (`new` / `list` / `delete
 |---|---|
 | `openkanban ticket new` | Create a ticket. Prints an `id=<uuid>` line and then the `.md` path (path stays the final line for back-compat). `--json` emits a stable object `{id, path, slug, status, project_id, worktree_path, branch_name, base_branch}`. `--worktree` provisions the git worktree + branch now (same derivation the TUI uses at spawn, so spawn reuses it) — distinct from the lazy `--no-worktree` hint. Also honors `--description-file` / stdin, `--labels`, `--priority`, `--status`, `--session`, `--migrate`, `--force`, `--created-by`. |
 | `openkanban ticket list` | Enumerate tickets across all projects. Filters: `--project`, `--status` (comma/repeatable), `--title-contains`. Default is a human table (short id, title, status, project, updated); `--json` emits a stable array (every key present, `labels` always an array, RFC3339 timestamps). Read-only — skips migration-pending projects (noted on stderr) rather than migrating them. The canonical id-discovery path. |
-| `openkanban ticket done` | Mark the current ticket done (reads `$OPENKANBAN_TICKET_ID` injected at spawn). The TUI sees the transition and gracefully stops the pane. |
+| `openkanban ticket done` | Mark the current ticket done (reads `$OPENKANBAN_TICKET_ID` injected at spawn). A status change, not a shutdown — the session stays alive and `Enter` on the Done card re-attaches to it. |
 | `openkanban ticket delete` | Daemon-aware. If the daemon owns the session, sends a `KillReq` first, then unlinks the `.md`. `--id` accepts the full id, a unique 4+ char id prefix (or filename short-hash), or a unique title slug; passing a **project** id by mistake returns a hint pointing at `ticket list` instead of a bare "not found". |
 | `openkanban daemon {list,stop,restart,log}` | Daemon lifecycle. |
 | `openkanban hooks install` | Wires Claude Code `SessionStart` / `UserPromptSubmit` / `Stop` / `Notification` hooks into `~/.claude/settings.json`. Atomic write, timestamped backup, preserves foreign keys, dedupes by command prefix. |
@@ -274,13 +274,13 @@ If you have a config from before this version, your existing `tickets/<project_i
 
 ## Agent self-completion
 
-When openkanban spawns an agent into a ticket, the child can mark the ticket done and exit cleanly:
+When openkanban spawns an agent into a ticket, the child can mark the ticket done itself:
 
 ```bash
 openkanban ticket done
 ```
 
-This sets `status: done`, stamps `completed_at`, sets `agent_status: completed`, and signals the TUI to gracefully stop the pane (SIGTERM, 3 s grace, SIGKILL). The agent exits, the card lands in Done, no manual `/quit` or column-move required.
+This sets `status: done`, stamps `completed_at`, and sets `agent_status: completed`. The card lands in Done with no manual column-move required. It does **not** end the session: status changes never do, so `Enter` on the Done card re-attaches to the same agent with its scrollback intact.
 
 Worktrees and branches are preserved on `done`. Only `openkanban ticket delete` tears them down. See [`docs/AGENT_INTEGRATION.md`](./docs/AGENT_INTEGRATION.md#agent-callable-commands-in-session) for env vars, status-file mechanics, and Claude Code `Stop` hook interaction.
 
