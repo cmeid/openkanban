@@ -29,7 +29,9 @@ Stay scoped to this ticket's worktree; don't change ticket status — OpenKanban
 
 ## First action
 
-**Run `/prime` IMMEDIATELY before anything else.** It loads the project CLAUDE.md and your memory at `~/.claude/projects/-Users-cmeid-manifold-dev/memory/`. You need this context.
+Orient yourself before starting: read this repo's `CLAUDE.md` and, if this ticket has one, the brief named below. For most tickets that is enough.
+
+Run `/prime` when those leave you genuinely unoriented — when you need the in-flight git/PR picture, or your persisted memory at `~/.claude/projects/-Users-cmeid-manifold-dev/memory/`. It fans work out to subagents, so run it because you need that picture, not as a reflex.
 
 ## Your assignment
 
@@ -42,7 +44,7 @@ Stay scoped to this ticket's worktree; don't change ticket status — OpenKanban
 {{if .HasBrief}}
 ## Your brief
 
-The ticket Description above is a one-line pointer, not the spec. The canonical brief lives at `{{.BriefPath}}` in this worktree. Read it immediately after `/prime`.
+The ticket Description above is a one-line pointer, not the spec. The canonical brief lives at `{{.BriefPath}}` in this worktree. Read it first.
 
 The brief uses sections `## Brief / ## Acceptance / ## Must NOT / ## File anchors / ## Context (read these)`. The Context section may reference memory files via `[[slug]]` tokens — for each token, read `~/.claude/projects/-Users-cmeid-manifold-dev/memory/<slug>.md`. If a referenced memory file doesn't exist, note it in your summary; don't fabricate.
 
@@ -55,6 +57,8 @@ This ticket has no separate brief file — proceed from the title and descriptio
 ## How to work
 
 Lean on specialized subagents when they're available — they protect your main context window and surface things a single pass misses. Fan independent work out in parallel via the Agent tool.
+
+- **Route reads by purpose.** For the file you're about to edit, read it directly — you need the exact bytes. For "where is this" or "how does this work", search, query a code-graph tool, or send a subagent, and keep only the conclusion. Whole files pulled in to *understand* stay in your context and are re-sent every turn afterward, which is the largest cost in a long session.
 
 - **Code changes:** before claiming done, route the diff through whatever code-review, test/build validation, and cross-stack risk subagents your environment provides. Treat their findings as signal — fix the underlying issue rather than rationalizing past it.
 - **Substantive doc edits** (READMEs, design notes, customer-facing artifacts): if an adversarial or multi-role reviewer subagent is installed, run the draft through it before commit.
@@ -81,4 +85,4 @@ Specifically, in this session:
 
 Follow your global `~/.claude/CLAUDE.md` for everything else — signing, push gates, etc. This template only defines OpenKanban-specific orchestration.
 
-Begin by running `/prime`.{{end}}
+Begin by orienting yourself in the worktree.{{end}}
