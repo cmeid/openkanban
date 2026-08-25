@@ -86,7 +86,7 @@ Add the following to `~/.config/openkanban/config.json` under the `"agents"` key
 
 Then pin the project via **`g`** (sidebar cycle) or **`e`** (full project + agent editor). The `--model` flag passes through to Claude unchanged — openkanban only manages `--dangerously-skip-permissions` and `--permission-mode`, nothing else. `opusplan` is a valid `--model` value (`claude --help`'s alias list is introduced with "e.g." and is non-exhaustive).
 
-The same pattern works for any model (`opus`, `sonnet`, `fable`, …) or for combining a model override with a different `CLAUDE_CONFIG_DIR`. The shipped `claude-lean` preset in `config.json` is a good reference for the full shape of a Claude-class variant.
+The same pattern works for any model (`opus`, `sonnet`, `fable`, …) or for combining a model override with a different `CLAUDE_CONFIG_DIR`. The shipped `claude-custom` preset in `config.json` is a good reference for the full shape of a Claude-class variant. Note that a non-default `CLAUDE_CONFIG_DIR` needs its own one-time `claude` login, and that three things resolve under the real `~/.claude` regardless of it: openkanban's status hooks (`~/.claude/settings.json`), the bundled close-out skill (`~/.claude/skills/`), and the launch-time subagent check. A worker under a different config dir therefore reports status via coarse terminal parsing and cannot see the close-out skill — see [`TOKEN_OPTIMIZATION.md`](TOKEN_OPTIMIZATION.md).
 
 > To edit agents without touching `config.json` by hand: sidebar **`e`** opens a unified project + agent editor in the TUI.
 

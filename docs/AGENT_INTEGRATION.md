@@ -598,7 +598,7 @@ case agentStatusMsg:
 
 1. Agent-specific `init_prompt` in config
 2. Global `defaults.init_prompt` in config
-3. Built-in default prompt — embedded from [`internal/config/agent_prompt.tmpl`](../internal/config/agent_prompt.tmpl) via `//go:embed`. Edit the markdown file, not a Go string constant. On `Load`, `mergeAgentDefaults` restores the embedded default when a user's `init_prompt` field is empty or absent, so clearing the override falls through to the binary's shipped content (not to the much shorter generic `defaultGlobalPrompt`).
+3. Built-in default prompt — embedded from [`internal/config/agent_prompt.tmpl`](../internal/config/agent_prompt.tmpl) via `//go:embed`. Edit the markdown file, not a Go string constant. On `Load`, `mergeAgentDefaults` restores the embedded default when a user's `init_prompt` field is empty or absent, so clearing the override falls through to the binary's shipped content (not to the much shorter generic `defaultGlobalPrompt`). **Consequence worth knowing:** because the backfill only fires when the field is *empty*, the first run bakes the shipped template into `config.json`, so later edits to `agent_prompt.tmpl` do not reach existing installs until that key is cleared — see [`TOKEN_OPTIMIZATION.md`](TOKEN_OPTIMIZATION.md) "Two traps".
 
 ### Design intent of the shipped template
 
@@ -606,19 +606,28 @@ The embedded `agent_prompt.tmpl` is deliberately **generic about cross-cutting w
 
 The one deliberate exception is the **`finishing-an-openkanban-ticket`** skill, which the template names for the close-out. That skill is openkanban-owned (vendored at [`internal/finishskill/SKILL.md`](../internal/finishskill/SKILL.md) and written into `~/.claude/skills/` on launch — see "Standardized close-out" below), so it is guaranteed present in any openkanban-spawned session. The template's wrap-up section delegates the entire end-of-ticket flow to it: verify → self-evaluate readiness → one enumerated permission prompt → land via commit → PR → merge → reflective wind-down. The template itself stays generic and prose-affirmative (it describes *what* the close-out does, not a list of `NEVER` rules) so it doesn't restate the user's global push-gate.
 
-### Token / context optimization (the `claude-lean` preset)
+### Token / context optimization
 
-A default spawned session loads ~55k tokens of context before doing any work —
-mostly the *environment* (enabled plugins, auto-memory, global `CLAUDE.md`, MCP
-listings), not OpenKanban's own ~1.2k-token prompt. The **`claude-lean`** preset
-(`defaultAgents()` in `internal/config/config.go`) spawns a worker under a
-slimmed `CLAUDE_CONFIG_DIR`, disables auto-memory, forbids MCP, and uses a
-trimmed InitPrompt (`agent_prompt_lean.tmpl`, no `/prime` mandate) — cutting a
-worker to roughly half a default session. It rides the same basename-keyed spawn
-path as `claude`/`claude-custom` (no `model.go` change) and is opt-in per project
-(pin via sidebar `g`/`e`). Full measured breakdown, the one-time `~/.claude-lean`
-setup recipe, and why a literal "30%" is bounded by Claude Code's fixed system
-prompt + tools: see [`TOKEN_OPTIMIZATION.md`](TOKEN_OPTIMIZATION.md).
+A default spawned session loads ~34k tokens of context before doing any work
+(Claude Code 2.1.231) — almost all of it the *environment* (MCP server listings,
+enabled plugins/skills, global `CLAUDE.md`), not OpenKanban's own ~1.2k-token
+prompt. The prompt is therefore **deliberately not trimmed for token reasons**:
+it is load-bearing for orientation and the saving would be ≲0.5k.
+
+A `claude-lean` preset used to live in `defaultAgents()` and spawn workers under
+a slimmed `CLAUDE_CONFIG_DIR` with auto-memory and MCP off. It was **removed** on
+2026-08-25: it had never once run, its measurements were calibrated to a CLI
+whose startup cost has since fallen 38%, it needed an interactive `/login` that
+nothing automated, and a non-default `CLAUDE_CONFIG_DIR` silently breaks three
+paths that hardcode `~/.claude` — `cmd/hooks.go:101` (hooks go to
+`~/.claude/settings.json`, so `openkanban status set` never fires and status
+detection falls back to terminal parsing), `internal/finishskill` (the close-out
+skill the preset's own template told the agent to use), and
+`cmd/launch_check.go:202` (which checks the *real* `~/.claude` and so suppresses
+the "subagents not found" warning while the worker cannot see them). Before rebuilding anything like it, read
+[`TOKEN_OPTIMIZATION.md`](TOKEN_OPTIMIZATION.md): it keeps the measurement
+methodology, the current per-lever breakdown, and the levers that actually pay
+(MCP scoping, trimming always-loaded user files) — none of which need a preset.
 
 ### Standardized close-out
 

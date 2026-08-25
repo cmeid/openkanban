@@ -278,52 +278,56 @@ func TestBuildSpawnReq_InjectsAgentEnv(t *testing.T) {
 	})
 }
 
-// TestBuildSpawnReq_LeanPresetReachesSpawn is the authoritative test for the
-// claude-lean preset: it feeds the SHIPPED preset's Env+Args through
-// buildSpawnReq and asserts the token-optimizing knobs actually reach the
-// SpawnReq the daemon executes — not merely that the config map contains the
-// key (a config-only assertion passes vacuously even if the wiring breaks).
-// Red-before-green: strip any of CLAUDE_CONFIG_DIR / CLAUDE_CODE_DISABLE_AUTO_MEMORY
-// / --strict-mcp-config from the preset in config.go and the matching sub-check
-// fails. See docs/TOKEN_OPTIMIZATION.md.
-func TestBuildSpawnReq_LeanPresetReachesSpawn(t *testing.T) {
+// TestBuildSpawnReq_ShippedPresetReachesSpawn feeds a SHIPPED preset's
+// Env+Args from config.DefaultConfig() through buildSpawnReq and asserts they
+// actually reach the SpawnReq the daemon executes — not merely that the config
+// map contains the key (a config-only assertion passes vacuously even if the
+// wiring breaks). claude-custom is the surviving preset that ships a
+// CLAUDE_CONFIG_DIR, so it guards the config.go-definition -> SpawnReq seam.
+// Red-before-green: drop Env or Args from the preset in config.go, or break
+// tilde expansion in buildSpawnReq, and the matching sub-check fails.
+func TestBuildSpawnReq_ShippedPresetReachesSpawn(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
-	lean, ok := config.DefaultConfig().Agents["claude-lean"]
+	preset, ok := config.DefaultConfig().Agents["claude-custom"]
 	if !ok {
-		t.Fatal("claude-lean preset missing from default agents")
+		t.Fatal("claude-custom preset missing from default agents")
 	}
-	if lean.Command != "claude" {
-		t.Fatalf("claude-lean Command = %q, want \"claude\" (must inherit Claude-class spawn behavior via basename switch)", lean.Command)
+	if preset.Command != "claude" {
+		t.Fatalf("claude-custom Command = %q, want \"claude\" (must inherit Claude-class spawn behavior via basename switch)", preset.Command)
 	}
 
 	// Mirror model.go's cleanArgs derivation (strip empty entries).
-	cleanArgs := make([]string, 0, len(lean.Args))
-	for _, a := range lean.Args {
+	cleanArgs := make([]string, 0, len(preset.Args))
+	for _, a := range preset.Args {
 		if strings.TrimSpace(a) != "" {
 			cleanArgs = append(cleanArgs, a)
 		}
 	}
 
-	in := baseClaudeInputs(t, "TICK-LEAN", "task/lean")
+	in := baseClaudeInputs(t, "TICK-CUSTOM", "task/custom")
 	in.cleanArgs = cleanArgs
-	in.agentEnv = lean.Env
+	in.agentEnv = preset.Env
 
 	req := buildSpawnReq(in)
 
-	wantCfgDir := "CLAUDE_CONFIG_DIR=" + filepath.Join(home, ".claude-lean")
+	// Tilde in the shipped Env value must be expanded against HOME.
+	wantCfgDir := "CLAUDE_CONFIG_DIR=" + filepath.Join(home, ".claude-personal")
 	if !envHas(req.Env, wantCfgDir) {
-		t.Errorf("lean env missing %q, got %v", wantCfgDir, req.Env)
+		t.Errorf("env missing %q, got %v", wantCfgDir, req.Env)
 	}
-	if !envHas(req.Env, "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1") {
-		t.Errorf("lean env missing CLAUDE_CODE_DISABLE_AUTO_MEMORY=1, got %v", req.Env)
+	// Guard against a vacuous loop: an empty cleanArgs would assert nothing.
+	if len(cleanArgs) == 0 {
+		t.Fatal("claude-custom ships no Args; this test would assert nothing")
 	}
-	if !argsContain(req.Args, "--strict-mcp-config") {
-		t.Errorf("lean args missing --strict-mcp-config, got %v", req.Args)
+	if !argsContain(req.Args, "--dangerously-skip-permissions") {
+		t.Errorf("args missing --dangerously-skip-permissions, got %v", req.Args)
 	}
-	if !argsContain(req.Args, "--exclude-dynamic-system-prompt-sections") {
-		t.Errorf("lean args missing --exclude-dynamic-system-prompt-sections, got %v", req.Args)
+	for _, arg := range cleanArgs {
+		if !argsContain(req.Args, arg) {
+			t.Errorf("args missing shipped preset arg %q, got %v", arg, req.Args)
+		}
 	}
 }
 
